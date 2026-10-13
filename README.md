@@ -20,6 +20,14 @@ WGSL at runtime via naga. The bundled collection lives in `shaders/shadertoys`.
 Some of the included shaders react to the music by using the player's spectrum data (`iChannel0`
 is fed a 512-wide spectrum texture every frame).
 
+## Screenshots
+
+![Music view — cover-flow carousel, spectrum analyzer and album strip](screenshots/music-view.png)
+
+![Audio settings — spectrum, ReplayGain and playback options](screenshots/settings.png)
+
+![Shader view — spectrum-reactive background with the clock widget](screenshots/shader-view.png)
+
 ## Build
 
 - Compile: `cargo build --release`
