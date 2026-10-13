@@ -1,20 +1,62 @@
-//! The expanding search pill (Lacrima's `AlbumSearch` TextBox): a 35x35
-//! rounded pill collapsed to a magnifier that grows leftward to 220px
+//! The expanding search pill (Lacrima's `AlbumSearch` TextBox): a
+//! rounded pill collapsed to a magnifier that grows to its full width
 //! over 0.35s CubicEaseOut while hovered/focused, then shrinks back.
+//!
+//! Two specs share the machinery:
+//! - `ui` — the 35px top-right pill, expands *leftward* from its
+//!   right-docked anchor.
+//! - `ui_band` — a bigger pill docked in the media-buttons band. Its
+//!   collapsed face is just the magnifier (no button chrome); hovering
+//!   fades the icon out (a slightly bigger one fades in with the box)
+//!   while the box expands *rightward* from the icon.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
 };
 
-const W_MIN: f32 = 35.0;
-const W_MAX: f32 = 220.0;
-const H: f32 = 35.0;
-const RADIUS: f32 = 18.0;
 const OPEN_SECS: f32 = 0.35;
 const FADE_SECS: f32 = 0.3;
-const FONT: f32 = 12.5;
-const ICON_D: f32 = 16.0;
-const ICON_LEFT: f32 = 10.0;
+
+struct Spec {
+    w_min: f32,
+    w_max: f32,
+    h: f32,
+    radius: f32,
+    font: f32,
+    icon_d: f32,
+    icon_left: f32,
+    /// Icon→text margin inside the open box.
+    text_gap: f32,
+    /// Expand rightward from a left anchor (band) vs leftward from a
+    /// right anchor (top-right pill).
+    grow_right: bool,
+}
+
+const PILL: Spec = Spec {
+    w_min: 35.0,
+    w_max: 220.0,
+    h: 35.0,
+    radius: 18.0,
+    font: 12.5,
+    icon_d: 16.0,
+    icon_left: 10.0,
+    text_gap: 5.0,
+    grow_right: false,
+};
+
+const BAND: Spec = Spec {
+    // w_min == h: the shrunken border is a perfect circle around the
+    // collapsed icon — 60px matches the band's other button glyphs.
+    w_min: 60.0,
+    w_max: 300.0,
+    h: 60.0,
+    radius: 30.0,
+    font: 15.0,
+    icon_d: 28.0,
+    icon_left: 16.0,
+    text_gap: 11.0,
+    grow_right: true,
+};
 
 #[derive(Default)]
 pub struct SearchPill {
@@ -27,8 +69,8 @@ pub struct SearchPill {
 impl SearchPill {
     /// `right`/`top` anchor the pill's top-right corner (Lacrima docks
     /// it HorizontalAlignment=Right Margin 0,15,30,0). `active` fades
-    /// the pill in/out (the band toggle reveals the album-filter pill);
-    /// `forced_open` keeps it expanded regardless of hover.
+    /// the pill in/out; `forced_open` keeps it expanded regardless of
+    /// hover. Expands leftward.
     #[allow(clippy::too_many_arguments)]
     pub fn ui(
         &mut self,
@@ -42,30 +84,84 @@ impl SearchPill {
         interactive: bool,
         s: f32,
     ) {
+        let spec = &PILL;
         let id = ui.id().with("search-pill").with(hint);
-        let avail = ui.ctx().animate_bool_with_time(id.with("act"), active, FADE_SECS);
+        let avail =
+            ui.ctx().animate_bool_with_time(id.with("act"), active, FADE_SECS);
         if avail < 0.01 {
             self.focused = false;
             self.expanded = false;
             return;
         }
         let alpha = alpha * avail;
-        let t = ease_out_cubic(ui.ctx().animate_bool_with_time(
+        let t = self.open_t(ui, id);
+        let w = (spec.w_min + (spec.w_max - spec.w_min) * t) * s;
+        let rect = Rect::from_min_max(
+            Pos2::new(right - w, top),
+            Pos2::new(right, top + spec.h * s),
+        );
+        self.track_expand(ui, rect, interactive, forced_open);
+        self.draw(ui, id, rect, t, alpha, interactive, s, spec, hint);
+    }
+
+    /// The media-buttons band variant: `icon_center` is where the
+    /// collapsed magnifier sits (centered on its slot). The box grows
+    /// rightward from there — icon fades out as a slightly bigger one
+    /// fades in with the box; on close the icon fades back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ui_band(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon_center: Pos2,
+        hint: &str,
+        active: bool,
+        forced_open: bool,
+        alpha: f32,
+        interactive: bool,
+        s: f32,
+    ) {
+        let spec = &BAND;
+        let id = ui.id().with("search-pill").with(hint);
+        let avail =
+            ui.ctx().animate_bool_with_time(id.with("act"), active, FADE_SECS);
+        if avail < 0.01 {
+            self.focused = false;
+            self.expanded = false;
+            return;
+        }
+        let alpha = alpha * avail;
+        let t = self.open_t(ui, id);
+        let w = (spec.w_min + (spec.w_max - spec.w_min) * t) * s;
+        // Left anchor: the icon slot's left edge, so the icon stays
+        // put while the box grows to its right.
+        let left = icon_center.x - (spec.icon_left + spec.icon_d * 0.5) * s;
+        let rect = Rect::from_min_max(
+            Pos2::new(left, icon_center.y - spec.h * 0.5 * s),
+            Pos2::new(left + w, icon_center.y + spec.h * 0.5 * s),
+        );
+        self.track_expand(ui, rect, interactive, forced_open);
+        self.draw(ui, id, rect, t, alpha, interactive, s, spec, hint);
+    }
+
+    /// Width animation time (0 collapsed .. 1 open), eased.
+    fn open_t(&mut self, ui: &egui::Ui, id: egui::Id) -> f32 {
+        ease_out_cubic(ui.ctx().animate_bool_with_time(
             id.with("t"),
             self.expanded,
             OPEN_SECS,
-        ));
-        let w = (W_MIN + (W_MAX - W_MIN) * t) * s;
-        let rect = Rect::from_min_max(
-            Pos2::new(right - w, top),
-            Pos2::new(right, top + H * s),
-        );
+        ))
+    }
 
-        // Pointer-inside test, not a hovered widget: the TextEdit inside
-        // the expanded rect claims hover for itself, which would flip
-        // `expanded` false->true->false every frame (flicker).
-        // the expanded rect claims hover for itself, which would flip
-        // `expanded` false->true->false every frame (flicker).
+    /// Pointer-inside test, not a hovered widget: the TextEdit inside
+    /// the expanded rect claims hover for itself, which would flip
+    /// `expanded` false->true->false every frame (flicker).
+    fn track_expand(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        interactive: bool,
+        forced_open: bool,
+    ) {
         let hovered = ui
             .ctx()
             .input(|i| i.pointer.latest_pos())
@@ -75,33 +171,78 @@ impl SearchPill {
         if hovered && !self.expanded {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        rect: Rect,
+        t: f32,
+        alpha: f32,
+        interactive: bool,
+        s: f32,
+        spec: &Spec,
+        hint: &str,
+    ) {
         let painter = ui.painter();
-        let r = CornerRadius::same((RADIUS * s).round() as u8);
+        let r = CornerRadius::same((spec.radius * s).round() as u8);
         painter.rect_filled(
             rect,
             r,
             Color32::from_black_alpha((0xAA as f32 * t * alpha) as u8),
         );
-        painter.rect_stroke(
-            rect,
-            r,
-            Stroke::new(
-                1.0,
-                Color32::from_white_alpha((0x44 as f32 * t * alpha) as u8),
-            ),
-            StrokeKind::Inside,
-        );
+        // Border: the band pill keeps it while collapsed — shrunk to
+        // w_min==h it reads as a stroked circle around the icon, same
+        // weight/finish as the album-toggle's outlined square. The
+        // top-right pill's collapsed face is a bare icon, so its
+        // border only fades in with the box.
+        if spec.grow_right {
+            painter.rect_stroke(
+                rect,
+                r,
+                Stroke::new(
+                    3.5 * s,
+                    Color32::from_white_alpha((0xB0 as f32 * alpha) as u8),
+                ),
+                StrokeKind::Inside,
+            );
+        } else {
+            painter.rect_stroke(
+                rect,
+                r,
+                Stroke::new(
+                    1.0,
+                    Color32::from_white_alpha((0x44 as f32 * t * alpha) as u8),
+                ),
+                StrokeKind::Inside,
+            );
+        }
 
         // Magnifier, docked left (InnerLeftContent, Margin 10,0,5,0).
-        let ic = Pos2::new(rect.min.x + (ICON_LEFT + ICON_D * 0.5) * s, rect.center().y);
-        let k = ICON_D * s / 24.0;
-        let c = Color32::from_white_alpha((0xCC as f32 * alpha) as u8);
-        painter.circle_stroke(ic + Vec2::new(-0.5 * k, -0.5 * k), 6.5 * k, Stroke::new(2.0 * k, c));
-        painter.line_segment(
-            [ic + Vec2::new(4.4 * k, 4.4 * k), ic + Vec2::new(9.2 * k, 9.2 * k)],
-            Stroke::new(2.4 * k, c),
+        let ic = Pos2::new(
+            rect.min.x + (spec.icon_left + spec.icon_d * 0.5) * s,
+            rect.center().y,
         );
+        let k = spec.icon_d * s / 24.0;
+        if spec.grow_right {
+            // One continuous icon — lit white like the sibling glyphs,
+            // swelling ~15% into the box's version as it opens.
+            magnifier(
+                painter,
+                ic,
+                k * (1.0 + 0.15 * t),
+                Color32::from_white_alpha((0xF0 as f32 * alpha) as u8),
+            );
+        } else {
+            magnifier(
+                painter,
+                ic,
+                k,
+                Color32::from_white_alpha((0xCC as f32 * alpha) as u8),
+            );
+        }
 
         // Text field + clear button while open (Lacrima fades them with
         // the same transition).
@@ -127,10 +268,10 @@ impl SearchPill {
                 );
             }
             let edit_right = rect.max.x - if clear { 30.0 } else { 8.0 } * s;
-            let line_h = FONT * s * 1.4;
+            let line_h = spec.font * s * 1.4;
             let inner = Rect::from_min_max(
                 Pos2::new(
-                    rect.min.x + (ICON_LEFT + ICON_D + 5.0) * s,
+                    rect.min.x + (spec.icon_left + spec.icon_d + spec.text_gap) * s,
                     rect.center().y - line_h * 0.5,
                 ),
                 Pos2::new(edit_right, rect.center().y + line_h * 0.5),
@@ -141,15 +282,18 @@ impl SearchPill {
                 // (it ignores TextEdit::font), so pin both styles.
                 ui.style_mut()
                     .text_styles
-                    .insert(egui::TextStyle::Body, FontId::proportional(FONT * s));
+                    .insert(egui::TextStyle::Body, FontId::proportional(spec.font * s));
                 ui.style_mut()
                     .text_styles
-                    .insert(egui::TextStyle::Monospace, FontId::proportional(FONT * s));
+                    .insert(
+                        egui::TextStyle::Monospace,
+                        FontId::proportional(spec.font * s),
+                    );
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut text)
                         .id(id.with("edit"))
                         .desired_width(f32::INFINITY)
-                        .font(FontId::proportional(FONT * s))
+                        .font(FontId::proportional(spec.font * s))
                         .text_color(Color32::WHITE.gamma_multiply(alpha))
                         .hint_text(hint)
                         .frame(egui::Frame::NONE),
@@ -170,6 +314,22 @@ impl SearchPill {
             self.focused = false;
         }
     }
+}
+
+/// The magnifier glyph at `k` = size/24 scale.
+fn magnifier(painter: &egui::Painter, ic: Pos2, k: f32, c: Color32) {
+    painter.circle_stroke(
+        ic + Vec2::new(-0.5 * k, -0.5 * k),
+        6.5 * k,
+        Stroke::new(2.0 * k, c),
+    );
+    painter.line_segment(
+        [
+            ic + Vec2::new(4.4 * k, 4.4 * k),
+            ic + Vec2::new(9.2 * k, 9.2 * k),
+        ],
+        Stroke::new(2.4 * k, c),
+    );
 }
 
 /// CubicEaseOut (Lacrima's width transition).

@@ -30,7 +30,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use symphonia::default::{get_codecs, get_probe};
 
-use super::dsp::{Equalizer, EQ_BANDS};
+use super::dsp::{Denoiser, Equalizer, EQ_BANDS};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -101,6 +101,9 @@ struct Shared {
     /// PauseForZeroVolume skips the bookkeeping).
     pos_when_paused: AtomicU64,
     was_paused: AtomicBool,
+    /// AiNoiseReduction — the decode thread runs its spectral-
+    /// subtraction denoiser on the resampled stream when set.
+    denoise: AtomicBool,
     band_db: [AtomicU32; 10], // f32 bits
     /// Seek request picked up by the decode thread (seconds).
     seek: Mutex<Option<f64>>,
@@ -191,6 +194,7 @@ impl AudioPlayer {
             restart_secs: AtomicU64::new(10f64.to_bits()),
             pos_when_paused: AtomicU64::new(0),
             was_paused: AtomicBool::new(false),
+            denoise: AtomicBool::new(false),
             band_db: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())),
             seek: Mutex::new(None),
             buffering: AtomicBool::new(false),
@@ -467,6 +471,9 @@ impl AudioPlayer {
             (a.restart_on_resume_threshold_seconds as f64).to_bits(),
             Ordering::Relaxed,
         );
+        self.shared
+            .denoise
+            .store(a.ai_noise_reduction, Ordering::Relaxed);
         *self.shared.rg_opts.lock().unwrap() = ReplayGainOptions {
             enabled: a.replay_gain_enabled,
             use_tags: a.replay_gain_use_tags,
@@ -601,6 +608,8 @@ fn run_decoder(
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     let mut resampler = Resampler::new(src_rate, out_rate);
     let mut rg = RgTrack::new();
+    let mut denoiser = Denoiser::new();
+    let mut filtered = Vec::new();
 
     loop {
         match rx.try_recv() {
@@ -619,6 +628,7 @@ fn run_decoder(
             );
             decoder.reset();
             resampler.reset();
+            denoiser.reset();
             shared.pos_base.store((t * out_rate as f64) as u64, Ordering::Relaxed);
             shared.pos_consumed.store(0, Ordering::Relaxed);
             shared.flush_seq.fetch_add(1, Ordering::Relaxed);
@@ -665,7 +675,13 @@ fn run_decoder(
         };
         rg.accumulate(&stereo, src_rate, shared, rg_key.as_deref());
         for chunk in resampler.push(&stereo) {
-            if let Some(cmd) = push_samples(prod, &chunk, rx) {
+            filtered.clear();
+            denoiser.push(
+                &chunk,
+                shared.denoise.load(Ordering::Relaxed),
+                &mut filtered,
+            );
+            if let Some(cmd) = push_samples(prod, &filtered, rx) {
                 return Ok(match cmd {
                     Cmd::Load(p) => DecodeEnd::Reload(p),
                     _ => DecodeEnd::Stopped,

@@ -10,7 +10,7 @@
 //! scrolling, velocity fling on release, wheel impulses clamped to
 //! ±14 items/s.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -104,9 +104,10 @@ pub enum Action {
     AddUrl,
     /// "Add Playlist" context menu — open the playlist URL prompt.
     AddPlaylist,
-    /// "Delete" context menu on a pointed item (Lacrima's
-    /// DeletePointedItem — removes it from the view, not from disk).
-    Delete(PathBuf),
+    /// "Delete" on the pointed item or the Delete key on the
+    /// selection — Lacrima's DeletePointedItem, plural for the
+    /// multi-selection (removes from the view, not from disk).
+    Delete(Vec<PathBuf>),
     /// "Clear Album" — empties the loaded album's children
     /// (Lacrima's ClearAlbumCommand; files are never touched).
     Clear,
@@ -149,28 +150,40 @@ struct Press {
 /// the pointer while neighbors slide aside. Committing applies the
 /// actual `items` move — `display_slot` is exactly the post-move
 /// permutation, so the landing is seamless.
+/// `indices` is the dragged block (sorted, contains `index`) — the
+/// current selection when the held card is selected, else just the
+/// held card (ListboxItemDragBehavior's _draggedIndices).
 struct ItemDrag {
     /// Index into `items` (reorder only runs unfiltered, so visible
     /// index == items index throughout).
     index: usize,
+    /// Sorted dragged block — moves as one contiguous run.
+    indices: Vec<usize>,
     /// Grab point kept constant: pointer - card center at lift.
     grab: Vec2,
-    /// Floating card's current center.
+    /// Floating primary card's current center.
     center: Pos2,
-    /// Slot the card would land in now.
+    /// Slot the primary card would land in now; the block lands
+    /// contiguously around it.
     drop_target: usize,
     /// Per-item displacement blend 0..1 toward the shifted slot —
     /// eases the gap open instead of teleporting neighbors.
     swap: HashMap<usize, f32>,
+    /// 0→1 glue ease — selected cards collapse from their scattered
+    /// slots into a contiguous block (Lacrima's AnimateGlue).
+    glue: f32,
     /// 0→1 lift-in (scale + shadow).
     lift: f32,
-    /// Release glide — floats from pointer to the drop slot's center.
+    /// Release glide — floats from pointer to the drop slots' centers.
     commit: Option<ItemCommit>,
 }
 
 struct ItemCommit {
-    from: Pos2,
-    to: Pos2,
+    /// Every dragged card's center at release — they glide home as a
+    /// group, `starts[k]` -> `targets[k]`.
+    starts: Vec<Pos2>,
+    /// Each dragged card's landing slot center after the drop.
+    targets: Vec<Pos2>,
     progress: f32,
 }
 
@@ -181,6 +194,15 @@ pub struct Carousel {
     target: f32,
     velocity: f32,
     sel: usize,
+    /// Multi-selection (SelectionMode=Multiple) — item indices;
+    /// `sel` is the primary. Painted on cards in the grid modes.
+    sel_set: BTreeSet<usize>,
+    /// Item the last plain/ctrl click landed on — Shift+click extends
+    /// the range from it.
+    sel_anchor: usize,
+    /// Set on any user selection gesture — the app consumes it to
+    /// decide which view owns the Delete key.
+    sel_touched: bool,
     press: Option<Press>,
     wheel_settle_at: Option<Instant>,
     /// Grid-mode scroll offset (px) + spring.
@@ -232,6 +254,9 @@ impl Carousel {
             target: 0.0,
             velocity: 0.0,
             sel: 0,
+            sel_set: BTreeSet::new(),
+            sel_anchor: 0,
+            sel_touched: false,
             press: None,
             wheel_settle_at: None,
             grid_current: 0.0,
@@ -293,6 +318,8 @@ impl Carousel {
         self.target = 0.0;
         self.velocity = 0.0;
         self.sel = 0;
+        self.sel_set = BTreeSet::from([0]);
+        self.sel_anchor = 0;
         self.grid_current = 0.0;
         self.grid_target = 0.0;
         self.grid_vel = 0.0;
@@ -363,6 +390,17 @@ impl Carousel {
             .collect()
     }
 
+    /// The loaded album's file items — the counterpart to
+    /// `url_items`, persisted as `ExcludedTracks` on Clear Album so a
+    /// rescan doesn't resurrect them.
+    pub fn file_items(&self) -> Vec<PathBuf> {
+        self.items
+            .iter()
+            .filter(|i| !crate::library::is_url(&i.path))
+            .map(|i| i.path.clone())
+            .collect()
+    }
+
     /// The loaded url items' cover sources in item order — the album
     /// tile's web fan mirrors this so resolved thumbnails and item
     /// order changes propagate to the tile automatically.
@@ -374,13 +412,36 @@ impl Carousel {
             .collect()
     }
 
-    /// Remove an item (DeletePointedItem) — view-side only; a file
-    /// comes back on the next album open, url items stay gone via the
-    /// persisted list.
-    pub fn remove(&mut self, path: &Path) {
+    /// Remove several items at once — the Delete key on a
+    /// multi-selection. Indices resolve first, then removals run
+    /// descending so earlier positions stay valid.
+    pub fn remove_many(&mut self, paths: &[PathBuf]) {
         self.item_drag = None;
-        if let Some(i) = self.index_of(path) {
+        let mut idxs: Vec<usize> = paths
+            .iter()
+            .filter_map(|p| self.index_of(p))
+            .collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        for &i in idxs.iter().rev() {
             self.items.remove(i);
+            // Remap the multi-selection: drop the removed item,
+            // shift later members down.
+            self.sel_set.remove(&i);
+            let shifted: BTreeSet<usize> = self
+                .sel_set
+                .iter()
+                .map(|&s| if s > i { s - 1 } else { s })
+                .collect();
+            self.sel_set = shifted;
+        }
+        if !idxs.is_empty() {
+            // Primary + anchor shift down by every removal before them.
+            let shift = |v: usize| {
+                v.saturating_sub(idxs.iter().filter(|&&i| i < v).count())
+            };
+            self.sel = shift(self.sel);
+            self.sel_anchor = shift(self.sel_anchor);
             let max = self.items.len().saturating_sub(1) as f32;
             self.current = self.current.clamp(0.0, max);
             self.target = self.target.clamp(0.0, max);
@@ -407,6 +468,7 @@ impl Carousel {
         self.press = None;
         self.preview = None;
         self.pending_reveal = None;
+        self.sel_set.clear();
     }
 
     /// Any online (URL) items loaded — gates "Export Playlist".
@@ -453,6 +515,7 @@ impl Carousel {
         self.current = 0.0;
         self.target = 0.0;
         self.sel = 0;
+        self.sel_set.clear();
     }
 
     /// The item's own cover source — for the now-playing disc art of
@@ -521,6 +584,34 @@ impl Carousel {
     /// frame (transport next/prev, auto-advance on track end).
     pub fn reveal(&mut self, path: &Path) {
         self.pending_reveal = Some(path.to_path_buf());
+    }
+
+    /// Ctrl+A — every visible item selected. Filter-hidden items stay
+    /// out, so a following Delete can't remove what isn't shown.
+    pub fn select_all(&mut self, filter: &str) {
+        self.sel_set = self.visible(filter).into_iter().collect();
+        if let Some(&first) = self.sel_set.iter().next() {
+            self.sel = first;
+            self.sel_anchor = first;
+        }
+        if !self.sel_set.is_empty() {
+            self.sel_touched = true;
+        }
+    }
+
+    /// A user selection gesture happened since the last check — the
+    /// app uses it to give the cover view Delete-key ownership.
+    pub fn take_sel_touched(&mut self) -> bool {
+        std::mem::take(&mut self.sel_touched)
+    }
+
+    /// Selected items' paths (the Delete key payload).
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        self.sel_set
+            .iter()
+            .filter_map(|&i| self.items.get(i))
+            .map(|i| i.path.clone())
+            .collect()
     }
 
     /// The item `dir` steps after `playing` in album order — the
@@ -698,21 +789,38 @@ impl Carousel {
         std::mem::take(&mut self.reorder_dirty)
     }
 
-    /// Where `index` displays while `drag` hovers `target`: the held
-    /// card owns the target slot, the rest shift around it. After the
+    /// Where `index` displays while the dragged block targets
+    /// `block_start` (ComputeDisplaySlot extended to a contiguous run
+    /// — ListboxItemDragBehavior's ShiftItemsForSwap): dragged items
+    /// own the block slots, the rest shift around them. After the
     /// commit this mapping IS the new item order, so the landing is
-    /// seamless (same scheme as the album row's ComputeDisplaySlot).
-    fn display_slot(index: usize, drag: usize, target: usize, count: usize) -> usize {
-        let target = target.min(count.saturating_sub(1));
-        if index == drag {
-            return target;
+    /// seamless.
+    fn display_slot(index: usize, dragged: &[usize], block_start: usize) -> usize {
+        match dragged.binary_search(&index) {
+            Ok(rank) => block_start + rank,
+            Err(ins) => {
+                let rank = index - ins;
+                if rank < block_start {
+                    rank
+                } else {
+                    rank + dragged.len()
+                }
+            }
         }
-        let rank = index - usize::from(index > drag);
-        if rank < target {
-            rank
-        } else {
-            rank + 1
-        }
+    }
+
+    /// Block start for a drag: the primary's target slot minus its
+    /// rank in the dragged set (Lacrima's blockToIndex clamp).
+    fn block_start(d: &ItemDrag, count: usize) -> usize {
+        let pr = d
+            .indices
+            .iter()
+            .position(|&i| i == d.index)
+            .unwrap_or(0);
+        d.drop_target
+            .min(count.saturating_sub(1))
+            .saturating_sub(pr)
+            .min(count.saturating_sub(d.indices.len()))
     }
 
     /// An item's displaced index-position while a drag hovers —
@@ -720,10 +828,13 @@ impl Carousel {
     /// glide aside instead of teleporting.
     fn disp_index(&self, vi: usize) -> f32 {
         match &self.item_drag {
-            Some(d) if vi != d.index => {
+            Some(d) if d.indices.binary_search(&vi).is_err() => {
                 let n = self.items.len();
-                let disp =
-                    Self::display_slot(vi, d.index, d.drop_target, n) as f32;
+                let disp = Self::display_slot(
+                    vi,
+                    &d.indices,
+                    Self::block_start(d, n),
+                ) as f32;
                 let t = d.swap.get(&vi).copied().unwrap_or(0.0);
                 vi as f32 + (disp - vi as f32) * t
             }
@@ -763,6 +874,66 @@ impl Carousel {
         }
     }
 
+    /// (home offset, glued offset) of dragged item rank `k` relative
+    /// to the primary card's slot — home is its own slot, glued is
+    /// the contiguous slot `k - primary_rank` away from the primary's
+    /// (Lacrima's _targetOffsetsRelPrimary). Uniform grid layout makes
+    /// both scroll-independent; carousel-mode drags are singletons.
+    fn drag_item_offsets(
+        &self,
+        d: &ItemDrag,
+        k: usize,
+        geo: Option<&GridGeo>,
+    ) -> (Vec2, Vec2) {
+        let Some(g) = geo else {
+            return (Vec2::ZERO, Vec2::ZERO);
+        };
+        let pr = d
+            .indices
+            .iter()
+            .position(|&i| i == d.index)
+            .unwrap_or(0);
+        let Some(pc) = g.card_rect(d.index, 0.0).map(|r| r.center()) else {
+            return (Vec2::ZERO, Vec2::ZERO);
+        };
+        let home = g
+            .card_rect(d.indices[k], 0.0)
+            .map(|r| r.center() - pc)
+            .unwrap_or(Vec2::ZERO);
+        let glued = g
+            .card_rect(d.index + k - pr, 0.0)
+            .map(|r| r.center() - pc)
+            .unwrap_or(Vec2::ZERO);
+        (home, glued)
+    }
+
+    /// A dragged card's live offset from the primary's floating
+    /// center: grid members ease from their own slots into the glued
+    /// block; carousel members fan out horizontally under the pointer
+    /// (a pile — the honest equivalent of collapsed margins on a
+    /// curved layout).
+    fn drag_member_offset(
+        &self,
+        d: &ItemDrag,
+        k: usize,
+        geo: Option<&GridGeo>,
+        s: f32,
+    ) -> Vec2 {
+        let pr = d
+            .indices
+            .iter()
+            .position(|&i| i == d.index)
+            .unwrap_or(0);
+        match geo {
+            Some(_) => {
+                let (home, glued) = self.drag_item_offsets(d, k, geo);
+                let e = 1.0 - (1.0 - d.glue).powi(3);
+                home + (glued - home) * e
+            }
+            None => Vec2::new((k as f32 - pr as f32) * 36.0 * s, 0.0),
+        }
+    }
+
     /// Hold-to-lift item reorder: a press that stays put for
     /// REORDER_HOLD_MS floats the item off its slot; the card then
     /// tracks the pointer 1:1 (grab offset preserved), neighbors ease
@@ -788,13 +959,15 @@ impl Carousel {
         if self
             .item_drag
             .as_ref()
-            .map(|d| d.index >= n)
+            .map(|d| d.index >= n || d.indices.iter().any(|&i| i >= n))
             .unwrap_or(false)
         {
             self.item_drag = None;
         }
 
-        // Drop glide: ease the card home, then permute the model.
+        // Drop glide: ease the card home, then permute the model —
+        // the whole dragged block moves as one contiguous run,
+        // selection following it (Lacrima's TryReorderItems).
         let landed = match self.item_drag.as_mut().and_then(|d| d.commit.as_mut()) {
             Some(c) => {
                 c.progress += dt / ITEM_COMMIT_SECS;
@@ -804,12 +977,37 @@ impl Carousel {
         };
         if landed {
             let d = self.item_drag.take().unwrap();
-            let to = d.drop_target.min(n.saturating_sub(1));
-            if n > 0 && d.index != to {
-                let it = self.items.remove(d.index);
-                self.items.insert(to, it);
-                self.sel = to;
-                self.reorder_dirty = true;
+            let mut indices = d.indices.clone();
+            indices.retain(|&i| i < n);
+            if !indices.is_empty() {
+                // Pull the dragged items out (descending indices keep
+                // positions valid), preserving their relative order.
+                let mut pulled: Vec<Item> =
+                    Vec::with_capacity(indices.len());
+                for &i in indices.iter().rev() {
+                    pulled.push(self.items.remove(i));
+                }
+                pulled.reverse();
+                let pr = indices
+                    .iter()
+                    .position(|&i| i == d.index)
+                    .unwrap_or(0);
+                let insert = d
+                    .drop_target
+                    .min(n - 1)
+                    .saturating_sub(pr)
+                    .min(self.items.len());
+                let unchanged =
+                    indices == (insert..insert + indices.len()).collect::<Vec<_>>();
+                for (j, it) in pulled.into_iter().enumerate() {
+                    self.items.insert(insert + j, it);
+                }
+                self.sel = insert + pr;
+                self.sel_set = (insert..insert + indices.len()).collect();
+                self.sel_anchor = insert + pr;
+                if !unchanged {
+                    self.reorder_dirty = true;
+                }
             }
             return;
         }
@@ -842,12 +1040,25 @@ impl Carousel {
                 return;
             };
             let grab = pr.start - c;
+            // Drag set: the selection when the held card is part of
+            // it, else just the held card (Lacrima's _draggedIndices).
+            let indices: Vec<usize> = if self.sel_set.contains(&vi) {
+                self.sel_set
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < n)
+                    .collect()
+            } else {
+                vec![vi]
+            };
             self.item_drag = Some(ItemDrag {
                 index: vi,
+                indices,
                 grab,
                 center: c,
                 drop_target: vi,
                 swap: HashMap::new(),
+                glue: 0.0,
                 lift: 0.0,
                 commit: None,
             });
@@ -858,15 +1069,38 @@ impl Carousel {
 
         // Released (or view went inactive) — glide to the target slot.
         if !interactive || !down {
-            let (from, to) = {
+            let bs = {
                 let d = self.item_drag.as_ref().unwrap();
-                (d.center, d.drop_target.min(n.saturating_sub(1)))
+                Self::block_start(d, n)
             };
-            let home = self
-                .slot_center(to, mode, geo, grid_area, row, ctx, cfg, s)
-                .unwrap_or(from);
+            let len = self.item_drag.as_ref().unwrap().indices.len();
+            // Every dragged card glides from where it floats now into
+            // its own landing slot (the block's contiguous run).
+            let mut starts = Vec::with_capacity(len);
+            let mut targets = Vec::with_capacity(len);
+            for k in 0..len {
+                let off = {
+                    let d = self.item_drag.as_ref().unwrap();
+                    self.drag_member_offset(d, k, geo, s)
+                };
+                let c = self.item_drag.as_ref().unwrap().center;
+                starts.push(c + off);
+                targets.push(
+                    self.slot_center(
+                        bs + k,
+                        mode,
+                        geo,
+                        grid_area,
+                        row,
+                        ctx,
+                        cfg,
+                        s,
+                    )
+                    .unwrap_or(c + off),
+                );
+            }
             self.item_drag.as_mut().unwrap().commit =
-                Some(ItemCommit { from, to: home, progress: 0.0 });
+                Some(ItemCommit { starts, targets, progress: 0.0 });
             ctx.request_repaint();
             return;
         }
@@ -902,12 +1136,20 @@ impl Carousel {
         {
             let d = self.item_drag.as_mut().unwrap();
             d.drop_target = best;
+            // Selected cards glue into a contiguous block (Lacrima's
+            // AnimateGlue ~150ms ease-out).
+            let g_want = (d.indices.len() > 1) as u8 as f32;
+            d.glue += (g_want - d.glue) * (1.0 - (-dt / 0.05).exp());
+            if g_want == 0.0 && d.glue < 0.01 {
+                d.glue = 0.0;
+            }
             // Neighbors ease toward their displaced slots.
+            let bs = Self::block_start(d, n);
             for vi in 0..n {
-                if vi == d.index {
+                if d.indices.binary_search(&vi).is_ok() {
                     continue;
                 }
-                let disp = Self::display_slot(vi, d.index, d.drop_target, n);
+                let disp = Self::display_slot(vi, &d.indices, bs);
                 let want = if disp == vi { 0.0 } else { 1.0 };
                 let cur = d.swap.get(&vi).copied().unwrap_or(0.0);
                 let next =
@@ -1031,6 +1273,10 @@ impl Carousel {
         let reorderable = filter.trim().is_empty();
         if !reorderable {
             self.item_drag = None;
+            // Hidden items must never be deletable — prune the
+            // selection to what the filter shows.
+            let vis: BTreeSet<usize> = visible.iter().copied().collect();
+            self.sel_set = self.sel_set.intersection(&vis).copied().collect();
         }
         let n = visible.len();
         if n == 0 {
@@ -1086,6 +1332,11 @@ impl Carousel {
         if let Some(path) = self.pending_reveal.take() {
             if let Some(idx) = self.index_of(&path) {
                 self.sel = idx;
+                // The playing item becoming primary collapses the
+                // multi-selection to it (Avalonia's SelectedItem
+                // setter clears the rest in multiple mode).
+                self.sel_set = BTreeSet::from([idx]);
+                self.sel_anchor = idx;
                 if let Some(vi) = visible.iter().position(|&v| v == idx) {
                     match mode {
                         Mode::Carousel => {
@@ -1398,7 +1649,20 @@ impl Carousel {
                         ui.close();
                     }
                     if ui.button("Delete").clicked() {
-                        action = Action::Delete(p);
+                        // Pointing at a selected item deletes the whole
+                        // selection (ListBox Delete semantics), else
+                        // just the pointed item.
+                        let paths = if self
+                            .index_of(&p)
+                            .map(|i| self.sel_set.contains(&i))
+                            .unwrap_or(false)
+                            && self.sel_set.len() > 1
+                        {
+                            self.selected_paths()
+                        } else {
+                            vec![p]
+                        };
+                        action = Action::Delete(paths);
                         self.menu_item = None;
                         ui.close();
                     }
@@ -1436,6 +1700,31 @@ impl Carousel {
                     if let Some(vi) = hit {
                         let idx = visible[vi];
                         self.sel = idx;
+                        // Multi-selection (SelectionMode=Multiple):
+                        // Shift extends a range from the anchor, Ctrl
+                        // toggles the item, plain click singles it.
+                        // Ranges run over *visible* items — filtered-
+                        // out tracks never get silently selected.
+                        let mods = ctx.input(|i| i.modifiers);
+                        if mods.shift {
+                            let anchor_vi = visible
+                                .iter()
+                                .position(|&i| i == self.sel_anchor)
+                                .unwrap_or(vi);
+                            let (a, b) =
+                                (anchor_vi.min(vi), anchor_vi.max(vi));
+                            self.sel_set =
+                                visible[a..=b].iter().copied().collect();
+                        } else if mods.ctrl || mods.command {
+                            if !self.sel_set.remove(&idx) {
+                                self.sel_set.insert(idx);
+                            }
+                            self.sel_anchor = idx;
+                        } else {
+                            self.sel_set = BTreeSet::from([idx]);
+                            self.sel_anchor = idx;
+                        }
+                        self.sel_touched = true;
                         if resp.double_clicked() {
                             // Snap to the item and play it.
                             if mode == Mode::Carousel {
@@ -1790,13 +2079,16 @@ impl Carousel {
             rect.center().y + cfg.vertical_offset * s,
         );
 
-        let held = self.item_drag.as_ref().map(|d| d.index);
         // Draw farthest first so z-order follows the animation
         // continuously instead of snapping at the halfway point.
-        // Displaced neighbors evaluate at their eased slot position.
+        // Displaced neighbors evaluate at their eased slot position;
+        // dragged-group members paint floating instead.
         let mut order: Vec<usize> = (0..visible.len())
             .filter(|&i| {
-                Some(i) != held
+                self.item_drag
+                    .as_ref()
+                    .map(|d| d.indices.binary_search(&i).is_err())
+                    .unwrap_or(true)
                     && (self.disp_index(i) - self.current).abs() < VISIBLE_RANGE
             })
             .collect();
@@ -1881,48 +2173,65 @@ impl Carousel {
 
         // The held card floats on top — unrotated, glued to the
         // pointer, scaled/shadowed by its lift. During the drop glide
-        // it eases from the release point into the slot.
+        // it eases from the release point into the slot. A dragged
+        // selection paints as a glued pile (non-primary members
+        // underneath, the grabbed card last/on top).
         if let Some(d) = &self.item_drag {
-            let item = &self.items[d.index];
-            let tex = Self::item_tex(row, &ctx, item);
-            let (w, h) = Self::item_size(&tex, cfg, s);
+            let pr = d
+                .indices
+                .iter()
+                .position(|&i| i == d.index)
+                .unwrap_or(0);
             let e = d
                 .commit
                 .as_ref()
                 .map(|c| ease_out_cubic(c.progress.min(1.0)));
-            let c = match (&d.commit, e) {
-                (Some(c), Some(t)) => lerp_pos(c.from, c.to, t),
-                _ => d.center,
-            };
+            let centers: Vec<Pos2> = (0..d.indices.len())
+                .map(|k| match (&d.commit, e) {
+                    (Some(c), Some(t)) => {
+                        lerp_pos(c.starts[k], c.targets[k], t)
+                    }
+                    _ => d.center + self.drag_member_offset(d, k, None, s),
+                })
+                .collect();
             let lift = d.lift * (1.0 - e.unwrap_or(0.0));
             let sc = 1.0 + (ITEM_DRAG_LIFT - 1.0) * lift;
             // Unclipped: a lifted card reads as floating above the
             // chrome — hard-clipping it at the cover edge would pop.
             let float_paint = ui.painter();
-            if lift > 0.01 {
-                float_paint.rect_filled(
-                    Rect::from_center_size(
-                        c + Vec2::new(0.0, 14.0 * s),
-                        Vec2::new(w, h) * sc,
-                    ),
-                    16.0 * s,
-                    Color32::BLACK.gamma_multiply(0.38 * lift * alpha),
+            for k in (0..d.indices.len())
+                .filter(|&k| k != pr)
+                .chain(std::iter::once(pr))
+            {
+                let item = &self.items[d.indices[k]];
+                let tex = Self::item_tex(row, &ctx, item);
+                let (w, h) = Self::item_size(&tex, cfg, s);
+                let c = centers[k];
+                if lift > 0.01 {
+                    float_paint.rect_filled(
+                        Rect::from_center_size(
+                            c + Vec2::new(0.0, 14.0 * s),
+                            Vec2::new(w, h) * sc,
+                        ),
+                        16.0 * s,
+                        Color32::BLACK.gamma_multiply(0.38 * lift * alpha),
+                    );
+                }
+                let m = self.item_mesh(
+                    0.0,
+                    0.0,
+                    0.0,
+                    sc,
+                    c,
+                    w,
+                    h,
+                    tex.size(),
+                    tex.id(),
+                    alpha,
+                    false,
                 );
+                float_paint.add(Shape::mesh(m));
             }
-            let m = self.item_mesh(
-                0.0,
-                0.0,
-                0.0,
-                sc,
-                c,
-                w,
-                h,
-                tex.size(),
-                tex.id(),
-                alpha,
-                false,
-            );
-            float_paint.add(Shape::mesh(m));
         }
     }
 
@@ -2145,14 +2454,15 @@ impl Carousel {
         // control below MainTopBar's own row).
         let painter = ui.painter().clone().with_clip_rect(rect);
         let pulse = 0.5 + 0.5 * self.pulse.sin();
-        let held = self.item_drag.as_ref().map(|d| d.index);
         let n_items = visible.len();
 
-        // Drop hole — the slot the held card would land in.
+        // Drop hole — the slots the dragged block would land in.
         if let Some(d) = &self.item_drag {
-            if let Some(hole) =
-                geo.card_rect(d.drop_target.min(n_items.saturating_sub(1)), scroll)
-            {
+            let bs = Self::block_start(d, n_items);
+            for slot in bs..(bs + d.indices.len()).min(n_items) {
+                let Some(hole) = geo.card_rect(slot, scroll) else {
+                    continue;
+                };
                 if hole.intersects(rect) {
                     painter.rect_filled(
                         hole.shrink(3.0 * s),
@@ -2173,16 +2483,21 @@ impl Carousel {
         }
 
         for (vi, &idx) in visible.iter().enumerate() {
-            if Some(vi) == held {
+            if self
+                .item_drag
+                .as_ref()
+                .map(|d| d.indices.binary_search(&vi).is_ok())
+                .unwrap_or(false)
+            {
                 continue;
             }
             let Some(mut card) = geo.card_rect(vi, scroll) else {
                 continue;
             };
-            // Neighbors ease toward the slot the held card vacated.
+            // Neighbors ease toward the slots the block vacated.
             if let Some(d) = &self.item_drag {
                 let disp =
-                    Self::display_slot(vi, d.index, d.drop_target, n_items);
+                    Self::display_slot(vi, &d.indices, Self::block_start(d, n_items));
                 let t = d.swap.get(&vi).copied().unwrap_or(0.0);
                 if t > 0.001 && disp != vi {
                     if let Some(to) = geo.card_rect(disp, scroll) {
@@ -2206,42 +2521,62 @@ impl Carousel {
                 &tex,
                 Some(vi) == playing_vidx,
                 pulse,
-                idx == self.sel,
+                self.sel_set.contains(&idx),
                 alpha,
                 s,
             );
         }
 
-        // The held card floats on top, glued to the pointer.
+        // The held card floats on top, glued to the pointer — a
+        // dragged selection paints as its glued block, non-primary
+        // members underneath the grabbed card.
         if let Some(d) = &self.item_drag {
-            let item = &self.items[d.index];
-            let tex = Self::item_tex(row, &ctx, item);
+            let pr = d
+                .indices
+                .iter()
+                .position(|&i| i == d.index)
+                .unwrap_or(0);
             let e = d
                 .commit
                 .as_ref()
                 .map(|c| ease_out_cubic(c.progress.min(1.0)));
-            let c = match (&d.commit, e) {
-                (Some(c), Some(t)) => lerp_pos(c.from, c.to, t),
-                _ => d.center,
-            };
+            let centers: Vec<Pos2> = (0..d.indices.len())
+                .map(|k| match (&d.commit, e) {
+                    (Some(c), Some(t)) => {
+                        lerp_pos(c.starts[k], c.targets[k], t)
+                    }
+                    _ => {
+                        d.center
+                            + self.drag_member_offset(d, k, Some(geo), s)
+                    }
+                })
+                .collect();
             let lift = d.lift * (1.0 - e.unwrap_or(0.0));
             let sc = 1.0 + (ITEM_DRAG_LIFT - 1.0) * lift;
-            let card = Rect::from_center_size(
-                c,
-                Vec2::new(geo.card_w, geo.card_h) * sc,
-            );
-            // Unclipped — the lifted card floats over the chrome too.
+            // Unclipped — the lifted cards float over the chrome too.
             let float_paint = ui.painter();
-            if lift > 0.01 {
-                float_paint.rect_filled(
-                    card.translate(Vec2::new(0.0, 12.0 * s)),
-                    (CARD_RADIUS + 4.0) * s,
-                    Color32::BLACK.gamma_multiply(0.40 * lift * alpha),
+            for k in (0..d.indices.len())
+                .filter(|&k| k != pr)
+                .chain(std::iter::once(pr))
+            {
+                let item = &self.items[d.indices[k]];
+                let tex = Self::item_tex(row, &ctx, item);
+                let card = Rect::from_center_size(
+                    centers[k],
+                    Vec2::new(geo.card_w, geo.card_h) * sc,
+                );
+                if lift > 0.01 {
+                    float_paint.rect_filled(
+                        card.translate(Vec2::new(0.0, 12.0 * s)),
+                        (CARD_RADIUS + 4.0) * s,
+                        Color32::BLACK.gamma_multiply(0.40 * lift * alpha),
+                    );
+                }
+                Self::paint_card(
+                    &float_paint, &ctx, card, item, &tex, false, pulse, false,
+                    alpha, s,
                 );
             }
-            Self::paint_card(
-                &float_paint, &ctx, card, item, &tex, false, pulse, false, alpha, s,
-            );
         }
     }
 

@@ -53,28 +53,48 @@ fn album_row_rect(content: Rect, s: f32) -> Rect {
     )
 }
 
-/// Reorder a fresh scan to the user's saved drag order (dirs as keys).
-/// Albums missing from `order` (new folders, removed+rescanned items)
-/// keep their scan order and land at the end.
-fn apply_album_order(
-    mut albums: Vec<library::Album>,
-    order: &[String],
-) -> Vec<library::Album> {
-    if order.is_empty() {
-        return albums;
+
+
+/// Merge the persisted virtual albums into the list (deduped by dir).
+/// Created and .apl-imported albums are the same record — neither is a
+/// filesystem result, so waiting for scan completion left their slots
+/// empty the whole walk.
+fn merge_virtual_albums(albums: &mut Vec<library::Album>, lib: &settings::Library) {
+    for ia in &lib.virtual_albums {
+        if albums.iter().any(|a| a.dir.to_string_lossy() == ia.dir) {
+            continue;
+        }
+        let urls = lib.url_items.get(&ia.dir).cloned().unwrap_or_default();
+        let mut a = library::Album::virtual_album(&ia.dir, ia.title.clone(), &urls);
+        normalize_scanned_album(lib, &mut a);
+        albums.push(a);
     }
-    let rank: std::collections::HashMap<&str, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_str(), i))
-        .collect();
-    albums.sort_by_key(|a| {
-        rank.get(a.dir.to_string_lossy().as_ref())
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
-    albums
 }
+
+/// Apply the persisted per-album overlays to a freshly scanned album:
+/// url cover layers + count (the scanner can't see url items), the
+/// Rename Album display-title override, and the deleted-track
+/// exclusion so card deletions survive rescans.
+fn normalize_scanned_album(lib: &settings::Library, a: &mut library::Album) {
+    let dir = a.dir.to_string_lossy().into_owned();
+    let urls = lib.url_items.get(&dir).cloned().unwrap_or_default();
+    // Folder albums' scan covers carry no url thumbs — merge persisted
+    // url items into the fan layers.
+    let web: Vec<library::CoverSrc> = urls
+        .iter()
+        .filter_map(|u| library::CoverSrc::web_for(u))
+        .collect();
+    a.sync_url_covers(web, urls.len());
+    if let Some(t) = lib.album_titles.get(&dir) {
+        a.title = t.clone();
+    }
+    if let Some(ex) = lib.excluded_tracks.get(&dir) {
+        a.tracks
+            .retain(|t| !ex.iter().any(|s| s == t.to_string_lossy().as_ref()));
+    }
+}
+
+
 
 /// Smoothstep ease-in-out: slow start and end, no hard velocity changes.
 fn ease(t: f32) -> f32 {
@@ -273,7 +293,11 @@ struct AesRustApp {
     last_save: std::time::Instant,
     albums: Vec<library::Album>,
     album_row: album_row::AlbumRow,
-    album_rx: Option<std::sync::mpsc::Receiver<Vec<library::Album>>>,
+    album_rx: Option<std::sync::mpsc::Receiver<library::Album>>,
+    /// Dirs seen in the in-flight scan — on completion, list entries
+    /// absent here (folders deleted from disk since the last scan)
+    /// are dropped instead of lingering forever.
+    scan_seen: std::collections::HashSet<String>,
     /// Created lazily on first play — errors (no output device) just
     /// leave it None.
     player: Option<audio::AudioPlayer>,
@@ -329,10 +353,30 @@ struct AesRustApp {
     playing_cover_rx: Option<
         std::sync::mpsc::Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>,
     >,
+    /// Opened album's top cover decoded on a worker — pairs with the
+    /// album dir so a stale result (user opened another album) drops.
+    /// Web covers fetch over the network; decoding them on the UI
+    /// thread froze the whole view for seconds.
+    album_cover_rx:
+        Option<std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>>,
     /// Path currently loaded in the player — drives the playing-item
     /// glow and the top-left track info overlay.
     playing_track: Option<std::path::PathBuf>,
+    /// Which view owns the current selection — the albums strip or
+    /// the loaded album's cards. The Delete key routes here only, so
+    /// a stale highlight in the other view can never delete
+    /// (Lacrima's per-ListBox selection scope).
+    sel_owner: SelOwner,
     started: std::time::Instant,
+}
+
+/// Selection owner for Delete-key routing — set by whichever view
+/// last saw a user selection gesture.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelOwner {
+    None,
+    Albums,
+    Cards,
 }
 
 impl AesRustApp {
@@ -397,6 +441,45 @@ impl AesRustApp {
         let mut transport = transport::Transport::new();
         transport.cover_layout = settings.carousel.layout_mode.min(2);
 
+        // Seed the row from the persisted manifest (last session's
+        // display order incl. virtual keys): virtual albums build for
+        // real, scanned dirs become placeholders — title + default art
+        // — that the streamed scan replaces in place. The row renders
+        // instantly in final order instead of filling as folders walk.
+        let lib = &settings.library;
+        let mut initial_albums: Vec<library::Album> = lib
+            .cached_albums
+            .iter()
+            .filter(|d| !lib.excluded_albums.contains(*d))
+            .map(|d| {
+                if let Some(ia) =
+                    lib.virtual_albums.iter().find(|ia| ia.dir == *d)
+                {
+                    // Virtual album — real record (its position in the
+                    // manifest restores interleaved ordering exactly).
+                    let urls =
+                        lib.url_items.get(&ia.dir).cloned().unwrap_or_default();
+                    let mut a = library::Album::virtual_album(
+                        &ia.dir,
+                        ia.title.clone(),
+                        &urls,
+                    );
+                    normalize_scanned_album(lib, &mut a);
+                    a
+                } else {
+                    // Scanned dir — placeholder tile until the stream
+                    // replaces it in place.
+                    let mut a = library::Album::placeholder(d);
+                    normalize_scanned_album(lib, &mut a);
+                    a
+                }
+            })
+            .collect();
+        // Virtual albums imported since the manifest was written aren't
+        // in it — append them (also covers zero music roots, where no
+        // scan ever runs).
+        merge_virtual_albums(&mut initial_albums, lib);
+
         let mut app = Self {
             icons: icons::load(&cc.egui_ctx),
             menu_scales: [1.0; 4],
@@ -441,12 +524,13 @@ impl AesRustApp {
             } else {
                 Some(library::spawn_scan(&settings.library.music_roots))
             },
+            scan_seen: std::collections::HashSet::new(),
             settings,
             nav: Nav::Settled(View::Main),
             settings_open: false,
             settings_tab: 0,
             last_save: std::time::Instant::now(),
-            albums: Vec::new(),
+            albums: initial_albums,
             album_row: album_row::AlbumRow::new(),
             player: None,
             waveform: Vec::new(),
@@ -471,7 +555,9 @@ impl AesRustApp {
             playlist_rx: None,
             url_info_rx: None,
             playing_cover_rx: None,
+            album_cover_rx: None,
             playing_track: None,
+            sel_owner: SelOwner::None,
             started: std::time::Instant::now(),
         };
         // Lacrima kicks off RefreshYtDlpInfo at startup so the
@@ -587,76 +673,101 @@ impl eframe::App for AesRustApp {
         let mut back_clicked = false;
         let mut gear_clicked = false;
 
-        // Album scan results arrive on a background thread; take them
-        // whenever they land, in any view. Deleted albums stay excluded
-        // (their dirs are in Settings.Library.ExcludedAlbums).
-        if let Some(rx) = &self.album_rx {
-            if let Ok(found) = rx.try_recv() {
-                let ex = &self.settings.library.excluded_albums;
-                let mut kept: Vec<_> = found
-                    .into_iter()
-                    .filter(|a| {
-                        !ex.contains(&a.dir.to_string_lossy().into_owned())
-                    })
-                    .collect();
-                // Persisted url-item counts gate the tile menu's
-                // "Export Playlist" (the scanner doesn't see them).
-                for a in &mut kept {
-                    let urls = self
-                        .settings
-                        .library
-                        .url_items
-                        .get(&a.dir.to_string_lossy().into_owned())
-                        .cloned()
-                        .unwrap_or_default();
-                    // Folder albums' scan covers carry no url thumbs —
-                    // merge persisted url items into the fan layers.
-                    let web: Vec<library::CoverSrc> = urls
-                        .iter()
-                        .filter_map(|u| library::CoverSrc::web_for(u))
-                        .collect();
-                    a.sync_url_covers(web, urls.len());
-                }
-                // Rename Album overrides apply to every album after
-                // each scan/import merge (folder names are never
-                // touched on disk — this is a display label).
-                for a in &mut kept {
-                    if let Some(t) = self
-                        .settings
-                        .library
-                        .album_titles
-                        .get(&a.dir.to_string_lossy().into_owned())
-                    {
-                        a.title = t.clone();
-                    }
-                }
-                // Imported .apl albums aren't discovered by the
-                // filesystem scan — re-append them from settings so
-                // they survive rescans (before order application so a
-                // dragged position is honored too).
-                for ia in &self.settings.library.imported_albums {
-                    if !kept
-                        .iter()
-                        .any(|a| a.dir.to_string_lossy() == ia.dir)
-                    {
-                        let urls = self
+        // Album scan results stream in on a background thread — each
+        // album lands the moment its directory walk finishes, so the
+        // row fills tile by tile instead of staying empty until the
+        // whole scan completes. Deleted albums stay excluded (their
+        // dirs are in Settings.Library.ExcludedAlbums); the per-album
+        // merge normalizes url covers, title overrides, and removed
+        // tracks before the tile is inserted into its sorted slot.
+        if self.album_rx.is_some() {
+            let rx = self.album_rx.as_ref().unwrap();
+            let mut done = false;
+            // Cap the per-frame drain so tiles visibly fill in during
+            // a big scan rather than landing in one burst.
+            for _ in 0..32 {
+                match rx.try_recv() {
+                    Ok(mut a) => {
+                        let dir = a.dir.to_string_lossy().into_owned();
+                        self.scan_seen.insert(dir.clone());
+                        if self
                             .settings
                             .library
-                            .url_items
-                            .get(&ia.dir)
-                            .cloned()
-                            .unwrap_or_default();
-                        kept.push(library::Album::imported(
-                            &ia.dir,
-                            ia.title.clone(),
-                            &urls,
-                        ));
+                            .excluded_albums
+                            .contains(&dir)
+                        {
+                            continue;
+                        }
+                        normalize_scanned_album(&self.settings.library, &mut a);
+                        // Append in discovery order while scanning —
+                        // the sorted insert made late-list tiles pop in
+                        // ahead of un-arrived front ones (arrival order
+                        // can't know final positions mid-scan). The
+                        // real order applies once, when the walk ends.
+                        if let Some(pos) =
+                            self.albums.iter().position(|x| x.dir == a.dir)
+                        {
+                            self.albums[pos] = a;
+                        } else {
+                            self.albums.push(a);
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
                     }
                 }
-                self.albums =
-                    apply_album_order(kept, &self.settings.library.album_order);
+            }
+            if done {
+                // A rescan replaces the list album by album — entries
+                // whose dirs never arrived (folder deleted from disk,
+                // or now excluded) drop out. Virtual albums aren't
+                // discovered by the filesystem scan — keep and
+                // re-append them from settings (a dragged position is
+                // honored too).
+                let imported = self.settings.library.virtual_albums.clone();
+                self.albums.retain(|a| {
+                    let dir = a.dir.to_string_lossy();
+                    self.scan_seen.contains(dir.as_ref())
+                        || imported.iter().any(|ia| ia.dir == dir)
+                });
+                merge_virtual_albums(&mut self.albums, &self.settings.library);
+                // Scan-complete ordering: saved drag rank first, then
+                // root grouping + alphabetical — near-identity when the
+                // discovery walk already arrived alpha-sorted.
+                let rank: std::collections::HashMap<&str, usize> = self
+                    .settings
+                    .library
+                    .album_order
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.as_str(), i))
+                    .collect();
+                let roots = self.settings.library.music_roots.clone();
+                self.albums.sort_by_key(|a| {
+                    let dir = a.dir.to_string_lossy();
+                    (
+                        rank.get(dir.as_ref()).copied().unwrap_or(usize::MAX),
+                        roots
+                            .iter()
+                            .position(|r| a.dir.starts_with(r))
+                            .unwrap_or(usize::MAX),
+                        a.title.to_lowercase(),
+                    )
+                });
+                // Persist the final order as next session's manifest —
+                // the row then renders instantly in this order while
+                // the rescan streams real albums into their slots.
+                self.settings.library.cached_albums = self
+                    .albums
+                    .iter()
+                    .map(|a| a.dir.to_string_lossy().into_owned())
+                    .collect();
+                settings::save(&self.settings);
                 self.album_rx = None;
             }
+            ui.ctx().request_repaint();
         }
         // Waveform buckets land the same way (one decode per track).
         // The worker streams partial snapshots while generating — drain
@@ -746,7 +857,10 @@ impl eframe::App for AesRustApp {
             playlist_rx,
             url_info_rx,
             playing_cover_rx,
+            album_cover_rx,
+            scan_seen,
             playing_track,
+            sel_owner,
             shadertoy,
             ..
         } = self;
@@ -883,6 +997,33 @@ impl eframe::App for AesRustApp {
                 }
             }
             ui.ctx().request_repaint();
+        }
+        // The opened album's top cover decoded on a worker — apply the
+        // spectrum gradient + shadertoy palette, but only if that
+        // album is still the loaded one.
+        if let Some(rx) = album_cover_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((dir, img)) => {
+                    if carousel.album_key() == Some(dir.as_str()) {
+                        *spectrum_colors = img
+                            .as_ref()
+                            .map(|i| spectrum_bar::dominant_colors(i, 3));
+                        if let (Some(toy), Some(img)) =
+                            (shadertoy.as_mut(), img.as_ref())
+                        {
+                            toy.set_cover_image(img);
+                            if let Some(c) = spectrum_colors.as_deref() {
+                                toy.set_palette(c);
+                            }
+                        }
+                    }
+                    *album_cover_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *album_cover_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
         }
         // The url item's remote cover decoded on a worker — apply it
         // to the vinyl label + spectrum/shadertoy palette, but only
@@ -1144,6 +1285,7 @@ impl eframe::App for AesRustApp {
                                         album_search,
                                         radius,
                                         s,
+                                        album_rx.is_some(),
                                     );
                                     row_action = ra;
                                     seek_secs = sk;
@@ -1160,12 +1302,16 @@ impl eframe::App for AesRustApp {
                     }
                 });
                 // A landed drag reorder persists the dir order so the
-                // next scan (and next launch) restores it.
+                // next scan (and next launch) restores it — the
+                // manifest cache too, or next launch's seeded order
+                // would briefly show the pre-drag layout.
                 if album_row.take_order_dirty() {
                     settings.library.album_order = albums
                         .iter()
                         .map(|a| a.dir.to_string_lossy().into_owned())
                         .collect();
+                    settings.library.cached_albums =
+                        settings.library.album_order.clone();
                     settings::save(settings);
                 }
                 // A landed item reorder: the new URL order persists
@@ -1174,6 +1320,54 @@ impl eframe::App for AesRustApp {
                 // comes from the folder scan).
                 if carousel.take_reorder_dirty() {
                     persist_url_items(carousel, albums, settings);
+                }
+                // Selection ownership follows whichever view the user
+                // last selected in — a stale highlight in the other
+                // view never fires the Delete key.
+                if album_row.take_sel_touched() {
+                    *sel_owner = SelOwner::Albums;
+                }
+                if carousel.take_sel_touched() {
+                    *sel_owner = SelOwner::Cards;
+                }
+                // Delete: route to the owning view's selection.
+                // Text fields eat the key first (wants_keyboard_input)
+                // and overlays gate via view_interactive.
+                if view_interactive
+                    && !ui.ctx().egui_wants_keyboard_input()
+                    && ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                    })
+                {
+                    match *sel_owner {
+                        SelOwner::Albums => {
+                            let dirs = album_row.selected_dirs(albums);
+                            if !dirs.is_empty() {
+                                row_action =
+                                    album_row::Action::DeleteAlbum(dirs);
+                            }
+                        }
+                        SelOwner::Cards => {
+                            let paths = carousel.selected_paths();
+                            delete_path = (!paths.is_empty()).then_some(paths);
+                        }
+                        SelOwner::None => {}
+                    }
+                }
+                // Ctrl+A — select everything in the owning view (same
+                // owner routing as Delete: the list after a list
+                // gesture, the cards after a card gesture).
+                if view_interactive
+                    && !ui.ctx().egui_wants_keyboard_input()
+                    && ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)
+                    })
+                {
+                    match *sel_owner {
+                        SelOwner::Albums => album_row.select_all(albums),
+                        SelOwner::Cards => carousel.select_all(&search.text),
+                        SelOwner::None => {}
+                    }
                 }
                 match row_action {
                     album_row::Action::AddFolder => {
@@ -1184,60 +1378,68 @@ impl eframe::App for AesRustApp {
                             settings.library.music_roots.push(dir);
                             settings::save(settings);
                             album_row.reset();
+                            scan_seen.clear();
                             *album_rx =
                                 Some(library::spawn_scan(&settings.library.music_roots));
                         }
                     }
                     album_row::Action::Rescan => {
                         album_row.reset();
+                        scan_seen.clear();
                         *album_rx = Some(library::spawn_scan(&settings.library.music_roots));
                     }
-                    album_row::Action::DeleteAlbum(dir) => {
-                        // Lacrima's DeleteFolder: remove the album from
-                        // the list (files stay on disk — the dir is
-                        // recorded so scans don't resurrect it), stop
-                        // playback if a child was playing, and clear
-                        // the cover view if it was the loaded album.
-                        if let Some(i) =
-                            albums.iter().position(|a| {
-                                a.dir.to_string_lossy() == dir
-                            })
-                        {
-                            if carousel.album_key() == Some(dir.as_str()) {
-                                if let Some(cur) = playing_track.as_ref() {
-                                    if carousel.index_of(cur).is_some() {
-                                        if let Some(p) = player {
-                                            p.stop();
+                    album_row::Action::DeleteAlbum(dirs) => {
+                        // Lacrima's DeleteFolder per album (context
+                        // menu: one dir; Delete key: the selection):
+                        // remove from the list (files stay on disk —
+                        // the dir is recorded so scans don't resurrect
+                        // it), stop playback if a child was playing,
+                        // and clear the cover view if it was loaded.
+                        for dir in dirs {
+                            if let Some(i) =
+                                albums.iter().position(|a| {
+                                    a.dir.to_string_lossy() == dir
+                                })
+                            {
+                                if carousel.album_key() == Some(dir.as_str()) {
+                                    if let Some(cur) = playing_track.as_ref() {
+                                        if carousel.index_of(cur).is_some() {
+                                            if let Some(p) = player {
+                                                p.stop();
+                                            }
+                                            *playing_track = None;
+                                            *playing_cover = None;
+                                            *waveform_loading = false;
                                         }
-                                        *playing_track = None;
-                                        *playing_cover = None;
-                                        *waveform_loading = false;
+                                    }
+                                    carousel.close();
+                                }
+                                albums.remove(i);
+                                album_row.removed(i);
+                                album_row.deselect_dir(&dir);
+                                let lib = &mut settings.library;
+                                // Imported albums aren't scan results —
+                                // deleting removes the import entry itself
+                                // rather than recording a scan exclusion.
+                                if library::is_virtual_dir(std::path::Path::new(&dir)) {
+                                    lib.virtual_albums.retain(|a| a.dir != dir);
+                                } else if !lib.excluded_albums.contains(&dir) {
+                                    lib.excluded_albums.push(dir.clone());
+                                }
+                                // The album's url items are gone with it —
+                                // their stream/metadata/cover caches too.
+                                if let Some(urls) = lib.url_items.remove(&dir) {
+                                    for u in urls {
+                                        evict_url_caches(&u);
                                     }
                                 }
-                                carousel.close();
+                                lib.album_order.retain(|d| d != &dir);
+                                lib.cached_albums.retain(|d| d != &dir);
+                                lib.album_titles.remove(&dir);
+                                lib.excluded_tracks.remove(&dir);
                             }
-                            albums.remove(i);
-                            album_row.removed(i);
-                            let lib = &mut settings.library;
-                            // Imported albums aren't scan results —
-                            // deleting removes the import entry itself
-                            // rather than recording a scan exclusion.
-                            if library::is_virtual_dir(std::path::Path::new(&dir)) {
-                                lib.imported_albums.retain(|a| a.dir != dir);
-                            } else if !lib.excluded_albums.contains(&dir) {
-                                lib.excluded_albums.push(dir.clone());
-                            }
-                            // The album's url items are gone with it —
-                            // their stream/metadata/cover caches too.
-                            if let Some(urls) = lib.url_items.remove(&dir) {
-                                for u in urls {
-                                    evict_url_caches(&u);
-                                }
-                            }
-                            lib.album_order.retain(|d| d != &dir);
-                            lib.album_titles.remove(&dir);
-                            settings::save(settings);
                         }
+                        settings::save(settings);
                     }
                     album_row::Action::Export(dir) => {
                         // The tile menu's export — same document as the
@@ -1347,14 +1549,14 @@ impl eframe::App for AesRustApp {
                                         library::VIRTUAL_SCHEME,
                                         title
                                     );
-                                    albums.push(library::Album::imported(
+                                    albums.push(library::Album::virtual_album(
                                         &dir,
                                         title.clone(),
                                         &urls,
                                     ));
                                     let lib = &mut settings.library;
-                                    lib.imported_albums.push(
-                                        settings::ImportedAlbum {
+                                    lib.virtual_albums.push(
+                                        settings::VirtualAlbum {
                                             dir: dir.clone(),
                                             title,
                                         },
@@ -1472,13 +1674,13 @@ impl eframe::App for AesRustApp {
                                 .map(|d| d.as_nanos())
                                 .unwrap_or(0)
                         );
-                        albums.push(library::Album::imported(
+                        albums.push(library::Album::virtual_album(
                             &dir,
                             title.clone(),
                             &[],
                         ));
                         let lib = &mut settings.library;
-                        lib.imported_albums.push(settings::ImportedAlbum {
+                        lib.virtual_albums.push(settings::VirtualAlbum {
                             dir: dir.clone(),
                             title: title.clone(),
                         });
@@ -1502,7 +1704,7 @@ impl eframe::App for AesRustApp {
                             let lib = &mut settings.library;
                             lib.album_titles.insert(dir.clone(), title.clone());
                             if let Some(ia) = lib
-                                .imported_albums
+                                .virtual_albums
                                 .iter_mut()
                                 .find(|ia| ia.dir == dir)
                             {
@@ -1521,19 +1723,27 @@ impl eframe::App for AesRustApp {
                         // is double-clicked. The spectrum cover gradient
                         // follows the album's top cover.
                         if let Some(album) = albums.get(i) {
-                            let img = album
-                                .covers
-                                .last()
-                                .and_then(library::decode_cover);
-                            *spectrum_colors =
-                                img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
-                            // iChannel1 = the top cover; the gradient
-                            // colors feed u_primary/secondary/tertiary.
-                            if let (Some(toy), Some(img)) = (shadertoy.as_mut(), img.as_ref()) {
-                                toy.set_cover_image(img);
-                                if let Some(c) = spectrum_colors.as_deref() {
-                                    toy.set_palette(c);
-                                }
+                            // The top cover feeds the spectrum gradient +
+                            // shadertoy palette — decode it off the UI
+                            // thread: a Web source is a network fetch
+                            // (seconds), which used to freeze the whole
+                            // view (and stall track-end advance).
+                            if let Some(src) = album.covers.last().cloned() {
+                                let dir =
+                                    album.dir.to_string_lossy().into_owned();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::Builder::new()
+                                    .name("aes-album-cover".into())
+                                    .spawn(move || {
+                                        let _ = tx.send((
+                                            dir,
+                                            library::decode_cover(&src),
+                                        ));
+                                    })
+                                    .ok();
+                                *album_cover_rx = Some(rx);
+                            } else {
+                                *album_cover_rx = None;
                             }
                             // The album's persisted url items append
                             // after its file tracks (Lacrima's album
@@ -1728,24 +1938,60 @@ impl eframe::App for AesRustApp {
                 if let Some(kind) = prompt_kind {
                     url_prompt.open(kind, &ui.ctx().clone());
                 }
-                // "Delete" on a pointed item — Lacrima's
-                // DeletePointedItem: remove from the view and stop
-                // playback when it was the current item.
-                if let Some(path) = delete_path {
-                    if playing_track.as_ref() == Some(&path) {
-                        if let Some(p) = player {
-                            p.stop();
+                // "Delete" on a pointed item or the Delete key on the
+                // card selection — Lacrima's DeletePointedItem:
+                // remove from the view and stop playback when a
+                // removed item was the current one.
+                if let Some(paths) = delete_path {
+                    if let Some(cur) = playing_track.as_ref() {
+                        if paths.contains(cur) {
+                            if let Some(p) = player {
+                                p.stop();
+                            }
+                            *playing_track = None;
+                            *playing_cover = None;
+                            *waveform_loading = false;
                         }
-                        *playing_track = None;
-                        *playing_cover = None;
-                        *waveform_loading = false;
                     }
                     // A deleted stream item's caches go with it —
                     // stream ranges, resolved labels, thumbnails.
-                    if library::is_url(&path) {
-                        evict_url_caches(&path.to_string_lossy());
+                    for path in &paths {
+                        if library::is_url(path) {
+                            evict_url_caches(&path.to_string_lossy());
+                        }
                     }
-                    carousel.remove(&path);
+                    carousel.remove_many(&paths);
+                    // Persist file-item deletions: the scanner would
+                    // otherwise re-add them on the next scan (Lacrima
+                    // serializes the reduced Children list; we carry
+                    // the removal in Settings.Library.ExcludedTracks).
+                    if let Some(key) =
+                        carousel.album_key().map(|k| k.to_string())
+                    {
+                        let removed: Vec<String> = paths
+                            .iter()
+                            .filter(|p| !library::is_url(p))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect();
+                        if !removed.is_empty() {
+                            settings
+                                .library
+                                .excluded_tracks
+                                .entry(key.clone())
+                                .or_default()
+                                .extend(removed);
+                            settings::save(settings);
+                        }
+                        // The tile's count badge = tracks + url items —
+                        // drop removed file items from `tracks` too (url
+                        // items update via sync_url_covers in persist).
+                        if let Some(a) = albums
+                            .iter_mut()
+                            .find(|a| a.dir.to_string_lossy() == key)
+                        {
+                            a.tracks.retain(|t| !paths.contains(t));
+                        }
+                    }
                     persist_url_items(carousel, albums, settings);
                     ui.ctx().request_repaint();
                 }
@@ -1769,7 +2015,37 @@ impl eframe::App for AesRustApp {
                     for u in carousel.url_items() {
                         evict_url_caches(&u);
                     }
+                    // File items persist the same way a Delete does —
+                    // excluded_tracks keeps them out of the next scan.
+                    let file_paths = carousel.file_items();
                     carousel.clear_items();
+                    if let Some(key) =
+                        carousel.album_key().map(|k| k.to_string())
+                    {
+                        if !file_paths.is_empty() {
+                            settings
+                                .library
+                                .excluded_tracks
+                                .entry(key.clone())
+                                .or_default()
+                                .extend(
+                                    file_paths
+                                        .iter()
+                                        .map(|p| {
+                                            p.to_string_lossy().into_owned()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                );
+                            settings::save(settings);
+                        }
+                        // Count badge: every child left the view.
+                        if let Some(a) = albums
+                            .iter_mut()
+                            .find(|a| a.dir.to_string_lossy() == key)
+                        {
+                            a.tracks.clear();
+                        }
+                    }
                     persist_url_items(carousel, albums, settings);
                     ui.ctx().request_repaint();
                 }
@@ -2508,13 +2784,14 @@ fn music_view(
     album_search: &mut search_pill::SearchPill,
     radius: u8,
     s: f32,
+    scanning: bool,
 ) -> (
     album_row::Action,
     Option<f64>,
     Option<std::path::PathBuf>,
     Option<std::path::PathBuf>,
     Option<url_prompt::Kind>,
-    Option<std::path::PathBuf>,
+    Option<Vec<std::path::PathBuf>>,
     bool,
     bool,
 ) {
@@ -2673,16 +2950,16 @@ fn music_view(
         interactive,
         s,
     );
-    // The band magnifier reveals the album-filter pill at the strip's
-    // top-right (MusicListView's "Filter Albums", Margin 0,-5,30,0).
-    album_search.ui(
+    // The band's search slot is the album filter itself — a bigger
+    // expanding pill that opens rightward from the magnifier instead
+    // of a toggle button (filters `shown` like the old strip pill).
+    album_search.ui_band(
         ui,
-        content.max.x - 30.0 * s,
-        menu_top - 5.0 * s,
+        transport.search_icon,
         "Filter Albums",
-        transport.search_open && list_t > 0.5,
+        true,
         false,
-        alpha * list_t,
+        alpha,
         interactive,
         s,
     );
@@ -2808,13 +3085,14 @@ fn music_view(
             alpha * list_t,
             interactive && list_t > 0.999,
             s,
+            scanning,
         )
     } else {
         album_row::Action::None
     };
     let mut edit = None;
     let mut prompt = None;
-    let mut delete = None;
+    let mut delete: Option<Vec<std::path::PathBuf>> = None;
     let mut clear = false;
     let mut export = false;
     let mut play = match carousel_action {
@@ -2831,8 +3109,8 @@ fn music_view(
             prompt = Some(url_prompt::Kind::Playlist);
             None
         }
-        carousel::Action::Delete(path) => {
-            delete = Some(path);
+        carousel::Action::Delete(paths) => {
+            delete = Some(paths);
             None
         }
         carousel::Action::Clear => {
@@ -3074,23 +3352,70 @@ fn settings_overlay(
     }
 
     // Footer row (Margin 15,8,12,6, top border): separator above the
-    // version block pinned right.
+    // version block pinned right, "Open AES Directory" button left.
     painter.line_segment(
         [
-            Pos2::new(panel.min.x + 15.0 * scale, panel.max.y - 44.0 * scale),
-            Pos2::new(panel.max.x - 12.0 * scale, panel.max.y - 44.0 * scale),
+            Pos2::new(panel.min.x + 15.0 * scale, panel.max.y - 70.0 * scale),
+            Pos2::new(panel.max.x - 12.0 * scale, panel.max.y - 70.0 * scale),
         ],
         Stroke::new(1.0, Color32::from_gray(45).gamma_multiply(t)),
     );
+
+    // "Open AES Directory" — reveals the app's data root in the OS
+    // file manager (settings, caches, tools, shaders all live there).
+    let btn_rect = Rect::from_min_size(
+        Pos2::new(panel.min.x + 15.0 * scale, panel.max.y - 60.0 * scale),
+        Vec2::new(320.0 * scale, 48.0 * scale),
+    );
+    let btn = ui.interact(btn_rect, ui.id().with("open-aes-dir"), Sense::click());
+    let hot = btn.hovered();
+    painter.rect_filled(
+        btn_rect,
+        CornerRadius::same((10.0 * scale).round() as u8),
+        Color32::from_white_alpha((if hot { 18.0 } else { 8.0 } * t) as u8),
+    );
+    painter.rect_stroke(
+        btn_rect,
+        CornerRadius::same((10.0 * scale).round() as u8),
+        Stroke::new(
+            1.0,
+            Color32::from_white_alpha(
+                ((if hot { 110.0 } else { 70.0 }) * t) as u8,
+            ),
+        ),
+        StrokeKind::Inside,
+    );
     painter.text(
-        Pos2::new(panel.max.x - 12.0 * scale, panel.max.y - 30.0 * scale),
+        btn_rect.center(),
+        Align2::CENTER_CENTER,
+        "Open AES Directory",
+        FontId::proportional(20.0 * scale),
+        Color32::from_gray(if hot { 235 } else { 200 }).gamma_multiply(t),
+    );
+    if hot {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if btn.clicked() {
+        if let Some(dir) = settings::data_root() {
+            let _ = if cfg!(windows) {
+                std::process::Command::new("explorer").arg(&dir).spawn()
+            } else if cfg!(target_os = "macos") {
+                std::process::Command::new("open").arg(&dir).spawn()
+            } else {
+                std::process::Command::new("xdg-open").arg(&dir).spawn()
+            };
+        }
+    }
+
+    painter.text(
+        Pos2::new(panel.max.x - 24.0 * scale, panel.max.y - 46.0 * scale),
         Align2::RIGHT_CENTER,
         "CURRENT VERSION",
         FontId::proportional(12.0 * scale),
         Color32::from_gray(110).gamma_multiply(t),
     );
     painter.text(
-        Pos2::new(panel.max.x - 12.0 * scale, panel.max.y - 12.0 * scale),
+        Pos2::new(panel.max.x - 24.0 * scale, panel.max.y - 26.0 * scale),
         Align2::RIGHT_CENTER,
         env!("CARGO_PKG_VERSION"),
         FontId::proportional(16.0 * scale),
@@ -3740,7 +4065,30 @@ fn ui_tab_audio(
         }
         ui.ctx().data_mut(|d| d.insert_persisted(text_id, text));
     }
-    y += 40.0 * s;
+    y += 46.0 * s;
+
+    // Rustified-only option (no Lacrima equivalent): spectral-
+    // subtraction denoiser for AI-generated tracks.
+    check_box(
+        &mut cui,
+        x,
+        y,
+        "Digital noise reduction (AI music)",
+        16.0,
+        &mut audio.ai_noise_reduction,
+        t,
+        s,
+        "audio-denoise",
+    );
+    y += 30.0 * s;
+    painter.text(
+        Pos2::new(x + 20.0 * s, y),
+        Align2::LEFT_TOP,
+        "Spectral-gates the hiss/shimmer neural codecs leave in AI-generated tracks.",
+        FontId::proportional(13.0 * s),
+        Color32::from_rgb(0xBB, 0xBB, 0xBB).gamma_multiply(t),
+    );
+    y += 34.0 * s;
 
     // Scroll bookkeeping: clamp against the real content height and
     // show a thin scrollbar thumb when it overflows the body.

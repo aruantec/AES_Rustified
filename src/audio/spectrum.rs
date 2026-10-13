@@ -15,8 +15,12 @@ pub const SPECTRUM_BARS: usize = 48;
 pub const SHADER_BINS: usize = 512;
 const FFT_SIZE: usize = 2048;
 /// Analysis range; upper edge also clamps to 90% of Nyquist.
+/// Lacrima's analyzer reads 256 linear bins of a 1024-pt FFT at
+/// 44.1 kHz — a 0..~11 kHz span (256 * 43.066 Hz). Bands placed above
+/// ~11k only measure codec lowpass (AAC/MP3 cut ~15-16k) and render
+/// as a dead tail, so the display range matches Lacrima's coverage.
 const MIN_FREQ: f32 = 30.0;
-const MAX_FREQ: f32 = 16_000.0;
+const MAX_FREQ: f32 = 11_025.0;
 /// Per-frame smoothing: rise fast, fall slowly.
 const ATTACK: f32 = 0.55;
 const DECAY: f32 = 0.12;

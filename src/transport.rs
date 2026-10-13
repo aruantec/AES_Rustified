@@ -64,8 +64,10 @@ pub enum Step {
 #[derive(Default)]
 pub struct Transport {
     pub album_list_open: bool,
-    /// Album filter box toggle (MusicListView's "Filter Albums" search).
-    pub search_open: bool,
+    /// Where the band's search magnifier sits — the album-filter pill
+    /// (drawn by the caller) anchors its collapsed icon here. It's a
+    /// bigger expanding search box, not a button.
+    pub search_icon: Pos2,
     pub repeat: RepeatMode,
     /// 0 carousel, 1 vertical grid, 2 horizontal grid — Lacrima's
     /// CoverLayoutMode toggle.
@@ -117,18 +119,17 @@ impl Transport {
         let ic = scaled(left, self.press_scale(ui, &r));
         icon_album_list(ui.painter(), ic, self.album_list_open, alpha);
 
-        // Search toggle to its right (same left StackPanel, Spacing=50).
+        // Search slot to its right (same left StackPanel, Spacing=50) —
+        // not a button: the album-filter pill lives here, expanding
+        // rightward on hover. The caller draws it at `search_icon`.
         let search = Rect::from_center_size(
             Pos2::new(left.max.x + RIGHT_SPACING * s + BTN * 0.5 * s, cy),
             Vec2::splat(BTN * s),
         );
-        let r = hit(search, "t-search");
-        if r.clicked() {
-            self.search_open = !self.search_open;
-        }
-        hover_cursor(ui, &r);
-        let ic = scaled(search, self.press_scale(ui, &r));
-        icon_search(ui.painter(), ic, self.search_open, alpha);
+        // Nudge down a few px: the toggle's glyph mass (top bar +
+        // square) centers slightly below the slot center, and the
+        // magnifier reads high beside it otherwise.
+        self.search_icon = Pos2::new(search.center().x, cy + 4.0 * s);
 
         // --- Center: stop / prev / play / next / repeat ---------------
         let widths = [BTN, BTN, PLAY_BTN, BTN, BTN];
@@ -645,23 +646,6 @@ fn icon_layout(painter: &egui::Painter, rect: Rect, mode: u8, alpha: f32) {
             }
         }
     }
-}
-
-/// Magnifier in the album-toggle's style: stroked lens circle plus a
-/// handle, same 100-canvas footprint and stroke weight as the other
-/// outlined icons. Lit while the album filter is open.
-fn icon_search(painter: &egui::Painter, rect: Rect, active: bool, alpha: f32) {
-    let c = (if active { LIT } else { DIM }).gamma_multiply(alpha);
-    let k = rect.height() / 100.0;
-    painter.circle_stroke(
-        cv(rect, 100.0, 45.0, 45.0),
-        26.0 * k,
-        Stroke::new(7.0 * k, c),
-    );
-    painter.line_segment(
-        [cv(rect, 100.0, 64.0, 64.0), cv(rect, 100.0, 86.0, 86.0)],
-        Stroke::new(9.0 * k, c),
-    );
 }
 
 /// Equalizer: rounded frame with a divider, 4 vertical slider slots

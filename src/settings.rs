@@ -141,24 +141,38 @@ pub struct Library {
     /// Album dirs removed via "Delete Album" — filtered out of every
     /// scan so they don't resurrect on rescan.
     pub excluded_albums: Vec<String>,
-    /// Albums imported from .apl files — virtual albums with no
-    /// backing folder, re-created on top of every scan result. `dir`
-    /// is a synthetic "apl://..." key also used in `url_items`.
-    pub imported_albums: Vec<ImportedAlbum>,
+    /// File tracks removed from an album via the card Delete or Clear
+    /// Album — kept out of `Album.tracks` on every scan merge so
+    /// deletions persist across reopen/rescan (Lacrima serializes the
+    /// reduced Children list; our scan re-reads the folder, so the
+    /// exclusion is what carries the deletion forward). Key = album
+    /// dir string, value = removed track paths.
+    pub excluded_tracks: std::collections::BTreeMap<String, Vec<String>>,
+    /// Virtual albums — created via "Create Album" or imported from
+    /// .apl files — no backing folder, re-created on top of every
+    /// scan result. Both produce the identical record: `dir` is a
+    /// synthetic "apl://..." key also used in `url_items`.
+    #[serde(alias = "ImportedAlbums")]
+    pub virtual_albums: Vec<VirtualAlbum>,
     /// "Rename Album" display-title overrides, keyed by album dir —
     /// folder names on disk are never touched, and virtual albums'
     /// `apl://` keys stay stable while their labels change.
     pub album_titles: std::collections::BTreeMap<String, String>,
+    /// Last session's album list in display order (dirs incl. virtual
+    /// keys) — written at each scan's end, read at startup so the row
+    /// renders instantly in final order while the rescan streams the
+    /// real albums into their slots.
+    pub cached_albums: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
-pub struct ImportedAlbum {
+pub struct VirtualAlbum {
     pub dir: String,
     pub title: String,
 }
 
-impl Default for ImportedAlbum {
+impl Default for VirtualAlbum {
     fn default() -> Self {
         Self {
             dir: String::new(),
@@ -298,6 +312,10 @@ pub struct Audio {
     /// trailing-silence region (measured off the generated waveform)
     /// before ending the track early.
     pub silence_advance_delay_ms: u32,
+    /// AiNoiseReduction (Rustified-only — no Lacrima equivalent):
+    /// spectral-subtraction denoiser for the broadband shimmer neural
+    /// codecs leave in AI-generated tracks.
+    pub ai_noise_reduction: bool,
 }
 
 impl Default for Audio {
@@ -317,6 +335,7 @@ impl Default for Audio {
             restart_on_resume_threshold_seconds: 10.0,
             pause_when_volume_is_zero: false,
             silence_advance_delay_ms: 500,
+            ai_noise_reduction: false,
         }
     }
 }
@@ -373,6 +392,13 @@ pub fn path() -> Option<PathBuf> {
             .join("Settings")
             .join("Settings.json")
     })
+}
+
+/// `%LOCALAPPDATA%\AES_Rustified` — the app's data root (Settings/,
+/// Tools/, caches, Shaders/), opened by Settings' "Open AES
+/// Directory" button.
+pub fn data_root() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join(APP_DIR))
 }
 
 pub fn load() -> Settings {

@@ -7,7 +7,7 @@
 //! Constants are ported from CompositionAlbumRowVisualHandler /
 //! AlbumRowLayoutHelper.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -49,6 +49,9 @@ const BADGE_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
 /// `image::load_from_memory` on embedded art can take tens of ms, so
 /// doing it on the UI thread froze the view on entry.
 const COVER_WORKERS: usize = 2;
+/// Concurrent web-thumbnail fetches — enough to keep tiles filling
+/// without saturating the connection when many URL albums are visible.
+const WEB_WORKERS: usize = 3;
 
 // --- Drag-to-reorder (CompositionAlbumRowControl) ----------------------
 /// Pointer travel before a press becomes a drag (DragStartThreshold).
@@ -75,9 +78,10 @@ pub enum Action {
     /// Double-clicked — will open the album's track view later.
     Opened(usize),
     /// "Delete Album" on the pointed tile (Lacrima's DeleteFolder —
-    /// removes it from the list, not from disk). Carries the album's
-    /// dir, not an index — the shown list can be filter-cloned.
-    DeleteAlbum(String),
+    /// removes it from the list, not from disk). Carries the albums'
+    /// dirs, not indices — the shown list can be filter-cloned. The
+    /// Delete key pushes every selected album.
+    DeleteAlbum(Vec<String>),
     /// "Export Playlist" on the pointed tile — write its URL items
     /// to an .apl file (Lacrima's ExportOnlinePlaylistCommand).
     Export(String),
@@ -102,6 +106,7 @@ enum CoverTex {
 /// Per-album fan animation state: a spring-driven 0..1 spread factor
 /// that all layer offsets derive from (equivalent to Lacrima's
 /// per-layer lerp — every target moves proportionally).
+#[derive(Clone, Copy, Default)]
 struct Fan {
     spread: f32,
     vel: f32,
@@ -115,35 +120,65 @@ fn spring_step(pos: f32, vel: &mut f32, target: f32, stiffness: f32, damping: f3
     pos + *vel * dt
 }
 
-/// Post-release glide of a dropped tile back into its slot
-/// (Lacrima's AlbumRowDragCommitMessage + DragCommitSeconds).
-#[derive(Clone, Copy)]
+/// Post-release glide of a dropped block back into its slots
+/// (Lacrima's AlbumRowDragCommitMessage + DragCommitSeconds). `offs`
+/// captures each tile's offset from the primary tile's center at
+/// release time so the whole group glides home together.
+#[derive(Clone)]
 struct Commit {
     start: Pos2,
+    offs: Vec<Vec2>,
     progress: f32,
 }
 
 /// In-progress drag-reorder (Lacrima's _isDragging state): the pressed
 /// tile is tracked, and past DRAG_START_PX it lifts and follows the
 /// pointer while the other tiles slide aside to open the drop slot.
+/// `indices` is the whole dragged block (sorted, contains `index`) —
+/// the current selection when the grabbed tile is selected, else just
+/// the grabbed tile (ListboxItemDragBehavior's _draggedIndices).
 struct Drag {
-    /// Album grabbed at press time.
+    /// Album grabbed at press time (_currentDraggedIndex).
     index: usize,
+    /// Sorted dragged block — index set moves as one contiguous run.
+    indices: Vec<usize>,
     /// Press position — the move-threshold reference (_startPoint).
     press: Pos2,
     /// Tile-center ↔ pointer offset kept for the whole drag
     /// (_dragPointerOffset).
     grab_offset: Vec2,
-    /// Latest visual center of the floating tile (_dragPosition).
+    /// Latest visual center of the floating primary tile
+    /// (_dragPosition).
     center: Pos2,
-    /// Slot the tile would land in now (_currentDragTargetIndex).
+    /// Slot the PRIMARY tile would land in now
+    /// (_lastValidSlotIndex); the block lands contiguously around it.
     drop_target: usize,
     /// Per-tile x shifts that open the gap, animated (_swapOffsets).
     swap_offsets: HashMap<usize, f32>,
+    /// 0→1 glue ease — selected tiles collapse from their scattered
+    /// slots into a contiguous block under the pointer (AnimateGlue).
+    glue: f32,
     /// Past the threshold — before that the press is just a click.
     has_moved: bool,
     /// Set on release when the target differs from the start slot.
     commit: Option<Commit>,
+}
+
+impl Clone for Drag {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            indices: self.indices.clone(),
+            press: self.press,
+            grab_offset: self.grab_offset,
+            center: self.center,
+            drop_target: self.drop_target,
+            swap_offsets: self.swap_offsets.clone(),
+            glue: self.glue,
+            has_moved: self.has_moved,
+            commit: self.commit.clone(),
+        }
+    }
 }
 
 pub struct AlbumRow {
@@ -153,6 +188,20 @@ pub struct AlbumRow {
     scale: f32,
     hovered: i32,
     pub selected: i32,
+    /// Multi-selection (SelectionMode=Multiple): album dir keys so a
+    /// filtered `shown` list or removals can't shift membership.
+    /// `selected` stays the primary tile for the single-select paths.
+    sel_dirs: BTreeSet<String>,
+    /// Dir the last plain/ctrl click landed on — Shift+click extends
+    /// the range from it.
+    sel_anchor: String,
+    /// Set on any user selection gesture — the app consumes it to
+    /// decide which view owns the Delete key.
+    sel_touched: bool,
+    /// Press on an already-selected tile keeps the group for a
+    /// possible drag; a release that never moved collapses the
+    /// selection to that tile (deferred single-click).
+    defer_collapse: bool,
     hover_lift: HashMap<usize, (f32, f32)>,
     selection_fade: f32,
     scrollbar_opacity: f32,
@@ -170,11 +219,13 @@ pub struct AlbumRow {
     /// Lacrima's `PlaceholderGenerator` music-note cover, used for any
     /// layer with no real art (uploaded lazily on first use).
     placeholder: Option<egui::TextureHandle>,
-    /// Work queue shared with the decode threads.
+    /// Work queue shared with the local decode threads.
     cover_queue: Arc<(Mutex<VecDeque<CoverSrc>>, Condvar)>,
-    /// Sender clone for one-shot web-cover fetches (they block on
-    /// network timeouts, so they bypass the shared pool).
-    cover_tx: mpsc::Sender<(CoverSrc, Option<egui::ColorImage>)>,
+    /// Separate bounded queue for web covers — they block on network
+    /// timeouts, so a dedicated small pool keeps many URL albums
+    /// filling without a thread-per-source storm or starving local
+    /// decodes.
+    web_queue: Arc<(Mutex<VecDeque<CoverSrc>>, Condvar)>,
     /// Finished decodes, drained on the UI thread (texture upload is
     /// cheap — it's the image decode that stalls).
     cover_results: mpsc::Receiver<(CoverSrc, Option<egui::ColorImage>)>,
@@ -214,28 +265,38 @@ impl AlbumRow {
         let (tx, cover_results) = mpsc::channel();
         let cover_queue =
             Arc::new((Mutex::new(VecDeque::<CoverSrc>::new()), Condvar::new()));
-        for _ in 0..COVER_WORKERS {
-            let queue = cover_queue.clone();
-            let tx = tx.clone();
-            std::thread::Builder::new()
-                .name("aes-cover-decode".into())
-                .spawn(move || loop {
-                    let src = {
-                        let (mutex, cv) = &*queue;
-                        let mut g = mutex.lock().unwrap();
-                        loop {
-                            if let Some(s) = g.pop_front() {
-                                break s;
+        let web_queue =
+            Arc::new((Mutex::new(VecDeque::<CoverSrc>::new()), Condvar::new()));
+        let spawn_pool = |queue: Arc<(Mutex<VecDeque<CoverSrc>>, Condvar)>,
+                          workers: usize,
+                          name: &'static str| {
+            for _ in 0..workers {
+                let queue = queue.clone();
+                let tx = tx.clone();
+                std::thread::Builder::new()
+                    .name(name.into())
+                    .spawn(move || loop {
+                        let src = {
+                            let (mutex, cv) = &*queue;
+                            let mut g = mutex.lock().unwrap();
+                            loop {
+                                if let Some(s) = g.pop_front() {
+                                    break s;
+                                }
+                                g = cv.wait(g).unwrap();
                             }
-                            g = cv.wait(g).unwrap();
+                        };
+                        if tx.send((src.clone(), library::decode_cover(&src)))
+                            .is_err()
+                        {
+                            return;
                         }
-                    };
-                    if tx.send((src.clone(), library::decode_cover(&src))).is_err() {
-                        return;
-                    }
-                })
-                .expect("cover decode thread");
-        }
+                    })
+                    .expect("cover decode thread");
+            }
+        };
+        spawn_pool(cover_queue.clone(), COVER_WORKERS, "aes-cover-decode");
+        spawn_pool(web_queue.clone(), WEB_WORKERS, "aes-cover-web");
         Self {
             current_scroll: 0.0,
             target_scroll: 0.0,
@@ -251,12 +312,16 @@ impl AlbumRow {
             scrollbar_drag: false,
             sb_grab_dx: 0.0,
             fans: Vec::new(),
+            sel_dirs: BTreeSet::new(),
+            sel_anchor: String::new(),
+            sel_touched: false,
+            defer_collapse: false,
             drag: None,
             menu_album: None,
             textures: HashMap::new(),
             placeholder: None,
             cover_queue,
-            cover_tx: tx,
+            web_queue,
             cover_results,
             cover_pending: HashSet::new(),
             order_dirty: false,
@@ -320,6 +385,9 @@ impl AlbumRow {
         self.textures.clear();
         self.fans.clear();
         self.selected = -1;
+        self.sel_dirs.clear();
+        self.sel_anchor.clear();
+        self.defer_collapse = false;
         self.hovered = -1;
         self.current_scroll = 0.0;
         self.target_scroll = 0.0;
@@ -377,33 +445,63 @@ impl AlbumRow {
         }
     }
 
-    /// Where `index` displays while `drag` hovers `target`
-    /// (AlbumRowLayoutHelper.ComputeDisplaySlot): the dragged tile owns
-    /// the target slot, the rest shift around it.
-    fn display_slot(index: usize, drag: usize, target: usize, count: usize) -> usize {
-        let target = target.min(count.saturating_sub(1));
-        if index == drag {
-            return target;
+    /// Where `index` displays while the dragged block targets
+    /// `block_start` (AlbumRowLayoutHelper.ComputeDisplaySlot extended
+    /// to a contiguous run — ListboxItemDragBehavior's
+    /// ShiftItemsForSwap): dragged tiles own the block slots, the rest
+    /// shift around them.
+    fn display_slot(index: usize, dragged: &[usize], block_start: usize) -> usize {
+        match dragged.binary_search(&index) {
+            Ok(rank) => block_start + rank,
+            Err(ins) => {
+                let rank = index - ins;
+                if rank < block_start {
+                    rank
+                } else {
+                    rank + dragged.len()
+                }
+            }
         }
-        let rank = index - usize::from(index > drag);
-        if rank < target {
-            rank
-        } else {
-            rank + 1
-        }
+    }
+
+    /// Block start for a drag: the primary's target slot minus its
+    /// rank in the dragged set (Lacrima's blockToIndex clamp).
+    fn block_start(d: &Drag, count: usize) -> usize {
+        let pr = d
+            .indices
+            .iter()
+            .position(|&i| i == d.index)
+            .unwrap_or(0);
+        d.drop_target
+            .min(count.saturating_sub(1))
+            .saturating_sub(pr)
+            .min(count.saturating_sub(d.indices.len()))
     }
 
     /// Re-key index-addressed animation state after `albums` got a
     /// remove+insert move (Lacrima's SwapTileCoverState/MoveSnapshotItem —
     /// our textures are keyed by cover source so they need no remap).
-    fn note_reorder(&mut self, from: usize, to: usize) {
-        if from != to && from < self.fans.len() && to < self.fans.len() {
-            let f = self.fans.remove(from);
-            self.fans.insert(to, f);
+    fn note_reorder(&mut self, dragged: &[usize], block_start: usize, primary_rank: usize) {
+        if dragged
+            .iter()
+            .enumerate()
+            .any(|(k, &i)| i != block_start + k)
+        {
+            let mut perm: Vec<usize> = (0..self.fans.len()).collect();
+            let mut pulled: Vec<usize> = Vec::with_capacity(dragged.len());
+            for &i in dragged.iter().rev() {
+                pulled.push(perm.remove(i));
+            }
+            pulled.reverse();
+            for (k, v) in pulled.into_iter().enumerate() {
+                perm.insert(block_start + k, v);
+            }
+            let old = std::mem::take(&mut self.fans);
+            self.fans = perm.into_iter().map(|i| old[i]).collect();
         }
         self.hover_lift.clear();
         self.hovered = -1;
-        self.selected = to as i32;
+        self.selected = (block_start + primary_rank) as i32;
     }
 
     /// Advance the drag-reorder state machine (ported from
@@ -421,14 +519,23 @@ impl AlbumRow {
         interactive: bool,
     ) {
         let count = albums.len();
-        if count == 0 || self.drag.as_ref().map(|d| d.index >= count).unwrap_or(false) {
+        if count == 0
+            || self
+                .drag
+                .as_ref()
+                .map(|d| d.index >= count || d.indices.iter().any(|&i| i >= count))
+                .unwrap_or(false)
+        {
             self.drag = None;
             return;
         }
         let (pointer, down) =
             ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
 
-        // Drop glide: ease the tile home, then reorder the model.
+        // Drop glide: ease the whole block home, then reorder the
+        // model — dragged indices out (descending keeps positions
+        // valid), back in contiguously at the block start
+        // (TryReorderItems).
         let landed = match self.drag.as_mut().and_then(|d| d.commit.as_mut()) {
             Some(c) => {
                 c.progress += dt / COMMIT_SECS;
@@ -438,12 +545,28 @@ impl AlbumRow {
         };
         if landed {
             let d = self.drag.take().unwrap();
-            let to = d.drop_target.min(count - 1);
-            if d.index != to {
-                let a = albums.remove(d.index);
-                albums.insert(to, a);
+            let bs = Self::block_start(&d, count);
+            let already = d
+                .indices
+                .iter()
+                .enumerate()
+                .all(|(k, &i)| i == bs + k);
+            if !already {
+                let mut pulled: Vec<Album> = Vec::with_capacity(d.indices.len());
+                for &i in d.indices.iter().rev() {
+                    pulled.push(albums.remove(i));
+                }
+                pulled.reverse();
+                for (k, a) in pulled.into_iter().enumerate() {
+                    albums.insert(bs + k, a);
+                }
             }
-            self.note_reorder(d.index, to);
+            let pr = d
+                .indices
+                .iter()
+                .position(|&i| i == d.index)
+                .unwrap_or(0);
+            self.note_reorder(&d.indices, bs, pr);
             self.order_dirty = true;
             return;
         }
@@ -454,14 +577,84 @@ impl AlbumRow {
         }
 
         // Released mid-drag (or the view went inactive): never-moved
-        // drags were plain clicks; landing on the start slot snaps back.
+        // drags were plain clicks — a click on an already-selected
+        // tile collapses the selection to it (the defer set on press).
         if !interactive || !down {
-            let d = self.drag.as_mut().unwrap();
-            if !d.has_moved || d.drop_target == d.index {
-                self.drag = None;
-            } else {
-                let start = d.center;
-                d.commit = Some(Commit { start, progress: 0.0 });
+            enum Rel {
+                Click,
+                SnapBack,
+                Glide { start: Pos2, offs: Vec<Vec2> },
+            }
+            let rel = {
+                let d = self.drag.as_ref().unwrap();
+                if !d.has_moved {
+                    Rel::Click
+                } else {
+                    let bs = Self::block_start(d, count);
+                    if d
+                        .indices
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &i)| i == bs + k)
+                    {
+                        // Landing on the start slots snaps back.
+                        Rel::SnapBack
+                    } else {
+                        // Freeze each tile's offset from the primary
+                        // center so the group glides in formation.
+                        let stride = m.tile_w + SPACING * self.scale;
+                        let glue_e =
+                            (d.glue.min(1.0) * std::f32::consts::FRAC_PI_2).sin();
+                        let pr = d
+                            .indices
+                            .iter()
+                            .position(|&i| i == d.index)
+                            .unwrap_or(0);
+                        let pc = self.tile_rect(rect, m, d.index).center();
+                        let offs: Vec<Vec2> = d
+                            .indices
+                            .iter()
+                            .enumerate()
+                            .map(|(k, &i)| {
+                                let home = self.tile_rect(rect, m, i).center() - pc;
+                                let glued = Vec2::new(
+                                    (k as f32 - pr as f32) * stride,
+                                    0.0,
+                                );
+                                home + (glued - home) * glue_e
+                            })
+                            .collect();
+                        Rel::Glide {
+                            start: d.center,
+                            offs,
+                        }
+                    }
+                }
+            };
+            match rel {
+                Rel::Click => {
+                    if self.defer_collapse {
+                        if let Some(a) = self
+                            .drag
+                            .as_ref()
+                            .and_then(|d| albums.get(d.index))
+                        {
+                            let dir = a.dir.to_string_lossy().into_owned();
+                            self.sel_dirs.clear();
+                            self.sel_dirs.insert(dir.clone());
+                            self.sel_anchor = dir;
+                        }
+                        self.defer_collapse = false;
+                    }
+                    self.drag = None;
+                }
+                Rel::SnapBack => {
+                    self.drag = None;
+                }
+                Rel::Glide { start, offs } => {
+                    self.drag.as_mut().unwrap().commit =
+                        Some(Commit { start, offs, progress: 0.0 });
+                }
             }
             return;
         }
@@ -492,6 +685,9 @@ impl AlbumRow {
             }
             d.center = p + d.grab_offset;
             center = d.center;
+            // Selected tiles converge into a contiguous block under
+            // the pointer — Lacrima's AnimateGlue (250ms sin ease).
+            d.glue = (d.glue + dt / 0.25).min(1.0);
 
             // Nearest slot center decides the drop target
             // (FindNearestDropTargetIndex).
@@ -560,22 +756,17 @@ impl AlbumRow {
         }
     }
 
-    /// Send `src` to a decoder. Web covers fetch over the network with
-    /// multi-second timeouts — they each get a one-shot thread so a
-    /// slow host can't starve the shared pool's local decodes.
+    /// Send `src` to a decoder. Web covers route to the bounded web
+    /// pool — one thread per fetch used to storm the network when many
+    /// URL albums were visible at once.
     fn submit_cover(&self, src: CoverSrc) {
-        if matches!(src, CoverSrc::Web(_)) {
-            let tx = self.cover_tx.clone();
-            std::thread::Builder::new()
-                .name("aes-cover-web".into())
-                .spawn(move || {
-                    let _ = tx.send((src.clone(), library::decode_cover(&src)));
-                })
-                .ok();
+        let queue = if matches!(src, CoverSrc::Web(_)) {
+            &self.web_queue
         } else {
-            self.cover_queue.0.lock().unwrap().push_back(src);
-            self.cover_queue.1.notify_one();
-        }
+            &self.cover_queue
+        };
+        queue.0.lock().unwrap().push_back(src);
+        queue.1.notify_one();
     }
 
     /// Queue `src` for decode if needed and return its texture when
@@ -637,6 +828,7 @@ impl AlbumRow {
         alpha: f32,
         interactive: bool,
         scale: f32,
+        scanning: bool,
     ) -> Action {
         let mut action = Action::None;
         self.scale = scale;
@@ -798,23 +990,82 @@ impl AlbumRow {
                     }
                     let hit = self.hit_tile(rect, &m, albums.len(), p);
                     if hit >= 0 {
+                        // Selection gestures (SelectionMode=Multiple):
+                        // Ctrl toggles, Shift extends from the anchor,
+                        // plain click selects — except a press on an
+                        // already-selected tile, which keeps the group
+                        // so it can be dragged (collapse defers to a
+                        // no-move release).
+                        let dir =
+                            albums[hit as usize].dir.to_string_lossy().into_owned();
+                        self.defer_collapse = false;
+                        let mods = ui.ctx().input(|i| i.modifiers);
+                        if mods.command {
+                            if !self.sel_dirs.remove(&dir) {
+                                self.sel_dirs.insert(dir.clone());
+                            }
+                            self.sel_anchor = dir.clone();
+                        } else if mods.shift && !self.sel_anchor.is_empty() {
+                            let ai = albums
+                                .iter()
+                                .position(|a| {
+                                    a.dir.to_string_lossy() == self.sel_anchor
+                                })
+                                .unwrap_or(hit as usize);
+                            let (lo, hi) =
+                                (ai.min(hit as usize), ai.max(hit as usize));
+                            self.sel_dirs = (lo..=hi)
+                                .map(|i| {
+                                    albums[i].dir.to_string_lossy().into_owned()
+                                })
+                                .collect();
+                        } else if self.sel_dirs.contains(&dir) {
+                            self.defer_collapse = true;
+                        } else {
+                            self.sel_dirs.clear();
+                            self.sel_dirs.insert(dir.clone());
+                            self.sel_anchor = dir.clone();
+                        }
+                        self.sel_touched = true;
                         self.selected = hit;
                         action = Action::Selected(hit as usize);
                         // Start tracking the press as a potential drag
                         // (BeginItemDrag); it becomes a visual drag past
-                        // DRAG_START_PX.
+                        // DRAG_START_PX. A selected tile drags the whole
+                        // selection (_draggedIndices).
                         let hit = hit as usize;
+                        let indices: Vec<usize> = if self.sel_dirs.contains(&dir) {
+                            albums
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, a)| {
+                                    self.sel_dirs
+                                        .contains(a.dir.to_string_lossy().as_ref())
+                                })
+                                .map(|(i, _)| i)
+                                .collect()
+                        } else {
+                            vec![hit]
+                        };
                         let center = self.tile_rect(rect, &m, hit).center();
                         self.drag = Some(Drag {
                             index: hit,
+                            indices,
                             press: p,
                             grab_offset: center - p,
                             center,
                             drop_target: hit,
                             swap_offsets: HashMap::new(),
+                            glue: 0.0,
                             has_moved: false,
                             commit: None,
                         });
+                    } else if !ui.ctx().input(|i| i.modifiers).command {
+                        // Empty-row click clears the selection.
+                        self.sel_dirs.clear();
+                        self.sel_anchor.clear();
+                        self.selected = -1;
+                        self.sel_touched = true;
                     }
                 }
             }
@@ -912,11 +1163,12 @@ impl AlbumRow {
             let slot_x = |i: usize| rect.min.x + PAD_X * s + i as f32 * stride - scroll;
             let step = 1.0 - (-dt / SWAP_TAU).exp();
             let d = self.drag.as_mut().unwrap();
+            let bs = Self::block_start(&d, albums.len());
             for i in 0..albums.len() {
-                if i == d.index {
+                if d.indices.binary_search(&i).is_ok() {
                     continue;
                 }
-                let slot = Self::display_slot(i, d.index, d.drop_target, albums.len());
+                let slot = Self::display_slot(i, &d.indices, bs);
                 let target = if slot == i {
                     0.0
                 } else {
@@ -956,10 +1208,17 @@ impl AlbumRow {
         painter.rect_filled(rect, 0.0, ROW_BG.gamma_multiply(alpha));
 
         if albums.is_empty() {
+            // While the scan streams in, say so — an empty row with no
+            // feedback reads as "no library" during a long first walk.
+            let hint = if scanning {
+                "Scanning library…"
+            } else {
+                "Add a music folder to get started — right-click for options"
+            };
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "Add a music folder to get started — right-click for options",
+                hint,
                 FontId::proportional(20.0 * s),
                 Color32::from_rgba_unmultiplied(0x78, 0x78, 0x78, (0x88 as f32 * alpha) as u8),
             );
@@ -977,33 +1236,38 @@ impl AlbumRow {
             .max(0) as usize;
         self.ensure_textures(ui.ctx(), albums, (first, last));
 
-        let drag_index = self
+        // Owned snapshot — the draw calls below borrow &mut self.
+        let dragged = self
             .drag
-            .as_ref()
-            .filter(|d| d.has_moved && d.index < albums.len())
-            .map(|d| d.index);
-        // Drop-slot hole: dashed outline at the slot the dragged tile
-        // will land in (Lacrima's DrawPlaceholder, dash 8 on / 8 off).
-        if let Some(d) = self
-            .drag
-            .as_ref()
-            .filter(|d| d.has_moved && d.index < albums.len())
-        {
-            let hole = self.tile_rect(rect, &m, d.drop_target.min(albums.len() - 1));
-            dashed_rect(
-                &painter,
-                hole,
-                8.0 * s,
-                2.0 * s,
-                HOLE.gamma_multiply(HOLE_ALPHA * alpha),
-            );
+            .clone()
+            .filter(|d| d.has_moved && d.index < albums.len());
+        // Drop-slot holes: dashed outline at each slot the dragged
+        // block will land in (Lacrima's DrawPlaceholder, dash 8 on /
+        // 8 off).
+        if let Some(d) = dragged.as_ref() {
+            let bs = Self::block_start(d, albums.len());
+            for k in 0..d.indices.len() {
+                let hole = self.tile_rect(rect, &m, bs + k);
+                dashed_rect(
+                    &painter,
+                    hole,
+                    8.0 * s,
+                    2.0 * s,
+                    HOLE.gamma_multiply(HOLE_ALPHA * alpha),
+                );
+            }
         }
 
         for i in first..=last {
-            if i as i32 == self.selected || Some(i) == drag_index {
+            if i as i32 == self.selected
+                || dragged
+                    .as_ref()
+                    .map(|d| d.indices.binary_search(&i).is_ok())
+                    .unwrap_or(false)
+            {
                 continue;
             }
-            let off = if drag_index.is_some() {
+            let off = if dragged.is_some() {
                 self.drag
                     .as_ref()
                     .and_then(|d| d.swap_offsets.get(&i).copied())
@@ -1015,11 +1279,14 @@ impl AlbumRow {
         }
         if self.selected >= 0
             && (self.selected as usize) < albums.len()
-            && Some(self.selected as usize) != drag_index
+            && !dragged
+                .as_ref()
+                .map(|d| d.indices.binary_search(&(self.selected as usize)).is_ok())
+                .unwrap_or(false)
         {
             let i = self.selected as usize;
             if i >= first && i <= last {
-                let off = if drag_index.is_some() {
+                let off = if dragged.is_some() {
                     self.drag
                         .as_ref()
                         .and_then(|d| d.swap_offsets.get(&i).copied())
@@ -1030,35 +1297,49 @@ impl AlbumRow {
                 self.draw_tile(ui.ctx(), &painter, rect, &m, albums, i, off, None, alpha);
             }
         }
-        // The dragged tile floats on top (DrawDraggedTile): pointer-
-        // glued at DRAG_LIFT, or gliding into the slot during commit.
-        if let Some(i) = drag_index {
-            let (center, lift) = {
-                let d = self.drag.as_ref().unwrap();
-                match d.commit {
+        // The dragged block floats on top (DrawDraggedTile): the
+        // primary is pointer-glued at DRAG_LIFT, the rest ride
+        // contiguous beside it, all gliding home during commit.
+        if let Some(d) = dragged.as_ref() {
+            let stride = m.tile_w + SPACING * s;
+            let pr = d
+                .indices
+                .iter()
+                .position(|&i| i == d.index)
+                .unwrap_or(0);
+            let glue_e = (d.glue.min(1.0) * std::f32::consts::FRAC_PI_2).sin();
+            let bs = Self::block_start(d, albums.len());
+            let prim_center = self.tile_rect(rect, &m, d.index).center();
+            for (k, &i) in d.indices.iter().enumerate() {
+                let glued = Vec2::new((k as f32 - pr as f32) * stride, 0.0);
+                let (center, lift) = match &d.commit {
                     Some(c) => {
                         let t = 1.0 - (1.0 - c.progress.clamp(0.0, 1.0)).powi(3);
-                        let slot = d.drop_target.min(albums.len() - 1);
-                        let target = self.tile_rect(rect, &m, slot).center();
+                        let target =
+                            self.tile_rect(rect, &m, bs + k).center();
                         (
-                            c.start + (target - c.start) * t,
+                            c.start + c.offs[k] + (target - c.start - c.offs[k]) * t,
                             DRAG_LIFT + (1.0 - DRAG_LIFT) * t,
                         )
                     }
-                    None => (d.center, DRAG_LIFT),
-                }
-            };
-            self.draw_tile(
-                ui.ctx(),
-                &painter,
-                rect,
-                &m,
-                albums,
-                i,
-                0.0,
-                Some((center, lift)),
-                alpha,
-            );
+                    None => {
+                        let home =
+                            self.tile_rect(rect, &m, i).center() - prim_center;
+                        (d.center + home + (glued - home) * glue_e, DRAG_LIFT)
+                    }
+                };
+                self.draw_tile(
+                    ui.ctx(),
+                    &painter,
+                    rect,
+                    &m,
+                    albums,
+                    i,
+                    0.0,
+                    Some((center, lift)),
+                    alpha,
+                );
+            }
         }
 
         // Inline title edit (Create Album / Rename Album): a TextEdit
@@ -1157,6 +1438,45 @@ impl AlbumRow {
         }
     }
 
+    /// Drop `dir` from the multi-selection (it left the list).
+    pub fn deselect_dir(&mut self, dir: &str) {
+        self.sel_dirs.remove(dir);
+        if self.sel_anchor == dir {
+            self.sel_anchor.clear();
+        }
+    }
+
+    /// Ctrl+A — every listed album selected (keyed by dir, like the
+    /// click gestures, so filtering/reordering can't shift members).
+    pub fn select_all(&mut self, albums: &[Album]) {
+        self.sel_dirs = albums
+            .iter()
+            .map(|a| a.dir.to_string_lossy().into_owned())
+            .collect();
+        self.sel_anchor = albums
+            .first()
+            .map(|a| a.dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !self.sel_dirs.is_empty() {
+            self.sel_touched = true;
+        }
+    }
+
+    /// A user selection gesture happened since the last check — the
+    /// app uses it to give the row Delete-key ownership.
+    pub fn take_sel_touched(&mut self) -> bool {
+        std::mem::take(&mut self.sel_touched)
+    }
+
+    /// Selected albums' dirs in list order (the Delete key payload).
+    pub fn selected_dirs(&self, albums: &[Album]) -> Vec<String> {
+        albums
+            .iter()
+            .filter(|a| self.sel_dirs.contains(a.dir.to_string_lossy().as_ref()))
+            .map(|a| a.dir.to_string_lossy().into_owned())
+            .collect()
+    }
+
     fn context_menu(&mut self, ui: &mut egui::Ui, action: &mut Action, albums: &[Album]) {
         if ui.button("Add music folder").clicked() {
             *action = Action::AddFolder;
@@ -1193,9 +1513,9 @@ impl AlbumRow {
                 ui.close();
             }
             if ui.button("Delete Album").clicked() {
-                *action = Action::DeleteAlbum(
+                *action = Action::DeleteAlbum(vec![
                     albums[i].dir.to_string_lossy().into_owned(),
-                );
+                ]);
                 self.menu_album = None;
                 ui.close();
             }
@@ -1219,7 +1539,13 @@ impl AlbumRow {
         let base = self
             .tile_rect(row, m, index)
             .translate(Vec2::new(offset_x, 0.0));
-        let is_selected = index as i32 == self.selected;
+        // Selection visuals: every album in the multi-selection gets
+        // the ring + lift. `selected` alone only marks the primary
+        // when no multi-selection is populated (legacy single path) —
+        // a Ctrl-toggled-off tile must not keep the ring.
+        let dir_key = album.dir.to_string_lossy();
+        let is_selected = self.sel_dirs.contains(dir_key.as_ref())
+            || (self.sel_dirs.is_empty() && index as i32 == self.selected);
         let fade = if placement.is_none() && is_selected {
             self.selection_fade
         } else {

@@ -56,36 +56,35 @@ pub struct Album {
     pub url_count: usize,
 }
 
-/// Scan `roots` on a background thread; albums arrive on the receiver.
-pub fn spawn_scan(roots: &[PathBuf]) -> mpsc::Receiver<Vec<Album>> {
+/// Scan `roots` on a background thread; each album is sent the moment
+/// its directory walk completes so the row fills in procedurally
+/// instead of staying empty until the whole scan finishes (the
+/// channel closing marks the scan done).
+pub fn spawn_scan(roots: &[PathBuf]) -> mpsc::Receiver<Album> {
     let roots = roots.to_vec();
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("aes-library-scan".into())
         .spawn(move || {
-            let _ = tx.send(scan_roots(&roots));
+            scan_roots(&roots, &tx);
         })
         .expect("library scan thread");
     rx
 }
 
-pub fn scan_roots(roots: &[PathBuf]) -> Vec<Album> {
-    let mut albums = Vec::new();
+pub fn scan_roots(roots: &[PathBuf], tx: &mpsc::Sender<Album>) {
     for root in roots {
         if root.is_dir() {
-            // Grouped by root in scan order (a newly added folder lands
-            // last in the row), alphabetical within each root.
-            let start = albums.len();
-            scan_dir(root, 0, &mut albums);
-            albums[start..].sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+            scan_dir(root, 0, tx);
         }
     }
-    albums
 }
 
 /// Depth-first walk; every directory holding audio files yields one
 /// album, and descent continues for nested albums (Artist/Album trees).
-fn scan_dir(dir: &Path, depth: usize, albums: &mut Vec<Album>) {
+/// Each result is sent immediately — the UI side inserts it into the
+/// sorted position so discovery order doesn't scramble the row.
+fn scan_dir(dir: &Path, depth: usize, tx: &mpsc::Sender<Album>) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -136,10 +135,20 @@ fn scan_dir(dir: &Path, depth: usize, albums: &mut Vec<Album>) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
-        albums.push(build_album(title, dir.to_path_buf(), audio, images));
+        if tx.send(build_album(title, dir.to_path_buf(), audio, images)).is_err() {
+            return;
+        }
     }
+    // Descend in case-insensitive name order — streamed albums then
+    // arrive roughly alphabetically, so the row fills left-to-right
+    // instead of tiles popping in at random positions mid-scan.
+    subdirs.sort_by_key(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned().to_lowercase())
+            .unwrap_or_default()
+    });
     for sub in subdirs {
-        scan_dir(&sub, depth + 1, albums);
+        scan_dir(&sub, depth + 1, tx);
     }
 }
 
@@ -192,6 +201,24 @@ impl CoverSrc {
 }
 
 impl Album {
+    /// A pre-scan stand-in built from the persisted manifest (cached
+    /// dir order): the tile shows instantly — title + default art —
+    /// and the streamed scan result replaces it in place once the
+    /// folder is walked.
+    pub fn placeholder(dir: &str) -> Album {
+        let title = Path::new(dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.to_string());
+        Album {
+            title,
+            dir: dir.into(),
+            tracks: Vec::new(),
+            covers: Vec::new(),
+            url_count: 0,
+        }
+    }
+
     /// Rebuild the web-derived fan layers after the album's url items
     /// change — a created/imported album starts with no covers and the
     /// tile must pick up thumbnails as items are added, dropped on
@@ -235,7 +262,7 @@ impl Album {
     }
 }
 
-/// Synthetic dir scheme for imported .apl albums — the "dir" has no
+/// Synthetic dir scheme for virtual albums — the "dir" has no
 /// backing folder; it just keys `UrlItems` like a real path does.
 pub const VIRTUAL_SCHEME: &str = "apl://";
 
@@ -244,10 +271,11 @@ pub fn is_virtual_dir(dir: &Path) -> bool {
 }
 
 impl Album {
-    /// A playlist-imported album: no files on disk, URL items only
-    /// (persisted in `UrlItems` under `dir`). Presentation covers are
-    /// the first items' web thumbnails.
-    pub fn imported(dir: &str, title: String, urls: &[String]) -> Self {
+    /// A virtual album: no files on disk, URL items only (persisted
+    /// in `UrlItems` under `dir`). Identical whether created empty
+    /// via Create Album or imported from an .apl. Presentation covers
+    /// are the first items' web thumbnails.
+    pub fn virtual_album(dir: &str, title: String, urls: &[String]) -> Self {
         // Same convention as build_album/url-only sync: fan = first
         // items' thumbs, top cover = the FIRST item's thumb.
         let web: Vec<CoverSrc> =
@@ -276,11 +304,11 @@ pub fn decode_cover(src: &CoverSrc) -> Option<egui::ColorImage> {
         CoverSrc::File(p) => std::fs::read(p).ok()?,
         CoverSrc::Tag(p) => tag_picture(p)?,
         CoverSrc::Web(urls) => {
+            // Cached candidates win instantly — thumbnail bytes
+            // persist on disk, so a hit skips the network entirely.
+            // Corrupt entries are dropped and re-fetched.
             let mut found = None;
             for u in urls {
-                // Thumbnail bytes persist on disk — a cached hit skips
-                // the network fetch entirely. Corrupt entries are
-                // dropped and re-fetched.
                 if let Some(b) = crate::meta_cache::load_image(u) {
                     if image::load_from_memory(&b).is_ok() {
                         found = Some(b);
@@ -288,13 +316,30 @@ pub fn decode_cover(src: &CoverSrc) -> Option<egui::ColorImage> {
                     }
                     crate::meta_cache::remove_image(u);
                 }
-                if let Some(b) = crate::ytdlp::fetch_bytes(u, 6) {
-                    if image::load_from_memory(&b).is_ok() {
-                        crate::meta_cache::save_image(u, &b);
-                        found = Some(b);
-                        break;
-                    }
+            }
+            // Race the remaining candidates in parallel — the serial
+            // ladder cost up to candidates x timeout when a host was
+            // slow, which froze URL-album tiles for tens of seconds.
+            // First valid image wins; other threads still land their
+            // bytes in the cache when they finish.
+            if found.is_none() {
+                let (tx, rx) = mpsc::channel();
+                for u in urls.clone() {
+                    let tx = tx.clone();
+                    std::thread::Builder::new()
+                        .name("aes-thumb-candidate".into())
+                        .spawn(move || {
+                            if let Some(b) = crate::ytdlp::fetch_bytes(&u, 6) {
+                                if image::load_from_memory(&b).is_ok() {
+                                    crate::meta_cache::save_image(&u, &b);
+                                    let _ = tx.send(b);
+                                }
+                            }
+                        })
+                        .ok();
                 }
+                drop(tx);
+                found = rx.recv().ok();
             }
             found?
         }
@@ -411,7 +456,7 @@ pub fn spawn_url_info(
     album_title: String,
 ) -> mpsc::Receiver<Vec<(PathBuf, TrackInfo)>> {
     let (tx, rx) = mpsc::channel();
-    const WORKERS: usize = 4;
+    const WORKERS: usize = 8;
     let paths = std::sync::Arc::new(paths);
     let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for _ in 0..paths.len().min(WORKERS) {
