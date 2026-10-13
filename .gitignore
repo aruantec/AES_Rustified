@@ -1,0 +1,7 @@
+/target
+/Build
+*.pdb
+
+# Git Bash doesn't map NUL to the null device — `2> nul` creates a
+# real file. Ignore it so a stray redirect never gets committed.
+nul

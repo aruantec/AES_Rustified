@@ -1,0 +1,43 @@
+[package]
+name = "aes_rustified"
+version = "0.1.0"
+edition = "2021"
+description = "AES Rustified"
+
+# The shipped binary is AES-Rustified.exe — the package name stays a
+# normal crate identifier.
+[[bin]]
+name = "AES-Rustified"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dirs = "6.0"
+eframe = "0.36.2"
+egui_extras = { version = "0.36.2", features = ["svg"] }
+resvg = { version = "0.45.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Audio stack: decode -> resample -> ring buffer -> output, with EQ and
+# spectrum taps as pipeline stages.
+symphonia = { version = "0.5", features = ["all"] }
+cpal = "0.16"
+ringbuf = "0.4"
+rustfft = "6"
+rubato = "0.16"
+
+# Library/metadata: embedded cover art extraction, image decode for
+# cover textures, native folder picker for "Add music folder".
+lofty = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rfd = "0.15"
+# GLSL -> WGSL translation for the Shadertoy .frag collection (same
+# naga wgpu already uses internally).
+naga = { version = "30", features = ["glsl-in", "wgsl-out"] }
+ureq = "3.4.2"
+zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
