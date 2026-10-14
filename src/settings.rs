@@ -372,6 +372,19 @@ pub struct Emulation {
     pub back_cover_letterbox_fill: bool,
     /// GameplayRecordingOutputDirectory — where recorded videos land.
     pub recording_dir: String,
+    /// Emulator executable paths keyed by handler id (Lacrima's
+    /// per-section EmulatorPath, e.g. "xenia" → …\xenia.exe).
+    pub emulators: std::collections::BTreeMap<String, String>,
+    /// Game file paths keyed by section key (e.g. "X360" → roms).
+    pub games: std::collections::BTreeMap<String, Vec<String>>,
+    /// Console-section keys in the user's drag order (Lacrima's
+    /// EmulationViewModel "AlbumOrder") — applied over the catalog
+    /// order, unknown sections appended.
+    pub section_order: Vec<String>,
+    /// Section key → handler id (Lacrima's per-section
+    /// `EmulationSectionConfiguration.DefaultHandlerId`) — which
+    /// configured handler launches games for that console.
+    pub default_handlers: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Emulation {
@@ -387,6 +400,10 @@ impl Default for Emulation {
                     data_root().map(|d| d.join("Recordings").to_string_lossy().into_owned())
                 })
                 .unwrap_or_default(),
+            emulators: Default::default(),
+            games: Default::default(),
+            section_order: Default::default(),
+            default_handlers: Default::default(),
         }
     }
 }

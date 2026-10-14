@@ -57,7 +57,7 @@ fn sniff_mime(data: &[u8]) -> MimeType {
 
 /// Cover-fit UV rect (`UniformToFill`): crops the texture so it fills `rect`
 /// without letterboxing.
-fn cover_uv(tex: egui::Vec2, rect: egui::Vec2) -> Rect {
+pub(crate) fn cover_uv(tex: egui::Vec2, rect: egui::Vec2) -> Rect {
     let ta = tex.x / tex.y;
     let ra = rect.x / rect.y;
     let uv = if ta > ra {
@@ -457,8 +457,9 @@ impl TagEditor {
     }
 
     /// Fluent-ish TextBox: dark fill, 1px gray border (light when focused).
+    /// Shared with `rom_editor` (the EmulationMetadataOverlay port).
     #[allow(clippy::too_many_arguments)]
-    fn text_box(
+    pub(crate) fn text_box(
         ui: &mut egui::Ui,
         s: f32,
         id: egui::Id,
@@ -493,7 +494,12 @@ impl TagEditor {
         )
     }
 
-    fn button(ui: &mut egui::Ui, text: &str, min: egui::Vec2, pad: egui::Vec2) -> egui::Response {
+    pub(crate) fn button(
+        ui: &mut egui::Ui,
+        text: &str,
+        min: egui::Vec2,
+        pad: egui::Vec2,
+    ) -> egui::Response {
         ui.scope(|ui| {
             ui.spacing_mut().button_padding = pad;
             ui.add(egui::Button::new(text).min_size(min))
@@ -932,7 +938,7 @@ impl TagEditor {
 /// Lacrima's overlay is laid out in the same scaled space as the rest of
 /// the UI; egui's stock widgets aren't, so scale their fonts/metrics by
 /// `s` and give them the Fluent dark look (borderless gray buttons).
-fn scale_style(style: &mut egui::Style, s: f32) {
+pub(crate) fn scale_style(style: &mut egui::Style, s: f32) {
     use egui::{FontId, TextStyle};
     style.text_styles = [
         (TextStyle::Small, FontId::proportional(12.0 * s)),

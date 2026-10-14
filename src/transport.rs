@@ -114,12 +114,13 @@ impl Transport {
     ) -> Step {
         let mut step = Step::None;
         let cy = rect.center().y;
-        let hit = |r: Rect, id: &str| {
+        let hit = |r: Rect, id: &str, tip: &str| {
             if interactive {
                 ui.interact(r, ui.id().with(id), Sense::click())
             } else {
                 ui.interact(r, ui.id().with(id), Sense::hover())
             }
+            .on_hover_text(tip)
         };
 
         // --- Left: album-list toggle (Margin 50,0,0,0) ----------------
@@ -127,7 +128,7 @@ impl Transport {
             Pos2::new(rect.min.x + SIDE_MARGIN * s + BTN * 0.5 * s, cy),
             Vec2::splat(BTN * s),
         );
-        let r = hit(left, "t-list");
+        let r = hit(left, "t-list", "Album List");
         if r.clicked() {
             self.album_list_open = !self.album_list_open;
         }
@@ -166,7 +167,7 @@ impl Transport {
 
         let playing = matches!(player.map(|p| p.state()), Some(PlayerState::Playing));
 
-        let r = hit(stop, "t-stop");
+        let r = hit(stop, "t-stop", "Stop");
         if r.clicked() {
             if let Some(p) = player {
                 p.stop();
@@ -176,7 +177,7 @@ impl Transport {
         let ic = scaled(stop, self.press_scale(ui, &r));
         icon_stop(ui.painter(), ic, alpha);
 
-        let r = hit(prev, "t-prev");
+        let r = hit(prev, "t-prev", "Previous Track");
         if r.clicked() {
             step = Step::Prev;
         }
@@ -184,7 +185,7 @@ impl Transport {
         let ic = scaled(prev, self.press_scale(ui, &r));
         icon_prev(ui.painter(), ic, alpha);
 
-        let r = hit(play, "t-play");
+        let r = hit(play, "t-play", "Play / Pause");
         if r.clicked() {
             if let Some(p) = player {
                 p.toggle();
@@ -194,7 +195,7 @@ impl Transport {
         let ic = scaled(play, self.press_scale(ui, &r));
         icon_play(ui.painter(), ic, playing, alpha);
 
-        let r = hit(next, "t-next");
+        let r = hit(next, "t-next", "Next Track");
         if r.clicked() {
             step = Step::Next;
         }
@@ -202,7 +203,7 @@ impl Transport {
         let ic = scaled(next, self.press_scale(ui, &r));
         icon_next(ui.painter(), ic, alpha);
 
-        let r = hit(repeat, "t-repeat");
+        let r = hit(repeat, "t-repeat", "Repeat: Off / All / One");
         if r.clicked() {
             self.repeat = match self.repeat {
                 RepeatMode::Off => RepeatMode::All,
@@ -232,7 +233,7 @@ impl Transport {
             Vec2::splat(BTN * s),
         );
 
-        let r = hit(layout, "t-layout");
+        let r = hit(layout, "t-layout", "Cover Layout");
         if r.clicked() {
             self.cover_layout = (self.cover_layout + 1) % 3;
         }
@@ -240,7 +241,7 @@ impl Transport {
         let ic = scaled(layout, self.press_scale(ui, &r));
         icon_layout(ui.painter(), ic, self.cover_layout, alpha);
 
-        let r = hit(eq, "t-eq");
+        let r = hit(eq, "t-eq", "Equalizer");
         if r.clicked() {
             self.equalizer_open = !self.equalizer_open;
         }
@@ -306,7 +307,9 @@ impl Transport {
         let cap_r = r * 0.66;
         let mut vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
         if interactive {
-            let resp = ui.interact(rect, ui.id().with("t-vol"), Sense::click_and_drag());
+            let resp = ui
+                .interact(rect, ui.id().with("t-vol"), Sense::click_and_drag())
+                .on_hover_text("Volume — drag to adjust, click the cap to mute");
             // Cap press/release edges handled manually: egui's
             // clicked() dies the moment drag_started fires (a couple
             // px of jitter), which turns most cap clicks into tiny
@@ -607,7 +610,10 @@ fn icon_prev(painter: &egui::Painter, rect: Rect, alpha: f32) {
     );
 }
 
-fn icon_play(painter: &egui::Painter, rect: Rect, playing: bool, alpha: f32) {
+/// Circle with pause bars (playing) / play triangle (paused) —
+/// Lacrima's ToggleEmulatorPause button. Shared with the Emulation
+/// band's session pause control.
+pub(crate) fn icon_play(painter: &egui::Painter, rect: Rect, playing: bool, alpha: f32) {
     let k = rect.height() / 100.0;
     let c = WHITE.gamma_multiply(alpha);
     painter.circle_stroke(
@@ -743,6 +749,51 @@ pub(crate) fn icon_layout(painter: &egui::Painter, rect: Rect, mode: u8, alpha: 
             }
         }
     }
+}
+
+/// Emulator-viewport toggle (Lacrima's ToggleEmulatorViewport):
+/// a swap glyph — two counter-pointing horizontal arrows (game ⇄
+/// list). Lit while the emulator presentation covers the item list,
+/// dim when the user switched back.
+pub(crate) fn icon_viewport(painter: &egui::Painter, rect: Rect, shown: bool, alpha: f32) {
+    let c = (if shown { LIT } else { DIM }).gamma_multiply(alpha);
+    let stroke = Stroke::new(7.5 * rect.height() / 100.0, c);
+    let cpt = |x: f32, y: f32| cv(rect, 100.0, x, y);
+    // Top arrow pointing right.
+    painter.add(Shape::line(vec![cpt(20.0, 34.0), cpt(74.0, 34.0)], stroke));
+    painter.add(Shape::line(
+        vec![cpt(60.0, 20.0), cpt(74.0, 34.0), cpt(60.0, 48.0)],
+        stroke,
+    ));
+    // Bottom arrow pointing left.
+    painter.add(Shape::line(vec![cpt(80.0, 66.0), cpt(26.0, 66.0)], stroke));
+    painter.add(Shape::line(
+        vec![cpt(40.0, 80.0), cpt(26.0, 66.0), cpt(40.0, 52.0)],
+        stroke,
+    ));
+}
+
+/// Close-emulator power glyph (Lacrima's CloseEmulator button):
+/// an arc with a gap at the top + the vertical power line.
+pub(crate) fn icon_power(painter: &egui::Painter, rect: Rect, alpha: f32) {
+    let c = WHITE.gamma_multiply(alpha);
+    let k = rect.height() / 100.0;
+    let stroke = Stroke::new(9.0 * k, c);
+    painter.line_segment(
+        [cv(rect, 100.0, 50.0, 12.0), cv(rect, 100.0, 50.0, 45.0)],
+        stroke,
+    );
+    // ~270° arc, gap centred at 12 o'clock.
+    let center = cv(rect, 100.0, 50.0, 55.0);
+    let r = 33.0 * k;
+    let pts: Vec<Pos2> = (-40..=220)
+        .step_by(6)
+        .map(|deg| {
+            let rad = (deg as f32).to_radians();
+            center + Vec2::new(rad.cos() * r, rad.sin() * r)
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, stroke));
 }
 
 /// Equalizer: rounded frame with a divider, 4 vertical slider slots

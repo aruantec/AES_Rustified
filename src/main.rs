@@ -5,6 +5,8 @@ mod apl;
 mod audio;
 mod carousel;
 mod edge_border;
+mod emu_dl;
+mod emu_meta;
 mod emulation;
 mod equalizer;
 mod icons;
@@ -13,6 +15,9 @@ mod logo;
 mod meta_cache;
 mod paint;
 mod particles;
+mod rom_editor;
+mod xenia_cfg;
+mod xenia_overlay;
 mod settings;
 mod shadertoy;
 mod search_pill;
@@ -21,7 +26,9 @@ mod tag_editor;
 mod transport;
 mod url_prompt;
 mod waveform_bar;
+mod wgc;
 mod widgets;
+mod xenia;
 // dead_code: a few query helpers (full -J metadata, extractor
 // profiles beyond Default) are the surface for future video-stream
 // selection — Lacrima's OnlineStreamSelector shape.
@@ -180,6 +187,33 @@ impl Nav {
 }
 
 fn main() -> eframe::Result<()> {
+    // Crash forensics — a panic anywhere (UI thread, capture worker,
+    // FFI-adjacent paths) dumps its message + backtrace to
+    // <data_root>/crash.log before the process dies. Keeps silent
+    // kills diagnosable.
+    std::panic::set_hook(Box::new(|info| {
+        let mut msg = format!(
+            "[{}] panic: {}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            info
+        );
+        msg.push_str(&format!("{}\n", std::backtrace::Backtrace::capture()));
+        if let Some(dir) = settings::data_root() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+                .map(|mut f| {
+                    use std::io::Write;
+                    let _ = f.write_all(msg.as_bytes());
+                });
+        }
+        eprintln!("{msg}");
+    }));
     // Program.cs startup: append the per-user Tools dir to PATH so
     // spawned tools (yt-dlp and its helpers) are always locatable.
     {
@@ -425,6 +459,8 @@ enum PendingDelete {
     Items(Vec<std::path::PathBuf>),
     /// Album-row dirs (DeleteFolder / selection Delete).
     Albums(Vec<String>),
+    /// Emulation ROM items (the rom-mode card menu / Delete key).
+    Roms(Vec<std::path::PathBuf>),
 }
 
 /// The same Switch-style confirm dialog for deletes — the request is
@@ -656,6 +692,8 @@ impl AesRustApp {
         // Lacrima kicks off RefreshYtDlpInfo at startup so the
         // Libraries tab opens with populated state (worker thread).
         app.ytdlp.ensure_queried();
+        // Restore persisted per-section game lists onto the tiles.
+        app.emu.seed_games(&app.settings.emulation);
         app
     }
 }
@@ -1314,7 +1352,15 @@ impl eframe::App for AesRustApp {
                         row_action = album_row::Action::DeleteAlbum(d);
                         albums_confirmed = true;
                     }
+                    Some(PendingDelete::Roms(p)) => {
+                        emu.remove_games(&mut settings.emulation, &p);
+                    }
                     None => {}
+                }
+                // ROM-item removals from the card menu wait on the
+                // same confirmation dialog.
+                if let Some(paths) = emu.pending_delete.take() {
+                    del_prompt.request(PendingDelete::Roms(paths), ui.ctx());
                 }
                 // EQ band gains mutate inside music_view — snapshot for
                 // the dirty check since fx_before is taken after it.
@@ -1484,6 +1530,8 @@ impl eframe::App for AesRustApp {
                                         a,
                                         view_interactive,
                                         emu,
+                                        &mut settings.emulation,
+                                        &settings.carousel,
                                         &mut transport.cover_layout,
                                         radius,
                                         s,
@@ -1523,6 +1571,80 @@ impl eframe::App for AesRustApp {
                 if carousel.take_sel_touched() {
                     *sel_owner = SelOwner::Cards;
                 }
+                // Emulation game-list edits (Add Roms / Scan Folder /
+                // Remove / Clear, Xenia path) persist immediately.
+                if emu.take_settings_dirty() {
+                    settings::save(settings);
+                }
+                // Enter on the Emulation view launches the selected
+                // game when no session is running — with a game in
+                // the background it switches back to the capture
+                // viewport instead (one emulator at a time).
+                if view_interactive
+                    && nav.target() == View::Emulation
+                    && (emu.session.is_none() || emu.viewport_dismissed)
+                    && emu.active.is_some()
+                    && !emu.editor.is_open()
+                    && !emu.patches.is_open()
+                    && !emu.cfg_ov.is_open()
+                    && !ui.ctx().text_edit_focused()
+                    && ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    })
+                {
+                    if emu.session.is_some() {
+                        emu.viewport_dismissed = false;
+                    } else if let Some(game) = emu.cards.primary_path() {
+                        emu.launch(&settings.emulation, &game);
+                    }
+                }
+                // The Emulation view owns the keys while it's up —
+                // the ROM cards navigate/select exactly like the
+                // audio list (arrows, Ctrl+A, Delete → confirm). With
+                // a session running they only work while the capture
+                // viewport is dismissed (the list is the visible UI).
+                if view_interactive
+                    && nav.target() == View::Emulation
+                    && (emu.session.is_none() || emu.viewport_dismissed)
+                    && emu.active.is_some()
+                    && !emu.editor.is_open()
+                    && !emu.patches.is_open()
+                    && !emu.cfg_ov.is_open()
+                    && !ui.ctx().text_edit_focused()
+                {
+                    let (mut dx, mut dy) = (0i32, 0i32);
+                    ui.ctx().input_mut(|i| {
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                            dx -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                            dx += 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                            dy -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                            dy += 1;
+                        }
+                    });
+                    if dx != 0 || dy != 0 {
+                        emu.cards.arrow(&emu.search.text, dx, dy);
+                    }
+                    if ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+                    {
+                        emu.cards.select_all(&emu.search.text);
+                    }
+                    if ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                    }) {
+                        let paths = emu.cards.selected_paths();
+                        if !paths.is_empty() {
+                            emu.pending_delete = Some(paths);
+                        }
+                    }
+                }
                 // egui's own focus navigation (begin_pass reads raw Tab/
                 // arrow events before our consume_key runs) hands focus
                 // to the first focusable widget — a focused button then
@@ -1539,8 +1661,10 @@ impl eframe::App for AesRustApp {
                 }
                 // Delete: route to the owning view's selection.
                 // Text fields eat the key first (text_edit_focused)
-                // and overlays gate via view_interactive.
+                // and overlays gate via view_interactive. The
+                // Emulation view owns its keys separately below.
                 if view_interactive
+                    && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
@@ -1565,6 +1689,7 @@ impl eframe::App for AesRustApp {
                 // owner routing as Delete: the list after a list
                 // gesture, the cards after a card gesture).
                 if view_interactive
+                    && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)
@@ -1579,7 +1704,11 @@ impl eframe::App for AesRustApp {
                 // Arrow-key navigation — same owner routing. With no
                 // owner yet, a loaded album's cards win (the cover
                 // view is the primary surface), else the album strip.
-                if view_interactive && !ui.ctx().text_edit_focused() {
+                // Emulation routes its own keys below.
+                if view_interactive
+                    && nav.target() != View::Emulation
+                    && !ui.ctx().text_edit_focused()
+                {
                     let (mut dx, mut dy) = (0i32, 0i32);
                     let (mut mdx, mut mdy) = (0i32, 0i32);
                     ui.ctx().input_mut(|i| {
@@ -1647,6 +1776,7 @@ impl eframe::App for AesRustApp {
                 // target view reveals its current selection; with no
                 // cards loaded the strip keeps focus.
                 if view_interactive
+                    && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
@@ -1670,6 +1800,7 @@ impl eframe::App for AesRustApp {
                 // Enter — activates the owning view's selection like a
                 // double-click: plays the card, opens the album.
                 if view_interactive
+                    && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
@@ -1736,6 +1867,18 @@ impl eframe::App for AesRustApp {
                             album_search.close(ui.ctx());
                         } else if emu.search.is_open() {
                             emu.search.close(ui.ctx());
+                        } else if nav.target() == View::Emulation
+                            && emu.session.is_some()
+                            && emu.game_fs
+                        {
+                            // Esc backs out of game-fullscreen first —
+                            // the session keeps running.
+                            emu.game_fs = false;
+                        } else if nav.target() == View::Emulation && emu.session.is_some() {
+                            // Esc while a game runs closes the
+                            // emulator session (graceful WM_CLOSE,
+                            // TerminateProcess fallback).
+                            emu.stop_session();
                         } else if !ui.ctx().text_edit_focused() {
                             if ui
                                 .ctx()
@@ -2956,6 +3099,15 @@ impl eframe::App for AesRustApp {
                             "Removed from the library — the files stay on disk."
                                 .to_string(),
                         ),
+                        Some(PendingDelete::Roms(p)) => (
+                            if p.len() == 1 {
+                                "Remove item?".to_string()
+                            } else {
+                                format!("Remove {} items?", p.len())
+                            },
+                            "Removed from the section — the files stay on disk."
+                                .to_string(),
+                        ),
                         None => ("Delete?".to_string(), String::new()),
                     };
                     match confirm_overlay(
@@ -3918,6 +4070,11 @@ fn music_view(
             export = true;
             None
         }
+        // ROM-mode actions never fire on the music carousel.
+        carousel::Action::AddRoms
+        | carousel::Action::ScanFolder
+        | carousel::Action::Patches(_)
+        | carousel::Action::CustomConfig(_) => None,
         carousel::Action::None => None,
     };
     // Transport prev/next resolve against the loaded album's items

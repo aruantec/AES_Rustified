@@ -1,0 +1,401 @@
+//! Emulator downloads — the Rust port of Lacrima's
+//! `XeniaEmulatorUpdateService.DownloadOrUpdateAsync`: fetch the
+//! newest Xenia Canary GitHub release, download the windows zip into
+//! `<data>/Emulators/<Section>/<Handler>` (`Emulators/X360/Xenia`),
+//! extract it, pull the game-patches pack into `patches/`, and mark
+//! the installed version — all on a worker thread while the settings
+//! card polls `DlProgress`.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+const RELEASES_API: &str =
+    "https://api.github.com/repos/xenia-canary/xenia-canary/releases?per_page=20";
+const GAME_PATCHES_URL: &str =
+    "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
+const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
+const VERSION_MARKER: &str = "xenia_version.txt";
+
+/// Shared download state the settings card polls each frame.
+#[derive(Default)]
+pub struct DlProgress {
+    /// Human-readable stage ("Downloading xenia_canary…", …).
+    pub stage: String,
+    /// 0..=1 within the current download stage.
+    pub frac: f32,
+    /// Set once: Ok(resolved xenia.exe path) or Err(message).
+    pub done: Option<Result<String, String>>,
+}
+
+pub type Shared = Arc<Mutex<DlProgress>>;
+
+/// `<data>/Emulators/X360/Xenia` — Lacrima's
+/// `ApplicationPaths.EmulatorsDirectory/<SectionKey>/Xenia`.
+pub fn xenia_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("X360").join("Xenia"))
+}
+
+/// Find the installed launcher (`ResolveLauncherPath`):
+/// `xenia_canary.exe`, then `xenia.exe`, then any *xenia* exe.
+pub fn xenia_exe() -> Option<PathBuf> {
+    let dir = xenia_dir()?;
+    let mut all = Vec::new();
+    walk(&dir, &mut all);
+    for want in ["xenia_canary.exe", "xenia.exe"] {
+        if let Some(p) = all.iter().find(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case(want))
+        }) {
+            return Some(p.clone());
+        }
+    }
+    all.into_iter().find(|p| {
+        p.file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.to_lowercase().contains("xenia") && f.ends_with(".exe"))
+    })
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+/// Depth-first search for a directory named `name`.
+fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(root) else { return None };
+    let mut nested = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.file_name().and_then(|f| f.to_str()) == Some(name) {
+            return Some(p);
+        }
+        nested.push(p);
+    }
+    nested.iter().find_map(|d| find_dir(d, name))
+}
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(600)))
+            .build(),
+    )
+}
+
+fn set(dl: &Shared, stage: &str, frac: f32) {
+    let mut p = dl.lock().unwrap_or_else(|e| e.into_inner());
+    p.stage = stage.to_string();
+    p.frac = frac;
+}
+
+/// Kick off the download/install — returns immediately; poll the
+/// shared progress until `done` is set.
+/// Standalone "Download patches" for the patches overlay —
+/// game-patches.zip → `<root>/patches` (same archive the emulator
+/// Download path installs via `install_patches`).
+pub fn download_patches(root: PathBuf) -> Shared {
+    let dl: Shared = Arc::new(Mutex::new(DlProgress {
+        stage: "Downloading game patches…".into(),
+        ..Default::default()
+    }));
+    let shared = dl.clone();
+    std::thread::spawn(move || {
+        let res = (|| -> Result<String, String> {
+            let update_dir = root.join("Emu_Update");
+            std::fs::create_dir_all(&update_dir).map_err(|e| format!("Dir not writable: {e}"))?;
+            install_patches(&shared, &root, &update_dir)?;
+            let _ = std::fs::remove_dir_all(&update_dir);
+            Ok("Patches installed.".to_string())
+        })();
+        shared.lock().unwrap_or_else(|e| e.into_inner()).done = Some(res);
+    });
+    dl
+}
+
+pub fn download_xenia() -> Shared {
+    let dl: Shared = Arc::new(Mutex::new(DlProgress {
+        stage: "Starting Xenia download…".into(),
+        ..Default::default()
+    }));
+    let shared = dl.clone();
+    std::thread::spawn(move || {
+        let res = work(&shared);
+        let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
+        p.done = Some(res);
+    });
+    dl
+}
+
+fn work(dl: &Shared) -> Result<String, String> {
+    let Some(emu_dir) = xenia_dir() else {
+        return Err("Could not resolve the emulators directory".into());
+    };
+    let update_dir = emu_dir.join("Emu_Update");
+    std::fs::create_dir_all(&update_dir).map_err(|e| format!("Emu dir not writable: {e}"))?;
+
+    // Fetch releases — newest non-prerelease first.
+    set(dl, "Fetching Xenia releases…", 0.0);
+    let mut resp = agent()
+        .get(RELEASES_API)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("Release lookup failed: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Release lookup failed: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Bad release json: {e}"))?;
+    let releases = json.as_array().cloned().unwrap_or_default();
+    let mut releases: Vec<&serde_json::Value> = releases
+        .iter()
+        .filter(|r| r.get("prerelease").and_then(|p| p.as_bool()) != Some(true))
+        .collect();
+    releases.sort_by(|a, b| {
+        let pa = a.get("published_at").and_then(|p| p.as_str()).unwrap_or("");
+        let pb = b.get("published_at").and_then(|p| p.as_str()).unwrap_or("");
+        pb.cmp(pa)
+    });
+    let release = releases
+        .first()
+        .ok_or_else(|| "No Xenia Canary releases found".to_string())?;
+    let tag = release
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Pick the windows canary archive (Lacrima's
+    // SelectAssetForPlatform — current releases ship .7z).
+    let assets: Vec<(String, String)> = release
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| {
+                    Some((
+                        n.get("name")?.as_str()?.to_string(),
+                        n.get("browser_download_url")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let is_archive = |n: &str| n.ends_with(".zip") || n.ends_with(".7z");
+    let pick = |pred: &dyn Fn(&str) -> bool| assets.iter().find(|(n, _)| pred(n)).cloned();
+    let (asset_name, asset_url) = pick(&|n: &str| {
+        let n = n.to_lowercase();
+        n.contains("windows") && n.contains("canary") && is_archive(&n)
+    })
+    .or_else(|| pick(&|n: &str| n.to_lowercase().contains("win") && is_archive(&n.to_lowercase())))
+    .or_else(|| pick(&|n: &str| is_archive(&n.to_lowercase())))
+    .ok_or_else(|| "No compatible Xenia Canary asset found".to_string())?;
+
+    // Download the zip.
+    let stage = format!("Downloading {asset_name} ({tag})…");
+    let zip_path = update_dir.join(&asset_name);
+    download(dl, &stage, &asset_url, &zip_path)?;
+
+    // Extract to a staging dir, normalize a single root folder, then
+    // copy into the emulator dir (skipping Emu_Update payloads).
+    set(dl, "Extracting Xenia…", 0.0);
+    let extracted = update_dir.join("extracted");
+    let _ = std::fs::remove_dir_all(&extracted);
+    std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
+    extract_archive(&zip_path, &extracted)?;
+    let root = normalize_root(&extracted);
+    copy_dir_contents(&root, &emu_dir, "Emu_Update")?;
+
+    // Game patches — best effort (Lacrima tolerates failure here too).
+    set(dl, "Downloading game patches…", 0.0);
+    let _ = install_patches(dl, &emu_dir, &update_dir);
+
+    // Version marker + cleanup.
+    let _ = std::fs::write(emu_dir.join(VERSION_MARKER), tag.trim());
+    let _ = std::fs::remove_dir_all(&update_dir);
+    let _ = std::fs::create_dir_all(&update_dir);
+
+    set(dl, "Done", 1.0);
+    resolve_exe(&emu_dir).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// `xenia_canary.exe` → `xenia.exe` → any *xenia*.exe under the dir.
+fn resolve_exe(dir: &Path) -> Result<PathBuf, String> {
+    let mut all = Vec::new();
+    walk(dir, &mut all);
+    for want in ["xenia_canary.exe", "xenia.exe"] {
+        if let Some(p) = all.iter().find(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case(want))
+        }) {
+            return Ok(p.clone());
+        }
+    }
+    all.into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.to_lowercase().contains("xenia") && f.ends_with(".exe"))
+        })
+        .ok_or_else(|| "xenia.exe not found after install".to_string())
+}
+
+fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), String> {
+    let mut resp = agent()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| format!("{stage} failed: {e}"))?;
+    let total = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut f = std::fs::File::create(dest).map_err(|e| format!("{stage} failed: {e}"))?;
+    let mut reader = resp.body_mut().as_reader();
+    let mut buf = [0u8; 16384];
+    let mut got = 0u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("{stage} failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n])
+            .map_err(|e| format!("{stage} failed: {e}"))?;
+        got += n as u64;
+        set(dl, stage, total.map(|t| got as f32 / t as f32).unwrap_or(0.0).clamp(0.0, 1.0));
+    }
+    Ok(())
+}
+
+/// Zip via `zip`, 7z via `sevenz_rust2` — falling back to the
+/// system `tar.exe` (Windows' bsdtar reads 7z) like Lacrima's
+/// ArchiveExtractionHelper does when managed extraction fails.
+fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    let is_7z = archive
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("7z"));
+    if is_7z {
+        if let Err(e) = sevenz_rust2::decompress_file(archive, dest) {
+            // System-tool fallback (Lacrima's TryExtract7zWithSystemTool).
+            // Call Windows' bsdtar by full path — a bare "tar" can
+            // resolve to GNU tar (no 7z support) on dev machines.
+            let ok = std::process::Command::new(r"C:\Windows\System32\tar.exe")
+                .arg("-xf")
+                .arg(archive)
+                .arg("-C")
+                .arg(dest)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !ok {
+                return Err(format!("Extract failed: {e}"));
+            }
+        }
+        return Ok(());
+    }
+    extract_zip(archive, dest)
+}
+
+fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
+    let f = std::fs::File::open(zip_path).map_err(|e| format!("Invalid zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(f).map_err(|e| format!("Invalid zip: {e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Extract failed: {e}"))?;
+        let Some(name) = entry.enclosed_name().map(|n| n.to_path_buf()) else {
+            continue;
+        };
+        let out = dest.join(name);
+        if entry.is_dir() {
+            let _ = std::fs::create_dir_all(&out);
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut w = std::fs::File::create(&out).map_err(|e| format!("Extract failed: {e}"))?;
+        std::io::copy(&mut entry, &mut w).map_err(|e| format!("Extract failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// If the archive ships a single root folder, descend into it.
+fn normalize_root(extracted: &Path) -> PathBuf {
+    let dirs: Vec<PathBuf> = std::fs::read_dir(extracted)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    let has_files = std::fs::read_dir(extracted)
+        .map(|rd| rd.flatten().any(|e| e.path().is_file()))
+        .unwrap_or(false);
+    if dirs.len() == 1 && !has_files {
+        dirs[0].clone()
+    } else {
+        extracted.to_path_buf()
+    }
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path, skip_prefix: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("Copy failed: {e}"))?;
+    let mut files = Vec::new();
+    walk(src, &mut files);
+    for f in files {
+        let rel = f.strip_prefix(src).unwrap_or(&f);
+        if rel
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .is_some_and(|c| c.eq_ignore_ascii_case(skip_prefix))
+        {
+            continue;
+        }
+        let out = dst.join(rel);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::copy(&f, &out).map_err(|e| format!("Copy failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// `EnsureGamePatchesAsync`: fetch game-patches.zip, find the
+/// `patches` dir inside, and replace `<emu_dir>/patches` with it.
+fn install_patches(dl: &Shared, emu_dir: &Path, update_dir: &Path) -> Result<(), String> {
+    // The game-patches repo ships a .7z on the "latest" tag.
+    let arc_path = update_dir.join("game-patches.7z");
+    download(dl, "Downloading game patches…", GAME_PATCHES_URL, &arc_path)?;
+    let extracted = update_dir.join("patches_extracted");
+    let _ = std::fs::remove_dir_all(&extracted);
+    std::fs::create_dir_all(&extracted).map_err(|e| format!("Patch extract failed: {e}"))?;
+    extract_archive(&arc_path, &extracted)?;
+
+    // The archive may root at `patches/` or nest it one level down.
+    let src = if extracted.join("patches").is_dir() {
+        extracted.join("patches")
+    } else {
+        find_dir(&extracted, "patches").ok_or_else(|| "No patches folder in archive".to_string())?
+    };
+    let dst = emu_dir.join("patches");
+    let _ = std::fs::remove_dir_all(&dst);
+    copy_dir_contents(&src, &dst, "")?;
+    Ok(())
+}

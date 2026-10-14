@@ -114,6 +114,14 @@ pub enum Action {
     /// "Export Playlist" — write the album's URL items to an .apl
     /// file (Lacrima's ExportOnlinePlaylistCommand).
     Export,
+    /// ROM mode: "Add Roms" context menu — the caller picks files.
+    AddRoms,
+    /// ROM mode: "Scan Folder" context menu — recursive scan.
+    ScanFolder,
+    /// X360 ROM menu: "Patches" — the XeniaPatchesOverlay.
+    Patches(PathBuf),
+    /// X360 ROM menu: "Custom Config" — the XeniaCustomConfigOverlay.
+    CustomConfig(PathBuf),
 }
 
 /// One carousel/grid item = one track of the loaded album.
@@ -253,6 +261,14 @@ pub struct Carousel {
     /// Held lift (0→1) while Shift is down — the selection floats
     /// slightly to signal it can be reordered with arrows.
     pop: f32,
+    /// ROM mode (the Emulation view): same widget, different menu
+    /// vocabulary — Add Roms / Scan Folder / Play / Remove /
+    /// Clear Section instead of the URL/playlist entries.
+    pub rom_mode: bool,
+    /// ROM mode + Xenia handler — shows the Lacrima "Patches" /
+    /// "Custom Config" item menu entries (XeniaPatchesMenuItem /
+    /// XeniaCustomConfigMenuItem).
+    pub xenia_menu: bool,
 }
 
 impl Carousel {
@@ -289,6 +305,8 @@ impl Carousel {
             nav_geo: None,
             focus_flash: 0.0,
             pop: 0.0,
+            rom_mode: false,
+            xenia_menu: false,
         }
     }
 
@@ -326,6 +344,88 @@ impl Carousel {
         }
         self.album_key = Some(album.dir.to_string_lossy().into_owned());
         self.album_title = album.title.clone();
+        self.reset_view();
+        (
+            self.items.iter().map(|i| i.path.clone()).collect(),
+            album.title.clone(),
+        )
+    }
+
+    /// ROM mode load (Emulation view's section → game list): same
+    /// item model, but covers come from the caller's resolver (a
+    /// cached online box-art file when one was fetched, else the
+    /// console-art fallback via the failed-decode path).
+    pub fn open_roms(
+        &mut self,
+        album: &Album,
+        cover: &dyn Fn(&Path) -> Option<CoverSrc>,
+    ) {
+        let fallback = album
+            .covers
+            .iter()
+            .find(|c| matches!(c, CoverSrc::File(_)))
+            .cloned();
+        self.items = album
+            .tracks
+            .iter()
+            .map(|p| Self::rom_item(p.clone(), cover, &fallback, &album.title))
+            .collect();
+        self.album_key = Some(album.dir.to_string_lossy().into_owned());
+        self.album_title = album.title.clone();
+        self.reset_view();
+    }
+
+    fn rom_item(
+        path: PathBuf,
+        cover: &dyn Fn(&Path) -> Option<CoverSrc>,
+        fallback: &Option<CoverSrc>,
+        section: &str,
+    ) -> Item {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Item {
+            cover: cover(&path)
+                .or_else(|| fallback.clone())
+                // Web([]) fails fast without IO — the card then falls
+                // back through `item_tex` to the placeholder.
+                .unwrap_or_else(|| CoverSrc::Web(Vec::new())),
+            fallback: fallback.clone(),
+            title: stem,
+            artist: String::new(),
+            album: section.to_string(),
+            path,
+        }
+    }
+
+    /// Append a ROM item (Add Roms / Scan Folder results) — deduped
+    /// like the URL path. Caller persists the new games list.
+    pub fn add_rom(
+        &mut self,
+        path: PathBuf,
+        cover: &dyn Fn(&Path) -> Option<CoverSrc>,
+        fallback: &Option<CoverSrc>,
+    ) -> bool {
+        if self.items.iter().any(|i| i.path == path) {
+            return false;
+        }
+        let section = self.album_title.clone();
+        self.items.push(Self::rom_item(path, cover, fallback, &section));
+        true
+    }
+
+    /// An online-fetched cover landed for `path` — swap the item's
+    /// cover source so the decode pool picks the new file up.
+    pub fn set_cover(&mut self, path: &Path, src: CoverSrc) {
+        if let Some(i) = self.index_of(path) {
+            self.items[i].cover = src;
+        }
+    }
+
+    /// Shared post-load reset (spring, selection, drag/menu state)
+    /// so `open` and `open_roms` can't drift apart.
+    fn reset_view(&mut self) {
         self.current = 0.0;
         self.target = 0.0;
         self.velocity = 0.0;
@@ -342,10 +442,6 @@ impl Carousel {
         self.pending_reveal = None;
         self.menu_item = None;
         self.transition_alpha = 0.0;
-        (
-            self.items.iter().map(|i| i.path.clone()).collect(),
-            album.title.clone(),
-        )
     }
 
     /// Push one URL item (deduped like Lacrima's IsMediaDuplicate —
@@ -1508,10 +1604,19 @@ impl Carousel {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "No album loaded",
+                if self.rom_mode { "No items" } else { "No album loaded" },
                 FontId::proportional(24.0 * s),
                 Color32::from_rgb(0x78, 0x78, 0x78).gamma_multiply(alpha * 0.53),
             );
+            if self.rom_mode && self.album_key.is_some() {
+                painter.text(
+                    rect.center() + Vec2::new(0.0, 30.0 * s),
+                    Align2::CENTER_CENTER,
+                    "Right-click to add games",
+                    FontId::proportional(15.0 * s),
+                    Color32::from_rgb(0x5A, 0x5A, 0x5A).gamma_multiply(alpha * 0.53),
+                );
+            }
             // Menu still reachable when an album is loaded but the
             // filter hides every item (Lacrima's menu lives on the
             // cover view itself, not on items).
@@ -1519,19 +1624,35 @@ impl Carousel {
                 let resp =
                     ui.interact(rect, ui.id().with("cover-view-empty"), Sense::click());
                 resp.context_menu(|ui| {
-                    if ui.button("Add Url").clicked() {
-                        action = Action::AddUrl;
-                        ui.close();
+                    if self.rom_mode {
+                        if ui.button("Add Roms").clicked() {
+                            action = Action::AddRoms;
+                            ui.close();
+                        }
+                        if ui.button("Scan Folder").clicked() {
+                            action = Action::ScanFolder;
+                            ui.close();
+                        }
+                    } else {
+                        if ui.button("Add Url").clicked() {
+                            action = Action::AddUrl;
+                            ui.close();
+                        }
+                        if ui.button("Add Playlist").clicked() {
+                            action = Action::AddPlaylist;
+                            ui.close();
+                        }
+                        if self.has_url_items()
+                            && ui.button("Export Playlist").clicked()
+                        {
+                            action = Action::Export;
+                            ui.close();
+                        }
                     }
-                    if ui.button("Add Playlist").clicked() {
-                        action = Action::AddPlaylist;
-                        ui.close();
-                    }
-                    if self.has_url_items() && ui.button("Export Playlist").clicked() {
-                        action = Action::Export;
-                        ui.close();
-                    }
-                    if ui.button("Clear Album").clicked() {
+                    if ui
+                        .button(if self.rom_mode { "Clear Section" } else { "Clear Album" })
+                        .clicked()
+                    {
                         action = Action::Clear;
                         ui.close();
                     }
@@ -1865,23 +1986,58 @@ impl Carousel {
         if interactive {
             resp.context_menu(|ui| {
                 // Lacrima's cover-view menu: Add entries always,
-                // item entries only while one is pointed.
-                if ui.button("Add Url").clicked() {
-                    action = Action::AddUrl;
-                    ui.close();
-                }
-                if ui.button("Add Playlist").clicked() {
-                    action = Action::AddPlaylist;
-                    ui.close();
+                // item entries only while one is pointed. ROM mode
+                // swaps in the emulation vocabulary (EmulationView's
+                // item ContextMenu).
+                if self.rom_mode {
+                    if ui.button("Add Roms").clicked() {
+                        action = Action::AddRoms;
+                        ui.close();
+                    }
+                    if ui.button("Scan Folder").clicked() {
+                        action = Action::ScanFolder;
+                        ui.close();
+                    }
+                } else {
+                    if ui.button("Add Url").clicked() {
+                        action = Action::AddUrl;
+                        ui.close();
+                    }
+                    if ui.button("Add Playlist").clicked() {
+                        action = Action::AddPlaylist;
+                        ui.close();
+                    }
                 }
                 if let Some(p) = self.menu_item.clone() {
                     ui.separator();
+                    if self.rom_mode && ui.button("Play").clicked() {
+                        action = Action::Play(p.clone());
+                        self.menu_item = None;
+                        ui.close();
+                    }
                     if ui.button("Edit Metadata").clicked() {
                         action = Action::Edit(p.clone());
                         self.menu_item = None;
                         ui.close();
                     }
-                    if ui.button("Delete").clicked() {
+                    // X360 + Xenia handler — Lacrima's per-game
+                    // Patches / Custom Config menu items.
+                    if self.rom_mode && self.xenia_menu {
+                        if ui.button("Patches").clicked() {
+                            action = Action::Patches(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                        if ui.button("Custom Config").clicked() {
+                            action = Action::CustomConfig(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                    }
+                    if ui
+                        .button(if self.rom_mode { "Remove" } else { "Delete" })
+                        .clicked()
+                    {
                         // Pointing at a selected item deletes the whole
                         // selection (ListBox Delete semantics), else
                         // just the pointed item.
@@ -1901,11 +2057,17 @@ impl Carousel {
                     }
                 }
                 ui.separator();
-                if self.has_url_items() && ui.button("Export Playlist").clicked() {
+                if !self.rom_mode
+                    && self.has_url_items()
+                    && ui.button("Export Playlist").clicked()
+                {
                     action = Action::Export;
                     ui.close();
                 }
-                if ui.button("Clear Album").clicked() {
+                if ui
+                    .button(if self.rom_mode { "Clear Section" } else { "Clear Album" })
+                    .clicked()
+                {
                     action = Action::Clear;
                     ui.close();
                 }
