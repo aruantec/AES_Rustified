@@ -562,7 +562,8 @@ fn cubic(rect: Rect, canvas: f32, p0: (f32, f32), c1: (f32, f32), c2: (f32, f32)
 // --- Icons (MusicView.axaml button canvases) ---------------------------
 
 /// Rounded top bar + outlined rounded square; lit when the list is open.
-fn icon_album_list(painter: &egui::Painter, rect: Rect, open: bool, alpha: f32) {
+/// Shared with the Emulation view's section-list toggle.
+pub(crate) fn icon_album_list(painter: &egui::Painter, rect: Rect, open: bool, alpha: f32) {
     let c = (if open { LIT } else { DIM }).gamma_multiply(alpha);
     let k = rect.height() / 100.0;
     painter.rect_filled(
@@ -701,7 +702,8 @@ fn icon_repeat(painter: &egui::Painter, rect: Rect, mode: RepeatMode, alpha: f32
 }
 
 /// Cover-layout toggle: carousel / vertical grid / horizontal grid.
-fn icon_layout(painter: &egui::Painter, rect: Rect, mode: u8, alpha: f32) {
+/// Shared with the Emulation view's band (same global CoverLayoutMode).
+pub(crate) fn icon_layout(painter: &egui::Painter, rect: Rect, mode: u8, alpha: f32) {
     let k = rect.height() / 100.0;
     let c = WHITE.gamma_multiply(alpha);
     match mode {

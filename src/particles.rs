@@ -104,8 +104,9 @@ impl LacrimaParticles {
     /// Every drop is a tapered pentagon (narrow tail top, wide shoulders,
     /// pointed tip) plus a center vertex so the fan interpolates the same
     /// soft gradient as the original fragment shader: alpha(u,v) =
-    /// horiz * mix(tail, 1, head) * a.
-    pub fn paint(&self, painter: &Painter, rect: Rect) {
+    /// horiz * mix(tail, 1, head) * a. `tint` — the cover palette —
+    /// colors drops round-robin like the shadertoy gradients.
+    pub fn paint(&self, painter: &Painter, rect: Rect, tint: Option<&[egui::Color32]>) {
         if self.drops.is_empty() || rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
@@ -113,7 +114,7 @@ impl LacrimaParticles {
         mesh.vertices.reserve(self.drops.len() * 6);
         mesh.indices.reserve(self.drops.len() * 15);
         let (w, h) = (rect.width(), rect.height());
-        for p in &self.drops {
+        for (i, p) in self.drops.iter().enumerate() {
             let px = rect.min.x + (p.x + 1.0) * 0.5 * w;
             let py = rect.min.y + (1.0 - (p.y + 1.0) * 0.5) * h;
             let half_w = (p.width * 0.5).max(0.45);
@@ -124,7 +125,22 @@ impl LacrimaParticles {
             let head_y = py + len * 0.22;
             let tip_y = py + len * 0.5 + half_w * 0.35;
             let u_of = |x: f32| (x - px + bot_hw) / (2.0 * bot_hw);
-            let lum = (p.lum * 255.0) as u8;
+            let (r8, g8, b8) = match tint {
+                Some(pal) if !pal.is_empty() => {
+                    // Cover-colored drops — the palette luminance is
+                    // already encoded, `lum` keeps per-drop variation.
+                    let c = pal[i % pal.len()];
+                    (
+                        (c.r() as f32 * p.lum) as u8,
+                        (c.g() as f32 * p.lum) as u8,
+                        (c.b() as f32 * p.lum) as u8,
+                    )
+                }
+                _ => {
+                    let lum = (p.lum * 255.0) as u8;
+                    (lum, lum, lum)
+                }
+            };
 
             let base = mesh.vertices.len() as u32;
             let vert = |mesh: &mut egui::epaint::Mesh, x: f32, y: f32, u: f32, v: f32| {
@@ -132,9 +148,9 @@ impl LacrimaParticles {
                     pos: Pos2::new(x, y),
                     uv: egui::epaint::WHITE_UV,
                     color: Color32::from_rgba_unmultiplied(
-                        lum,
-                        lum,
-                        lum,
+                        r8,
+                        g8,
+                        b8,
                         (drop_alpha(u, v, p.alpha) * 255.0) as u8,
                     ),
                 });

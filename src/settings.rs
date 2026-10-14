@@ -25,6 +25,10 @@ pub struct Settings {
     /// Audio-tab "ReplayGain / Normalization" and "Playback Options"
     /// sections (Lacrima's SettingsViewModel audio settings).
     pub audio: Audio,
+    /// Emulation-tab "Miscellaneous" + "Gameplay Recording" sections
+    /// (Lacrima's EmulationUseFirstItemCover / EmulationGameplayAutoplay /
+    /// EmulationUseBackCoverLetterboxFill / GameplayRecordingOutputDirectory).
+    pub emulation: Emulation,
     pub ui: Ui,
     /// Whether `Ui.ScaleFactor` was actually present in the loaded JSON —
     /// Lacrima's `HasPersistedScaleFactor`. When false, the app picks the
@@ -80,6 +84,9 @@ impl Default for Clock {
 #[serde(default, rename_all = "PascalCase")]
 pub struct Effects {
     pub show_lacrima: bool,
+    /// Tint the rain drops with the cover palette (like the
+    /// cover-colored shadertoys) instead of white.
+    pub lacrima_cover_color: bool,
     pub lacrima_count: u32,
     pub show_edge_border: bool,
     pub animate_title: bool,
@@ -93,6 +100,7 @@ impl Default for Effects {
     fn default() -> Self {
         Self {
             show_lacrima: true,
+            lacrima_cover_color: false,
             lacrima_count: 100,
             show_edge_border: true,
             animate_title: true,
@@ -347,6 +355,42 @@ impl Default for Audio {
     }
 }
 
+/// Emulation tab settings (Lacrima's SettingsOverlay Emulation tab).
+/// The per-console handler configuration is view-model state in the
+/// prototype — only the plain options persist here.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct Emulation {
+    /// EmulationUseFirstItemCover — album tiles show the first ROM
+    /// item's cover instead of the section art.
+    pub use_first_item_cover: bool,
+    /// EmulationGameplayAutoplay — start the gameplay preview the
+    /// moment a cover is highlighted instead of after the dwell delay.
+    pub gameplay_autoplay: bool,
+    /// EmulationUseBackCoverLetterboxFill — fill the capture's
+    /// letterbox bars with the game's back cover art.
+    pub back_cover_letterbox_fill: bool,
+    /// GameplayRecordingOutputDirectory — where recorded videos land.
+    pub recording_dir: String,
+}
+
+impl Default for Emulation {
+    fn default() -> Self {
+        Self {
+            use_first_item_cover: false,
+            gameplay_autoplay: false,
+            back_cover_letterbox_fill: false,
+            // Lacrima: MyVideos/AES_Lacrima, else DataRoot/Recordings.
+            recording_dir: dirs::video_dir()
+                .map(|d| d.join("AES_Rustified").to_string_lossy().into_owned())
+                .or_else(|| {
+                    data_root().map(|d| d.join("Recordings").to_string_lossy().into_owned())
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Global UI scale (Lacrima's ScaleFactor — the "Scaling" slider in the
 /// 10-band equalizer gains in dB (ISO centers 31Hz..16kHz, ±12dB) —
 /// the mini-player style EQ drawer between transport and waveform.
@@ -387,6 +431,7 @@ impl Default for Settings {
             carousel: Carousel::default(),
             equalizer: Equalizer::default(),
             audio: Audio::default(),
+            emulation: Emulation::default(),
             ui: Ui::default(),
             scale_factor_persisted: false,
         }
@@ -432,6 +477,7 @@ pub fn load() -> Settings {
                 section(&v, "Carousel", &mut s.carousel);
                 section(&v, "Equalizer", &mut s.equalizer);
                 section(&v, "Audio", &mut s.audio);
+                section(&v, "Emulation", &mut s.emulation);
                 section(&v, "Ui", &mut s.ui);
             }
             s

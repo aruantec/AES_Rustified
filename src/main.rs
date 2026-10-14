@@ -5,6 +5,7 @@ mod apl;
 mod audio;
 mod carousel;
 mod edge_border;
+mod emulation;
 mod equalizer;
 mod icons;
 mod library;
@@ -376,6 +377,11 @@ struct AesRustApp {
     /// Switch-style "exit fullscreen?" confirmation — see
     /// `FsExitPrompt`.
     fs_exit: FsExitPrompt,
+    /// Item/album delete confirmation — same dialog style.
+    del_prompt: DeletePrompt,
+    /// Emulation view state — section strip, item search, active
+    /// section (prototype; ROM items land later).
+    emu: emulation::EmuView,
     started: std::time::Instant,
 }
 
@@ -409,6 +415,41 @@ impl FsExitPrompt {
         self.open = true;
         self.pending_exit = false;
         ctx.request_repaint();
+    }
+}
+
+/// What a delete confirmation guards — re-injected as the original
+/// action on confirm so the handlers run unchanged.
+enum PendingDelete {
+    /// Carousel items (DeletePointedItem / selection Delete).
+    Items(Vec<std::path::PathBuf>),
+    /// Album-row dirs (DeleteFolder / selection Delete).
+    Albums(Vec<String>),
+}
+
+/// The same Switch-style confirm dialog for deletes — the request is
+/// stashed in `pending` while open; on confirm it lands in
+/// `confirmed` and is consumed next frame.
+#[derive(Default)]
+struct DeletePrompt {
+    open: bool,
+    sel: usize,
+    vis: f32,
+    pending: Option<PendingDelete>,
+    confirmed: Option<PendingDelete>,
+}
+
+impl DeletePrompt {
+    fn request(&mut self, pending: PendingDelete, ctx: &egui::Context) {
+        self.sel = 1; // safe default: Cancel focused
+        self.pending = Some(pending);
+        self.open = true;
+        ctx.request_repaint();
+    }
+
+    fn dismiss(&mut self) {
+        self.open = false;
+        self.pending = None;
     }
 }
 
@@ -608,6 +649,8 @@ impl AesRustApp {
             alt_down: false,
             alt_clean: false,
             fs_exit: FsExitPrompt::default(),
+            del_prompt: DeletePrompt::default(),
+            emu: emulation::EmuView::new(),
             started: std::time::Instant::now(),
         };
         // Lacrima kicks off RefreshYtDlpInfo at startup so the
@@ -931,6 +974,8 @@ impl eframe::App for AesRustApp {
             alt_down,
             alt_clean,
             fs_exit,
+            del_prompt,
+            emu,
             shadertoy,
             ..
         } = self;
@@ -1189,11 +1234,14 @@ impl eframe::App for AesRustApp {
             && overlay_slide < 0.001
             && !tag_editor.is_open()
             && !url_prompt.is_open()
-            && !fs_exit.open;
+            && !fs_exit.open
+            && !del_prompt.open;
         // The scrollbar grab zone owns the window's bottom edge in the
         // Music view: suppress the resize grip over the same rect so
         // presses reach the scrollbar instead of starting a resize.
-        let resize_exclude = if nav.target() == View::Music && transport.album_list_open {
+        let resize_exclude = if (nav.target() == View::Music && transport.album_list_open)
+            || (nav.target() == View::Emulation && emu.list_open)
+        {
             let row = album_row_rect(content, s);
             Some(Rect::from_min_max(
                 album_row::AlbumRow::scroll_zone(row, s).min,
@@ -1252,6 +1300,22 @@ impl eframe::App for AesRustApp {
                 let mut delete_path = None;
                 let mut clear_album = false;
                 let mut export_album = false;
+                // A delete confirmed last frame re-injects as the
+                // original action — the `confirmed` flags make the
+                // handlers run instead of re-asking the prompt.
+                let mut items_confirmed = false;
+                let mut albums_confirmed = false;
+                match del_prompt.confirmed.take() {
+                    Some(PendingDelete::Items(p)) => {
+                        delete_path = Some(p);
+                        items_confirmed = true;
+                    }
+                    Some(PendingDelete::Albums(d)) => {
+                        row_action = album_row::Action::DeleteAlbum(d);
+                        albums_confirmed = true;
+                    }
+                    None => {}
+                }
                 // EQ band gains mutate inside music_view — snapshot for
                 // the dirty check since fx_before is taken after it.
                 let eq_before = settings.equalizer.bands;
@@ -1409,6 +1473,21 @@ impl eframe::App for AesRustApp {
                                     delete_path = del;
                                     clear_album = cl;
                                     export_album = ex;
+                                }
+                                View::Emulation => {
+                                    // The layout toggle shares the
+                                    // global CoverLayoutMode — the same
+                                    // setting the music band cycles.
+                                    emulation::view(
+                                        ui,
+                                        content,
+                                        a,
+                                        view_interactive,
+                                        emu,
+                                        &mut transport.cover_layout,
+                                        radius,
+                                        s,
+                                    );
                                 }
                                 _ => placeholder_view(ui, content, v.name(), s),
                             }
@@ -1613,23 +1692,26 @@ impl eframe::App for AesRustApp {
                 // Ctrl+F — focus the search box for whichever list
                 // owns selection: the band's album filter for the
                 // strip, the top-right item search for the cards.
-                // The pills only live on the Music view.
+                // The Emulation view's item pill takes it there too.
                 if view_interactive
-                    && nav.target() == View::Music
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::CTRL, egui::Key::F)
                     })
                 {
-                    match *sel_owner {
-                        SelOwner::Albums => album_search.open(),
-                        SelOwner::Cards => search.open(),
-                        SelOwner::None => {
-                            if carousel.has_items() {
-                                search.open()
-                            } else {
-                                album_search.open()
+                    match nav.target() {
+                        View::Music => match *sel_owner {
+                            SelOwner::Albums => album_search.open(),
+                            SelOwner::Cards => search.open(),
+                            SelOwner::None => {
+                                if carousel.has_items() {
+                                    search.open()
+                                } else {
+                                    album_search.open()
+                                }
                             }
-                        }
+                        },
+                        View::Emulation => emu.search.open(),
+                        _ => {}
                     }
                 }
                 // Esc — the exit-fullscreen prompt closes first (and
@@ -1639,17 +1721,21 @@ impl eframe::App for AesRustApp {
                 // and Backspace are the back button. The overlays'
                 // own Esc handling runs while they're open —
                 // view_interactive gates this path then.
-                if view_interactive || fs_exit.open {
+                if view_interactive || fs_exit.open || del_prompt.open {
                     let esc = ui
                         .ctx()
                         .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                     if esc {
                         if fs_exit.open {
                             fs_exit.open = false;
+                        } else if del_prompt.open {
+                            del_prompt.dismiss();
                         } else if search.is_open() {
                             search.close(ui.ctx());
                         } else if album_search.is_open() {
                             album_search.close(ui.ctx());
+                        } else if emu.search.is_open() {
+                            emu.search.close(ui.ctx());
                         } else if !ui.ctx().text_edit_focused() {
                             if ui
                                 .ctx()
@@ -1662,6 +1748,7 @@ impl eframe::App for AesRustApp {
                         }
                     }
                     if !fs_exit.open
+                        && !del_prompt.open
                         && !ui.ctx().text_edit_focused()
                         && ui.ctx().input_mut(|i| {
                             i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
@@ -1827,6 +1914,9 @@ impl eframe::App for AesRustApp {
                         album_row.reset();
                         scan_seen.clear();
                         *album_rx = Some(library::spawn_scan(&settings.library.music_roots));
+                    }
+                    album_row::Action::DeleteAlbum(dirs) if !albums_confirmed => {
+                        del_prompt.request(PendingDelete::Albums(dirs), ui.ctx());
                     }
                     album_row::Action::DeleteAlbum(dirs) => {
                         // Lacrima's DeleteFolder per album (context
@@ -2382,8 +2472,17 @@ impl eframe::App for AesRustApp {
                 // "Delete" on a pointed item or the Delete key on the
                 // card selection — Lacrima's DeletePointedItem:
                 // remove from the view and stop playback when a
-                // removed item was the current one.
-                if let Some(paths) = delete_path {
+                // removed item was the current one. Unconfirmed
+                // requests open the confirmation dialog first.
+                let confirmed_items = if items_confirmed {
+                    delete_path.take()
+                } else {
+                    if let Some(paths) = delete_path {
+                        del_prompt.request(PendingDelete::Items(paths), ui.ctx());
+                    }
+                    None
+                };
+                if let Some(paths) = confirmed_items {
                     if let Some(cur) = playing_track.as_ref() {
                         if paths.contains(cur) {
                             if let Some(p) = player {
@@ -2615,6 +2714,8 @@ impl eframe::App for AesRustApp {
                     settings.spectrum.clone(),
                     settings.carousel.clone(),
                     settings.audio.clone(),
+                    settings.emulation.clone(),
+                    settings.effects.lacrima_cover_color,
                 );
                 let slide = overlay_slide;
                 if slide > 0.001 {
@@ -2628,6 +2729,7 @@ impl eframe::App for AesRustApp {
                         settings,
                         transport,
                         ytdlp,
+                        emu,
                         shadertoy.as_ref().map(|t| t.names()).unwrap_or(&[]),
                         s,
                     );
@@ -2686,7 +2788,12 @@ impl eframe::App for AesRustApp {
                     lacrima.update(dt);
                     let clip = frame_rect.shrink(1.0);
                     let painter = ui.painter().with_clip_rect(clip);
-                    lacrima.paint(&painter, clip);
+                    let tint = if settings.effects.lacrima_cover_color {
+                        spectrum_colors.as_deref()
+                    } else {
+                        None
+                    };
+                    lacrima.paint(&painter, clip, tint);
                     ui.ctx().request_repaint();
                 }
                 // Outermost layer: the glowing edge border around the
@@ -2721,6 +2828,8 @@ impl eframe::App for AesRustApp {
                         settings.spectrum.clone(),
                         settings.carousel.clone(),
                         settings.audio.clone(),
+                        settings.emulation.clone(),
+                        settings.effects.lacrima_cover_color,
                     )
                     || settings.equalizer.bands != eq_before;
                 // Audio-tab changes apply live to the player — Lacrima
@@ -2739,8 +2848,10 @@ impl eframe::App for AesRustApp {
                 // through fullscreen transitions (the title bar hides
                 // there); size persists in absolute virtual units so
                 // fullscreen never inflates widgets.
-                let csz = Vec2::new(frame_rect.width().max(1.0), frame_rect.height().max(1.0));
-                let off = (clock.rect.center() - frame_rect.min) / csz;
+                // anchor_offset evaluates the canonical intent — a
+                // clamped/transient display rect can't leak into the
+                // save (the source of the random shift on launches).
+                let off = clock.anchor_offset(content, frame_rect);
                 let wsize = clock.rect.size();
                 let differs = settings.clock.left != off.x
                     || settings.clock.top != off.y
@@ -2753,7 +2864,7 @@ impl eframe::App for AesRustApp {
                 settings.clock.height = wsize.y;
                 settings.clock.visible = clock.visible;
                 // The turntable widget persists the same way.
-                let poff = (player_widget.rect.center() - frame_rect.min) / csz;
+                let poff = player_widget.anchor_offset(content, frame_rect);
                 let psize = player_widget.rect.size();
                 let pdiffers = settings.player.left != poff.x
                     || settings.player.top != poff.y
@@ -2792,20 +2903,25 @@ impl eframe::App for AesRustApp {
                     fs_exit.vis = (fs_exit.vis
                         + dt / if fs_exit.open { 0.18 } else { -0.14 })
                     .clamp(0.0, 1.0);
-                    match fs_exit_prompt_overlay(
+                    match confirm_overlay(
                         ui,
                         content,
+                        "Exit fullscreen?",
+                        "Are you sure you want to leave fullscreen mode?",
+                        "Exit",
+                        "Cancel",
                         &mut fs_exit.sel,
                         s,
                         fs_exit.vis,
                         fs_exit.open,
+                        "fs-exit",
                     ) {
-                        FsExitAction::Exit => {
+                        DialogAction::Confirm => {
                             fs_exit.open = false;
                             fs_exit.pending_exit = true;
                         }
-                        FsExitAction::Cancel => fs_exit.open = false,
-                        FsExitAction::None => {}
+                        DialogAction::Cancel => fs_exit.open = false,
+                        DialogAction::None => {}
                     }
                     ui.ctx().request_repaint();
                     if fs_exit.pending_exit && fs_exit.vis <= 0.001 {
@@ -2813,6 +2929,56 @@ impl eframe::App for AesRustApp {
                         ui.ctx()
                             .send_viewport_cmd(ViewportCommand::Fullscreen(false));
                     }
+                }
+                // Delete confirmation — same dialog, payload parked in
+                // `pending` and re-injected next frame on confirm.
+                if del_prompt.open || del_prompt.vis > 0.001 {
+                    let dtp = ui.ctx().input(|i| i.stable_dt);
+                    del_prompt.vis = (del_prompt.vis
+                        + dtp / if del_prompt.open { 0.18 } else { -0.14 })
+                    .clamp(0.0, 1.0);
+                    let (title, subtitle) = match &del_prompt.pending {
+                        Some(PendingDelete::Items(p)) => (
+                            if p.len() == 1 {
+                                "Delete item?".to_string()
+                            } else {
+                                format!("Delete {} items?", p.len())
+                            },
+                            "Removed from the album — the files stay on disk."
+                                .to_string(),
+                        ),
+                        Some(PendingDelete::Albums(d)) => (
+                            if d.len() == 1 {
+                                "Delete album?".to_string()
+                            } else {
+                                format!("Delete {} albums?", d.len())
+                            },
+                            "Removed from the library — the files stay on disk."
+                                .to_string(),
+                        ),
+                        None => ("Delete?".to_string(), String::new()),
+                    };
+                    match confirm_overlay(
+                        ui,
+                        content,
+                        &title,
+                        &subtitle,
+                        "Delete",
+                        "Cancel",
+                        &mut del_prompt.sel,
+                        s,
+                        del_prompt.vis,
+                        del_prompt.open,
+                        "del-confirm",
+                    ) {
+                        DialogAction::Confirm => {
+                            del_prompt.open = false;
+                            del_prompt.confirmed = del_prompt.pending.take();
+                        }
+                        DialogAction::Cancel => del_prompt.dismiss(),
+                        DialogAction::None => {}
+                    }
+                    ui.ctx().request_repaint();
                 }
             },
         );
@@ -3883,6 +4049,7 @@ fn settings_overlay(
     settings: &mut settings::Settings,
     transport: &mut transport::Transport,
     ytdlp: &mut ytdlp::YtDlp,
+    emu: &mut emulation::EmuView,
     toy_names: &[String],
     scale: f32,
 ) {
@@ -3966,6 +4133,8 @@ fn settings_overlay(
     // Body content per tab.
     if *tab == 0 {
         ui_tab_effects(ui, panel, t, settings, toy_names, scale);
+    } else if *tab == 1 {
+        emulation::settings_tab(ui, panel, t, emu, &mut settings.emulation, scale);
     } else if *tab == 3 {
         ui_tab_audio(ui, panel, t, settings, scale);
     } else if *tab == 4 {
@@ -4134,6 +4303,14 @@ fn ui_tab_effects(
     };
     label_row(ui, y, "Show Lacrima", &mut settings.effects.show_lacrima, "lacrima-toggle");
     y += 40.0 * s;
+    label_row(
+        ui,
+        y,
+        "Lacrima cover color",
+        &mut settings.effects.lacrima_cover_color,
+        "lacrima-cover-toggle",
+    );
+    y += 40.0 * s;
 
     // Lacrima count: pill slider + "N / 60000" readout.
     text(&painter, y, "Lacrima count");
@@ -4245,9 +4422,11 @@ fn ui_tab_audio(
     // ScrollViewer. Content is painted into a body rect clipped below
     // the tab strip and above the footer; the clip also makes scrolled-
     // away widgets non-interactive (egui intersects hit rects with it).
+    // Clip ends just above the footer separator (-70s) — content must
+    // never underlap the "Open AES Directory" row.
     let body = Rect::from_min_max(
         Pos2::new(panel.min.x, panel.min.y + 78.0 * s),
-        Pos2::new(panel.max.x, panel.max.y - 46.0 * s),
+        Pos2::new(panel.max.x, panel.max.y - 74.0 * s),
     );
     let scroll_id = ui.id().with("audio-scroll");
     let mut scroll = ui
@@ -5289,19 +5468,13 @@ fn pill_slider(
     changed
 }
 
-/// Result of the exit-fullscreen prompt for this frame.
+/// Result of a confirmation dialog for this frame.
 #[derive(Clone, Copy, PartialEq)]
-enum FsExitAction {
+enum DialogAction {
     None,
-    Exit,
+    Confirm,
     Cancel,
 }
-
-/// The Switch-style exit prompt: a translucent veil over the live
-/// content, a centered dialog, and two focusable buttons.
-/// Tab/arrows move the focus (the focus glow lerps between buttons
-/// as a visual flash), hover also moves it, Enter/click runs the
-/// focused button; Esc closes (handled by the caller).
 /// Keyboard media buttons — egui-winit drops VK_MEDIA_* (they never
 /// reach `egui::Key`), so pressed-edges are polled via
 /// GetAsyncKeyState: bit 0 of the return is "pressed since the
@@ -5337,15 +5510,28 @@ fn media_key_events(mut f: impl FnMut(MediaKey)) {
 #[cfg(not(windows))]
 fn media_key_events(_f: impl FnMut(MediaKey)) {}
 
-fn fs_exit_prompt_overlay(
+/// The Switch-style confirmation dialog: a translucent veil over the
+/// live content, a centered dialog, and two focusable buttons.
+/// Tab/arrows move the focus (the focus glow lerps between buttons
+/// as a visual flash), hover also moves it, Enter/click runs the
+/// focused button; Esc closes (handled by the caller). Shared by the
+/// exit-fullscreen and delete prompts — `salt` keeps the interaction
+/// and animation ids distinct.
+#[allow(clippy::too_many_arguments)]
+fn confirm_overlay(
     ui: &mut egui::Ui,
     rect: Rect,
+    title: &str,
+    subtitle: &str,
+    confirm_label: &str,
+    cancel_label: &str,
     sel: &mut usize,
     s: f32,
     vis: f32,
     interactive: bool,
-) -> FsExitAction {
-    let mut act = FsExitAction::None;
+    salt: &str,
+) -> DialogAction {
+    let mut act = DialogAction::None;
     if interactive {
         ui.ctx().input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
@@ -5358,9 +5544,9 @@ fn fs_exit_prompt_overlay(
             }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
                 act = if *sel == 0 {
-                    FsExitAction::Exit
+                    DialogAction::Confirm
                 } else {
-                    FsExitAction::Cancel
+                    DialogAction::Cancel
                 };
             }
         });
@@ -5390,14 +5576,14 @@ fn fs_exit_prompt_overlay(
     painter.text(
         Pos2::new(dlg.center().x, dlg.min.y + 36.0 * s * pop),
         Align2::CENTER_CENTER,
-        "Exit fullscreen?",
+        title,
         FontId::proportional(20.0 * s),
         Color32::WHITE.gamma_multiply(vis),
     );
     painter.text(
         Pos2::new(dlg.center().x, dlg.min.y + 66.0 * s * pop),
         Align2::CENTER_CENTER,
-        "Are you sure you want to leave fullscreen mode?",
+        subtitle,
         FontId::proportional(13.0 * s),
         Color32::from_gray(190).gamma_multiply(vis),
     );
@@ -5405,26 +5591,26 @@ fn fs_exit_prompt_overlay(
     let bw = 140.0 * s;
     let bh = 38.0 * s;
     let by = dlg.min.y + 108.0 * s * pop;
-    for (i, label) in ["Exit", "Cancel"].iter().enumerate() {
+    for (i, label) in [confirm_label, cancel_label].iter().enumerate() {
         let cx = dlg.center().x + (i as f32 - 0.5) * (bw + 20.0 * s) * pop;
         let b = Rect::from_center_size(Pos2::new(cx, by + bh * 0.5), Vec2::new(bw, bh));
         if interactive {
-            let resp = ui.interact(b, ui.id().with(("fs-exit-btn", i)), Sense::click());
+            let resp = ui.interact(b, ui.id().with((salt, "btn", i)), Sense::click());
             if resp.hovered() {
                 *sel = i;
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
             }
             if resp.clicked() {
                 act = if i == 0 {
-                    FsExitAction::Exit
+                    DialogAction::Confirm
                 } else {
-                    FsExitAction::Cancel
+                    DialogAction::Cancel
                 };
             }
         }
         // The focused button's glow lerps in — reads as the selection
         // flash moving between buttons.
-        let hot = ctx.animate_bool_with_time(ui.id().with(("fs-exit-sel", i)), *sel == i, 0.15);
+        let hot = ctx.animate_bool_with_time(ui.id().with((salt, "sel", i)), *sel == i, 0.15);
         let br = CornerRadius::same((8.0 * s).round() as u8);
         painter.rect_filled(
             b,

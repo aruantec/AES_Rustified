@@ -201,13 +201,13 @@ impl WidgetFrame {
 
     pub fn reset(&mut self, content: Rect, frame: Rect, s: f32) {
         self.rect = (self.default_rect)(content, frame, s);
-        self.anchor = Some(self.anchor_of(content, frame));
+        let r = self.rect;
+        self.anchor = Some(self.anchor_of(r, content, frame));
     }
 
-    /// Per-axis anchors for the current rect — the placement intent
-    /// captured once, then re-evaluated against every new geometry.
-    fn anchor_of(&self, content: Rect, frame: Rect) -> [Anchor; 2] {
-        let r = self.rect;
+    /// Per-axis anchors for `r` — the placement intent captured once,
+    /// then re-evaluated against every new geometry.
+    fn anchor_of(&self, r: Rect, content: Rect, frame: Rect) -> [Anchor; 2] {
         [
             axis_anchor(
                 r.min.x, r.max.x, content.min.x, content.max.x, frame.min.x, frame.width(),
@@ -224,7 +224,11 @@ impl WidgetFrame {
     /// when the title bar collapses in fullscreen. Returns `visible`.
     fn begin(&mut self, content: Rect, frame: Rect, s: f32) -> bool {
         if !self.rect.is_finite() || !self.rect.is_positive() {
-            self.rect = match (self.saved_offset, self.saved_size) {
+            // The anchor derives from the UNCLAMPED intent — on a
+            // transient small first frame the display rect pins to an
+            // edge, and anchoring THAT would glue the widget to the
+            // corner permanently (the random drift on fresh builds).
+            let (rect, intent) = match (self.saved_offset, self.saved_size) {
                 (Some(off), Some(size)) => {
                     // Offset is the widget CENTER as a fraction of the
                     // whole window, so a widget keeps its screen spot
@@ -237,20 +241,23 @@ impl WidgetFrame {
                         ),
                         size,
                     );
-                    fit_inside(restored, content.shrink(EDIT_MARGIN))
+                    (fit_inside(restored, content.shrink(EDIT_MARGIN)), restored)
                 }
-                _ => (self.default_rect)(content, frame, s),
+                _ => {
+                    let r = (self.default_rect)(content, frame, s);
+                    (r, r)
+                }
             };
-            // The anchor derives from the restored position — a spot
-            // near an edge glues, mid-field keeps the center fraction.
-            self.anchor = Some(self.anchor_of(content, frame));
+            self.rect = rect;
+            self.anchor = Some(self.anchor_of(intent, content, frame));
         }
         // The widget lives inside the ScalableDecorator: on a UI-scale
         // change the rect rescales once, then the anchor re-derives.
         if self.last_scale > 0.0 && (s - self.last_scale).abs() > 1e-6 {
             let k = s / self.last_scale;
             self.rect = Rect::from_center_size(self.rect.center(), self.rect.size() * k);
-            self.anchor = Some(self.anchor_of(content, frame));
+            let r = self.rect;
+            self.anchor = Some(self.anchor_of(r, content, frame));
         }
         self.last_scale = s;
         // Placement is a pure function of (anchor, content, frame) —
@@ -318,7 +325,8 @@ impl WidgetFrame {
         }
         if move_resp.drag_stopped() {
             self.drag_from = None;
-            self.anchor = Some(self.anchor_of(content, frame));
+            let r = self.rect;
+            self.anchor = Some(self.anchor_of(r, content, frame));
         }
         let move_dragged = move_resp.dragged();
         out.ended = move_resp.drag_stopped();
@@ -350,13 +358,35 @@ impl WidgetFrame {
         }
         if grip_resp.drag_stopped() {
             self.drag_from = None;
-            self.anchor = Some(self.anchor_of(content, frame));
+            let r = self.rect;
+            self.anchor = Some(self.anchor_of(r, content, frame));
         }
         let grip_dragged = grip_resp.dragged();
         out.ended = out.ended || grip_resp.drag_stopped();
         grip_resp.on_hover_cursor(CursorIcon::ResizeNwSe);
         self.dragging = move_dragged || grip_dragged;
         out
+    }
+
+    /// The persistable position: the anchor's center as a fraction of
+    /// `frame` — evaluated from intent so a clamped or transient
+    /// display rect can't leak into the save.
+    pub fn anchor_offset(&self, content: Rect, frame: Rect) -> Vec2 {
+        if let Some([ax, ay]) = self.anchor {
+            let size = self.rect.size();
+            let cx = axis_pos(
+                ax, size.x, content.min.x, content.max.x, frame.min.x, frame.width(),
+            ) + size.x * 0.5;
+            let cy = axis_pos(
+                ay, size.y, content.min.y, content.max.y, frame.min.y, frame.height(),
+            ) + size.y * 0.5;
+            Vec2::new(
+                (cx - frame.min.x) / frame.width().max(1.0),
+                (cy - frame.min.y) / frame.height().max(1.0),
+            )
+        } else {
+            (self.rect.center() - frame.min) / frame.size()
+        }
     }
 }
 
