@@ -86,6 +86,10 @@ pub struct TagEditor {
     shown: bool,
     saved: Option<PathBuf>,
     path: PathBuf,
+    /// Online media item — no file exists to tag; fields and the
+    /// cover persist into the local meta cache instead (Lacrima's
+    /// .meta store semantics).
+    stream: bool,
     title: String,
     album: String,
     artist: String,
@@ -117,6 +121,7 @@ impl TagEditor {
             shown: false,
             saved: None,
             path: PathBuf::new(),
+            stream: false,
             title: String::new(),
             album: String::new(),
             artist: String::new(),
@@ -155,9 +160,14 @@ impl TagEditor {
         self.open = true;
         self.shown = true;
         self.path = path;
+        self.stream = crate::library::is_url(&self.path);
         // animate_bool jumps to its target on the first call — seed the
         // id at 0 so the first painted frame actually fades in.
         ctx.animate_bool(egui::Id::new("meta_editor").with(&self.path), false);
+        if self.stream {
+            self.open_stream();
+            return;
+        }
         match Probe::open(&self.path).and_then(|p| p.read()) {
             Ok(tagged) => {
                 if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
@@ -186,6 +196,39 @@ impl TagEditor {
                 }
             }
             Err(e) => self.err = Some(format!("Could not read tags: {e}")),
+        }
+    }
+
+    /// Stream item open — fields come from the local meta cache (same
+    /// store `read_track_info` reads), the cover card from the edited
+    /// local cover or the cached remote thumbnail, so the editor shows
+    /// exactly what the item displays.
+    fn open_stream(&mut self) {
+        let url = self.path.to_string_lossy().into_owned();
+        let meta = crate::meta_cache::load(&url);
+        if let Some(m) = &meta {
+            self.title = m.title.clone();
+            self.album = m.album.clone();
+            self.artist = m.artist.clone();
+            self.track = m.track.clone();
+            self.year = m.year.clone();
+            self.genres = m.genre.clone();
+            self.comment = m.comment.clone();
+            self.lyrics = m.lyrics.clone();
+        }
+        let bytes = crate::meta_cache::load_cover(&url).or_else(|| {
+            meta.as_ref()
+                .and_then(|m| m.thumb.clone())
+                .and_then(|t| crate::meta_cache::load_image(&t))
+        });
+        if let Some(data) = bytes {
+            self.images.push(ImageEntry {
+                kind: PictureType::CoverFront,
+                data,
+                desc: String::new(),
+                tex: None,
+                tex_failed: false,
+            });
         }
     }
 
@@ -220,6 +263,9 @@ impl TagEditor {
     }
 
     fn save(&mut self) -> Result<(), String> {
+        if self.stream {
+            return self.save_stream();
+        }
         let mut tagged = Probe::open(&self.path)
             .and_then(|p| p.read())
             .map_err(|e| format!("Could not open file: {e}"))?;
@@ -277,6 +323,41 @@ impl TagEditor {
         tagged
             .save_to_path(&self.path, WriteOptions::default())
             .map_err(|e| format!("Write failed: {e}"))
+    }
+
+    /// Stream item save — everything lands in the local meta cache;
+    /// the remote source is never touched. The fetched thumbnail url
+    /// is kept as the remote fallback while the active cover image is
+    /// stored as the local cover override (first CoverFront entry,
+    /// else the first image). No image entries -> drop the override,
+    /// which returns the item to its remote thumbnail.
+    fn save_stream(&mut self) -> Result<(), String> {
+        let url = self.path.to_string_lossy().into_owned();
+        let thumb = crate::meta_cache::load(&url).and_then(|m| m.thumb);
+        crate::meta_cache::save(
+            &url,
+            &crate::meta_cache::CachedMeta {
+                title: self.title.trim().to_string(),
+                artist: self.artist.trim().to_string(),
+                album: self.album.trim().to_string(),
+                track: self.track.trim().to_string(),
+                year: self.year.trim().to_string(),
+                genre: self.genres.trim().to_string(),
+                comment: self.comment.trim().to_string(),
+                lyrics: self.lyrics.clone(),
+                thumb,
+            },
+        );
+        match self
+            .images
+            .iter()
+            .find(|i| i.kind == PictureType::CoverFront)
+            .or_else(|| self.images.first())
+        {
+            Some(img) => crate::meta_cache::save_cover(&url, &img.data),
+            None => crate::meta_cache::remove_cover(&url),
+        }
+        Ok(())
     }
 
     /// Painted as the last content layer of the music view (above the

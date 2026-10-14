@@ -193,8 +193,13 @@ impl CoverSrc {
     /// A url item's thumbnail source — the guessed img.youtube.com
     /// candidate ladder (real resolved thumbs arrive via metadata
     /// and land on the item's `cover` directly). `None` for urls
-    /// without a known thumbnail host.
+    /// without a known thumbnail host. A cover edited into the local
+    /// meta cache wins over every remote candidate.
     pub fn web_for(url: &str) -> Option<CoverSrc> {
+        let local = crate::meta_cache::cover_path(url);
+        if local.exists() {
+            return Some(CoverSrc::File(local));
+        }
         crate::ytdlp::extract_video_id(url)
             .map(|id| CoverSrc::Web(crate::ytdlp::thumbnail_candidates(&id)))
     }
@@ -502,6 +507,10 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
                 t.title = c.title;
             }
             t.artist = c.artist;
+            // An edited Album field overrides the folder/tile label.
+            if !c.album.trim().is_empty() {
+                t.album = c.album;
+            }
             t.cover_url = c.thumb;
             return t;
         }
@@ -518,6 +527,7 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
                         thumb: t.cover_url.clone(),
+                        ..Default::default()
                     },
                 );
             }

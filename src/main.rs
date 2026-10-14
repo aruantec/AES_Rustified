@@ -367,6 +367,15 @@ struct AesRustApp {
     /// a stale highlight in the other view can never delete
     /// (Lacrima's per-ListBox selection scope).
     sel_owner: SelOwner,
+    /// Alt-tap detection for the cover-layout cycle — Alt is a
+    /// modifier, not a Key event, so the handler watches its edge
+    /// and requires a clean press→release (no other key, window
+    /// focused) so Alt+Tab can never fire it.
+    alt_down: bool,
+    alt_clean: bool,
+    /// Switch-style "exit fullscreen?" confirmation — see
+    /// `FsExitPrompt`.
+    fs_exit: FsExitPrompt,
     started: std::time::Instant,
 }
 
@@ -377,6 +386,30 @@ enum SelOwner {
     None,
     Albums,
     Cards,
+}
+
+/// The Switch-style exit-fullscreen confirmation: a translucent veil
+/// over the live content and a centered dialog. Esc again or Cancel
+/// closes it (staying fullscreen); Exit/Enter confirms.
+#[derive(Default)]
+struct FsExitPrompt {
+    open: bool,
+    /// 0 = Exit, 1 = Cancel — Tab/arrows toggle, hover follows.
+    sel: usize,
+    /// Painted fade 0..1 — trails `open` so the veil and dialog fade
+    /// OUT instead of snapping off when the prompt closes.
+    vis: f32,
+    /// Exit confirmed — fullscreen leaves once the fade completes.
+    pending_exit: bool,
+}
+
+impl FsExitPrompt {
+    fn begin(&mut self, ctx: &egui::Context) {
+        self.sel = 0;
+        self.open = true;
+        self.pending_exit = false;
+        ctx.request_repaint();
+    }
 }
 
 impl AesRustApp {
@@ -491,31 +524,45 @@ impl AesRustApp {
             }),
             logo: logo::TitleLogo::new(have_font),
             lacrima: particles::LacrimaParticles::new(),
-            // Widget geometry persists in virtual units; restore it in
-            // physical pixels at the current UI scale (1/ScaleFactor).
-            clock: widgets::ClockWidget::new(
-                have_light_font,
-                {
-                    let inv = 1.0 / settings.ui.scale_factor.clamp(1.0, 3.0);
-                    Some((
-                        Vec2::new(settings.clock.left * inv, settings.clock.top * inv),
-                        Vec2::new(settings.clock.width * inv, settings.clock.height * inv),
-                        settings.clock.visible,
-                    ))
-                },
-            ),
-            // Widget geometry persists in virtual units; restore it in
-            // physical pixels at the current UI scale. A negative
-            // Player.Left means "unplaced" -> Lacrima's default layout.
-            player_widget: widgets::PlayerWidget::new(if settings.player.left >= 0.0 {
-                let inv = 1.0 / settings.ui.scale_factor.clamp(1.0, 3.0);
-                Some((
-                    Vec2::new(settings.player.left * inv, settings.player.top * inv),
-                    Vec2::new(settings.player.width * inv, settings.player.height * inv),
-                    settings.player.visible,
-                ))
-            } else {
-                None
+            // Widget geometry: offset is the widget CENTER as a
+            // fraction of the content rect (centered stays centered at
+            // any window size); size is absolute virtual units so
+            // widgets keep their size. Sizes <= 4.0 are legacy
+            // fractional saves — fall back to the default layout once.
+            clock: widgets::ClockWidget::new(have_light_font, {
+                let c = &settings.clock;
+                (c.left >= -0.5
+                    && c.top >= -0.5
+                    && c.left <= 1.5
+                    && c.top <= 1.5
+                    && c.width > 4.0
+                    && c.height > 4.0)
+                    .then(|| {
+                        (
+                            Vec2::new(c.left, c.top),
+                            Vec2::new(c.width, c.height),
+                            c.visible,
+                        )
+                    })
+            }),
+            // Same split restore for the turntable. A negative or
+            // out-of-range Player.Left means "unplaced"/legacy ->
+            // Lacrima's default layout.
+            player_widget: widgets::PlayerWidget::new({
+                let p = &settings.player;
+                (p.left >= 0.0
+                    && p.top >= -0.5
+                    && p.left <= 1.5
+                    && p.top <= 1.5
+                    && p.width > 4.0
+                    && p.height > 4.0)
+                    .then(|| {
+                        (
+                            Vec2::new(p.left, p.top),
+                            Vec2::new(p.width, p.height),
+                            p.visible,
+                        )
+                    })
             }),
             playing_cover: None,
             widget_edit: false,
@@ -558,6 +605,9 @@ impl AesRustApp {
             album_cover_rx: None,
             playing_track: None,
             sel_owner: SelOwner::None,
+            alt_down: false,
+            alt_clean: false,
+            fs_exit: FsExitPrompt::default(),
             started: std::time::Instant::now(),
         };
         // Lacrima kicks off RefreshYtDlpInfo at startup so the
@@ -585,9 +635,12 @@ impl eframe::App for AesRustApp {
         // The shader paints first so everything else (frame stroke, menu)
         // lands on top of it. Painted every frame, so always repaint.
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        let is_fullscreen = ui
+            .ctx()
+            .input(|i| i.viewport().fullscreen.unwrap_or(false));
         // Mirror the current window size into settings (un-maximized only,
         // so the restored size is the normal one).
-        if !maximized {
+        if !maximized && !is_fullscreen {
             if let Some(inner) = ui.ctx().input(|i| i.viewport().inner_rect) {
                 self.settings.window.width = inner.width();
                 self.settings.window.height = inner.height();
@@ -602,7 +655,13 @@ impl eframe::App for AesRustApp {
         let scale =
             ((self.settings.ui.scale_factor.clamp(1.0, 3.0) * 20.0).round() / 20.0).max(1.0);
         let s = 1.0 / scale;
-        let bar_h = TITLE_BAR_HEIGHT * s;
+        // Fullscreen hides the title bar — the content covers the
+        // whole screen.
+        let bar_h = if is_fullscreen {
+            0.0
+        } else {
+            TITLE_BAR_HEIGHT * s
+        };
 
         let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
         let elapsed = ui.ctx().input(|i| i.time) as f32;
@@ -617,7 +676,11 @@ impl eframe::App for AesRustApp {
         }
         self.logo.advance(dt, "AES Rustified");
 
-        let radius = if maximized { 0 } else { CORNER_RADIUS };
+        let radius = if maximized || is_fullscreen {
+            0
+        } else {
+            CORNER_RADIUS
+        };
         let frame_rect = ui.max_rect();
         let content = Rect::from_min_max(
             Pos2::new(frame_rect.min.x, frame_rect.min.y + bar_h),
@@ -671,6 +734,10 @@ impl eframe::App for AesRustApp {
             }
         };
         let mut back_clicked = false;
+        let mut esc_back = false;
+        // Set by the title-bar's fullscreen-exit button — consumed
+        // after the frame to open the exit confirmation.
+        let mut fs_exit_req = false;
         let mut gear_clicked = false;
 
         // Album scan results stream in on a background thread — each
@@ -861,6 +928,9 @@ impl eframe::App for AesRustApp {
             scan_seen,
             playing_track,
             sel_owner,
+            alt_down,
+            alt_clean,
+            fs_exit,
             shadertoy,
             ..
         } = self;
@@ -1118,7 +1188,8 @@ impl eframe::App for AesRustApp {
         let view_interactive = interactive
             && overlay_slide < 0.001
             && !tag_editor.is_open()
-            && !url_prompt.is_open();
+            && !url_prompt.is_open()
+            && !fs_exit.open;
         // The scrollbar grab zone owns the window's bottom edge in the
         // Music view: suppress the resize grip over the same rect so
         // presses reach the scrollbar instead of starting a resize.
@@ -1145,6 +1216,7 @@ impl eframe::App for AesRustApp {
             animate_title,
             s,
             resize_exclude,
+            &mut fs_exit_req,
             |ui| {
                 // Right-click menu like Lacrima's view context menu —
                 // suppressed over the albums strip, which has its own.
@@ -1155,7 +1227,7 @@ impl eframe::App for AesRustApp {
                         .input(|i| i.pointer.latest_pos())
                         .map(|p| album_row_rect(content, s).contains(p))
                         .unwrap_or(false);
-                if !tag_editor.is_open() && !url_prompt.is_open() {
+                if !tag_editor.is_open() && !url_prompt.is_open() && !fs_exit.open {
                     resp.context_menu(|ui| {
                         if !over_album_row {
                             widget_menu(
@@ -1164,6 +1236,7 @@ impl eframe::App for AesRustApp {
                                 &mut player_widget.frame,
                                 widget_edit,
                                 content,
+                                frame_rect,
                                 s,
                             );
                         }
@@ -1194,15 +1267,17 @@ impl eframe::App for AesRustApp {
                             *settings_open,
                             s,
                         ) {
-                            if i == 3 {
-                                *settings_open = !*settings_open;
-                            } else {
-                                nav.request(View::SUB_VIEWS[i]);
-                            }
+                            menu_activate(
+                                i,
+                                menu_entries(icons).len(),
+                                settings_open,
+                                nav,
+                            );
                         }
                         let cout = clock.ui(
                             ui,
                             content,
+                            frame_rect,
                             *widget_edit && view_interactive,
                             elapsed,
                             s,
@@ -1211,6 +1286,7 @@ impl eframe::App for AesRustApp {
                         let pout = player_widget.ui(
                             ui,
                             content,
+                            frame_rect,
                             *widget_edit && view_interactive,
                             view_interactive,
                             elapsed,
@@ -1251,6 +1327,7 @@ impl eframe::App for AesRustApp {
                                     &mut player_widget.frame,
                                     widget_edit,
                                     content,
+                                    frame_rect,
                                     s,
                                 )
                             });
@@ -1262,6 +1339,35 @@ impl eframe::App for AesRustApp {
                             ui.set_opacity(a);
                             match v {
                                 View::Music => {
+                                    // The playing item's card spins
+                                    // while its stream url resolves or
+                                    // the decoder preroll fills —
+                                    // cleared the moment playback runs.
+                                    let stream_loading = playing_track
+                                        .as_ref()
+                                        .is_some_and(|t| library::is_url(t))
+                                        && (resolve_rx.is_some()
+                                            || player.as_ref().is_some_and(|p| {
+                                                p.buffering()
+                                                    && p.state()
+                                                        == audio::PlayerState::Playing
+                                            }));
+                                    // Shift held = reorder armed —
+                                    // the owning list lifts its
+                                    // selection to signal the arrows
+                                    // now move it (same routing as
+                                    // the Shift+arrow handler).
+                                    let shift_down = view_interactive
+                                        && !ui.ctx().text_edit_focused()
+                                        && ui.ctx().input(|i| i.modifiers.shift);
+                                    let cards_armed = shift_down
+                                        && (*sel_owner == SelOwner::Cards
+                                            || (*sel_owner == SelOwner::None
+                                                && carousel.has_items()));
+                                    let row_armed = shift_down
+                                        && (*sel_owner == SelOwner::Albums
+                                            || (*sel_owner == SelOwner::None
+                                                && !carousel.has_items()));
                                     let (ra, sk, play, ed, pr, del, cl, ex) = music_view(
                                         ui,
                                         content,
@@ -1272,6 +1378,7 @@ impl eframe::App for AesRustApp {
                                         carousel,
                                         player.as_ref(),
                                         playing_track.as_deref(),
+                                        stream_loading,
                                         waveform_shown,
                                         *waveform_loading,
                                         waveform_bar,
@@ -1281,11 +1388,18 @@ impl eframe::App for AesRustApp {
                                         &settings.carousel,
                                         &mut settings.equalizer,
                                         spectrum_colors.as_deref(),
+                                        Color32::from_rgb(
+                                            settings.audio.volume_knob_color[0],
+                                            settings.audio.volume_knob_color[1],
+                                            settings.audio.volume_knob_color[2],
+                                        ),
                                         search,
                                         album_search,
                                         radius,
                                         s,
                                         album_rx.is_some(),
+                                        row_armed,
+                                        cards_armed,
                                     );
                                     row_action = ra;
                                     seek_secs = sk;
@@ -1330,11 +1444,25 @@ impl eframe::App for AesRustApp {
                 if carousel.take_sel_touched() {
                     *sel_owner = SelOwner::Cards;
                 }
+                // egui's own focus navigation (begin_pass reads raw Tab/
+                // arrow events before our consume_key runs) hands focus
+                // to the first focusable widget — a focused button then
+                // blocks every key via wants_keyboard_input and eats
+                // Enter as a fake click. Our nav owns the keys: drop
+                // stray widget focus each frame (a real TextEdit keeps
+                // its focus — it genuinely needs them).
+                if view_interactive
+                    && !ui.ctx().text_edit_focused()
+                    && !search.wants_focus()
+                    && !album_search.wants_focus()
+                {
+                    ui.ctx().memory_mut(|m| m.stop_text_input());
+                }
                 // Delete: route to the owning view's selection.
-                // Text fields eat the key first (wants_keyboard_input)
+                // Text fields eat the key first (text_edit_focused)
                 // and overlays gate via view_interactive.
                 if view_interactive
-                    && !ui.ctx().egui_wants_keyboard_input()
+                    && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                     })
@@ -1358,7 +1486,7 @@ impl eframe::App for AesRustApp {
                 // owner routing as Delete: the list after a list
                 // gesture, the cards after a card gesture).
                 if view_interactive
-                    && !ui.ctx().egui_wants_keyboard_input()
+                    && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)
                     })
@@ -1367,6 +1495,318 @@ impl eframe::App for AesRustApp {
                         SelOwner::Albums => album_row.select_all(albums),
                         SelOwner::Cards => carousel.select_all(&search.text),
                         SelOwner::None => {}
+                    }
+                }
+                // Arrow-key navigation — same owner routing. With no
+                // owner yet, a loaded album's cards win (the cover
+                // view is the primary surface), else the album strip.
+                if view_interactive && !ui.ctx().text_edit_focused() {
+                    let (mut dx, mut dy) = (0i32, 0i32);
+                    let (mut mdx, mut mdy) = (0i32, 0i32);
+                    ui.ctx().input_mut(|i| {
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
+                            mdx -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
+                            mdx += 1;
+                        }
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                            mdy -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                            mdy += 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                            dx -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                            dx += 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                            dy -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                            dy += 1;
+                        }
+                    });
+                    // Shift+arrows reorder; plain arrows navigate —
+                    // same owner routing either way.
+                    if mdx != 0 || mdy != 0 {
+                        match *sel_owner {
+                            SelOwner::Albums => {
+                                album_row.move_selection(albums, mdx + mdy)
+                            }
+                            SelOwner::Cards => {
+                                carousel.move_selection(&search.text, mdx, mdy)
+                            }
+                            SelOwner::None => {
+                                if carousel.has_items() {
+                                    carousel.move_selection(&search.text, mdx, mdy)
+                                } else {
+                                    album_row.move_selection(albums, mdx + mdy)
+                                }
+                            }
+                        }
+                    } else if dx != 0 || dy != 0 {
+                        match *sel_owner {
+                            SelOwner::Albums => album_row.arrow(albums, dx + dy),
+                            SelOwner::Cards => {
+                                carousel.arrow(&search.text, dx, dy)
+                            }
+                            SelOwner::None => {
+                                if carousel.has_items() {
+                                    carousel.arrow(&search.text, dx, dy)
+                                } else {
+                                    album_row.arrow(albums, dx + dy)
+                                }
+                            }
+                        }
+                    }
+                }
+                // Tab — cycle focus between the album strip and the
+                // loaded album's items (Lacrima's focus cycle). The
+                // target view reveals its current selection; with no
+                // cards loaded the strip keeps focus.
+                if view_interactive
+                    && !ui.ctx().text_edit_focused()
+                    && ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                    })
+                {
+                    let next = match *sel_owner {
+                        SelOwner::Albums | SelOwner::None => SelOwner::Cards,
+                        SelOwner::Cards => SelOwner::Albums,
+                    };
+                    *sel_owner = if next == SelOwner::Cards && !carousel.has_items() {
+                        SelOwner::Albums
+                    } else {
+                        next
+                    };
+                    match *sel_owner {
+                        SelOwner::Albums => album_row.focus(albums),
+                        SelOwner::Cards => carousel.focus(&search.text),
+                        SelOwner::None => {}
+                    }
+                }
+                // Enter — activates the owning view's selection like a
+                // double-click: plays the card, opens the album.
+                if view_interactive
+                    && !ui.ctx().text_edit_focused()
+                    && ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    })
+                {
+                    match *sel_owner {
+                        SelOwner::Albums => {
+                            if let Some(i) = album_row.selected_index() {
+                                row_action = album_row::Action::Opened(i);
+                            }
+                        }
+                        SelOwner::Cards => {
+                            if let Some(p) = carousel.primary_path() {
+                                play_path = Some(p);
+                            }
+                        }
+                        SelOwner::None => {}
+                    }
+                }
+                // Ctrl+F — focus the search box for whichever list
+                // owns selection: the band's album filter for the
+                // strip, the top-right item search for the cards.
+                // The pills only live on the Music view.
+                if view_interactive
+                    && nav.target() == View::Music
+                    && ui.ctx().input_mut(|i| {
+                        i.consume_key(egui::Modifiers::CTRL, egui::Key::F)
+                    })
+                {
+                    match *sel_owner {
+                        SelOwner::Albums => album_search.open(),
+                        SelOwner::Cards => search.open(),
+                        SelOwner::None => {
+                            if carousel.has_items() {
+                                search.open()
+                            } else {
+                                album_search.open()
+                            }
+                        }
+                    }
+                }
+                // Esc — the exit-fullscreen prompt closes first (and
+                // stays fullscreen); then an open search box; then a
+                // focused text field owns it. In fullscreen it opens
+                // the Switch-style exit confirmation; otherwise Esc
+                // and Backspace are the back button. The overlays'
+                // own Esc handling runs while they're open —
+                // view_interactive gates this path then.
+                if view_interactive || fs_exit.open {
+                    let esc = ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                    if esc {
+                        if fs_exit.open {
+                            fs_exit.open = false;
+                        } else if search.is_open() {
+                            search.close(ui.ctx());
+                        } else if album_search.is_open() {
+                            album_search.close(ui.ctx());
+                        } else if !ui.ctx().text_edit_focused() {
+                            if ui
+                                .ctx()
+                                .input(|i| i.viewport().fullscreen.unwrap_or(false))
+                            {
+                                fs_exit.begin(ui.ctx());
+                            } else {
+                                esc_back = true;
+                            }
+                        }
+                    }
+                    if !fs_exit.open
+                        && !ui.ctx().text_edit_focused()
+                        && ui.ctx().input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+                        })
+                    {
+                        esc_back = true;
+                    }
+                }
+                // F12 toggles fullscreen — entering is instant, leaving
+                // goes through the same exit confirmation as Esc.
+                if view_interactive
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F12))
+                {
+                    if ui
+                        .ctx()
+                        .input(|i| i.viewport().fullscreen.unwrap_or(false))
+                    {
+                        fs_exit.begin(ui.ctx());
+                    } else {
+                        ui.ctx()
+                            .send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                    }
+                }
+                // Ctrl+arrows — Up/Down nudge the volume, Left/Right
+                // skip 5s. Text fields keep their word-jump/caret keys.
+                if view_interactive && !ui.ctx().text_edit_focused() {
+                    let (vol_up, vol_dn, skip_b, skip_f) = ui.ctx().input_mut(|i| {
+                        (
+                            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp),
+                            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown),
+                            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft),
+                            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight),
+                        )
+                    });
+                    if (vol_up || vol_dn || skip_b || skip_f) && player.is_some() {
+                        if let Some(p) = player.as_ref() {
+                            if vol_up || vol_dn {
+                                p.set_volume(
+                                    (p.volume() + if vol_up { 0.05 } else { -0.05 })
+                                        .clamp(0.0, 1.0),
+                                );
+                            }
+                            if skip_b || skip_f {
+                                let pos = p.position().as_secs_f64();
+                                p.seek((pos + if skip_f { 5.0 } else { -5.0 }).max(0.0));
+                            }
+                        }
+                    }
+                }
+                // Number keys activate the main-menu entries in
+                // order — the binding follows `menu_entries`, so a
+                // new entry automatically takes the next number.
+                // Only on the Main view where the menu lives.
+                if view_interactive
+                    && !ui.ctx().text_edit_focused()
+                    && nav.target() == View::Main
+                {
+                    let menu_n = menu_entries(icons).len();
+                    for n in 1..=menu_n.min(9) {
+                        let key = match n {
+                            1 => egui::Key::Num1,
+                            2 => egui::Key::Num2,
+                            3 => egui::Key::Num3,
+                            4 => egui::Key::Num4,
+                            5 => egui::Key::Num5,
+                            6 => egui::Key::Num6,
+                            7 => egui::Key::Num7,
+                            8 => egui::Key::Num8,
+                            _ => egui::Key::Num9,
+                        };
+                        if ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
+                        {
+                            menu_activate(n - 1, menu_n, settings_open, nav);
+                            break;
+                        }
+                    }
+                }
+                // Alt is a modifier, not a Key event — a clean tap
+                // (press + release with no other key and the window
+                // focused) cycles the cover layout like the band's
+                // layout button. Alt+Tab presses other keys and/or
+                // drops focus, so it can never fire this.
+                {
+                    // Track the Alt key events themselves — AltGr
+                    // arrives as ControlLeft+AltRight and Windows
+                    // modifier state can't distinguish it from a
+                    // real Ctrl+Alt, so edges on the Alt KEYS are
+                    // the reliable signal for both Alt keys.
+                    let is_mod = |k: egui::Key| {
+                        matches!(
+                            k,
+                            egui::Key::ShiftLeft
+                                | egui::Key::ShiftRight
+                                | egui::Key::ControlLeft
+                                | egui::Key::ControlRight
+                                | egui::Key::AltLeft
+                                | egui::Key::AltRight
+                                | egui::Key::SuperLeft
+                                | egui::Key::SuperRight
+                        )
+                    };
+                    let (mut pressed, mut released) = (false, false);
+                    let (other_key, focused) = ui.ctx().input(|i| {
+                        for ev in &i.events {
+                            if let egui::Event::Key { key, pressed: p, .. } = ev {
+                                match (key, p) {
+                                    (egui::Key::AltLeft | egui::Key::AltRight, true) => {
+                                        pressed = true
+                                    }
+                                    (egui::Key::AltLeft | egui::Key::AltRight, false) => {
+                                        released = true
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        (
+                            i.keys_down.iter().any(|k| !is_mod(*k)),
+                            i.focused,
+                        )
+                    });
+                    if pressed {
+                        *alt_down = true;
+                        *alt_clean = !other_key;
+                    }
+                    if *alt_down && other_key {
+                        *alt_clean = false;
+                    }
+                    if released {
+                        if *alt_down
+                            && *alt_clean
+                            && focused
+                            && view_interactive
+                            && !ui.ctx().text_edit_focused()
+                            && nav.target() == View::Music
+                        {
+                            transport.cover_layout =
+                                (transport.cover_layout + 1) % 3;
+                        }
+                        *alt_down = false;
+                        *alt_clean = false;
                     }
                 }
                 match row_action {
@@ -1618,6 +2058,7 @@ impl eframe::App for AesRustApp {
                                                     artist: artist
                                                         .clone(),
                                                     thumb: None,
+                                                    ..Default::default()
                                                 },
                                             );
                                             carousel.apply_info(
@@ -2081,21 +2522,72 @@ impl eframe::App for AesRustApp {
                 }
                 // A finished save: refresh the item labels, drop the
                 // cached cover so it re-decodes, and re-read the disc
-                // art if it's the playing track.
+                // art if it's the playing track. Stream items edit the
+                // local meta cache — refresh goes through the url-info
+                // path and the cover override file.
                 if let Some(saved) = tag_editor.take_saved() {
-                    album_row.invalidate_cover(&library::CoverSrc::Tag(saved.clone()));
-                    if let Some((tracks, title)) = carousel.info_refresh_args() {
-                        *track_info_rx = Some(library::spawn_track_info(tracks, title));
-                    }
-                    if playing_track.as_deref() == Some(saved.as_path()) {
-                        if let Some(img) =
-                            library::decode_cover(&library::CoverSrc::Tag(saved.clone()))
+                    if library::is_url(&saved) {
+                        let url = saved.to_string_lossy().into_owned();
+                        // Drop every texture keyed on cover sources this
+                        // item may use: the override file, the guessed
+                        // ladder, and the resolved thumb src.
+                        album_row.invalidate_cover(&library::CoverSrc::File(
+                            crate::meta_cache::cover_path(&url),
+                        ));
+                        if let Some(src) = library::CoverSrc::web_for(&url) {
+                            album_row.invalidate_cover(&src);
+                        }
+                        if let Some(t) =
+                            crate::meta_cache::load(&url).and_then(|m| m.thumb)
                         {
-                            *playing_cover = Some(ui.ctx().load_texture(
-                                "playing-cover",
-                                img,
-                                egui::TextureOptions::LINEAR,
-                            ));
+                            album_row
+                                .invalidate_cover(&library::CoverSrc::Web(vec![t]));
+                        }
+                        if let Some((tracks, title)) = carousel.info_refresh_args()
+                        {
+                            *url_info_rx = Some(library::spawn_url_info(tracks, title));
+                        }
+                        // Re-read the now-playing art off the UI thread —
+                        // without an override this is a remote fetch.
+                        if playing_track.as_deref() == Some(saved.as_path()) {
+                            let src = library::CoverSrc::File(
+                                crate::meta_cache::cover_path(&url),
+                            );
+                            let src = if crate::meta_cache::cover_path(&url).exists()
+                            {
+                                Some(src)
+                            } else {
+                                library::CoverSrc::web_for(&url)
+                            };
+                            if let Some(src) = src {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let t = saved.clone();
+                                std::thread::Builder::new()
+                                    .name("aes-cover-fetch".into())
+                                    .spawn(move || {
+                                        let _ =
+                                            tx.send((t, library::decode_cover(&src)));
+                                    })
+                                    .ok();
+                                *playing_cover_rx = Some(rx);
+                            }
+                        }
+                    } else {
+                        album_row.invalidate_cover(&library::CoverSrc::Tag(saved.clone()));
+                        if let Some((tracks, title)) = carousel.info_refresh_args() {
+                            *track_info_rx =
+                                Some(library::spawn_track_info(tracks, title));
+                        }
+                        if playing_track.as_deref() == Some(saved.as_path()) {
+                            if let Some(img) = library::decode_cover(
+                                &library::CoverSrc::Tag(saved.clone()),
+                            ) {
+                                *playing_cover = Some(ui.ctx().load_texture(
+                                    "playing-cover",
+                                    img,
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                            }
                         }
                     }
                 }
@@ -2242,10 +2734,14 @@ impl eframe::App for AesRustApp {
 
                 // Sync the settings mirror; save when a drag finishes or the
                 // layout changed while not dragging (menu actions, reset).
-                // Widget position/size persist in virtual (unscaled) units
-                // so a scale change doesn't corrupt the layout.
-                let off = (clock.rect.min - content.min) / s;
-                let wsize = clock.rect.size() / s;
+                // Offset persists as the widget CENTER's fraction of
+                // the whole WINDOW so a widget keeps its screen spot
+                // through fullscreen transitions (the title bar hides
+                // there); size persists in absolute virtual units so
+                // fullscreen never inflates widgets.
+                let csz = Vec2::new(frame_rect.width().max(1.0), frame_rect.height().max(1.0));
+                let off = (clock.rect.center() - frame_rect.min) / csz;
+                let wsize = clock.rect.size();
                 let differs = settings.clock.left != off.x
                     || settings.clock.top != off.y
                     || settings.clock.width != wsize.x
@@ -2257,8 +2753,8 @@ impl eframe::App for AesRustApp {
                 settings.clock.height = wsize.y;
                 settings.clock.visible = clock.visible;
                 // The turntable widget persists the same way.
-                let poff = (player_widget.rect.min - content.min) / s;
-                let psize = player_widget.rect.size() / s;
+                let poff = (player_widget.rect.center() - frame_rect.min) / csz;
+                let psize = player_widget.rect.size();
                 let pdiffers = settings.player.left != poff.x
                     || settings.player.top != poff.y
                     || settings.player.width != psize.x
@@ -2285,9 +2781,45 @@ impl eframe::App for AesRustApp {
                     settings::save(settings);
                     *last_save = std::time::Instant::now();
                 }
+
+                // Switch-style exit-fullscreen confirmation — the
+                // last thing drawn so it covers all content. `open`
+                // flips off on Cancel/Exit; `vis` trails it to 0 so
+                // the overlay fades out, and the actual fullscreen
+                // leave waits for the fade to finish.
+                if fs_exit.open || fs_exit.vis > 0.001 {
+                    let dt = ui.ctx().input(|i| i.stable_dt);
+                    fs_exit.vis = (fs_exit.vis
+                        + dt / if fs_exit.open { 0.18 } else { -0.14 })
+                    .clamp(0.0, 1.0);
+                    match fs_exit_prompt_overlay(
+                        ui,
+                        content,
+                        &mut fs_exit.sel,
+                        s,
+                        fs_exit.vis,
+                        fs_exit.open,
+                    ) {
+                        FsExitAction::Exit => {
+                            fs_exit.open = false;
+                            fs_exit.pending_exit = true;
+                        }
+                        FsExitAction::Cancel => fs_exit.open = false,
+                        FsExitAction::None => {}
+                    }
+                    ui.ctx().request_repaint();
+                    if fs_exit.pending_exit && fs_exit.vis <= 0.001 {
+                        fs_exit.pending_exit = false;
+                        ui.ctx()
+                            .send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                    }
+                }
             },
         );
-        if back_clicked {
+        if fs_exit_req {
+            fs_exit.begin(ui.ctx());
+        }
+        if back_clicked || esc_back {
             if self.url_prompt.is_open() {
                 self.url_prompt.dismiss();
             } else if self.tag_editor.is_open() {
@@ -2314,6 +2846,7 @@ fn widget_menu(
     player: &mut widgets::WidgetFrame,
     widget_edit: &mut bool,
     content: Rect,
+    frame: Rect,
     s: f32,
 ) {
     if ui
@@ -2332,8 +2865,8 @@ fn widget_menu(
     }
     ui.checkbox(widget_edit, "Widget Edit Mode");
     if ui.button("Reset Widget Layout").clicked() {
-        clock.reset(content, s);
-        player.reset(content, s);
+        clock.reset(content, frame, s);
+        player.reset(content, frame, s);
         ui.close();
     }
 }
@@ -2355,11 +2888,17 @@ fn lacrima_window_frame(
     animate_title: bool,
     scale: f32,
     resize_exclude: Option<Rect>,
+    fs_exit_req: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     let ctx = ui.ctx().clone();
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-    let radius = if maximized { 0 } else { CORNER_RADIUS };
+    let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+    let radius = if maximized || is_fullscreen {
+        0
+    } else {
+        CORNER_RADIUS
+    };
     let corner_radius = CornerRadius::same(radius);
 
     egui::CentralPanel::default()
@@ -2367,12 +2906,21 @@ fn lacrima_window_frame(
             egui::Frame::new()
                 .fill(Color32::TRANSPARENT)
                 .corner_radius(corner_radius)
-                .stroke(Stroke::new(1.0, Color32::from_rgb(105, 105, 105))),
+                .stroke(if maximized || is_fullscreen {
+                    Stroke::NONE
+                } else {
+                    Stroke::new(1.0, Color32::from_rgb(105, 105, 105))
+                }),
         )
         .show(ui, |ui| {
             let app_rect = ui.max_rect();
 
-            let resize_dir = resize_direction(&ctx, app_rect, maximized, resize_exclude);
+            let resize_dir = resize_direction(
+                &ctx,
+                app_rect,
+                maximized || is_fullscreen,
+                resize_exclude,
+            );
             if let Some(dir) = resize_dir {
                 ctx.set_cursor_icon(cursor_icon_for(dir));
                 if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
@@ -2382,23 +2930,40 @@ fn lacrima_window_frame(
 
             let title_bar_rect = Rect::from_min_max(
                 app_rect.min,
-                Pos2::new(app_rect.max.x, app_rect.min.y + TITLE_BAR_HEIGHT * scale),
+                Pos2::new(
+                    app_rect.max.x,
+                    app_rect.min.y
+                        + if is_fullscreen {
+                            0.0
+                        } else {
+                            TITLE_BAR_HEIGHT * scale
+                        },
+                ),
             );
-            let title_bar_response = ui.interact(
-                title_bar_rect,
-                ui.id().with("title_bar"),
-                Sense::click_and_drag(),
-            );
-            if resize_dir.is_none()
-                && title_bar_response.drag_started_by(PointerButton::Primary)
-            {
-                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-            }
-            if title_bar_response.double_clicked_by(PointerButton::Primary) {
-                ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+            if !is_fullscreen {
+                let title_bar_response = ui.interact(
+                    title_bar_rect,
+                    ui.id().with("title_bar"),
+                    Sense::click_and_drag(),
+                );
+                if resize_dir.is_none()
+                    && title_bar_response.drag_started_by(PointerButton::Primary)
+                {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if title_bar_response.double_clicked_by(PointerButton::Primary) {
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+                }
             }
 
             add_contents(ui);
+
+            // Fullscreen renders content only — no bar, title, or
+            // window buttons (Esc exits fullscreen; Esc/Backspace
+            // still navigate back).
+            if is_fullscreen {
+                return;
+            }
 
             // The bar is an overlay IN FRONT of the content, like
             // Lacrima's MainTopBar sharing the root grid cell with a
@@ -2473,16 +3038,22 @@ fn lacrima_window_frame(
                     if title_button(ui, TitleButton::Close, scale).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
-                    let kind = if maximized {
-                        TitleButton::Restore
-                    } else {
-                        TitleButton::Maximize
-                    };
-                    if title_button(ui, kind, scale).clicked() {
-                        ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-                    }
                     if title_button(ui, TitleButton::Minimize, scale).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                    }
+                    let kind = if is_fullscreen {
+                        TitleButton::FullscreenExit
+                    } else {
+                        TitleButton::Fullscreen
+                    };
+                    if title_button(ui, kind, scale).clicked() {
+                        // Exiting fullscreen goes through the
+                        // confirmation prompt like Esc does.
+                        if is_fullscreen {
+                            *fs_exit_req = true;
+                        } else {
+                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                        }
                     }
                     // Settings gear, left of the window buttons like
                     // Lacrima's MainTopBar: dimmed at 0.5 opacity normally,
@@ -2598,6 +3169,30 @@ const MENU_PRESS_SHRINK: f32 = 0.15;
 // kept constant while the icon magnifies (the label rides up with it).
 const MENU_LABEL_GAP: f32 = 17.0;
 
+/// The main-menu entries in display order. The number keys bind
+/// 1..=N in this order — a new entry here automatically picks up
+/// the next number. The last entry is always Settings (toggles
+/// the overlay instead of navigating).
+fn menu_entries(
+    icons: &icons::MenuIcons,
+) -> [(&'static str, &egui::TextureHandle); 4] {
+    [
+        ("Emulation", &icons.emulation),
+        ("Re/Decompilation", &icons.recomp),
+        ("Music", &icons.music),
+        ("Settings", &icons.settings),
+    ]
+}
+
+/// One menu activation — click or number key alike.
+fn menu_activate(i: usize, menu_len: usize, settings_open: &mut bool, nav: &mut Nav) {
+    if i == menu_len - 1 {
+        *settings_open = !*settings_open;
+    } else if i < View::SUB_VIEWS.len() {
+        nav.request(View::SUB_VIEWS[i]);
+    }
+}
+
 fn main_menu(
     ui: &mut egui::Ui,
     icons: &icons::MenuIcons,
@@ -2638,12 +3233,7 @@ fn main_menu(
         Color32::from_white_alpha(153),
     );
 
-    let entries = [
-        ("Emulation", &icons.emulation),
-        ("Re/Decompilation", &icons.recomp),
-        ("Music", &icons.music),
-        ("Settings", &icons.settings),
-    ];
+    let entries = menu_entries(icons);
     let row_w = item_w * entries.len() as f32 + spacing * (entries.len() - 1) as f32;
     let left = rect.center().x - row_w / 2.0;
     // Items overlap the dock by 10 (Lacrima's StackPanel Spacing="-10").
@@ -2771,6 +3361,7 @@ fn music_view(
     carousel: &mut carousel::Carousel,
     player: Option<&audio::AudioPlayer>,
     playing_track: Option<&std::path::Path>,
+    playing_loading: bool,
     waveform: &[f32],
     waveform_loading: bool,
     bar: &mut waveform_bar::WaveformBar,
@@ -2780,11 +3371,14 @@ fn music_view(
     car_cfg: &settings::Carousel,
     eq: &mut settings::Equalizer,
     cover_colors: Option<&[Color32]>,
+    accent: Color32,
     search: &mut search_pill::SearchPill,
     album_search: &mut search_pill::SearchPill,
     radius: u8,
     s: f32,
     scanning: bool,
+    row_reorder_armed: bool,
+    card_reorder_armed: bool,
 ) -> (
     album_row::Action,
     Option<f64>,
@@ -2876,11 +3470,13 @@ fn music_view(
         grid_area,
         row,
         playing_track,
+        playing_loading,
         &search.text,
         car_cfg,
         cover_mode,
         alpha,
         interactive,
+        card_reorder_armed,
         s,
     );
 
@@ -2917,7 +3513,41 @@ fn music_view(
         painter.hline(content.min.x..=content.max.x, eq_rect.min.y, line);
     }
 
-    let step = transport.ui(ui, band, player, alpha, interactive, s);
+    let mut step = transport.ui(ui, band, player, alpha, interactive, accent, s);
+    // Keyboard media buttons map onto the transport buttons (only
+    // while our window is focused — VK_MEDIA_* are global-visible).
+    if ui
+        .ctx()
+        .input(|i| i.viewport().focused.unwrap_or(false))
+    {
+        media_key_events(|k| match k {
+            MediaKey::PlayPause => {
+                if let Some(p) = player {
+                    p.toggle();
+                }
+            }
+            MediaKey::Stop => {
+                if let Some(p) = player {
+                    p.stop();
+                }
+            }
+            MediaKey::Next => step = transport::Step::Next,
+            MediaKey::Prev => step = transport::Step::Prev,
+        });
+    }
+    // Ctrl+R cycles the repeat mode (ToggleRepeat).
+    if interactive
+        && !ui.ctx().text_edit_focused()
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R))
+    {
+        transport.repeat = match transport.repeat {
+            transport::RepeatMode::Off => transport::RepeatMode::All,
+            transport::RepeatMode::All => transport::RepeatMode::One,
+            transport::RepeatMode::One => transport::RepeatMode::Off,
+        };
+    }
     // The EQ drawer under the (lifted) transport band — input unlocks
     // once the reveal finishes, like the album strip's gating.
     if eq_t > 0.001 {
@@ -2942,7 +3572,7 @@ fn music_view(
     search.ui(
         ui,
         content.max.x - 30.0 * s,
-        content.min.y + 15.0 * s,
+        content.min.y + 26.0 * s,
         "Search",
         true,
         false,
@@ -3086,6 +3716,7 @@ fn music_view(
             interactive && list_t > 0.999,
             s,
             scanning,
+            row_reorder_armed,
         )
     } else {
         album_row::Action::None
@@ -3742,6 +4373,32 @@ fn ui_tab_audio(
         });
     }
     y += 40.0 * s + 56.0 * s;
+
+    // Volume knob accent — same ColorPicker swatch as the gradient
+    // stops, bound to Audio.VolumeKnobColor.
+    painter.text(
+        Pos2::new(x, y),
+        Align2::LEFT_CENTER,
+        "Volume Knob",
+        label.clone(),
+        Color32::from_gray(225).gamma_multiply(t),
+    );
+    {
+        let rect = Rect::from_min_size(
+            Pos2::new(x + 130.0 * s, y - 20.0 * s),
+            Vec2::new(80.0 * s, 40.0 * s),
+        );
+        let rgb = &mut settings.audio.volume_knob_color;
+        let mut c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+        cui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.centered_and_justified(|ui| {
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    *rgb = [c.r(), c.g(), c.b()];
+                }
+            });
+        });
+    }
+    y += 56.0 * s;
 
     // ---- "ReplayGain / Normalization" (SettingsOverlay.axaml) ------
     let audio = &mut settings.audio;
@@ -4632,11 +5289,185 @@ fn pill_slider(
     changed
 }
 
+/// Result of the exit-fullscreen prompt for this frame.
+#[derive(Clone, Copy, PartialEq)]
+enum FsExitAction {
+    None,
+    Exit,
+    Cancel,
+}
+
+/// The Switch-style exit prompt: a translucent veil over the live
+/// content, a centered dialog, and two focusable buttons.
+/// Tab/arrows move the focus (the focus glow lerps between buttons
+/// as a visual flash), hover also moves it, Enter/click runs the
+/// focused button; Esc closes (handled by the caller).
+/// Keyboard media buttons — egui-winit drops VK_MEDIA_* (they never
+/// reach `egui::Key`), so pressed-edges are polled via
+/// GetAsyncKeyState: bit 0 of the return is "pressed since the
+/// previous call", which is exactly the tap event we want.
+enum MediaKey {
+    PlayPause,
+    Stop,
+    Next,
+    Prev,
+}
+
+#[cfg(windows)]
+fn media_key_events(mut f: impl FnMut(MediaKey)) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+    }
+    const MAP: [(i32, MediaKey); 4] = [
+        (0xB0, MediaKey::Next),     // VK_MEDIA_NEXT_TRACK
+        (0xB1, MediaKey::Prev),     // VK_MEDIA_PREV_TRACK
+        (0xB2, MediaKey::Stop),     // VK_MEDIA_STOP
+        (0xB3, MediaKey::PlayPause),// VK_MEDIA_PLAY_PAUSE
+    ];
+    unsafe {
+        for (vk, k) in MAP {
+            if GetAsyncKeyState(vk) & 1 != 0 {
+                f(k);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn media_key_events(_f: impl FnMut(MediaKey)) {}
+
+fn fs_exit_prompt_overlay(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    sel: &mut usize,
+    s: f32,
+    vis: f32,
+    interactive: bool,
+) -> FsExitAction {
+    let mut act = FsExitAction::None;
+    if interactive {
+        ui.ctx().input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+            {
+                *sel = 1 - *sel;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                act = if *sel == 0 {
+                    FsExitAction::Exit
+                } else {
+                    FsExitAction::Cancel
+                };
+            }
+        });
+    }
+
+    let ctx = ui.ctx().clone();
+    let painter = ui.painter().clone();
+    // Translucent veil over the live content — alpha follows `vis`
+    // so it fades in AND out.
+    painter.rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        Color32::from_black_alpha((170.0 * vis) as u8),
+    );
+
+    // Slight scale-in — the dialog pops like a Switch prompt.
+    let pop = 0.94 + 0.06 * vis;
+    let dlg = Rect::from_center_size(rect.center(), Vec2::new(420.0 * s, 170.0 * s) * pop);
+    let dr = CornerRadius::same((14.0 * s).round() as u8);
+    painter.rect_filled(dlg, dr, Color32::from_black_alpha((240.0 * vis) as u8));
+    painter.rect_stroke(
+        dlg,
+        dr,
+        Stroke::new(1.0, Color32::from_white_alpha((70.0 * vis) as u8)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        Pos2::new(dlg.center().x, dlg.min.y + 36.0 * s * pop),
+        Align2::CENTER_CENTER,
+        "Exit fullscreen?",
+        FontId::proportional(20.0 * s),
+        Color32::WHITE.gamma_multiply(vis),
+    );
+    painter.text(
+        Pos2::new(dlg.center().x, dlg.min.y + 66.0 * s * pop),
+        Align2::CENTER_CENTER,
+        "Are you sure you want to leave fullscreen mode?",
+        FontId::proportional(13.0 * s),
+        Color32::from_gray(190).gamma_multiply(vis),
+    );
+
+    let bw = 140.0 * s;
+    let bh = 38.0 * s;
+    let by = dlg.min.y + 108.0 * s * pop;
+    for (i, label) in ["Exit", "Cancel"].iter().enumerate() {
+        let cx = dlg.center().x + (i as f32 - 0.5) * (bw + 20.0 * s) * pop;
+        let b = Rect::from_center_size(Pos2::new(cx, by + bh * 0.5), Vec2::new(bw, bh));
+        if interactive {
+            let resp = ui.interact(b, ui.id().with(("fs-exit-btn", i)), Sense::click());
+            if resp.hovered() {
+                *sel = i;
+                ctx.set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                act = if i == 0 {
+                    FsExitAction::Exit
+                } else {
+                    FsExitAction::Cancel
+                };
+            }
+        }
+        // The focused button's glow lerps in — reads as the selection
+        // flash moving between buttons.
+        let hot = ctx.animate_bool_with_time(ui.id().with(("fs-exit-sel", i)), *sel == i, 0.15);
+        let br = CornerRadius::same((8.0 * s).round() as u8);
+        painter.rect_filled(
+            b,
+            br,
+            Color32::from_white_alpha(((40.0 + 215.0 * hot) * vis) as u8),
+        );
+        painter.rect_stroke(
+            b,
+            br,
+            Stroke::new(
+                (1.0 + hot) * s,
+                Color32::from_white_alpha(((90.0 + 165.0 * hot) * vis) as u8),
+            ),
+            StrokeKind::Inside,
+        );
+        if hot > 0.01 {
+            painter.rect_stroke(
+                b.expand((4.0 * hot) * s),
+                CornerRadius::same((11.0 * s).round() as u8),
+                Stroke::new(
+                    1.5 * s,
+                    Color32::from_white_alpha((80.0 * hot * vis) as u8),
+                ),
+                StrokeKind::Inside,
+            );
+        }
+        let g = (255.0 * (1.0 - hot)) as u8;
+        painter.text(
+            b.center(),
+            Align2::CENTER_CENTER,
+            *label,
+            FontId::proportional(15.0 * s),
+            Color32::from_rgb(g, g, g).gamma_multiply(vis),
+        );
+    }
+    act
+}
+
 #[derive(Clone, Copy)]
 enum TitleButton {
     Minimize,
-    Maximize,
-    Restore,
+    Fullscreen,
+    FullscreenExit,
     Close,
 }
 
@@ -4671,30 +5502,22 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton, scale: f32) -> egui::Respo
                 Stroke::new(2.5 * s, color),
             );
         }
-        TitleButton::Maximize => {
-            painter.rect_stroke(
-                Rect::from_center_size(c, Vec2::splat(14.0 * s)),
-                CornerRadius::ZERO,
-                glyph,
-                StrokeKind::Inside,
-            );
-        }
-        TitleButton::Restore => {
-            painter.rect_stroke(
-                Rect::from_center_size(
-                    c + egui::vec2(2.5 * s, -2.5 * s),
-                    Vec2::splat(12.0 * s),
-                ),
-                CornerRadius::ZERO,
-                glyph,
-                StrokeKind::Inside,
-            );
-            let front = Rect::from_center_size(
-                c + egui::vec2(-2.5 * s, 2.5 * s),
-                Vec2::splat(12.0 * s),
-            );
-            painter.rect_filled(front, CornerRadius::ZERO, Color32::BLACK);
-            painter.rect_stroke(front, CornerRadius::ZERO, glyph, StrokeKind::Inside);
+        // Big-picture mode icon: four corner brackets. Enter draws
+        // them hugging the glyph's outer box with arms running along
+        // the edges toward the middle (expand); exit draws the elbows
+        // near the center with arms pointing back out (collapse).
+        TitleButton::Fullscreen | TitleButton::FullscreenExit => {
+            let exit = matches!(kind, TitleButton::FullscreenExit);
+            let elbow = if exit { 2.5 * s } else { 7.0 * s };
+            let dir = if exit { 1.0 } else { -1.0 };
+            let arm = 4.5 * s;
+            for sx in [-1.0f32, 1.0] {
+                for sy in [-1.0f32, 1.0] {
+                    let p = c + egui::vec2(sx * elbow, sy * elbow);
+                    painter.line_segment([p, p + egui::vec2(dir * sx * arm, 0.0)], glyph);
+                    painter.line_segment([p, p + egui::vec2(0.0, dir * sy * arm)], glyph);
+                }
+            }
         }
         TitleButton::Close => {
             painter.line_segment(

@@ -5,10 +5,10 @@
 //! Two specs share the machinery:
 //! - `ui` — the 35px top-right pill, expands *leftward* from its
 //!   right-docked anchor.
-//! - `ui_band` — a bigger pill docked in the media-buttons band. Its
-//!   collapsed face is just the magnifier (no button chrome); hovering
-//!   fades the icon out (a slightly bigger one fades in with the box)
-//!   while the box expands *rightward* from the icon.
+//! - `ui_band` — a bigger pill docked in the media-buttons band;
+//!   hovering swells the icon into the box's magnifier while the box
+//!   expands *rightward* from it. Both collapse to a bordered circle
+//!   around the icon.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
@@ -46,14 +46,16 @@ const PILL: Spec = Spec {
 
 const BAND: Spec = Spec {
     // w_min == h: the shrunken border is a perfect circle around the
-    // collapsed icon — 60px matches the band's other button glyphs.
-    w_min: 60.0,
+    // collapsed icon — 50px tracks the album-toggle's glyph mass
+    // (its bar + square span ~73 of the 100-unit canvas ≈ 44px of
+    // the 60px slot) so both read the same visual height.
+    w_min: 50.0,
     w_max: 300.0,
-    h: 60.0,
-    radius: 30.0,
+    h: 50.0,
+    radius: 25.0,
     font: 15.0,
-    icon_d: 28.0,
-    icon_left: 16.0,
+    icon_d: 25.0,
+    icon_left: 12.5,
     text_gap: 11.0,
     grow_right: true,
 };
@@ -64,9 +66,43 @@ pub struct SearchPill {
     /// Last frame's open state — drives the width animation.
     expanded: bool,
     focused: bool,
+    /// `open` requested the field — focuses the TextEdit as soon as
+    /// it exists (it's only created while the pill is expanding).
+    want_focus: bool,
+    edit_id: Option<egui::Id>,
 }
 
 impl SearchPill {
+    /// Ctrl+F: expand the pill and focus its text field once it
+    /// exists.
+    pub fn open(&mut self) {
+        self.expanded = true;
+        self.want_focus = true;
+    }
+
+    /// Visibly open (or about to be) — Esc should close this rather
+    /// than navigating back or leaving fullscreen.
+    pub fn is_open(&self) -> bool {
+        self.expanded || self.focused || self.want_focus
+    }
+
+    /// A Ctrl+F focus request is still in flight — the stray-focus
+    /// clearing must not steal it before the edit widget exists.
+    pub fn wants_focus(&self) -> bool {
+        self.want_focus
+    }
+
+    /// Esc on an open pill: clear, defocus, collapse.
+    pub fn close(&mut self, ctx: &egui::Context) {
+        self.text.clear();
+        self.expanded = false;
+        self.focused = false;
+        self.want_focus = false;
+        if let Some(id) = self.edit_id.take() {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
+
     /// `right`/`top` anchor the pill's top-right corner (Lacrima docks
     /// it HorizontalAlignment=Right Margin 0,15,30,0). `active` fades
     /// the pill in/out; `forced_open` keeps it expanded regardless of
@@ -91,6 +127,7 @@ impl SearchPill {
         if avail < 0.01 {
             self.focused = false;
             self.expanded = false;
+            self.want_focus = false;
             return;
         }
         let alpha = alpha * avail;
@@ -127,6 +164,7 @@ impl SearchPill {
         if avail < 0.01 {
             self.focused = false;
             self.expanded = false;
+            self.want_focus = false;
             return;
         }
         let alpha = alpha * avail;
@@ -167,7 +205,11 @@ impl SearchPill {
             .input(|i| i.pointer.latest_pos())
             .is_some_and(|p| rect.contains(p));
         self.expanded = interactive
-            && (hovered || self.focused || forced_open || !self.text.is_empty());
+            && (hovered
+                || self.focused
+                || forced_open
+                || self.want_focus
+                || !self.text.is_empty());
         if hovered && !self.expanded {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -193,11 +235,11 @@ impl SearchPill {
             r,
             Color32::from_black_alpha((0xAA as f32 * t * alpha) as u8),
         );
-        // Border: the band pill keeps it while collapsed — shrunk to
-        // w_min==h it reads as a stroked circle around the icon, same
-        // weight/finish as the album-toggle's outlined square. The
-        // top-right pill's collapsed face is a bare icon, so its
-        // border only fades in with the box.
+        // Border: always drawn — shrunk to w_min==h it reads as a
+        // stroked circle around the collapsed icon (same treatment as
+        // the band pill and its album-toggle sibling). The top-right
+        // ring is proportionally lighter and eases to its thin open
+        // border as the box grows.
         if spec.grow_right {
             painter.rect_stroke(
                 rect,
@@ -209,12 +251,18 @@ impl SearchPill {
                 StrokeKind::Inside,
             );
         } else {
+            // Collapsed face sits dimmed — ~50% — brightening to full
+            // as the box opens.
+            let dim = 0.5 + 0.5 * t;
             painter.rect_stroke(
                 rect,
                 r,
                 Stroke::new(
-                    1.0,
-                    Color32::from_white_alpha((0x44 as f32 * t * alpha) as u8),
+                    (2.5 - 1.5 * t) * s,
+                    Color32::from_white_alpha(
+                        ((0xB0 as f32 - (0xB0 - 0x44) as f32 * t) * alpha * dim)
+                            as u8,
+                    ),
                 ),
                 StrokeKind::Inside,
             );
@@ -240,7 +288,9 @@ impl SearchPill {
                 painter,
                 ic,
                 k,
-                Color32::from_white_alpha((0xCC as f32 * alpha) as u8),
+                Color32::from_white_alpha(
+                    (0xCC as f32 * alpha * (0.5 + 0.5 * t)) as u8,
+                ),
             );
         }
 
@@ -298,6 +348,14 @@ impl SearchPill {
                         .hint_text(hint)
                         .frame(egui::Frame::NONE),
                 );
+                self.edit_id = Some(edit.id);
+                if self.want_focus {
+                    if edit.has_focus() {
+                        self.want_focus = false;
+                    } else {
+                        ui.ctx().memory_mut(|m| m.request_focus(edit.id));
+                    }
+                }
                 self.focused = edit.has_focus();
             });
             self.text = text;

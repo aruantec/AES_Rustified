@@ -57,12 +57,17 @@ impl PlayerState {
 
 enum Cmd {
     Load(Source),
+    /// Wake a decoder parked at track end — the position itself is in
+    /// `Shared::seek`; the command just restarts the last source so
+    /// it gets applied (Repeat One / seek-after-finish).
+    Seek,
     Stop,
     Quit,
 }
 
 /// What the decoder reads — a local file or a remote stream URL
 /// (yt-dlp-resolved googlevideo links, which honor Range requests).
+#[derive(Clone)]
 enum Source {
     File(PathBuf),
     /// Resolved media url + the stable item key (page url) that
@@ -119,6 +124,10 @@ struct Shared {
     pos_base: AtomicU64,
     pos_consumed: AtomicU64,
     duration: AtomicU64, // f64 bits, seconds
+    /// The decoder reached the source's end — the ring may still hold
+    /// seconds of undrained PCM. The output callback flips Finished
+    /// only once that tail has actually played out.
+    eof: AtomicBool,
 }
 
 /// Lacrima's `ReplayGainOptions` — a snapshot of the Audio-tab
@@ -202,6 +211,7 @@ impl AudioPlayer {
             pos_base: AtomicU64::new(0),
             pos_consumed: AtomicU64::new(0),
             duration: AtomicU64::new(0),
+            eof: AtomicBool::new(false),
         });
 
         // ~4s of stereo PCM — network streams (HttpSource reads) stall
@@ -273,11 +283,20 @@ impl AudioPlayer {
                             (l, r)
                         }
                         _ => {
-                            // Underrun mid-playback — re-arm the preroll
-                            // gate so the stream re-buffers like a
-                            // video player instead of stuttering in
-                            // and out on every hiccup.
-                            if cb_shared.state.load(Ordering::Relaxed) == STATE_PLAY {
+                            let st = cb_shared.state.load(Ordering::Relaxed);
+                            if cb_shared.eof.load(Ordering::Relaxed) {
+                                // The decoder ended and the ring just
+                                // played its last sample — this is the
+                                // audible track end (MediaEnded), not
+                                // an underrun.
+                                if st == STATE_PLAY {
+                                    cb_shared.state.store(STATE_FIN, Ordering::Relaxed);
+                                }
+                            } else if st == STATE_PLAY {
+                                // Underrun mid-playback — re-arm the
+                                // preroll gate so the stream re-buffers
+                                // like a video player instead of
+                                // stuttering in and out on every hiccup.
                                 cb_shared.buffering.store(true, Ordering::Relaxed);
                             }
                             (0.0, 0.0)
@@ -317,6 +336,8 @@ impl AudioPlayer {
 
     /// Open a file and start playing it.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.shared.eof.store(false, Ordering::Relaxed);
+        *self.shared.seek.lock().unwrap() = None;
         self.shared.buffering.store(false, Ordering::Relaxed);
         // The new source's ReplayGain is computed by the decode thread;
         // clear the previous track's adjustment so it never leaks in.
@@ -332,6 +353,8 @@ impl AudioPlayer {
     /// The output stays muted until the decode thread fills the preroll
     /// window.
     pub fn open_stream(&self, url: &str, key: &str) -> Result<()> {
+        self.shared.eof.store(false, Ordering::Relaxed);
+        *self.shared.seek.lock().unwrap() = None;
         self.shared.buffering.store(true, Ordering::Relaxed);
         self.shared.rg_db.store(0f32.to_bits(), Ordering::Relaxed);
         self.shared.state.store(STATE_PLAY, Ordering::Relaxed);
@@ -382,6 +405,7 @@ impl AudioPlayer {
 
     /// Stop playback and rewind. The decode thread idles until `open`.
     pub fn stop(&self) {
+        self.shared.eof.store(false, Ordering::Relaxed);
         self.shared.state.store(STATE_STOP, Ordering::Relaxed);
         self.shared.pos_base.store(0, Ordering::Relaxed);
         self.shared.pos_consumed.store(0, Ordering::Relaxed);
@@ -398,14 +422,27 @@ impl AudioPlayer {
         let _ = self.tx.send(Cmd::Stop);
     }
 
-    /// Seek to `seconds` within the current track.
+    /// Seek to `seconds` within the current track. Also wakes a
+    /// decoder parked at track end — Repeat One and seek-after-finish
+    /// restart the last source and apply the position.
     pub fn seek(&self, seconds: f64) {
         *self.shared.seek.lock().unwrap() = Some(seconds.max(0.0));
+        // A seek is a restart intent — the parked-decoder path clears
+        // eof via the reload; clearing here keeps the output callback
+        // from re-flagging Finished in the gap.
+        self.shared.eof.store(false, Ordering::Relaxed);
         self.shared.state.store(STATE_PLAY, Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::Seek);
     }
 
     pub fn state(&self) -> PlayerState {
         PlayerState::from_u8(self.shared.state.load(Ordering::Relaxed))
+    }
+
+    /// Stream preroll gate — true between `open_stream` and the first
+    /// ~1.5s of decoded PCM reaching the ring buffer.
+    pub fn buffering(&self) -> bool {
+        self.shared.buffering.load(Ordering::Relaxed)
     }
 
     pub fn position(&self) -> Duration {
@@ -521,27 +558,43 @@ fn decode_thread(
     out_rate: u32,
 ) {
     let mut pending: Option<Source> = None;
+    /// Last decoded source — a Seek while parked replays it (Repeat
+    /// One, seek-after-finish) since the seek position lives in
+    /// `Shared::seek` and gets applied by `run_decoder`.
+    let mut last: Option<Source> = None;
     loop {
         // Idle until a track arrives.
-        if pending.is_none() {
+        while pending.is_none() {
             match rx.recv() {
                 Ok(Cmd::Load(s)) => pending = Some(s),
-                _ => return,
+                Ok(Cmd::Seek) => pending = last.clone(),
+                // Stop while parked just leaves the thread waiting —
+                // exiting here would kill every later open().
+                Ok(Cmd::Stop) => {}
+                Ok(Cmd::Quit) | Err(_) => return,
             }
         }
         let src = pending.take().unwrap();
+        last = Some(src.clone());
         match decode_source(src, &rx, &shared, &mut prod, out_rate) {
             DecodeEnd::Eof => {
                 // A stream shorter than the preroll still plays what
                 // arrived — ungate the output.
                 shared.buffering.store(false, Ordering::Relaxed);
-                shared.state.store(STATE_FIN, Ordering::Relaxed);
+                // Don't flag Finished yet — the ring may still hold
+                // seconds of PCM. The output callback flips it once
+                // the last sample drains, so repeat/advance fires at
+                // the audible end.
+                shared.eof.store(true, Ordering::Relaxed);
             }
             DecodeEnd::Stopped => {}
             DecodeEnd::Reload(s) => pending = Some(s),
             DecodeEnd::Quit => return,
         }
-        if pending.is_none() && shared.state.load(Ordering::Relaxed) != STATE_FIN {
+        if pending.is_none()
+            && shared.state.load(Ordering::Relaxed) != STATE_FIN
+            && !shared.eof.load(Ordering::Relaxed)
+        {
             shared.state.store(STATE_STOP, Ordering::Relaxed);
         }
     }
@@ -603,6 +656,7 @@ fn run_decoder(
     shared.duration.store(duration.to_bits(), Ordering::Relaxed);
     shared.pos_base.store(0, Ordering::Relaxed);
     shared.pos_consumed.store(0, Ordering::Relaxed);
+    shared.eof.store(false, Ordering::Relaxed);
     shared.flush_seq.fetch_add(1, Ordering::Relaxed);
 
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
@@ -615,7 +669,9 @@ fn run_decoder(
         match rx.try_recv() {
             Ok(Cmd::Stop) | Ok(Cmd::Quit) => return Ok(DecodeEnd::Stopped),
             Ok(Cmd::Load(p)) => return Ok(DecodeEnd::Reload(p)),
-            Err(mpsc::TryRecvError::Empty) => {}
+            // Seek rides the `Shared::seek` mutex — consumed just
+            // below; the command itself needs no action mid-decode.
+            Ok(Cmd::Seek) | Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => return Ok(DecodeEnd::Quit),
         }
         if let Some(t) = shared.seek.lock().unwrap().take() {
@@ -781,6 +837,9 @@ fn push_samples(
         i += n;
         if n == 0 {
             match rx.try_recv() {
+                // A seek while the ring is full isn't an interrupt —
+                // the decode loop applies the position next pass.
+                Ok(Cmd::Seek) => std::thread::sleep(Duration::from_millis(1)),
                 Ok(cmd) => return Some(cmd),
                 Err(mpsc::TryRecvError::Disconnected) => return Some(Cmd::Quit),
                 Err(mpsc::TryRecvError::Empty) => {

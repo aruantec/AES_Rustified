@@ -49,8 +49,10 @@ impl Default for Window {
     }
 }
 
-/// Clock rect stored as an offset from the top-left of the content area
-/// (the region below the title bar), so it survives window resizes.
+/// Clock rect stored as fractions of the content area (the region
+/// below the title bar), so it restores proportionally at any window
+/// size. Values outside 0..=1.5 are treated as legacy absolute-unit
+/// saves and fall back to the default layout.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Clock {
@@ -101,9 +103,10 @@ impl Default for Effects {
     }
 }
 
-/// Player turntable widget rect — same offset semantics as `Clock`;
-/// negative `left` means "not placed yet" so the widget computes the
-/// Lacrima default (disc centered on the ShaderToy origin).
+/// Player turntable widget rect — same fractional semantics as
+/// `Clock`; negative `left` means "not placed yet" so the widget
+/// computes the Lacrima default (disc centered on the ShaderToy
+/// origin).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Player {
@@ -316,6 +319,9 @@ pub struct Audio {
     /// spectral-subtraction denoiser for the broadband shimmer neural
     /// codecs leave in AI-generated tracks.
     pub ai_noise_reduction: bool,
+    /// VolumeKnobColor (Rustified-only): accent color of the volume
+    /// knob's level arc in the transport band.
+    pub volume_knob_color: [u8; 3],
 }
 
 impl Default for Audio {
@@ -336,6 +342,7 @@ impl Default for Audio {
             pause_when_volume_is_zero: false,
             silence_advance_delay_ms: 500,
             ai_noise_reduction: false,
+            volume_knob_color: [0x3F, 0xD8, 0xE8],
         }
     }
 }

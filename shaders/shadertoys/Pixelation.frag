@@ -47,6 +47,9 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
     // Subtle additive bloom for the active equalizer blocks
     finalColor += baseColor * isFired * 0.2 * mask * randPulse;
 
+    // Dark band at the bottom so the transport buttons stay readable
+    finalColor *= mix(0.07, 1.0, pow(smoothstep(0.0, 0.32, uv.y), 1.6));
+
     // Final output respecting u_fade property [cite: 2025-12-22]
     fragColor = vec4(finalColor * u_fade, 1.0);
 }

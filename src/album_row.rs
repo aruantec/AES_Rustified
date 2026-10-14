@@ -244,8 +244,18 @@ pub struct AlbumRow {
     /// `edit_album` sets it so a freshly created/renamed tile is
     /// visible before the user types.
     pending_reveal: Option<String>,
+    /// Last frame's view rect + tile metrics — arrow-key navigation
+    /// glides the target tile into view between paints.
+    nav_view: Option<(Rect, Metrics)>,
+    /// Brief focus flash (1→0) on Tab focus-in — a fading border
+    /// around the strip so the user sees where the keys now land.
+    focus_flash: f32,
+    /// Held lift (0→1) while Shift is down — the selected tiles
+    /// float slightly to signal they can be reordered with arrows.
+    pop: f32,
 }
 
+#[derive(Clone)]
 struct Metrics {
     tile_w: f32,
     tile_h: f32,
@@ -329,6 +339,9 @@ impl AlbumRow {
             edit_text: String::new(),
             edit_armed: false,
             pending_reveal: None,
+            nav_view: None,
+            focus_flash: 0.0,
+            pop: 0.0,
         }
     }
 
@@ -829,11 +842,35 @@ impl AlbumRow {
         interactive: bool,
         scale: f32,
         scanning: bool,
+        reorder_armed: bool,
     ) -> Action {
         let mut action = Action::None;
         self.scale = scale;
         let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+        // Shift held = reorder armed — the selected tiles lift
+        // slightly to signal they can be moved. A tile press that
+        // could become a drag arms it the same way (the press
+        // selects on down, so the cue lands on the grabbed tile).
+        // Eases in fast, settles on release.
+        let press_armed =
+            matches!(&self.drag, Some(d) if !d.has_moved && d.commit.is_none());
+        let lift_target = if (reorder_armed
+            && !albums.is_empty()
+            && self.selected >= 0)
+            || press_armed
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let rate = dt / if lift_target > self.pop { 0.12 } else { 0.18 };
+        self.pop =
+            (self.pop + (lift_target - self.pop).clamp(-rate, rate)).clamp(0.0, 1.0);
+        if self.pop > 0.0 {
+            ui.ctx().request_repaint();
+        }
         let m = self.metrics(rect, albums.len());
+        self.nav_view = Some((rect, m.clone()));
         if self.fans.len() != albums.len() {
             self.fans = (0..albums.len())
                 .map(|_| Fan {
@@ -1204,7 +1241,14 @@ impl AlbumRow {
             .clamp(0.0, 1.0);
 
         // --- Draw ----------------------------------------------------
-        let painter = ui.painter().with_clip_rect(rect);
+        // Lifted tiles (Shift reorder cue / drags) poke a few px
+        // above the strip — give the clip that headroom so the
+        // float isn't sliced off at the top edge.
+        let clip = Rect::from_min_max(
+            rect.min - Vec2::new(0.0, 18.0 * s),
+            rect.max,
+        );
+        let painter = ui.painter().with_clip_rect(clip);
         painter.rect_filled(rect, 0.0, ROW_BG.gamma_multiply(alpha));
 
         if albums.is_empty() {
@@ -1422,6 +1466,27 @@ impl AlbumRow {
             painter.rect_filled(thumb, 4.0 * s, Color32::WHITE.gamma_multiply(0.7 * a));
         }
 
+        // Tab focus-in flash — a soft border around the strip that
+        // eases out over ~0.9s, marking where the keys now land.
+        if self.focus_flash > 0.0 {
+            self.focus_flash = (self.focus_flash - dt / 0.9).max(0.0);
+            let f = self.focus_flash * self.focus_flash * alpha;
+            let fr = rect.shrink(2.0 * s);
+            painter.rect_stroke(
+                fr,
+                8.0 * s,
+                Stroke::new(6.0 * s, Color32::WHITE.gamma_multiply(0.10 * f)),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                fr,
+                8.0 * s,
+                Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(0.55 * f)),
+                egui::StrokeKind::Inside,
+            );
+            ui.ctx().request_repaint();
+        }
+
         if interactive {
             resp.context_menu(|ui| self.context_menu(ui, &mut action, albums));
         }
@@ -1446,6 +1511,122 @@ impl AlbumRow {
         }
     }
 
+    /// Arrow-key navigation (ListBox directional nav on a horizontal
+    /// strip — every arrow steps ±1): collapse the selection to the
+    /// neighbor tile and glide it into view.
+    pub fn arrow(&mut self, albums: &[Album], dir: i32) {
+        if albums.is_empty() {
+            return;
+        }
+        let n = albums.len() as i32;
+        // No selection yet: the first arrow enters at an edge.
+        let base = if self.selected >= 0 {
+            self.selected
+        } else if dir > 0 {
+            -1
+        } else {
+            n
+        };
+        let new = (base + dir).clamp(0, n - 1);
+        if new == self.selected && !self.sel_dirs.is_empty() {
+            return;
+        }
+        self.selected = new;
+        let dir_key = albums[new as usize].dir.to_string_lossy().into_owned();
+        self.sel_dirs.clear();
+        self.sel_dirs.insert(dir_key.clone());
+        self.sel_anchor = dir_key;
+        self.sel_touched = true;
+        self.scroll_tile_into_view(new);
+    }
+
+    /// Tab focus-in — ensure a selection exists (first tile when none)
+    /// and reveal it.
+    pub fn focus(&mut self, albums: &[Album]) {
+        if albums.is_empty() {
+            return;
+        }
+        if self.selected < 0 {
+            self.selected = 0;
+            let dir = albums[0].dir.to_string_lossy().into_owned();
+            self.sel_dirs.insert(dir.clone());
+            self.sel_anchor = dir;
+        }
+        self.sel_touched = true;
+        self.focus_flash = 1.0;
+        self.scroll_tile_into_view(self.selected);
+    }
+
+    /// Shift+arrow — move the selection one step along the strip
+    /// (the drag-reorder's keyboard twin: the selection moves as a
+    /// contiguous run, `note_reorder` keeps fans/selection aligned).
+    pub fn move_selection(&mut self, albums: &mut Vec<Album>, dir: i32) {
+        let count = albums.len();
+        if dir == 0 || count < 2 || self.selected < 0 {
+            return;
+        }
+        // Selected tile indices (dir-keyed selection → positions).
+        let indices: Vec<usize> = if self.sel_dirs.is_empty() {
+            vec![self.selected as usize]
+        } else {
+            albums
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| self.sel_dirs.contains(a.dir.to_string_lossy().as_ref()))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if indices.is_empty() {
+            return;
+        }
+        let k = indices.len();
+        let bs = (indices[0] as i32 + dir)
+            .clamp(0, count as i32 - k as i32) as usize;
+        if indices
+            .iter()
+            .enumerate()
+            .all(|(j, &i)| i == bs + j)
+        {
+            return;
+        }
+        let pr = indices
+            .iter()
+            .position(|&i| i == self.selected as usize)
+            .unwrap_or(0);
+        let mut pulled: Vec<Album> = Vec::with_capacity(k);
+        for &i in indices.iter().rev() {
+            pulled.push(albums.remove(i));
+        }
+        pulled.reverse();
+        for (j, a) in pulled.into_iter().enumerate() {
+            albums.insert(bs + j, a);
+        }
+        self.note_reorder(&indices, bs, pr);
+        self.order_dirty = true;
+        self.scroll_tile_into_view(self.selected);
+    }
+
+    /// Spring the strip just enough for tile `index` to be fully
+    /// visible (same math as pending_reveal, eased via target_scroll
+    /// instead of snapping).
+    fn scroll_tile_into_view(&mut self, index: i32) {
+        if let Some((rect, m)) = self.nav_view.clone() {
+            let stride = m.tile_w + SPACING * self.scale;
+            let pad = PAD_X * self.scale;
+            let x0 = pad + index as f32 * stride;
+            let x1 = x0 + m.tile_w;
+            let w = rect.width();
+            let target = if x0 < self.target_scroll {
+                x0 - pad
+            } else if x1 > self.target_scroll + w {
+                x1 + pad - w
+            } else {
+                self.target_scroll
+            };
+            self.target_scroll = target.clamp(0.0, m.max_scroll);
+        }
+    }
+
     /// Ctrl+A — every listed album selected (keyed by dir, like the
     /// click gestures, so filtering/reordering can't shift members).
     pub fn select_all(&mut self, albums: &[Album]) {
@@ -1460,6 +1641,12 @@ impl AlbumRow {
         if !self.sel_dirs.is_empty() {
             self.sel_touched = true;
         }
+    }
+
+    /// The primary selection's index — Enter opens it like a
+    /// double-click.
+    pub fn selected_index(&self) -> Option<usize> {
+        (self.selected >= 0).then_some(self.selected as usize)
     }
 
     /// A user selection gesture happened since the last check — the
@@ -1558,16 +1745,31 @@ impl AlbumRow {
         } else {
             let lift = self.hover_lift.get(&index).copied().unwrap_or((0.0, 0.0)).0;
             let eased = 1.0 - (1.0 - lift).powi(3);
+            // Shift held — the selected tiles float slightly off the
+            // strip, signaling they can be reordered with arrows.
+            let pe = if is_selected { self.pop } else { 0.0 };
             (
-                base.center(),
-                if is_selected {
+                base.center() + Vec2::new(0.0, -4.0 * pe * self.scale),
+                (if is_selected {
                     1.0 + SELECT_LIFT * fade
                 } else {
                     1.0 + HOVER_LIFT * eased
-                },
+                }) * (1.0 + 0.06 * pe),
             )
         };
         let tile = Rect::from_center_size(center, base.size() * scale);
+        let pe = if is_selected && placement.is_none() {
+            self.pop
+        } else {
+            0.0
+        };
+        if pe > 0.001 {
+            painter.rect_filled(
+                tile.translate(Vec2::new(0.0, 8.0 * self.scale)),
+                TILE_RADIUS * self.scale,
+                Color32::BLACK.gamma_multiply(0.3 * pe * alpha),
+            );
+        }
 
         painter.rect_filled(tile, TILE_RADIUS * self.scale, TILE_BG.gamma_multiply(alpha));
         painter.rect_stroke(

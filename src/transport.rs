@@ -20,22 +20,19 @@ const CENTER_SPACING: f32 = 30.0;
 const RIGHT_SPACING: f32 = 50.0;
 const BTN: f32 = 60.0;
 const PLAY_BTN: f32 = 100.0;
-const VOLUME_W: f32 = 52.0;
-const VOLUME_H: f32 = 100.0;
+const KNOB_D: f32 = 100.0;
 
 const WHITE: Color32 = Color32::WHITE;
 const LIT: Color32 = Color32::from_rgb(0xF0, 0xF0, 0xF0);
 const DIM: Color32 = Color32::from_rgb(0x69, 0x69, 0x69);
 
-// Volume pill (VerticalVolumeSliderControl).
-const VOL_TRACK_W: f32 = 46.0;
-const VOL_TRACK_R: f32 = 23.0;
-const VOL_INNER_PAD: f32 = 3.0;
-const VOL_ICON_ZONE: f32 = 36.0;
-const VOL_OUTLINE: Color32 = Color32::from_rgb(70, 72, 80);
-const VOL_EMPTY: Color32 = Color32::from_rgb(115, 117, 125);
-const VOL_ICON: Color32 = Color32::from_rgb(80, 82, 90); // IconBrush a=200 applied at draw
-const VOL_ICON_A: f32 = 200.0 / 255.0;
+// Volume knob: rotary dial — cyan level arc over a 270° sweep with a
+// dead zone at the bottom (screen coords: 0° = right, 90° = down).
+const KNOB_START: f32 = 135.0;
+const KNOB_SWEEP: f32 = 270.0;
+const KNOB_RING: Color32 = Color32::from_rgb(0x15, 0x17, 0x1B);
+const KNOB_RING_EDGE: Color32 = Color32::from_rgb(0x2B, 0x2E, 0x33);
+const KNOB_TRACK: Color32 = Color32::from_rgb(0x28, 0x2C, 0x31);
 
 /// Button press bounce: deflate then re-inflate along a sine lobe so a
 /// quick click still completes the whole squash, not just the press.
@@ -77,6 +74,24 @@ pub struct Transport {
     bounce: HashMap<egui::Id, Instant>,
     /// Whether each button was down last frame (press-edge detect).
     pressed: HashMap<egui::Id, bool>,
+    /// Volume knob relative-drag anchor: (volume, pointer angle deg)
+    /// at grab time, so turning can't jump across the dead zone.
+    vol_drag: Option<(f32, f32)>,
+    /// Whether the current press started on the knob's cap — only
+    /// those clicks toggle mute (ring presses just turn it).
+    cap_press: bool,
+    /// Where the cap press began — a release near it counts as a
+    /// click even when egui's tiny drag threshold already tripped.
+    cap_origin: Option<Pos2>,
+    /// Total pointer rotation accumulated during the current press —
+    /// a click requires ~zero travel; any real turn disqualifies it
+    /// even if the release lands back at the grab point.
+    drag_travel: f32,
+    /// Cap currently held down — drives the squash animation.
+    cap_down: bool,
+    /// Volume captured when muted by a cap click — restored on the
+    /// next click. `Some` doubles as the muted flag for drawing.
+    muted_vol: Option<f32>,
 }
 
 impl Transport {
@@ -94,6 +109,7 @@ impl Transport {
         player: Option<&AudioPlayer>,
         alpha: f32,
         interactive: bool,
+        accent: Color32,
         s: f32,
     ) -> Step {
         let mut step = Step::None;
@@ -126,10 +142,10 @@ impl Transport {
             Pos2::new(left.max.x + RIGHT_SPACING * s + BTN * 0.5 * s, cy),
             Vec2::splat(BTN * s),
         );
-        // Nudge down a few px: the toggle's glyph mass (top bar +
+        // Nudge down a couple px: the toggle's glyph mass (top bar +
         // square) centers slightly below the slot center, and the
         // magnifier reads high beside it otherwise.
-        self.search_icon = Pos2::new(search.center().x, cy + 4.0 * s);
+        self.search_icon = Pos2::new(search.center().x, cy + 1.5 * s);
 
         // --- Center: stop / prev / play / next / repeat ---------------
         let widths = [BTN, BTN, PLAY_BTN, BTN, BTN];
@@ -199,13 +215,13 @@ impl Transport {
         icon_repeat(ui.painter(), ic, self.repeat, alpha);
 
         // --- Right: cover layout / equalizer / volume -----------------
-        let vol_w = VOLUME_W * s;
+        let vol_w = KNOB_D * s;
         let vol_rect = Rect::from_min_size(
             Pos2::new(
                 rect.max.x - SIDE_MARGIN * s - vol_w,
-                cy - VOLUME_H * 0.5 * s,
+                cy - KNOB_D * 0.5 * s,
             ),
-            Vec2::new(vol_w, VOLUME_H * s),
+            Vec2::new(vol_w, KNOB_D * s),
         );
         let eq = Rect::from_center_size(
             Pos2::new(vol_rect.min.x - RIGHT_SPACING * s - BTN * 0.5 * s, cy),
@@ -232,7 +248,7 @@ impl Transport {
         let ic = scaled(eq, self.press_scale(ui, &r));
         icon_eq(ui.painter(), ic, self.equalizer_open, alpha);
 
-        self.volume(ui, vol_rect, player, alpha, interactive, s);
+        self.volume(ui, vol_rect, player, alpha, interactive, accent, s);
         step
     }
 
@@ -264,9 +280,10 @@ impl Transport {
         }
     }
 
-    /// VerticalVolumeSliderControl: 46px pill, gray empty portion over
-    /// white fill rising from the bottom, speaker glyph at the base.
-    /// Drag sets volume; wheel nudges by 5%.
+    /// Rotary volume knob: dark ring with a cyan level arc sweeping
+    /// 270° (dead zone at the bottom), a conical metal cap built as a
+    /// vertex-shaded fan, and a cyan pip marking the position. Drag
+    /// rotates to the pointer angle; wheel nudges by 5%.
     fn volume(
         &mut self,
         ui: &mut egui::Ui,
@@ -274,152 +291,230 @@ impl Transport {
         player: Option<&AudioPlayer>,
         alpha: f32,
         interactive: bool,
+        accent: Color32,
         s: f32,
     ) {
+        // Slow breathing pulse on the level arc — ~4.5s cycle. The
+        // core stays near-full while the halo swings wide, so the
+        // neon visibly blooms and settles.
+        let wave = (ui.ctx().input(|i| i.time) as f32 * 1.4).sin();
+        ui.ctx().request_repaint();
+        let pulse = 0.72 + 0.28 * wave;
+        let accent = accent.gamma_multiply(pulse);
+        let c = rect.center();
+        let r = rect.height() * 0.5;
+        let cap_r = r * 0.66;
         let mut vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
         if interactive {
             let resp = ui.interact(rect, ui.id().with("t-vol"), Sense::click_and_drag());
-            if resp.is_pointer_button_down_on() {
-                if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-                    vol = ((rect.max.y - p.y) / rect.height()).clamp(0.0, 1.0);
+            // Cap press/release edges handled manually: egui's
+            // clicked() dies the moment drag_started fires (a couple
+            // px of jitter), which turns most cap clicks into tiny
+            // rotations. A release within 8px of the press point is a
+            // click — toggles mute; further than that was a turn.
+            let down = resp.is_pointer_button_down_on();
+            let was = self.pressed.insert(resp.id, down).unwrap_or(false);
+            let pos = resp
+                .interact_pointer_pos()
+                .or_else(|| ui.ctx().input(|i| i.pointer.interact_pos()));
+            if down && !was {
+                self.cap_press = pos.is_some_and(|p| p.distance(c) <= cap_r);
+                self.cap_origin = pos;
+                self.drag_travel = 0.0;
+            }
+            self.cap_down = down && self.cap_press;
+            // Release edge: a click needs ~zero pointer travel AND
+            // ~zero accumulated rotation — a turn that lands back
+            // near the grab point is still a turn, not a mute.
+            if !down && was {
+                let moved = pos
+                    .and_then(|p| self.cap_origin.map(|o| p.distance(o)))
+                    .unwrap_or(f32::MAX);
+                let clicked = moved < 8.0 * s && self.drag_travel < 15.0;
+                if clicked && self.cap_press {
+                    if let Some(prev) = self.muted_vol.take() {
+                        vol = prev;
+                    } else {
+                        self.muted_vol = Some(vol.max(0.05));
+                        vol = 0.0;
+                    }
+                    if let Some(p) = player {
+                        p.set_volume(vol);
+                    }
+                } else if clicked {
+                    // Ring click jumps the level to that angle
+                    // (dead zone clamps to the nearer end).
+                    if let Some(p0) = self.cap_origin {
+                        let a = (p0.y - c.y)
+                            .atan2(p0.x - c.x)
+                            .to_degrees()
+                            .rem_euclid(360.0);
+                        vol = if (45.0..KNOB_START).contains(&a) {
+                            if a < 90.0 { 1.0 } else { 0.0 }
+                        } else {
+                            ((if a < 45.0 { a + 360.0 } else { a }) - KNOB_START)
+                                .clamp(0.0, KNOB_SWEEP)
+                                / KNOB_SWEEP
+                        };
+                        self.muted_vol = None;
+                        if let Some(p) = player {
+                            p.set_volume(vol);
+                        }
+                    }
                 }
+                self.cap_press = false;
+                self.cap_origin = None;
+            }
+            // Relative rotary drag: the value accumulates per-frame
+            // angular deltas, so sweeping through the bottom dead
+            // zone just saturates at the nearer end — it can never
+            // jump max->min (or back).
+            if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                let a = (p.y - c.y).atan2(p.x - c.x).to_degrees().rem_euclid(360.0);
+                if resp.drag_started() {
+                    self.vol_drag = Some((vol, a));
+                }
+                if down {
+                    if let Some((v0, a0)) = self.vol_drag {
+                        let da = (a - a0 + 540.0).rem_euclid(360.0) - 180.0;
+                        vol = (v0 + da / KNOB_SWEEP).clamp(0.0, 1.0);
+                        self.vol_drag = Some((vol, a));
+                        self.drag_travel += da.abs();
+                        self.muted_vol = None;
+                    }
+                }
+            }
+            if !down {
+                self.vol_drag = None;
+                self.cap_press = false;
+                self.cap_down = false;
             }
             let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if resp.hovered() && scroll != 0.0 {
                 vol = (vol + scroll.signum() * 0.05).clamp(0.0, 1.0);
+                self.muted_vol = None;
             }
-            if let (Some(p), true) = (player, resp.is_pointer_button_down_on() || scroll != 0.0) {
+            if let (Some(p), true) = (player, down || scroll != 0.0) {
                 p.set_volume(vol);
             }
             hover_cursor(ui, &resp);
+        } else {
+            self.vol_drag = None;
+            self.cap_down = false;
         }
 
+        // Muted: the accent eases out to gray and the residual arc
+        // drains from the captured level — a visible power-down, not
+        // a snap. `draw_vol` renders the drain; `vol` stays 0 for
+        // logic while muted.
+        let muted = self.muted_vol.is_some();
+        let mute_t = ui
+            .ctx()
+            .animate_bool_with_time(ui.id().with("t-vol-mute"), muted, 0.3);
+        let accent = {
+            let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * mute_t) as u8;
+            Color32::from_rgb(
+                l(accent.r(), DIM.r()),
+                l(accent.g(), DIM.g()),
+                l(accent.b(), DIM.b()),
+            )
+        };
+        let draw_vol = if muted {
+            self.muted_vol.unwrap_or(0.0) * (1.0 - mute_t)
+        } else {
+            vol
+        };
+        // Cap squash while held — deflates ~10% with a quick ease.
+        let cap_t = ui
+            .ctx()
+            .animate_bool_with_time(ui.id().with("t-vol-cap"), self.cap_down, 0.12);
+        let cap_r = cap_r * (1.0 - 0.10 * cap_t);
         let painter = ui.painter();
-        let track_w = VOL_TRACK_W * s;
-        let pad = VOL_INNER_PAD * s;
-        let track = Rect::from_min_size(
-            Pos2::new(rect.center().x - track_w * 0.5, rect.min.y),
-            Vec2::new(track_w, rect.height()),
-        );
-        let outer_r = CornerRadius::same((VOL_TRACK_R * s).round() as u8);
-        painter.rect_stroke(
-            track,
-            outer_r,
-            Stroke::new(3.0 * s, VOL_OUTLINE.gamma_multiply(alpha)),
-            StrokeKind::Inside,
-        );
-        // Gray capsule is the track background; the white value fills
-        // upward from the bottom. Lacrima clips a square fill to the
-        // rounded track; egui only clips axis-aligned, so the fill is
-        // built as a convex polygon — straight sides down to the cap
-        // center, then the semicircular cap (or just the chord segment
-        // of it when the fill is shallower than the cap, which keeps
-        // low values curved instead of a squashed line).
-        let inner = track.shrink(pad);
-        let inner_r = (VOL_TRACK_R - VOL_INNER_PAD) * s;
-        painter.rect_filled(
-            inner,
-            CornerRadius::same(inner_r.round() as u8),
-            VOL_EMPTY.gamma_multiply(alpha),
-        );
-        let fill_top = inner.min.y + inner.height() * (1.0 - vol);
-        if fill_top <= inner.min.y {
-            // 100%: the fill is the whole capsule.
-            painter.rect_filled(
-                inner,
-                CornerRadius::same(inner_r.round() as u8),
-                WHITE.gamma_multiply(alpha),
-            );
-        } else if fill_top < inner.max.y {
-            // The fill is capsule ∩ {y >= fill_top} built as a convex
-            // polygon: a flat chord at the fill boundary (narrowed when
-            // it cuts through the top cap), the straight sides, and
-            // the sampled bottom-cap arc — or just the cap's chord
-            // segment when the fill is shallower than the cap.
-            let cx = inner.center().x;
-            let top_cy = inner.min.y + inner_r;
-            let bot_cy = inner.max.y - inner_r;
-            const N: usize = 12;
-            let mut pts = Vec::new();
-            if fill_top > bot_cy {
-                // Chord cut across the bottom cap: a0 = the arc angle
-                // at which y == fill_top.
-                let a0 = ((fill_top - bot_cy) / inner_r).clamp(0.0, 1.0).asin();
-                for i in 0..=N {
-                    let a = a0 + (std::f32::consts::PI - 2.0 * a0) * i as f32 / N as f32;
-                    pts.push(Pos2::new(cx + inner_r * a.cos(), bot_cy + inner_r * a.sin()));
-                }
-            } else if fill_top <= top_cy {
-                // Chord inside the top cap: boundary runs chord -> arc
-                // down the right of the top cap -> side -> bottom cap
-                // arc -> side -> arc up the left of the top cap.
-                let a0 = ((top_cy - fill_top) / inner_r).clamp(0.0, 1.0).asin();
-                pts.push(Pos2::new(cx + inner_r * a0.cos(), fill_top));
-                for i in 0..=N {
-                    let a = a0 * (1.0 - i as f32 / N as f32);
-                    pts.push(Pos2::new(
-                        cx + inner_r * a.cos(),
-                        top_cy - inner_r * a.sin(),
-                    ));
-                }
-                pts.push(Pos2::new(inner.max.x, bot_cy));
-                for i in 0..=N {
-                    let a = std::f32::consts::PI * i as f32 / N as f32;
-                    pts.push(Pos2::new(cx + inner_r * a.cos(), bot_cy + inner_r * a.sin()));
-                }
-                pts.push(Pos2::new(inner.min.x, top_cy));
-                for i in 0..=N {
-                    let a = a0 * i as f32 / N as f32;
-                    pts.push(Pos2::new(
-                        cx - inner_r * a.cos(),
-                        top_cy - inner_r * a.sin(),
-                    ));
-                }
-            } else {
-                pts.push(Pos2::new(inner.min.x, fill_top));
-                pts.push(Pos2::new(inner.max.x, fill_top));
-                for i in 0..=N {
-                    let a = std::f32::consts::PI * i as f32 / N as f32;
-                    pts.push(Pos2::new(cx + inner_r * a.cos(), bot_cy + inner_r * a.sin()));
-                }
-            }
-            painter.add(Shape::convex_polygon(
-                pts,
-                WHITE.gamma_multiply(alpha),
-                Stroke::NONE,
-            ));
-        }
-
-        // Speaker glyph (DrawSpeakerIcon) at the bottom icon zone.
-        let icon_c = Pos2::new(track.center().x, track.max.y - VOL_ICON_ZONE * 0.5 * s);
-        let (bw, bh, cone) = (6.0 * s, 8.0 * s, 4.5 * s);
-        painter.add(Shape::convex_polygon(
-            vec![
-                Pos2::new(icon_c.x - bw * 0.5 - cone, icon_c.y - bh * 0.3),
-                Pos2::new(icon_c.x - bw * 0.5, icon_c.y - bh * 0.5),
-                Pos2::new(icon_c.x + bw * 0.5, icon_c.y - bh * 0.5),
-                Pos2::new(icon_c.x + bw * 0.5, icon_c.y + bh * 0.5),
-                Pos2::new(icon_c.x - bw * 0.5, icon_c.y + bh * 0.5),
-                Pos2::new(icon_c.x - bw * 0.5 - cone, icon_c.y + bh * 0.3),
-            ],
-            VOL_ICON.gamma_multiply(alpha * VOL_ICON_A),
-            Stroke::NONE,
-        ));
-        for (r, a0, a1) in [(bh * 0.75, -50.0f32, 50.0f32), (bh * 1.25, -60.0, 60.0)] {
-            let pts: Vec<Pos2> = (0..=10)
+        let arc_r = r * 0.845;
+        let arc_w = 4.0 * s;
+        let arc = |a0: f32, a1: f32, radius: f32| -> Vec<Pos2> {
+            let n = ((a1 - a0).abs() / 4.0).ceil().max(1.0) as usize;
+            (0..=n)
                 .map(|i| {
-                    let a = (a0 + (a1 - a0) * i as f32 / 10.0).to_radians();
-                    Pos2::new(
-                        icon_c.x + bw * 0.5 + r * a.cos(),
-                        icon_c.y + r * a.sin(),
-                    )
+                    let a = (a0 + (a1 - a0) * i as f32 / n as f32).to_radians();
+                    Pos2::new(c.x + radius * a.cos(), c.y + radius * a.sin())
                 })
-                .collect();
+                .collect()
+        };
+
+        // Ring body + rim highlight.
+        painter.circle_filled(c, r, KNOB_RING.gamma_multiply(alpha));
+        painter.circle_stroke(
+            c,
+            r - 0.8 * s,
+            Stroke::new(1.6 * s, KNOB_RING_EDGE.gamma_multiply(alpha)),
+        );
+
+        // Level arc: full track, then the value over it with a soft
+        // halo underneath (fake bloom for the cyan).
+        painter.add(Shape::line(
+            arc(KNOB_START, KNOB_START + KNOB_SWEEP, arc_r),
+            Stroke::new(arc_w, KNOB_TRACK.gamma_multiply(alpha)),
+        ));
+        if draw_vol > 0.001 {
+            let pts = arc(KNOB_START, KNOB_START + draw_vol * KNOB_SWEEP, arc_r);
+            // Neon glow: stacked halo rings widening outward, each
+            // fainter than the last, under the solid core line. The
+            // halo alpha rides the pulse squared — it blooms twice as
+            // hard as the core dims.
+            let glow = pulse * pulse;
+            for (wk, ak) in [(6.0f32, 0.10), (3.6, 0.22), (2.0, 0.40)] {
+                painter.add(Shape::line(
+                    pts.clone(),
+                    Stroke::new(arc_w * wk, accent.gamma_multiply(alpha * ak * glow)),
+                ));
+            }
             painter.add(Shape::line(
                 pts,
-                Stroke::new(1.6 * s, VOL_ICON.gamma_multiply(alpha * VOL_ICON_A)),
+                Stroke::new(arc_w, accent.gamma_multiply(alpha)),
             ));
         }
+
+        // Conical metal cap: triangle fan whose rim brightness follows
+        // a cosine lobe peaking straight up — the brushed-knob look.
+        let n = 64;
+        let light = 270.0f32.to_radians();
+        // The cap dims toward gray while the mute fade runs.
+        let dim = 1.0 - 0.45 * mute_t;
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.colored_vertex(
+            c,
+            Color32::from_gray((0xE8 as f32 * dim) as u8).gamma_multiply(alpha),
+        );
+        for i in 0..=n {
+            let a = std::f32::consts::TAU * i as f32 / n as f32;
+            let t = 0.5 + 0.5 * (a - light).cos();
+            let g = ((96.0 + 150.0 * t.powf(1.2)) * dim) as u8;
+            mesh.colored_vertex(
+                Pos2::new(c.x + cap_r * a.cos(), c.y + cap_r * a.sin()),
+                Color32::from_gray(g).gamma_multiply(alpha),
+            );
+        }
+        for i in 1..=n {
+            mesh.indices.extend_from_slice(&[0, i as u32, i as u32 + 1]);
+        }
+        painter.add(Shape::mesh(mesh));
+        painter.circle_stroke(
+            c,
+            cap_r,
+            Stroke::new(
+                1.4 * s,
+                Color32::from_black_alpha((140.0 * alpha).min(255.0) as u8),
+            ),
+        );
+
+        // Position pip on the cap's outer edge.
+        let pa = (KNOB_START + draw_vol * KNOB_SWEEP).to_radians();
+        let pp = Pos2::new(
+            c.x + cap_r * 0.84 * pa.cos(),
+            c.y + cap_r * 0.84 * pa.sin(),
+        );
+        painter.circle_filled(pp, 3.8 * s, accent.gamma_multiply(alpha));
     }
 }
 

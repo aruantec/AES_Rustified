@@ -18,6 +18,20 @@ pub struct CachedMeta {
     pub artist: String,
     #[serde(default)]
     pub thumb: Option<String>,
+    // Metadata-editor fields for stream items — no file to tag, so
+    // edits persist here (title/artist also feed the item labels).
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub track: String,
+    #[serde(default)]
+    pub year: String,
+    #[serde(default)]
+    pub genre: String,
+    #[serde(default)]
+    pub comment: String,
+    #[serde(default)]
+    pub lyrics: String,
 }
 
 fn cache_dir() -> PathBuf {
@@ -93,13 +107,45 @@ pub fn remove_image(url: &str) {
     let _ = std::fs::remove_file(image_path(url));
 }
 
-/// Evict an item's metadata entry and its recorded thumbnail (the
-/// item was deleted — per-url entries are dead weight after that).
+/// Local cover override for a stream item — `cover-<key>.img` under
+/// the Covers dir, written by the metadata editor. A `CoverSrc::File`
+/// over this path decodes like any local art and wins over the remote
+/// thumbnail ladder.
+pub fn cover_path(url: &str) -> PathBuf {
+    cache_dir()
+        .join("Covers")
+        .join(format!("cover-{}.img", key_for(url)))
+}
+
+pub fn load_cover(url: &str) -> Option<Vec<u8>> {
+    std::fs::read(cover_path(url)).ok()
+}
+
+pub fn save_cover(url: &str, bytes: &[u8]) {
+    let path = cover_path(url);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Drop the edited cover — the item falls back to remote thumbnails.
+pub fn remove_cover(url: &str) {
+    let _ = std::fs::remove_file(cover_path(url));
+}
+
+/// Evict an item's metadata entry, its recorded thumbnail and any
+/// edited local cover (the item was deleted — per-url entries are
+/// dead weight after that).
 pub fn remove(url: &str) {
     if let Some(meta) = load(url) {
         if let Some(thumb) = meta.thumb {
             remove_image(&thumb);
         }
     }
+    remove_cover(url);
     let _ = std::fs::remove_file(meta_path(url));
 }

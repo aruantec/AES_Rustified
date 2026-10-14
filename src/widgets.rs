@@ -24,22 +24,98 @@ const CLOCK_DEFAULT_SIZE: Vec2 = Vec2::new(250.0, 250.0);
 const CLOCK_MIN: Vec2 = Vec2::new(90.0, 70.0);
 const PLAYER_MIN: Vec2 = Vec2::new(140.0, 140.0);
 
-fn clock_default(content: Rect, s: f32) -> Rect {
+fn clock_default(content: Rect, _frame: Rect, s: f32) -> Rect {
     Rect::from_min_size(content.min, CLOCK_DEFAULT_SIZE * s)
 }
 
 /// `MainContentWidgetLayout.Apply` for the turntable: proportional
-/// size, disc center on the ShaderToy origin (content center minus
-/// half the 70-unit top bar).
-fn player_default(content: Rect, s: f32) -> Rect {
+/// size, disc center on the ShaderToy render origin — the center of
+/// the whole window (`Atom` renders its rays at `0.5 * iResolution`,
+/// and `u_disc` occluders track the disc center).
+fn player_default(content: Rect, frame: Rect, s: f32) -> Rect {
     let w_v = content.width() / s;
     let h_v = content.height() / s;
     let pw = (w_v * 354.51 / 1092.0).max(180.0);
     let ph = (h_v * 372.04 / 769.0).max(200.0);
-    let d = disc_metrics(pw, ph);
-    let left = w_v * 0.5 - d.center_v.x;
-    let top = h_v * 0.5 - 35.0 - d.center_v.y;
-    Rect::from_min_size(content.min + Vec2::new(left, top) * s, Vec2::new(pw, ph) * s)
+    // Use disc_layout on the REAL rect — disc_metrics has .max()
+    // clamps so it isn't scale-linear; scaling virtual center_v by s
+    // drifts the disc off the frame center by a few px.
+    let size = Vec2::new(pw, ph) * s;
+    let d = disc_layout(Rect::from_min_size(Pos2::ZERO, size));
+    Rect::from_min_size(frame.center() - d.center.to_vec2(), size)
+}
+
+/// Translate `r` inside `bounds` without ever resizing: if the widget
+/// is larger than the content on an axis it pins to that edge and
+/// overflows (the painter clips it). A small window must not shrink
+/// a fixed-size widget — the size would persist permanently.
+fn fit_inside(rect: Rect, bounds: Rect) -> Rect {
+    let (w, h) = (rect.width(), rect.height());
+    let x = if w <= bounds.width() {
+        rect.min.x.clamp(bounds.min.x, bounds.max.x - w)
+    } else {
+        bounds.min.x
+    };
+    let y = if h <= bounds.height() {
+        rect.min.y.clamp(bounds.min.y, bounds.max.y - h)
+    } else {
+        bounds.min.y
+    };
+    Rect::from_min_size(Pos2::new(x, y), rect.size())
+}
+
+/// How one axis of a widget anchors as the window changes — the
+/// placement intent, captured once and re-evaluated each frame.
+/// `Min`/`Max` glue the rect to a CONTENT edge at an absolute gap
+/// (a corner widget stays in the corner; content min moves with the
+/// title bar); `Frac` keeps the CENTER at a fraction of the whole
+/// FRAME, so e.g. the turntable disc stays on the shadertoy render
+/// origin (frame center) through fullscreen.
+#[derive(Clone, Copy)]
+enum Anchor {
+    Frac(f32),
+    Min(f32),
+    Max(f32),
+}
+
+/// An edge gap below this is treated as glued.
+const EDGE_GLUE: f32 = 48.0;
+
+#[allow(clippy::too_many_arguments)]
+fn axis_anchor(
+    min: f32,
+    max: f32,
+    content_min: f32,
+    content_max: f32,
+    frame_min: f32,
+    frame_size: f32,
+) -> Anchor {
+    let dmin = min - content_min;
+    let dmax = content_max - max;
+    if dmin <= dmax && dmin < EDGE_GLUE {
+        Anchor::Min(dmin)
+    } else if dmax < dmin && dmax < EDGE_GLUE {
+        Anchor::Max(dmax)
+    } else {
+        Anchor::Frac(((min + max) * 0.5 - frame_min) / frame_size.max(1.0))
+    }
+}
+
+/// Evaluate an anchor to the axis' min coordinate for `size`.
+#[allow(clippy::too_many_arguments)]
+fn axis_pos(
+    a: Anchor,
+    size: f32,
+    content_min: f32,
+    content_max: f32,
+    frame_min: f32,
+    frame_size: f32,
+) -> f32 {
+    match a {
+        Anchor::Min(g) => content_min + g,
+        Anchor::Max(g) => content_max - g - size,
+        Anchor::Frac(f) => frame_min + f * frame_size - size * 0.5,
+    }
 }
 
 fn clamp_inside(rect: Rect, bounds: Rect) -> Rect {
@@ -78,9 +154,15 @@ pub struct WidgetFrame {
     pub dragging: bool,
     saved_offset: Option<Vec2>,
     saved_size: Option<Vec2>,
-    last_content_size: Vec2,
+    /// Canonical placement — placement is recomputed from this every
+    /// frame, so transient window sizes (startup races, fullscreen
+    /// transitions) can never corrupt the position incrementally.
+    anchor: Option<[Anchor; 2]>,
     last_scale: f32,
-    default_rect: fn(Rect, f32) -> Rect,
+    /// Rect at drag start — `drag_delta` applies to this snapshot, not
+    /// the live rect (which would compound the delta every frame).
+    drag_from: Option<Rect>,
+    default_rect: fn(Rect, Rect, f32) -> Rect,
     min_size: Vec2,
     id: &'static str,
 }
@@ -98,7 +180,7 @@ pub struct WidgetOut {
 impl WidgetFrame {
     fn new(
         saved: Option<(Vec2, Vec2, bool)>,
-        default_rect: fn(Rect, f32) -> Rect,
+        default_rect: fn(Rect, Rect, f32) -> Rect,
         min_size: Vec2,
         id: &'static str,
     ) -> Self {
@@ -108,65 +190,99 @@ impl WidgetFrame {
             dragging: false,
             saved_offset: saved.map(|s| s.0),
             saved_size: saved.map(|s| s.1),
-            last_content_size: Vec2::ZERO,
+            anchor: None,
             last_scale: 0.0,
+            drag_from: None,
             default_rect,
             min_size,
             id,
         }
     }
 
-    pub fn reset(&mut self, content: Rect, s: f32) {
-        self.rect = (self.default_rect)(content, s);
+    pub fn reset(&mut self, content: Rect, frame: Rect, s: f32) {
+        self.rect = (self.default_rect)(content, frame, s);
+        self.anchor = Some(self.anchor_of(content, frame));
     }
 
-    /// Initialize the rect (or restore it) and re-anchor it as the
-    /// content/scale changes. Returns `self.visible`.
-    fn begin(&mut self, content: Rect, s: f32) -> bool {
+    /// Per-axis anchors for the current rect — the placement intent
+    /// captured once, then re-evaluated against every new geometry.
+    fn anchor_of(&self, content: Rect, frame: Rect) -> [Anchor; 2] {
+        let r = self.rect;
+        [
+            axis_anchor(
+                r.min.x, r.max.x, content.min.x, content.max.x, frame.min.x, frame.width(),
+            ),
+            axis_anchor(
+                r.min.y, r.max.y, content.min.y, content.max.y, frame.min.y, frame.height(),
+            ),
+        ]
+    }
+
+    /// Initialize the rect (or restore it) and re-place it as the
+    /// window/scale changes. `frame` is the whole window — anchoring
+    /// there (not `content`) keeps widgets at the same screen spot
+    /// when the title bar collapses in fullscreen. Returns `visible`.
+    fn begin(&mut self, content: Rect, frame: Rect, s: f32) -> bool {
         if !self.rect.is_finite() || !self.rect.is_positive() {
             self.rect = match (self.saved_offset, self.saved_size) {
                 (Some(off), Some(size)) => {
-                    let restored = Rect::from_min_size(content.min + off, size);
-                    clamp_inside(restored.expand(EDIT_MARGIN), content).shrink(EDIT_MARGIN)
+                    // Offset is the widget CENTER as a fraction of the
+                    // whole window, so a widget keeps its screen spot
+                    // in any mode; size is absolute virtual units —
+                    // fullscreen must not inflate widgets.
+                    let restored = Rect::from_center_size(
+                        Pos2::new(
+                            frame.min.x + off.x * frame.width(),
+                            frame.min.y + off.y * frame.height(),
+                        ),
+                        size,
+                    );
+                    fit_inside(restored, content.shrink(EDIT_MARGIN))
                 }
-                _ => (self.default_rect)(content, s),
+                _ => (self.default_rect)(content, frame, s),
             };
+            // The anchor derives from the restored position — a spot
+            // near an edge glues, mid-field keeps the center fraction.
+            self.anchor = Some(self.anchor_of(content, frame));
         }
-        // The widget lives inside the ScalableDecorator: when the UI scale
-        // changes, re-anchor proportionally like a content resize.
+        // The widget lives inside the ScalableDecorator: on a UI-scale
+        // change the rect rescales once, then the anchor re-derives.
         if self.last_scale > 0.0 && (s - self.last_scale).abs() > 1e-6 {
             let k = s / self.last_scale;
-            let off = (self.rect.min - content.min) * k;
-            self.rect = clamp_inside(
-                Rect::from_min_size(content.min + off, self.rect.size() * k).expand(EDIT_MARGIN),
-                content,
-            )
-            .shrink(EDIT_MARGIN);
+            self.rect = Rect::from_center_size(self.rect.center(), self.rect.size() * k);
+            self.anchor = Some(self.anchor_of(content, frame));
         }
         self.last_scale = s;
-        // Keep position and size proportional to the content area when it
-        // resizes/maximizes (Lacrima re-anchors widgets the same way in
-        // `OnContainerBoundsChanged`).
-        if self.last_content_size.x > 0.0 && self.last_content_size != content.size() {
-            let sx = content.width() / self.last_content_size.x;
-            let sy = content.height() / self.last_content_size.y;
-            let off = self.rect.min - content.min;
-            self.rect = clamp_inside(
-                Rect::from_min_size(
-                    Pos2::new(content.min.x + off.x * sx, content.min.y + off.y * sy),
-                    Vec2::new(self.rect.width() * sx, self.rect.height() * sy),
-                )
-                .expand(EDIT_MARGIN),
-                content,
-            )
-            .shrink(EDIT_MARGIN);
+        // Placement is a pure function of (anchor, content, frame) —
+        // recomputed every frame so any transient size converges back
+        // to the same spot instead of chaining off a stale rect.
+        // Skipped while dragging (chrome writes the rect; the anchor
+        // re-derives on release).
+        if let (Some(a), false) = (self.anchor, self.dragging) {
+            let size = self.rect.size();
+            let min = Pos2::new(
+                axis_pos(a[0], size.x, content.min.x, content.max.x, frame.min.x, frame.width()),
+                axis_pos(a[1], size.y, content.min.y, content.max.y, frame.min.y, frame.height()),
+            );
+            self.rect = fit_inside(
+                Rect::from_min_size(min, size),
+                content.shrink(EDIT_MARGIN),
+            );
         }
-        self.last_content_size = content.size();
         self.visible
     }
 
     /// Edit-mode chrome: marching-ants outline, move drag, resize grip.
-    fn chrome(&mut self, ui: &mut egui::Ui, content: Rect, elapsed: f32, s: f32) -> WidgetOut {
+    /// On release the anchor re-derives from the final rect so the
+    /// dropped spot becomes the canonical placement.
+    fn chrome(
+        &mut self,
+        ui: &mut egui::Ui,
+        content: Rect,
+        frame: Rect,
+        elapsed: f32,
+        s: f32,
+    ) -> WidgetOut {
         let mut out = WidgetOut::default();
         let outer = self.rect.expand(EDIT_MARGIN);
         // Lacrima's focus rect: LightGray, {4,4} dashes, offset animated
@@ -187,12 +303,22 @@ impl WidgetFrame {
             ui.id().with((self.id, "move")),
             Sense::click_and_drag(),
         );
+        if move_resp.drag_started() {
+            self.drag_from = Some(self.rect);
+        }
         if move_resp.dragged() {
-            let moved = self.rect.translate(move_resp.drag_delta());
-            let r = clamp_inside(moved.expand(EDIT_MARGIN), content).shrink(EDIT_MARGIN);
+            // NOTE: `drag_delta` is per-frame motion in egui 0.36 —
+            // the cumulative press-to-now offset is `total_drag_delta`.
+            let from = self.drag_from.unwrap_or(self.rect);
+            let moved = from.translate(move_resp.total_drag_delta().unwrap_or_default());
+            let r = fit_inside(moved, content.shrink(EDIT_MARGIN));
             if r.is_positive() {
                 self.rect = r;
             }
+        }
+        if move_resp.drag_stopped() {
+            self.drag_from = None;
+            self.anchor = Some(self.anchor_of(content, frame));
         }
         let move_dragged = move_resp.dragged();
         out.ended = move_resp.drag_stopped();
@@ -209,13 +335,22 @@ impl WidgetFrame {
             Color32::from_white_alpha(170),
         );
         let grip_resp = ui.interact(grip, ui.id().with((self.id, "resize")), Sense::drag());
+        if grip_resp.drag_started() {
+            self.drag_from = Some(self.rect);
+        }
         if grip_resp.dragged() {
-            let size = (self.rect.size() + grip_resp.drag_delta()).max(self.min_size * s);
-            let resized = Rect::from_min_size(self.rect.min, size);
+            let from = self.drag_from.unwrap_or(self.rect);
+            let size = (from.size() + grip_resp.total_drag_delta().unwrap_or_default())
+                .max(self.min_size * s);
+            let resized = Rect::from_min_size(from.min, size);
             let r = clamp_inside(resized.expand(EDIT_MARGIN), content).shrink(EDIT_MARGIN);
             if r.is_positive() {
                 self.rect = r;
             }
+        }
+        if grip_resp.drag_stopped() {
+            self.drag_from = None;
+            self.anchor = Some(self.anchor_of(content, frame));
         }
         let grip_dragged = grip_resp.dragged();
         out.ended = out.ended || grip_resp.drag_stopped();
@@ -259,11 +394,12 @@ impl ClockWidget {
         &mut self,
         ui: &mut egui::Ui,
         content: Rect,
+        frame: Rect,
         edit_mode: bool,
         elapsed: f32,
         s: f32,
     ) -> WidgetOut {
-        if !self.frame.begin(content, s) {
+        if !self.frame.begin(content, frame, s) {
             return WidgetOut::default();
         }
 
@@ -273,7 +409,7 @@ impl ClockWidget {
             self.frame.dragging = false;
             return WidgetOut::default();
         }
-        self.frame.chrome(ui, content, elapsed, s)
+        self.frame.chrome(ui, content, frame, elapsed, s)
     }
 }
 
@@ -473,6 +609,7 @@ impl PlayerWidget {
         &mut self,
         ui: &mut egui::Ui,
         content: Rect,
+        frame: Rect,
         edit_mode: bool,
         interactive: bool,
         elapsed: f32,
@@ -483,7 +620,7 @@ impl PlayerWidget {
         is_playing: bool,
     ) -> PlayerOut {
         let mut out = PlayerOut::default();
-        if !self.frame.begin(content, s) {
+        if !self.frame.begin(content, frame, s) {
             return out;
         }
         let ctx = ui.ctx().clone();
@@ -586,7 +723,7 @@ impl PlayerWidget {
         );
 
         if edit_mode {
-            let chrome = self.frame.chrome(ui, content, elapsed, s);
+            let chrome = self.frame.chrome(ui, content, frame, elapsed, s);
             out.ended = chrome.ended;
             out.menu_resp = chrome.menu_resp;
         } else {
@@ -860,8 +997,14 @@ fn dashed_rect_stroke(
             continue;
         }
         let dir = (b - a) / len;
+        // Guaranteed forward progress: an advance smaller than the
+        // f32 precision at this magnitude is a no-op and would loop
+        // forever (the frame freezes inside this while).
+        let eps = (len * 1e-6).max(1e-4);
         let mut t = 0.0f32;
-        while t < len {
+        let mut steps = 0u32;
+        while t < len && steps < 4096 {
+            steps += 1;
             // `rem_euclid` may round up to exactly `period`; that's the
             // same as offset 0 (dash start), so fold it back.
             let off = (dist + t - phase).rem_euclid(period);
@@ -869,9 +1012,9 @@ fn dashed_rect_stroke(
             if off < dash {
                 let seg = (dash - off).min(len - t);
                 painter.line_segment([a + dir * t, a + dir * (t + seg)], stroke);
-                t += seg;
+                t += seg.max(eps);
             } else {
-                t += (period - off).min(len - t);
+                t += ((period - off).min(len - t)).max(eps);
             }
         }
         dist += len;
