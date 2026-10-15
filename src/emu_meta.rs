@@ -1083,6 +1083,12 @@ pub struct RomMetaDoc {
     pub x360_title_id: String,
     pub x360_media_id: String,
     pub user_edited: bool,
+    /// ArcadeLockedPillarboxCrop{Left,Right,FrameWidth} — a
+    /// user-locked pillarbox crop measured at `crop_fw` pixels wide;
+    /// re-scaled to the live frame width when applied.
+    pub crop_left: u32,
+    pub crop_right: u32,
+    pub crop_fw: u32,
     /// Non-cover images — `file` is the `<key>.k<n>` payload name.
     pub images: Vec<MetaImageRef>,
 }
@@ -1116,6 +1122,39 @@ pub fn save_meta(rom: &Path, doc: &RomMetaDoc) -> std::io::Result<()> {
     let tmp = p.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string(doc)?)?;
     std::fs::rename(&tmp, &p)
+}
+
+/// Lacrima's ArcadePillarboxCropMetadataHelper — a user-locked
+/// pillarbox crop for this ROM: `(left, right, frame_width)`, the
+/// insets measured when the capture was `frame_width` px wide.
+pub fn locked_crop(rom: &Path) -> Option<(u32, u32, u32)> {
+    let m = load_meta(rom)?;
+    (m.crop_fw > 0 && (m.crop_left > 0 || m.crop_right > 0))
+        .then_some((m.crop_left, m.crop_right, m.crop_fw))
+}
+
+pub fn save_locked_crop(rom: &Path, left: u32, right: u32, frame_width: u32) {
+    if frame_width == 0 || (left == 0 && right == 0) {
+        return;
+    }
+    let mut doc = load_meta(rom).unwrap_or_default();
+    doc.crop_left = left;
+    doc.crop_right = right;
+    doc.crop_fw = frame_width;
+    let _ = save_meta(rom, &doc);
+}
+
+pub fn clear_locked_crop(rom: &Path) {
+    let Some(mut doc) = load_meta(rom) else {
+        return;
+    };
+    if doc.crop_left == 0 && doc.crop_right == 0 && doc.crop_fw == 0 {
+        return;
+    }
+    doc.crop_left = 0;
+    doc.crop_right = 0;
+    doc.crop_fw = 0;
+    let _ = save_meta(rom, &doc);
 }
 
 /// Drop every `<key>.k*` payload not in `keep` — image removals.

@@ -15,9 +15,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use std::os::windows::io::AsRawHandle;
+
 use windows::core::BOOL;
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HWND, LPARAM, RECT, WAIT_TIMEOUT, WPARAM,
+};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
@@ -38,6 +45,56 @@ extern "system" {
 
 const SUSPEND_ACCESS: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(PROCESS_SUSPEND_RESUME.0 | PROCESS_QUERY_LIMITED_INFORMATION.0);
+
+/// Owns a Windows Job Object with KILL_ON_JOB_CLOSE: when the last
+/// handle to the job closes — on normal Drop AND on an abrupt process
+/// death where destructors never run (panic=abort, crash, kill) — the
+/// OS terminates every process assigned to it. This is what keeps a
+/// launched emulator from being orphaned when the app dies.
+struct JobGuard(HANDLE);
+
+// A job handle is a process-global kernel handle — safe to move
+// across threads.
+unsafe impl Send for JobGuard {}
+
+impl JobGuard {
+    /// Job with kill-on-close containing `child`. `None` when the OS
+    /// refuses (assignment can fail if the process is already in a
+    /// non-nesting job) — the session still runs, it just loses the
+    /// crash-safety net.
+    fn new(child: &Child) -> Option<Self> {
+        unsafe {
+            let job = CreateJobObjectW(None, None).ok()?;
+            let ok = (|| {
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+                .ok()?;
+                AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())).ok()
+            })()
+            .is_some();
+            if ok {
+                Some(Self(job))
+            } else {
+                let _ = CloseHandle(job);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 /// Session lifecycle shared with the UI thread.
 #[derive(Clone)]
@@ -64,10 +121,23 @@ pub struct Session {
     pub game: PathBuf,
     status: Arc<Mutex<Shared>>,
     frames: Arc<Mutex<wgc::FrameSlot>>,
+    /// The zero-copy shared-texture ring + cross-API fence for the
+    /// DX12 interop display path (populated once WGC attaches).
+    gpu: Arc<wgc::GpuState>,
     stop: Arc<AtomicBool>,
     /// Lacrima's IsEmulatorPaused — the process is suspended.
     paused: Arc<AtomicBool>,
+    /// Live render adjustments the WGC swizzle reads each frame.
+    render: Arc<wgc::RenderShared>,
+    /// The captured render window — written by the worker once the
+    /// capture target resolves; the Aspect-Ratio context menu resizes
+    /// it (Lacrima's EmulatorTargetHwnd).
+    hwnd: Arc<std::sync::atomic::AtomicUsize>,
     worker: Option<JoinHandle<()>>,
+    /// Kill-on-close job containing the emulator — keeps it from
+    /// being orphaned even by a hard crash. Declared last so it is
+    /// the final field to drop.
+    _job: Option<JobGuard>,
 }
 
 impl Session {
@@ -75,7 +145,8 @@ impl Session {
     /// worker. Lacrima inserts `--fullscreen` for fullscreen launches
     /// — we launch windowed instead since the window is hidden anyway
     /// and a windowed surface stays captureable when moved off-screen.
-    pub fn start(exe: &str, game: &Path) -> Result<Self, String> {
+    /// `low_latency` shrinks the WGC frame pool to a single buffer.
+    pub fn start(exe: &str, game: &Path, low_latency: bool) -> Result<Self, String> {
         let exe_path = PathBuf::from(exe);
         let work_dir = exe_path
             .parent()
@@ -87,17 +158,27 @@ impl Session {
             .spawn()
             .map_err(|e| format!("failed to start Xenia: {e}"))?;
 
+        // Kill-on-close job FIRST — if anything below panics the
+        // guard unwinds and the OS reaps the emulator for us.
+        let job = JobGuard::new(&child);
+
         let pid = child.id();
         let status = Arc::new(Mutex::new(Shared {
             status: Status::Resolving,
         }));
         let frames = Arc::new(Mutex::new(wgc::FrameSlot::default()));
+        let gpu = Arc::new(wgc::GpuState::default());
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let render = Arc::new(wgc::RenderShared::default());
+        let hwnd = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker = {
             let status = status.clone();
             let frames = frames.clone();
+            let gpu = gpu.clone();
             let stop = stop.clone();
+            let render = render.clone();
+            let hwnd = hwnd.clone();
             std::thread::Builder::new()
                 .name("xenia-session".into())
                 .spawn(move || {
@@ -106,7 +187,7 @@ impl Session {
                     // degrade to a failed session — never take the
                     // whole app down with the emulator.
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        worker_main(pid, status, frames, stop)
+                        worker_main(pid, status, frames, gpu, stop, render, hwnd, low_latency)
                     }))
                     .is_err()
                     {
@@ -123,10 +204,26 @@ impl Session {
             game: game.to_path_buf(),
             status,
             frames,
+            gpu,
             stop,
             paused,
+            render,
+            hwnd,
             worker: Some(worker),
+            _job: job,
         })
+    }
+
+    /// Live render adjustments — write the atomics and the capture
+    /// thread applies them on the very next frame.
+    pub fn render(&self) -> &Arc<wgc::RenderShared> {
+        &self.render
+    }
+
+    /// The captured render window — invalid until the worker resolves
+    /// the capture target.
+    pub fn hwnd(&self) -> HWND {
+        HWND(self.hwnd.load(Ordering::Relaxed) as *mut _)
     }
 
     pub fn status(&self) -> Status {
@@ -140,6 +237,12 @@ impl Session {
     /// The latest captured frame slot (`seq` bumps per frame).
     pub fn frames(&self) -> &Arc<Mutex<wgc::FrameSlot>> {
         &self.frames
+    }
+
+    /// The GPU shared-frame ring for the zero-copy display path —
+    /// `share` is populated once the capture's D3D11 side creates it.
+    pub fn gpu_state(&self) -> &Arc<wgc::GpuState> {
+        &self.gpu
     }
 
     /// Ask the worker to close the emulator gracefully (WM_CLOSE on
@@ -211,7 +314,11 @@ fn worker_main(
     pid: u32,
     status: Arc<Mutex<Shared>>,
     frames: Arc<Mutex<wgc::FrameSlot>>,
+    gpu: Arc<wgc::GpuState>,
     stop: Arc<AtomicBool>,
+    render: Arc<wgc::RenderShared>,
+    hwnd_out: Arc<std::sync::atomic::AtomicUsize>,
+    low_latency: bool,
 ) {
     let set_status = |s: Status| {
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
@@ -246,6 +353,7 @@ fn worker_main(
         }
         hwnd = resolve_capture_target(pid);
         if !hwnd.is_invalid() {
+            hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -277,8 +385,9 @@ fn worker_main(
     hide_window(hwnd);
     let mut hidden_others = hide_process_windows(pid, hwnd);
 
-    // 3. Attach WGC — frames land in the shared slot.
-    let _capture = wgc::Capture::start(hwnd, frames.clone());
+    // 3. Attach WGC — frames land in the shared slots (CPU mirror +
+    //    zero-copy GPU ring).
+    let _capture = wgc::Capture::start(hwnd, frames.clone(), gpu, render, low_latency);
     set_status(Status::Capturing);
 
     // 4. Monitor: stop request, process exit, or capture failure.
@@ -866,4 +975,74 @@ fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 128];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// Job guards for emulator processes launched without a Session
+/// (launch_setup). Kept for the process lifetime so the kill-on-close
+/// job still fires if the app exits or crashes while a setup window
+/// is open — the guards themselves only matter at process teardown.
+static SETUP_JOBS: Mutex<Vec<JobGuard>> = Mutex::new(Vec::new());
+
+/// Lacrima's ResizeWindowToAspectRatioInPlace — resize the captured
+/// window's top-level ancestor to `aspect` at ~1920px wide, clamped
+/// to the virtual screen (the render child follows its parent's
+/// bounds). The window stays parked at its hidden spot — only its
+/// size, and so the capture's native aspect, changes.
+pub fn apply_aspect_ratio(hwnd: HWND, aspect: f64) {
+    if hwnd.is_invalid() || aspect <= 0.0 {
+        return;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let target = if root.is_invalid() { hwnd } else { root };
+    let mut w = 1920i32;
+    let mut h = (w as f64 / aspect).round().max(1.0) as i32;
+    let (sw, sh) = unsafe {
+        (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if sw > 0 && w > sw {
+        w = sw;
+        h = (w as f64 / aspect).round().max(1.0) as i32;
+    }
+    if sh > 0 && h > sh {
+        h = sh;
+        w = (h as f64 * aspect).round().max(1.0) as i32;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            target,
+            None,
+            0,
+            0,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+        );
+    }
+}
+
+/// Lacrima's LaunchCurrentSectionHandlerSetup — spawn the emulator
+/// executable with no game so its own settings UI opens. A plain
+/// shell launch: not captured, not tracked — but still job-guarded so
+/// a dying app can't leave an orphan emulator process.
+pub fn launch_setup(exe: &str) -> Result<(), String> {
+    let exe_path = PathBuf::from(exe);
+    let child = Command::new(exe)
+        .current_dir(
+            exe_path
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_default(),
+        )
+        .spawn()
+        .map_err(|e| format!("failed to start emulator: {e}"))?;
+    if let Some(job) = JobGuard::new(&child) {
+        SETUP_JOBS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(job);
+    }
+    Ok(())
 }

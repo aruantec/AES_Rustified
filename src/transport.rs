@@ -773,6 +773,22 @@ pub(crate) fn icon_viewport(painter: &egui::Painter, rect: Rect, shown: bool, al
     ));
 }
 
+/// Capture-settings glyph (Lacrima's ToggleRenderOptions button):
+/// two horizontal slider tracks with filled knob dots at different
+/// positions. Lit while the render-options panel is open.
+pub(crate) fn icon_sliders(painter: &egui::Painter, rect: Rect, open: bool, alpha: f32) {
+    let c = (if open { LIT } else { DIM }).gamma_multiply(alpha);
+    let k = rect.height() / 100.0;
+    let stroke = Stroke::new(6.0 * k, c);
+    for (y, kx) in [(33.0, 34.0), (67.0, 66.0)] {
+        painter.add(Shape::line(
+            vec![cv(rect, 100.0, 14.0, y), cv(rect, 100.0, 86.0, y)],
+            stroke,
+        ));
+        painter.circle_filled(cv(rect, 100.0, kx, y), 11.0 * k, c);
+    }
+}
+
 /// Close-emulator power glyph (Lacrima's CloseEmulator button):
 /// an arc with a gap at the top + the vertical power line.
 pub(crate) fn icon_power(painter: &egui::Painter, rect: Rect, alpha: f32) {

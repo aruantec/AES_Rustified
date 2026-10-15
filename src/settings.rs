@@ -385,6 +385,68 @@ pub struct Emulation {
     /// `EmulationSectionConfiguration.DefaultHandlerId`) — which
     /// configured handler launches games for that console.
     pub default_handlers: std::collections::BTreeMap<String, String>,
+    /// Per-section capture/render options (Lacrima's RenderOptions
+    /// overlay, "Rendering" tab) — keyed by section key.
+    pub render: std::collections::BTreeMap<String, RenderOpts>,
+}
+
+/// Capture presentation options, persisted per emulation section —
+/// mirrors the Rendering tab of Lacrima's RenderOptions overlay.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct RenderOpts {
+    /// SelectedStretch — 0 Uniform (aspect-fit), 1 UniformToFill
+    /// (crop to cover), 2 Fill (stretch, ignores aspect).
+    pub stretch: u8,
+    /// RenderBrightness — 0.25..2.0 multiplier on capture pixels.
+    pub brightness: f32,
+    /// RenderSaturation — 0..2.0.
+    pub saturation: f32,
+    /// RenderOverlayOpacity — stats-overlay panel alpha.
+    pub overlay_opacity: f32,
+    /// DisableVSync — applied to the app's present mode at startup.
+    pub disable_vsync: bool,
+    /// LowLatencyCapture — single-buffered WGC frame pool; applies
+    /// on the next game launch.
+    pub low_latency: bool,
+    /// RemoveArcadePillarboxBars — auto-crop uniform black side
+    /// pillars from the capture.
+    pub remove_pillars: bool,
+    /// ShowStatisticsOverlay — fps/capture stats over the capture.
+    pub stats_overlay: bool,
+    /// ShowFrametimeGraph — rolling frametime polyline.
+    pub frametime_graph: bool,
+    /// ShowDetailedGpuInfo — adapter name inside the stats overlay.
+    pub gpu_info: bool,
+    /// PortalCaptureTint — RGB multiply over the capture.
+    pub tint: [u8; 3],
+    /// SelectedShaderPath — the capture post-process shader's file
+    /// stem ("" = None), applied to the frame on the GPU.
+    pub shader: String,
+    /// SelectedCaptureAspectRatioKey — "handler" (the emulator's own
+    /// aspect) or an explicit ratio ("4:3", "16:9", "21:9", "32:9",
+    /// "1:1") that resizes the captured emulator window.
+    pub aspect_key: String,
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        Self {
+            stretch: 0,
+            brightness: 1.0,
+            saturation: 1.0,
+            overlay_opacity: 0.55,
+            disable_vsync: false,
+            low_latency: true,
+            remove_pillars: false,
+            stats_overlay: false,
+            frametime_graph: false,
+            gpu_info: false,
+            tint: [255, 255, 255],
+            shader: String::new(),
+            aspect_key: "handler".into(),
+        }
+    }
 }
 
 impl Default for Emulation {
@@ -404,6 +466,7 @@ impl Default for Emulation {
             games: Default::default(),
             section_order: Default::default(),
             default_handlers: Default::default(),
+            render: Default::default(),
         }
     }
 }

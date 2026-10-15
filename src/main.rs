@@ -3,10 +3,13 @@
 mod album_row;
 mod apl;
 mod audio;
+mod cap_shader;
+mod pillarbox;
 mod carousel;
 mod edge_border;
 mod emu_dl;
 mod emu_meta;
+mod exe_icon;
 mod emulation;
 mod equalizer;
 mod icons;
@@ -186,7 +189,37 @@ impl Nav {
     }
 }
 
+/// Boot timing — stage timestamps appended to
+/// `<data_root>/boot.log` (truncated each launch) so startup
+/// regressions are diagnosable instead of guessed at.
+static BOOT_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub(crate) fn boot_mark(stage: &str) {
+    let (Some(t0), Some(dir)) = (BOOT_T0.get(), settings::data_root()) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("boot.log"))
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "{:>7.1}ms  {}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            stage
+        );
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    let _ = BOOT_T0.set(std::time::Instant::now());
+    if let Some(dir) = settings::data_root() {
+        let _ = std::fs::write(dir.join("boot.log"), "");
+    }
+    boot_mark("main enter");
     // Crash forensics — a panic anywhere (UI thread, capture worker,
     // FFI-adjacent paths) dumps its message + backtrace to
     // <data_root>/crash.log before the process dies. Keeps silent
@@ -229,7 +262,19 @@ fn main() -> eframe::Result<()> {
         }
     }
     let mut settings = settings::load();
+    boot_mark("settings loaded");
+    // DX12 only — the zero-copy WGC interop imports D3D11 shared
+    // textures through wgpu's DX12 backend; on Vulkan the import
+    // silently can't happen and capture falls back to the CPU
+    // mirror. Everything else (egui, shadertoys, capture shaders)
+    // runs fine on DX12.
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(cn) = &mut wgpu_options.wgpu_setup {
+        cn.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    }
+
     let native_options = eframe::NativeOptions {
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_title("AES Rustified")
             // Taskbar/alt-tab icon (the file icon comes from app.rc).
@@ -244,10 +289,19 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    boot_mark("run_native enter");
     eframe::run_native(
         "AES Rustified",
         native_options,
         Box::new(move |cc| {
+            boot_mark("creation ctx (window+wgpu device ready)");
+            if let Some(rs) = &cc.wgpu_render_state {
+                let i = rs.adapter.get_info();
+                boot_mark(&format!(
+                    "wgpu adapter: {} backend={:?} type={:?}",
+                    i.name, i.backend, i.device_type
+                ));
+            }
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             // Lacrima's first-run default (MainWindow.axaml.cs): when no
             // ScaleFactor was ever persisted, seed it from the display
@@ -548,6 +602,7 @@ impl AesRustApp {
         if have_font || have_light_font || have_cjk {
             cc.egui_ctx.set_fonts(defs);
         }
+        boot_mark("fonts loaded");
         let mut transport = transport::Transport::new();
         transport.cover_layout = settings.carousel.layout_mode.min(2);
 
@@ -689,17 +744,34 @@ impl AesRustApp {
             emu: emulation::EmuView::new(),
             started: std::time::Instant::now(),
         };
+        boot_mark("app struct built");
+        // Capture-shader pipelines live on the GPU — created once with
+        // the wgpu render state like the shadertoy background.
+        app.emu.cap_shader = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(cap_shader::CaptureShader::new);
+        boot_mark("cap_shader ready");
         // Lacrima kicks off RefreshYtDlpInfo at startup so the
         // Libraries tab opens with populated state (worker thread).
         app.ytdlp.ensure_queried();
         // Restore persisted per-section game lists onto the tiles.
         app.emu.seed_games(&app.settings.emulation);
+        boot_mark("app::new done");
         app
     }
 }
 
 impl eframe::App for AesRustApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        {
+            static FRAME: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 || n == 30 || n == 120 {
+                boot_mark(&format!("frame {n} built"));
+            }
+        }
         // Center the window once, before it is shown — on the work
         // area (screen minus the taskbar), not the full monitor.
         if !self.centered {
@@ -1587,6 +1659,7 @@ impl eframe::App for AesRustApp {
                     && !emu.editor.is_open()
                     && !emu.patches.is_open()
                     && !emu.cfg_ov.is_open()
+                    && !emu.render_open
                     && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
@@ -1610,6 +1683,7 @@ impl eframe::App for AesRustApp {
                     && !emu.editor.is_open()
                     && !emu.patches.is_open()
                     && !emu.cfg_ov.is_open()
+                    && !emu.render_open
                     && !ui.ctx().text_edit_focused()
                 {
                     let (mut dx, mut dy) = (0i32, 0i32);
@@ -1867,6 +1941,10 @@ impl eframe::App for AesRustApp {
                             album_search.close(ui.ctx());
                         } else if emu.search.is_open() {
                             emu.search.close(ui.ctx());
+                        } else if emu.render_open {
+                            // The capture render-options panel closes
+                            // like the other overlays.
+                            emu.render_open = false;
                         } else if nav.target() == View::Emulation
                             && emu.session.is_some()
                             && emu.game_fs
@@ -3149,6 +3227,14 @@ impl eframe::App for AesRustApp {
         if gear_clicked {
             self.settings_open = !self.settings_open;
         }
+        {
+            static FRAME2: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = FRAME2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 {
+                boot_mark(&format!("frame {n} ui() done"));
+            }
+        }
     }
 
     fn on_exit(&mut self) {
@@ -4419,7 +4505,7 @@ fn ui_tab_effects(
     let scale_track =
         Rect::from_min_size(Pos2::new(x, y + 6.0 * s), Vec2::new(260.0 * s, 16.0 * s));
     let mut factor = settings.ui.scale_factor;
-    if pill_slider(ui, scale_track, "ui-scale", &mut factor, 1.0, 3.0, 0.01, t) {
+    if pill_slider(ui, scale_track, "ui-scale", &mut factor, 1.0, 3.0, 0.01, t, None) {
         settings.ui.scale_factor = factor;
     }
     painter.text(
@@ -4483,6 +4569,7 @@ fn ui_tab_effects(
         particles::MAX_COUNT as f32,
         1.0,
         t,
+        None,
     ) {
         settings.effects.lacrima_count = count as u32;
     }
@@ -4638,7 +4725,7 @@ fn ui_tab_audio(
             Pos2::new(x + 130.0 * s, y - 8.0 * s),
             Vec2::new(300.0 * s, 16.0 * s),
         );
-        pill_slider(ui, track, &format!("spec-{name}"), value, min, max, step, t);
+        pill_slider(ui, track, &format!("spec-{name}"), value, min, max, step, t, None);
         let text = match decimals {
             0 => format!("{value:.0}"),
             _ => {
@@ -4842,6 +4929,7 @@ fn ui_tab_audio(
         12.0,
         0.1,
         t,
+        None,
     );
     painter.text(
         Pos2::new(track.max.x + 8.0 * s, y),
@@ -4886,6 +4974,7 @@ fn ui_tab_audio(
         12.0,
         0.1,
         t,
+        None,
     );
     painter.text(
         Pos2::new(track.max.x + 8.0 * s, y),
@@ -4978,6 +5067,7 @@ fn ui_tab_audio(
             20.0,
             0.5,
             dim,
+            None,
         );
     }
     painter.text(
@@ -5201,7 +5291,7 @@ fn ui_tab_carousel(
             Pos2::new(x + 170.0 * s, y - 8.0 * s),
             Vec2::new(260.0 * s, 16.0 * s),
         );
-        pill_slider(ui, track, &format!("car-{name}"), value, min, max, step, t);
+        pill_slider(ui, track, &format!("car-{name}"), value, min, max, step, t, None);
         painter.text(
             Pos2::new(track.max.x + 10.0 * s, y),
             Align2::LEFT_CENTER,
@@ -5507,7 +5597,10 @@ fn check_box(
 }
 
 /// `PillProgressSlider`: a thin rounded track filled from the left,
-/// click/drag anywhere on it to set the value.
+/// click/drag anywhere on it to set the value. `reset` is the value
+/// a double-click restores (Lacrima's DoubleTapped reset); None
+/// disables it.
+#[allow(clippy::too_many_arguments)]
 fn pill_slider(
     ui: &mut egui::Ui,
     track: Rect,
@@ -5517,6 +5610,7 @@ fn pill_slider(
     max: f32,
     step: f32,
     fade: f32,
+    reset: Option<f32>,
 ) -> bool {
     // Hit area covers the slider's 28px row around the 16px track.
     let hit = Rect::from_center_size(
@@ -5531,7 +5625,15 @@ fn pill_slider(
         resp.request_focus();
     }
     let mut changed = false;
-    if pressed || resp.clicked() {
+    if resp.double_clicked() {
+        if let Some(d) = reset {
+            let nv = d.clamp(min, max);
+            if nv != *value {
+                *value = nv;
+                changed = true;
+            }
+        }
+    } else if pressed || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             let f = ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0);
             let nv = ((min + f * (max - min)) / step).round() * step;

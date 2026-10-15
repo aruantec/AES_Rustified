@@ -16,9 +16,9 @@
 
 use eframe::egui_wgpu::{self, wgpu};
 use eframe::epaint::{Color32, ColorImage, PaintCallbackInfo};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 /// Lacrima's audio texture: 512 float bins, GL_RED.
@@ -216,6 +216,12 @@ pub struct Shadertoy {
     /// name -> built pipeline (None = translation failed, cached so we
     /// don't retry every frame).
     pipelines: BTreeMap<String, Option<Arc<wgpu::RenderPipeline>>>,
+    /// Builds run on worker threads — under DX12/FXC a heavy shader
+    /// takes ~1s to compile, which froze the first frame (startup)
+    /// and every shader switch when done on the UI thread.
+    building: HashSet<String>,
+    build_tx: mpsc::Sender<(String, Option<Arc<wgpu::RenderPipeline>>)>,
+    build_rx: mpsc::Receiver<(String, Option<Arc<wgpu::RenderPipeline>>)>,
     /// Extra .frag files on disk (`<exe>/Shaders/Shadertoys`) — these
     /// can add to or override the embedded collection, like Lacrima's
     /// GetLocalShaders scan.
@@ -233,6 +239,13 @@ pub struct Shadertoy {
     /// shader pipelines themselves write raw output offscreen).
     blit_pipe: Arc<wgpu::RenderPipeline>,
     blit_bgl: Arc<wgpu::BindGroupLayout>,
+    /// The pipeline the last callback drew + when it appeared — a new
+    /// selection fades in (0.4s smoothstep) instead of popping.
+    shown: Option<(Arc<wgpu::RenderPipeline>, Instant)>,
+    /// Background warm-up cursor — one idle-slot build per call walks
+    /// the whole set so a later pick is instant (wgpu has no on-disk
+    /// pipeline cache on DX12; this is the next best thing).
+    warm_idx: usize,
     start: Instant,
     frame: i32,
 }
@@ -481,6 +494,7 @@ impl Shadertoy {
             }
         }
         order.sort_by_key(|a| a.to_lowercase());
+        let (build_tx, build_rx) = mpsc::channel();
 
         Self {
             device: device.clone(),
@@ -498,6 +512,9 @@ impl Shadertoy {
                 spec_tex,
             },
             pipelines: BTreeMap::new(),
+            building: HashSet::new(),
+            build_tx,
+            build_rx,
             disk,
             order,
             current: String::new(),
@@ -507,6 +524,8 @@ impl Shadertoy {
             disc: [0.0; 4],
             blit_pipe,
             blit_bgl,
+            shown: None,
+            warm_idx: 0,
             start: Instant::now(),
             frame: 0,
         }
@@ -694,6 +713,19 @@ impl Shadertoy {
         let render_now = true;
         self.frame = self.frame.wrapping_add(1);
         let pipeline = self.pipeline_for(&self.current.clone());
+        // Fade the pipeline in over 0.4s when it changes — a worker-built
+        // shader arriving (startup, a settings switch) eases on instead
+        // of flashing at full opacity.
+        let now = Instant::now();
+        let arrive = match (&self.shown, &pipeline) {
+            (Some((p, t)), Some(q)) if Arc::ptr_eq(p, q) => *t,
+            _ => {
+                self.shown = pipeline.clone().map(|p| (p, now));
+                now
+            }
+        };
+        let ft = ((now - arrive).as_secs_f32() / 0.4).min(1.0);
+        let fade = fade * (ft * ft * (3.0 - 2.0 * ft));
         ShadertoyCallback {
             pipeline,
             shared: Arc::new(Shared {
@@ -739,43 +771,97 @@ impl Shadertoy {
         }
     }
 
-    /// Lazily translate+build the pipeline for `name` (embedded source
-    /// or disk .frag), falling back to the first shader that builds.
+    /// Lazily translate+build the pipeline for `name` on a worker
+    /// thread (a DX12/FXC compile takes ~1s — synchronous builds froze
+    /// startup and shader switches). While the build is in flight
+    /// nothing is drawn — showing a transient fallback flashed the
+    /// default shader at startup before the real selection landed.
+    /// The fallback only engages when `name` has failed permanently.
     fn pipeline_for(&mut self, name: &str) -> Option<Arc<wgpu::RenderPipeline>> {
-        if !self.pipelines.contains_key(name) {
-            let p = self.try_build(name);
-            self.pipelines.insert(name.to_string(), p);
+        while let Ok((n, p)) = self.build_rx.try_recv() {
+            self.building.remove(&n);
+            self.pipelines.insert(n, p);
         }
-        if let Some(p) = &self.pipelines[name] {
-            return Some(Arc::clone(p));
+        // Pace one extra build whenever no compile is in flight — the
+        // whole set warms up in the background over the first seconds
+        // after launch, so picking any shader later is instant.
+        if self.building.is_empty() {
+            while self.warm_idx < self.order.len() {
+                let n = self.order[self.warm_idx].clone();
+                self.warm_idx += 1;
+                if !self.pipelines.contains_key(&n) && !self.building.contains(&n) {
+                    self.spawn_build(&n);
+                    break;
+                }
+            }
         }
-        // Fallback: the default first, then anything that works
-        // (EnsureDefaultSelectedShaderToy prefers AnimatedBackground).
-        for n in ["AnimatedBackground"]
-            .into_iter()
-            .chain(self.order.iter().map(|s| s.as_str()))
-        {
+        match self.pipelines.get(name) {
+            Some(Some(p)) => return Some(Arc::clone(p)),
+            None => {
+                self.spawn_build(name);
+                return None;
+            }
+            Some(None) => {}
+        }
+        // Some(None) — failed permanently: fall back to the first
+        // ready pipeline (default first, matching Lacrima's
+        // EnsureDefaultSelectedShaderToy), kicking one extra build
+        // per call so the chain still converges on a working shader.
+        let mut kicked = false;
+        for i in 0..=self.order.len() {
+            let n = if i == 0 {
+                "AnimatedBackground"
+            } else {
+                self.order[i - 1].as_str()
+            };
             if n == name {
                 continue;
             }
-            if !self.pipelines.contains_key(n) {
-                let p = self.try_build(n);
-                self.pipelines.insert(n.to_string(), p);
-            }
-            if let Some(p) = &self.pipelines[n] {
-                return Some(Arc::clone(p));
+            match self.pipelines.get(n) {
+                Some(Some(p)) => return Some(Arc::clone(p)),
+                Some(None) => {}
+                None => {
+                    if !kicked {
+                        kicked = true;
+                        let owned = n.to_owned();
+                        self.spawn_build(&owned);
+                    }
+                }
             }
         }
         None
     }
 
-    /// `build` under `catch_unwind` — a shader that makes naga/wgpu
-    /// panic must degrade to the fallback, never kill the frame loop.
-    fn try_build(&self, name: &str) -> Option<Arc<wgpu::RenderPipeline>> {
-        let src = self.source(name)?;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.build(&src)))
+    /// Kick a worker-thread build for `name` unless it's already
+    /// built, failed, or in flight.
+    fn spawn_build(&mut self, name: &str) {
+        if self.building.contains(name) {
+            return;
+        }
+        let Some(src) = self.source(name) else {
+            self.pipelines.insert(name.to_owned(), None);
+            return;
+        };
+        self.building.insert(name.to_owned());
+        let (device, bgl, vs, format, tx) = (
+            self.device.clone(),
+            self.bgl.clone(),
+            self.vs.clone(),
+            self.format,
+            self.build_tx.clone(),
+        );
+        let name = name.to_owned();
+        std::thread::spawn(move || {
+            crate::boot_mark(&format!("shader '{name}' build start"));
+            let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::build_pipeline(&device, &bgl, &vs, format, &src)
+            }))
             .ok()
             .flatten()
+            .map(Arc::new);
+            crate::boot_mark(&format!("shader '{name}' build end"));
+            let _ = tx.send((name, p));
+        });
     }
 
     fn source(&self, name: &str) -> Option<String> {
@@ -791,7 +877,14 @@ impl Shadertoy {
     }
 
     /// GLSL -> naga module -> WGSL -> wgpu pipeline.
-    fn build(&self, src: &str) -> Option<Arc<wgpu::RenderPipeline>> {
+    /// Callable from a worker thread — all wgpu handles are Send+Sync.
+    fn build_pipeline(
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        vs: &wgpu::ShaderModule,
+        format: wgpu::TextureFormat,
+        src: &str,
+    ) -> Option<wgpu::RenderPipeline> {
         let mut body = process_shader(src.trim_start_matches('\u{feff}'));
         body = replace_ident(&body, "iChannel0", "sampler2D(_ch0_tex, _ch0_sam)");
         body = replace_ident(&body, "iChannel1", "sampler2D(_ch1_tex, _ch1_sam)");
@@ -811,52 +904,48 @@ impl Shadertoy {
         let wgsl =
             naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::EXPLICIT_TYPES)
                 .ok()?;
-        let fs = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadertoy_fs"),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
 
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("shadertoy_pl"),
-                bind_group_layouts: &[Some(&self.bgl)],
-                immediate_size: 0,
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("shadertoy_pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &self.vs,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &fs,
-                    entry_point: Some("main"),
-                    // REPLACE into the offscreen target — the blit pass
-                    // owns alpha compositing so the surface result is
-                    // identical to drawing the shader directly.
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-        Some(Arc::new(pipeline))
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadertoy_pl"),
+            bind_group_layouts: &[Some(bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadertoy_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: vs,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                // REPLACE into the offscreen target — the blit pass
+                // owns alpha compositing so the surface result is
+                // identical to drawing the shader directly.
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Some(pipeline)
     }
 
     fn bind_group(
@@ -1111,8 +1200,9 @@ fn process_shader(content: &str) -> String {
 }
 
 /// Replace whole-word `name` only — `iChannel1Size` must not be hit by
-/// the `iChannel1` substitution.
-fn replace_ident(src: &str, name: &str, repl: &str) -> String {
+/// the `iChannel1` substitution. `pub(crate)` — the capture shaders
+/// use it for `Texture`/`#define` expansion too.
+pub(crate) fn replace_ident(src: &str, name: &str, repl: &str) -> String {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());

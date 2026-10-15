@@ -392,6 +392,10 @@ impl RomEditor {
             }
         }
         emu_meta::prune_meta_images(&self.path, &keep);
+        // Fields the editor doesn't own but must not clear on save
+        // (Lacrima's CopyPreservedCacheFieldsFrom): the locked
+        // pillarbox crop written by the capture context menu.
+        let prev = emu_meta::load_meta(&self.path).unwrap_or_default();
         let doc = emu_meta::RomMetaDoc {
             title: self.title.trim().to_string(),
             developer: self.developer.trim().to_string(),
@@ -403,6 +407,9 @@ impl RomEditor {
             x360_title_id: self.tid.clone(),
             x360_media_id: self.mid.clone(),
             user_edited: true,
+            crop_left: prev.crop_left,
+            crop_right: prev.crop_right,
+            crop_fw: prev.crop_fw,
             images: refs,
         };
         emu_meta::save_meta(&self.path, &doc).map_err(|e| format!("Save failed: {e}"))
