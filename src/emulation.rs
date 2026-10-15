@@ -396,6 +396,11 @@ pub struct EmuView {
     pub cap_t: f32,
     /// egui texture captured frames upload into.
     pub frame_tex: Option<egui::TextureHandle>,
+    /// Back-cover letterbox fill (EmulationUseBackCoverLetterboxFill):
+    /// the game whose "Back Cover" `.meta` payload `letterbox_tex`
+    /// holds — kept through the fade-out after the session ends.
+    letterbox_key: Option<PathBuf>,
+    letterbox_tex: Option<egui::TextureHandle>,
     /// Last frame seq uploaded into `frame_tex`.
     pub frame_seq: u64,
     /// Persistent frame staging buffer — swapped with the capture
@@ -574,6 +579,8 @@ impl EmuView {
             motion_t0: std::time::Instant::now(),
             cap_t: 0.0,
             frame_tex: None,
+            letterbox_key: None,
+            letterbox_tex: None,
             frame_seq: 0,
             frame_buf: Vec::new(),
             notice: None,
@@ -1383,7 +1390,16 @@ pub fn view(
         // Fit/fill decisions key off this so nothing mid-transition
         // can flip the crop state.
         let stable = if fs { content } else { settled_upper };
-        draw_session(ui, &painter, pres_rect, stable, emu, alpha * cap_a, s);
+        draw_session(
+            ui,
+            &painter,
+            pres_rect,
+            stable,
+            emu,
+            alpha * cap_a,
+            s,
+            cfg.back_cover_letterbox_fill,
+        );
     }
     // The input tunnel — while it owns the session, pointer/key
     // events inside the frame rect PostMessage to the hidden
@@ -1443,14 +1459,25 @@ pub fn view(
             // Use Current Crop Size — persist the live resolved crop
             // into the ROM's .meta (SaveCurrentArcadePillarboxCrop).
             if ui.button("Use Current Crop Size").clicked() {
-                let (l, r) = (
-                    emu.pillar_cur.0.round() as u32,
-                    emu.pillar_cur.1.round() as u32,
-                );
+                // Resolved insets (TryGetPillarboxCrop's _cropLeft/
+                // _cropRight): the debounced target once detected —
+                // which is also what a live lock resolves to — with
+                // the animating value as the mid-tween fallback.
+                let (l, r) = if emu.pillar_tgt != (0, 0) {
+                    emu.pillar_tgt
+                } else {
+                    (
+                        emu.pillar_cur.0.round() as u32,
+                        emu.pillar_cur.1.round() as u32,
+                    )
+                };
+                // Frame width: the GPU ring on the zero-copy path —
+                // frame_tex only exists on the CPU mirror.
                 let fw = emu
-                    .frame_tex
+                    .gpu_cap
                     .as_ref()
-                    .map(|t| t.size()[0] as u32)
+                    .map(|g| g.size[0] as u32)
+                    .or_else(|| emu.frame_tex.as_ref().map(|t| t.size()[0] as u32))
                     .unwrap_or(0);
                 if let Some(session) = &emu.session {
                     if (l > 0 || r > 0) && fw > 0 {
@@ -1498,7 +1525,8 @@ pub fn view(
         });
         if open_editor {
             let g = emu.session.as_ref().unwrap().game.clone();
-            emu.editor.open(ui.ctx(), g, String::new());
+            let x360 = emu.loaded_key.as_deref() == Some(XENIA_SECTION);
+            emu.editor.open(ui.ctx(), g, String::new(), x360);
         }
         if stop {
             if let Some(session) = &emu.session {
@@ -2313,10 +2341,62 @@ fn draw_session(
     emu: &mut EmuView,
     alpha: f32,
     s: f32,
+    letterbox_fill: bool,
 ) {
     // Opaque backing — never a compositor hole, matching the
     // #FF000000 Border behind Lacrima's capture host.
     painter.rect_filled(rect, 0.0, Color32::BLACK.gamma_multiply(alpha));
+
+    // Back-cover letterbox fill (DrawLetterboxBackground): the ROM's
+    // "Back Cover" `.meta` payload — bar-cropped like the other web
+    // art — UniformToFill'd under the frame so pillarbox/letterbox
+    // area shows art. Kept through the fade-out once loaded.
+    if letterbox_fill {
+        if let Some(game) = emu.session.as_ref().map(|s| s.game.clone()) {
+            if emu.letterbox_key.as_deref() != Some(game.as_path()) {
+                emu.letterbox_key = Some(game);
+                emu.letterbox_tex = emu
+                    .letterbox_key
+                    .as_deref()
+                    .and_then(emu_meta::back_cover_path)
+                    // `image::open` keys the decoder off the
+                    // extension — `.k0` payloads need content
+                    // sniffing (load_from_memory) instead.
+                    .and_then(|p| std::fs::read(&p).ok())
+                    .and_then(|b| image::load_from_memory(&b).ok())
+                    .map(|img| {
+                        let rgba = library::crop_black_bars(img).to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        ui.ctx().load_texture(
+                            "emu-letterbox",
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &rgba,
+                            ),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+            }
+        }
+        if let Some(tex) = &emu.letterbox_tex {
+            let uv = crate::tag_editor::cover_uv(
+                Vec2::new(tex.size()[0] as f32, tex.size()[1] as f32),
+                rect.size(),
+            );
+            painter.with_clip_rect(rect).image(
+                tex.id(),
+                rect,
+                uv,
+                Color32::WHITE.gamma_multiply(alpha),
+            );
+        }
+    }
+    // Lacrima's IsBackCoverLetterboxBackgroundActive: the fill only
+    // shows where the frame's baked-in bars are cropped away, so an
+    // active fill implies pillarbox detection even when "Remove side
+    // pillars" is off (its effectiveEnableAutoCrop).
+    let pillar_active =
+        emu.render.remove_pillars || (letterbox_fill && emu.letterbox_tex.is_some());
 
     let Some(session) = &emu.session else {
         emu.tun_map = None;
@@ -2427,7 +2507,7 @@ fn draw_session(
     // actually needs pixels there — display on the mirror path, or
     // pillarbox detection.
     session.render().want_cpu.store(
-        emu.render.remove_pillars || emu.gpu_cap.is_none(),
+        pillar_active || emu.gpu_cap.is_none(),
         Ordering::Relaxed,
     );
 
@@ -2441,7 +2521,7 @@ fn draw_session(
         let mut new_seq: Option<u64> = None;
         // The CPU slot is consumed when the display needs its pixels
         // (mirror path) or pillarbox detection does.
-        if !gpu_live || emu.render.remove_pillars {
+        if !gpu_live || pillar_active {
             // Swap the frame into `frame_buf` — the slot gets the old
             // buffer back so the capture thread's scratch<->slot
             // ping-pong stays allocation-free.
@@ -2491,7 +2571,7 @@ fn draw_session(
                 // aggressive profile since AggressivePillarboxCrop ==
                 // RemoveArcadePillarboxBars there) + the arcade resolver,
                 // then the 6-stable-frame debounce before retargeting.
-                if emu.render.remove_pillars {
+                if pillar_active {
                     let det = if let Some((ll, lr, lfw)) = emu.pillar_lock {
                         crate::pillarbox::scale_locked(ll, lr, lfw, w as u32)
                     } else {
@@ -2587,8 +2667,7 @@ fn draw_session(
                 ui.ctx().request_repaint();
             }
         }
-        if !emu.render.remove_pillars && (emu.pillar_tgt != (0, 0) || emu.pillar_cur != (0.0, 0.0))
-        {
+        if !pillar_active && (emu.pillar_tgt != (0, 0) || emu.pillar_cur != (0.0, 0.0)) {
             emu.pillar_from = emu.pillar_cur;
             emu.pillar_tgt = (0, 0);
             emu.pillar_last = (0, 0);
@@ -2961,7 +3040,7 @@ fn draw_items(
                 .find(|c| section_key(c) == key)
                 .map(|c| c.title.clone())
                 .unwrap_or_default();
-            emu.editor.open(ui.ctx(), p, platform);
+            emu.editor.open(ui.ctx(), p, platform, key == XENIA_SECTION);
         }
         // Xenia per-game overlays — the storage root resolves the
         // same way a launch does (launcher dir ⇄ managed install).

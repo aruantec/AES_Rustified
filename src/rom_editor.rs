@@ -109,6 +109,20 @@ struct SearchOverlay {
     thumb_rx: mpsc::Receiver<(usize, Vec<u8>)>,
     thumb_pending: HashSet<usize>,
     thumbs: HashMap<usize, egui::TextureHandle>,
+    /// Hover-driven full-image preview (MetadataImageSearchOverlay's
+    /// preview column): which hit the pane shows, which fetch is in
+    /// flight, which index the decoded texture belongs to, and the
+    /// inferred wallpaper-vs-bezel kind. The texture is kept while
+    /// the next candidate downloads — Lacrima holds the old frame.
+    preview_hit: Option<usize>,
+    preview_req: Option<usize>,
+    preview_rx: Option<mpsc::Receiver<(usize, Option<Vec<u8>>)>>,
+    preview_loaded: Option<usize>,
+    preview_tex: Option<egui::TextureHandle>,
+    preview_kind: ImgKind,
+    /// URL of the pick download in flight — the wallpaper/bezel kind
+    /// is inferred from it once the bytes arrive.
+    pick_url: String,
 }
 
 impl SearchOverlay {
@@ -125,6 +139,13 @@ impl SearchOverlay {
             thumb_rx,
             thumb_pending: HashSet::new(),
             thumbs: HashMap::new(),
+            preview_hit: None,
+            preview_req: None,
+            preview_rx: None,
+            preview_loaded: None,
+            preview_tex: None,
+            preview_kind: ImgKind::BackCover,
+            pick_url: String::new(),
         }
     }
 
@@ -178,6 +199,67 @@ impl SearchOverlay {
         });
         self.thumb_pending.insert(i);
     }
+
+    /// Drive the hover preview (Lacrima's SetImageSearchPreview):
+    /// mark `i` as the hovered result and fetch its full image once.
+    /// The previous texture stays visible until the new one decodes.
+    fn want_preview(&mut self, ctx: &egui::Context, i: usize) {
+        self.preview_hit = Some(i);
+        if self.preview_loaded == Some(i) || self.preview_req == Some(i) {
+            return;
+        }
+        if self.preview_rx.is_some() {
+            return; // stale fetch lands, gets discarded, next frame retries
+        }
+        let Some(url) = self.hits.get(i).map(|h| h.url.clone()) else {
+            return;
+        };
+        // URL-only inference until the download reports real dims.
+        self.preview_kind = infer_wallpaper_kind(&url, 0, 0);
+        let (tx, rx) = mpsc::channel();
+        self.preview_rx = Some(rx);
+        self.preview_req = Some(i);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((i, emu_meta::fetch_image(&url)));
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// Lacrima's WallpaperBezelImageHeuristics.InferKind — bezel token in
+/// the URL wins, then aspect (≥1.55 = bezel/back cover, ≤0.85 =
+/// wallpaper), then a "wallpaper" token, defaulting to back cover.
+fn infer_wallpaper_kind(url: &str, w: u32, h: u32) -> ImgKind {
+    const BEZEL: &[&str] = &[
+        "bezel",
+        "marquee",
+        "cabinet",
+        "side-art",
+        "sideart",
+        "side_art",
+        "wide",
+        "control panel",
+        "cpanel",
+        "side panel",
+    ];
+    let lower = url.to_lowercase();
+    if BEZEL.iter().any(|t| lower.contains(t)) {
+        return ImgKind::BackCover;
+    }
+    if w > 0 && h > 0 {
+        let a = w as f64 / h as f64;
+        if a >= 1.55 {
+            return ImgKind::BackCover;
+        }
+        if a <= 0.85 {
+            return ImgKind::Wallpaper;
+        }
+    }
+    if lower.contains("wallpaper") {
+        return ImgKind::Wallpaper;
+    }
+    ImgKind::BackCover
 }
 
 /// A result card's label — the image's filename when it parses.
@@ -282,7 +364,11 @@ impl RomEditor {
     /// Opens instantly with the stem-derived title; the doc + xex id
     /// scan + images arrive on `load_rx` — inputs stay disabled until
     /// then so an early Save can't clobber unloaded fields.
-    pub fn open(&mut self, ctx: &egui::Context, path: PathBuf, platform: String) {
+    /// `platform` feeds the cover-search query; `x360` gates the XEX
+    /// id extraction (Lacrima only runs it for Xbox 360 media — the
+    /// fallback scans 512MB of ISO for a XEX2 blob, pointless on a
+    /// GC/Wii/PS2 disc).
+    pub fn open(&mut self, ctx: &egui::Context, path: PathBuf, platform: String, x360: bool) {
         *self = Self::new();
         self.open = true;
         self.shown = true;
@@ -321,7 +407,7 @@ impl RomEditor {
                 })
                 .unwrap_or_default();
             let _ = tx.send(LoadedDoc {
-                ids: emu_meta::x360_ids(&path),
+                ids: if x360 { emu_meta::x360_ids(&path) } else { None },
                 cached_title: emu_meta::cached_title(&path),
                 cover: std::fs::read(emu_meta::cover_path(&path)).ok(),
                 doc,
@@ -1093,13 +1179,50 @@ impl RomEditor {
                     }
                 }
             }
+            if let Some(rx) = &s.preview_rx {
+                if let Ok((i, data)) = rx.try_recv() {
+                    s.preview_rx = None;
+                    s.preview_req = None;
+                    if s.preview_hit == Some(i) {
+                        if let Some(img) = data
+                            .as_deref()
+                            .and_then(|d| image::load_from_memory(d).ok())
+                        {
+                            let url = s.hits.get(i).map(|h| h.url.as_str()).unwrap_or("");
+                            s.preview_kind =
+                                infer_wallpaper_kind(url, img.width(), img.height());
+                            let rgba = img.to_rgba8();
+                            let (w, h) = rgba.dimensions();
+                            s.preview_tex = Some(ctx.load_texture(
+                                "rom_search_preview",
+                                egui::ColorImage::from_rgba_unmultiplied(
+                                    [w as usize, h as usize],
+                                    &rgba,
+                                ),
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            s.preview_loaded = Some(i);
+                        }
+                    }
+                }
+            }
             if let Some(rx) = &s.pick_rx {
                 if let Ok(data) = rx.try_recv() {
                     s.pick_rx = None;
                     match data {
                         Some(d) => {
                             let kind = match s.mode {
-                                SearchMode::Wallpaper => ImgKind::Wallpaper,
+                                // Wallpaper/bezel picks save under
+                                // the inferred kind (Lacrima's
+                                // TryAddWallpaperBezelImageFromUrl) —
+                                // bezels land as Back Cover so the
+                                // letterbox fill finds them.
+                                SearchMode::Wallpaper => {
+                                    let (w, h) = image::load_from_memory(&d)
+                                        .map(|i| (i.width(), i.height()))
+                                        .unwrap_or((0, 0));
+                                    infer_wallpaper_kind(&s.pick_url, w, h)
+                                }
                                 _ => ImgKind::Cover,
                             };
                             picked = Some((d, kind));
@@ -1118,6 +1241,7 @@ impl RomEditor {
         }
         if self.search.search_rx.is_some()
             || self.search.pick_rx.is_some()
+            || self.search.preview_rx.is_some()
             || !self.search.thumb_pending.is_empty()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1175,15 +1299,45 @@ impl RomEditor {
                     egui::StrokeKind::Inside,
                 );
                 let inner = body.shrink(12.0 * s);
+                // Wallpaper/bezel searches get Lacrima's two-column
+                // layout — results (3*) + hover-driven preview (2*).
+                let wallpaper = self.search.mode == SearchMode::Wallpaper;
+                let (res_rect, pv_rect) = if wallpaper {
+                    let w = inner.width() * 0.6 - 9.0 * s;
+                    (
+                        Rect::from_min_max(
+                            inner.min,
+                            egui::pos2(inner.min.x + w, inner.max.y),
+                        ),
+                        Rect::from_min_max(
+                            egui::pos2(inner.min.x + w + 18.0 * s, inner.min.y),
+                            inner.max,
+                        ),
+                    )
+                } else {
+                    (inner, Rect::NOTHING)
+                };
                 ui.scope_builder(
                     UiBuilder::new()
-                        .max_rect(inner)
+                        .max_rect(res_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
-                        ui.set_clip_rect(inner.intersect(ui.clip_rect()));
-                        self.search_results(ui, inner, s);
+                        ui.set_clip_rect(res_rect.intersect(ui.clip_rect()));
+                        self.search_results(ui, res_rect, s);
                     },
                 );
+                if wallpaper {
+                    // OnResultsPointerExited — leaving the results
+                    // column clears the preview pane.
+                    let inside = ui
+                        .ctx()
+                        .pointer_hover_pos()
+                        .is_some_and(|p| res_rect.contains(p));
+                    if !inside {
+                        self.search.preview_hit = None;
+                    }
+                    self.search_preview_pane(ui, pv_rect, s);
+                }
                 // Footer: status + Close.
                 let foot = Rect::from_min_max(
                     egui::pos2(area.min.x, area.max.y - 36.0 * s),
@@ -1229,6 +1383,7 @@ impl RomEditor {
                 let cols = ((rect.width() + gap) / (card_w + gap)).floor().max(1.0) as usize;
                 let n = self.search.hits.len();
                 let mut pick = None;
+                let mut hover = None;
                 for start in (0..n).step_by(cols) {
                     let end = (start + cols).min(n);
                     ui.horizontal_top(|ui| {
@@ -1265,6 +1420,7 @@ impl RomEditor {
                                             );
                                         }
                                         if resp.hovered() {
+                                            hover = Some(i);
                                             ui.painter().rect_stroke(
                                                 r,
                                                 CornerRadius::same((6.0 * s).round() as u8),
@@ -1290,6 +1446,11 @@ impl RomEditor {
                     });
                     ui.add_space(gap);
                 }
+                if self.search.mode == SearchMode::Wallpaper {
+                    if let Some(i) = hover {
+                        self.search.want_preview(&ctx, i);
+                    }
+                }
                 if let Some(i) = pick {
                     let h = self.search.hits[i].url.clone();
                     match self.search.mode {
@@ -1299,6 +1460,7 @@ impl RomEditor {
                             self.search.open = false;
                         }
                         _ => {
+                            self.search.pick_url = h.clone();
                             let (tx, rx) = mpsc::channel();
                             self.search.pick_rx = Some(rx);
                             let ctx = ctx.clone();
@@ -1311,6 +1473,126 @@ impl RomEditor {
                     }
                 }
             });
+    }
+
+    // --------------------------------------------------------------
+    // Lacrima's preview column (MetadataImageSearchOverlay Grid 2* +
+    // CompositionWallpaperBezelPreviewControl): labels on top, the
+    // 16:9 composite below. Wallpaper candidates draw UniformToFill;
+    // bezel candidates draw height-filled with a centered "game"
+    // placeholder block so the pillar framing is visible.
+    // --------------------------------------------------------------
+    fn search_preview_pane(&mut self, ui: &mut egui::Ui, rect: Rect, s: f32) {
+        ui.painter().rect(
+            rect,
+            CornerRadius::same((10.0 * s).round() as u8),
+            egui::Color32::from_black_alpha(18),
+            Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
+            egui::StrokeKind::Inside,
+        );
+        let inner = rect.shrink(16.0 * s);
+        let s_o = &self.search;
+        let hit = s_o.preview_hit.and_then(|i| s_o.hits.get(i));
+        let wallpaper = s_o.preview_kind == ImgKind::Wallpaper;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0 * s;
+                ui.label(
+                    egui::RichText::new(if wallpaper {
+                        "Wallpaper preview"
+                    } else {
+                        "Letterbox bezel preview"
+                    })
+                    .size(22.0 * s)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(hit.map(|h| h.title.as_str()).unwrap_or("Item title"))
+                            .size(16.0 * s)
+                            .color(egui::Color32::from_rgb(0xB8, 0xB8, 0xB8)),
+                    )
+                    .truncate(),
+                );
+                if hit.is_some() {
+                    ui.label(
+                        egui::RichText::new(if wallpaper {
+                            "Will save as Wallpaper"
+                        } else {
+                            "Will save as Back Cover (letterbox fill)"
+                        })
+                        .size(15.0 * s)
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x8F, 0xE3, 0xA1)),
+                    );
+                }
+                // 16:9 composite area under the labels.
+                let top = ui.cursor().min.y + 6.0 * s;
+                let w = inner.width();
+                let pv = Rect::from_min_size(
+                    egui::pos2(inner.min.x, top),
+                    egui::vec2(w, (w * 9.0 / 16.0).min(inner.max.y - top)),
+                );
+                ui.painter().rect_filled(
+                    pv,
+                    CornerRadius::same((8.0 * s).round() as u8),
+                    egui::Color32::from_rgb(0x10, 0x10, 0x10),
+                );
+                if let Some(t) = &s_o.preview_tex {
+                    let tp = ui.painter().with_clip_rect(pv);
+                    let ts = t.size_vec2();
+                    if wallpaper {
+                        // UniformToFill over the whole preview.
+                        tp.image(t.id(), pv, cover_uv(ts, pv.size()), egui::Color32::WHITE);
+                    } else {
+                        // UniformToFillHeight: fill the height, crop
+                        // width when the source is wider (Lacrima's
+                        // UniformToFillHeightSrc), then the dark
+                        // game placeholder + faint border on top.
+                        let width = pv.height() * (ts.x / ts.y);
+                        let (cx, cw) = if width > pv.width() {
+                            let cw = ts.y * (pv.width() / pv.height());
+                            ((ts.x - cw) * 0.5, cw)
+                        } else {
+                            (0.0, ts.x)
+                        };
+                        tp.image(
+                            t.id(),
+                            pv,
+                            Rect::from_min_max(
+                                egui::pos2(cx / ts.x, 0.0),
+                                egui::pos2((cx + cw) / ts.x, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        let gw = pv.width() * 0.44;
+                        let gr = Rect::from_min_max(
+                            egui::pos2(pv.center().x - gw * 0.5, pv.min.y),
+                            egui::pos2(pv.center().x + gw * 0.5, pv.max.y),
+                        );
+                        tp.rect_filled(gr, 0.0, egui::Color32::from_rgb(0x05, 0x05, 0x05));
+                        tp.rect_stroke(
+                            gr,
+                            0.0,
+                            Stroke::new(1.0, egui::Color32::from_white_alpha(36)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                } else {
+                    ui.painter().text(
+                        pv.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Hover a result to preview how it will look.",
+                        egui::FontId::proportional(14.0 * s),
+                        egui::Color32::from_rgb(0x8A, 0x8A, 0x8A),
+                    );
+                }
+            },
+        );
     }
 }
 
@@ -1371,4 +1653,39 @@ fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
 #[cfg(not(windows))]
 fn clipboard_image() -> Option<Vec<u8>> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Lacrima's WallpaperBezelImageHeuristics.InferKind — bezel
+    // tokens win, then aspect (≥1.55 bezel / ≤0.85 wallpaper),
+    // then a "wallpaper" token, defaulting to back cover.
+    #[test]
+    fn wallpaper_kind_inference() {
+        assert_eq!(
+            infer_wallpaper_kind("https://x/mario-bezel.png", 0, 0),
+            ImgKind::BackCover
+        );
+        assert_eq!(
+            infer_wallpaper_kind("https://x/cabinet-art.png", 0, 0),
+            ImgKind::BackCover
+        );
+        assert_eq!(
+            infer_wallpaper_kind("https://x/img.png", 1920, 1080),
+            ImgKind::BackCover
+        );
+        assert_eq!(
+            infer_wallpaper_kind("https://x/img.png", 800, 1200),
+            ImgKind::Wallpaper
+        );
+        assert_eq!(
+            infer_wallpaper_kind("https://x/mario-wallpaper.png", 0, 0),
+            ImgKind::Wallpaper
+        );
+        // Ambiguous aspect + no tokens → back cover (bezel default).
+        assert_eq!(infer_wallpaper_kind("https://x/img.png", 4, 3), ImgKind::BackCover);
+        assert_eq!(infer_wallpaper_kind("https://x/img.png", 0, 0), ImgKind::BackCover);
+    }
 }

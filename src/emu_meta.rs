@@ -2682,6 +2682,29 @@ pub fn meta_doc_path(rom: &Path) -> PathBuf {
     cache_dir().join(format!("{}.meta", key_for(rom)))
 }
 
+/// The ROM's "Back Cover" extra-image payload — what the capture
+/// letterbox fill draws behind the frame (Lacrima's
+/// `EmulationLetterboxHelper.TryLoadBackCoverBitmap`, which reads
+/// the `.meta` store's BackCover entries).
+pub fn back_cover_path(rom: &Path) -> Option<PathBuf> {
+    let doc = load_meta(rom)?;
+    for (i, r) in doc.images.iter().enumerate() {
+        if !r.kind.eq_ignore_ascii_case("Back Cover") && !r.kind.eq_ignore_ascii_case("BackCover")
+        {
+            continue;
+        }
+        let p = cache_dir().join(&r.file);
+        if p.is_file() {
+            return Some(p);
+        }
+        let alt = meta_image_path(rom, i);
+        if alt.is_file() {
+            return Some(alt);
+        }
+    }
+    None
+}
+
 /// Payload path for a stored extra image (`<key>.k<n>`).
 pub fn meta_image_path(rom: &Path, n: usize) -> PathBuf {
     cache_dir().join(format!("{}.k{}", key_for(rom), n))
@@ -3201,6 +3224,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The letterbox fill reads the "Back Cover" `.meta` payload —
+    /// a doc ref must resolve to its `<key>.k<n>` file.
+    #[test]
+    fn back_cover_payload_resolves() {
+        let dir = std::env::temp_dir().join(format!("aes_test_bc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rom = dir.join("game.iso");
+        std::fs::write(&rom, b"fake").unwrap();
+        // No doc → no back cover.
+        assert!(back_cover_path(&rom).is_none());
+        let payload = meta_image_path(&rom, 0);
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"png-bytes").unwrap();
+        let doc = RomMetaDoc {
+            images: vec![
+                MetaImageRef {
+                    kind: "Wallpaper".into(),
+                    file: payload.file_name().unwrap().to_string_lossy().into_owned(),
+                },
+                MetaImageRef {
+                    kind: "Back Cover".into(),
+                    file: payload.file_name().unwrap().to_string_lossy().into_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+        save_meta(&rom, &doc).unwrap();
+        assert_eq!(back_cover_path(&rom).as_deref(), Some(payload.as_path()));
+        let _ = std::fs::remove_file(&payload);
+        let _ = std::fs::remove_file(meta_doc_path(&rom));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Serial normalization hits the DB through its variants —
     /// filenames like "SLUS_005.94 - Game.iso" must map too.
     #[test]
@@ -3213,5 +3269,26 @@ mod tests {
                 .as_deref(),
             Some("SLUS00594")
         );
+    }
+}
+
+#[cfg(test)]
+mod payload_decode_tests {
+    /// Regression: `.k<n>` payload files have no image extension —
+    /// `image::open` rejects them (`PathExtension` error), so the
+    /// letterbox path must decode from bytes with content sniffing.
+    #[test]
+    fn extensionless_payload_decodes_from_bytes() {
+        let dir = std::env::temp_dir().join(format!("aes_lb_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("abc.k0");
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([1, 2, 3]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        std::fs::write(&p, buf.into_inner()).unwrap();
+        assert!(image::open(&p).is_err(), ".k0 must fail extension decode");
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(image::load_from_memory(&bytes).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

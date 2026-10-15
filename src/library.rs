@@ -371,7 +371,7 @@ pub fn decode_cover(src: &CoverSrc) -> Option<egui::ColorImage> {
 /// thumbnail. An edge row/column counts as bar only when ≥98% of its
 /// pixels are near-black, so genuinely dark artwork keeps its edges.
 /// Each side is capped at 40% of the dimension as a safety bound.
-fn crop_black_bars(img: image::DynamicImage) -> image::DynamicImage {
+pub(crate) fn crop_black_bars(img: image::DynamicImage) -> image::DynamicImage {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     if w < 32 || h < 32 {
