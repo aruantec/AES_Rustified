@@ -1322,6 +1322,153 @@ fn ps2_title(path: &Path) -> Option<String> {
 }
 
 // ------------------------------------------------------------------
+// GameCube / Wii — DolphinDiscMetadataReader port: the volume header
+// at disc offset 0 (game id @0, internal name @0x20..0x80), read
+// through the WBFS / GCZ / CISO container readers. `.wad` carries a
+// title id but no embedded name — the stem fallback wins there.
+// ------------------------------------------------------------------
+
+const GC_DISC_MAGIC: u32 = 0xC2339F3D; // big-endian @0x1C
+const WII_DISC_MAGIC: u32 = 0x5D1C9EA3; // big-endian @0x18
+const GCZ_MAGIC: u32 = 0xB10BC001; // little-endian @0
+const CISO_MAGIC: u32 = 0x4F53_4943; // "CISO" little-endian @0
+const WBFS_MAGIC: u32 = 0x5346_4257; // "WBFS" little-endian @0
+
+/// The 0x80-byte volume header at disc offset 0, mapped through the
+/// container when the file is WBFS/GCZ/CISO. Plain images (iso, gcm,
+/// dol, elf, tgc…) read it straight.
+fn dolphin_disc_header(path: &Path) -> Option<[u8; 0x80]> {
+    use std::io::{Read, Seek, SeekFrom};
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 0x80];
+    match ext.as_str() {
+        "wbfs" => {
+            let mut h = [0u8; 512];
+            f.read_exact(&mut h).ok()?;
+            if u32::from_le_bytes(h[..4].try_into().ok()?) != WBFS_MAGIC || h[12] == 0 {
+                return None;
+            }
+            let (hd_shift, wbfs_shift) = (h[8] as u32, h[9] as u32);
+            if hd_shift > 31 || wbfs_shift > 31 {
+                return None;
+            }
+            let hd_size = 1u64 << hd_shift;
+            let wbfs_size = 1u64 << wbfs_shift;
+            if wbfs_size < 0x8000 {
+                return None;
+            }
+            let blocks = (143432u64 * 2 * 0x8000).div_ceil(wbfs_size);
+            let wlba_off = hd_size + 256;
+            let wlba_bytes = blocks * 2;
+            let flen = f.metadata().ok()?.len();
+            if flen < wlba_off + wlba_bytes {
+                return None;
+            }
+            f.seek(SeekFrom::Start(wlba_off)).ok()?;
+            let mut w = [0u8; 2];
+            f.read_exact(&mut w).ok()?;
+            let addr = wbfs_size * u16::from_be_bytes(w) as u64;
+            if addr + 0x80 > flen {
+                return None;
+            }
+            f.seek(SeekFrom::Start(addr)).ok()?;
+            f.read_exact(&mut hdr).ok()?;
+        }
+        "gcz" => {
+            let mut h = [0u8; 32];
+            f.read_exact(&mut h).ok()?;
+            if u32::from_le_bytes(h[0..4].try_into().ok()?) != GCZ_MAGIC {
+                return None;
+            }
+            let comp_size = u64::from_le_bytes(h[8..16].try_into().ok()?);
+            let block_size = u32::from_le_bytes(h[24..28].try_into().ok()?) as usize;
+            let num_blocks = u32::from_le_bytes(h[28..32].try_into().ok()?) as usize;
+            if block_size == 0 || num_blocks == 0 || block_size > (256 << 20) {
+                return None;
+            }
+            // Block-pointer table: num_blocks u64s at offset 32, then
+            // num_blocks adler32s, then the payload. Only block 0 is
+            // needed for the volume header.
+            f.seek(SeekFrom::Start(32)).ok()?;
+            let mut p0 = [0u8; 8];
+            f.read_exact(&mut p0).ok()?;
+            let mut start = u64::from_le_bytes(p0);
+            let stored_raw = (start & (1 << 63)) != 0;
+            start &= !(1 << 63);
+            let end = if num_blocks > 1 {
+                let mut p1 = [0u8; 8];
+                f.read_exact(&mut p1).ok()?;
+                u64::from_le_bytes(p1) & !(1 << 63)
+            } else {
+                comp_size
+            };
+            if end <= start || end - start > (256 << 20) {
+                return None;
+            }
+            let data_off = 32 + num_blocks as u64 * 8 + num_blocks as u64 * 4;
+            f.seek(SeekFrom::Start(data_off + start)).ok()?;
+            let mut comp = vec![0u8; (end - start) as usize];
+            f.read_exact(&mut comp).ok()?;
+            if stored_raw {
+                let n = comp.len().min(0x80);
+                hdr[..n].copy_from_slice(&comp[..n]);
+            } else {
+                use flate2::read::ZlibDecoder;
+                let mut dec = ZlibDecoder::new(&comp[..]);
+                dec.read_exact(&mut hdr).ok()?;
+            }
+        }
+        "ciso" => {
+            // Header 0x8000: magic, blockSize, then a 1-byte used flag
+            // per disc block; used blocks map to sequential file
+            // blocks. Block 0 unused → header is zeroed → no title.
+            let mut h = [0u8; 8];
+            f.read_exact(&mut h).ok()?;
+            if u32::from_le_bytes(h[0..4].try_into().ok()?) != CISO_MAGIC {
+                return None;
+            }
+            let block_size = u32::from_le_bytes(h[4..8].try_into().ok()?) as u64;
+            if block_size == 0 || block_size > (256 << 20) {
+                return None;
+            }
+            let mut flag = [0u8; 1];
+            f.read_exact(&mut flag).ok()?;
+            if flag[0] != 1 {
+                return None;
+            }
+            f.seek(SeekFrom::Start(0x8000)).ok()?;
+            f.read_exact(&mut hdr).ok()?;
+        }
+        _ => {
+            f.read_exact(&mut hdr).ok()?;
+        }
+    }
+    Some(hdr)
+}
+
+/// Internal disc name → display title. Accepts the header only when
+/// the Wii/GameCube magic or a full 6-char game id validates the
+/// read (Lacrima's ParseDiscHeader + FilterGameId guards).
+fn dolphin_disc_title(path: &Path) -> Option<String> {
+    let hdr = dolphin_disc_header(path)?;
+    let game_id: String = hdr[..6]
+        .iter()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .map(|b| *b as char)
+        .collect();
+    let magic_ok =
+        u32::from_be_bytes(hdr[0x18..0x1C].try_into().ok()?) == WII_DISC_MAGIC
+            || u32::from_be_bytes(hdr[0x1C..0x20].try_into().ok()?) == GC_DISC_MAGIC;
+    if !magic_ok && game_id.len() < 6 {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&hdr[0x20..0x80]);
+    let t = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    (t.chars().filter(|c| !c.is_control()).count() >= 2).then(|| t.to_string())
+}
+
+// ------------------------------------------------------------------
 // LibRetro thumbnails (LibRetroThumbnailCoverService)
 // ------------------------------------------------------------------
 const LIBRETRO_BASE: &str = "https://thumbnails.libretro.com/";
@@ -2282,6 +2429,9 @@ fn resolve_one(
             "DC" => dc_title(path),
             "PSX" => psx_title(path),
             "PS2" => ps2_title(path),
+            // GC + Wii share Dolphin's volume-header reader — the
+            // disc magic picks the console, not the section.
+            "GCN" | "WII" => dolphin_disc_title(path),
             "PS3" => ps3_title(path),
             "PS4" => ps4_title(path),
             _ => None,
@@ -2931,6 +3081,124 @@ mod tests {
         );
         assert_eq!(psx_title(&iso).as_deref(), Some("Metal Gear Solid (Disc 1)"));
         let _ = std::fs::remove_dir_all(&dir_p);
+    }
+
+    /// GC + Wii disc headers resolve their internal names through
+    /// the plain reader; magic validates the layout.
+    #[test]
+    fn dolphin_iso_reads_internal_title() {
+        let dir = std::env::temp_dir().join(format!("aes_test_gc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = vec![0u8; 0x200];
+        img[..6].copy_from_slice(b"GALE01");
+        img[0x1C..0x20].copy_from_slice(&GC_DISC_MAGIC.to_be_bytes());
+        img[0x20..0x20 + 20].copy_from_slice(b"Super Mario Sunshine");
+        let iso = dir.join("sms.iso");
+        std::fs::write(&iso, &img).unwrap();
+        assert_eq!(
+            dolphin_disc_title(&iso).as_deref(),
+            Some("Super Mario Sunshine")
+        );
+        // Wii magic sits at 0x18.
+        img[0x1C..0x20].fill(0);
+        img[0x18..0x1C].copy_from_slice(&WII_DISC_MAGIC.to_be_bytes());
+        img[..6].copy_from_slice(b"RMCE01");
+        img[0x20..0x60].fill(0);
+        img[0x20..0x20 + 14].copy_from_slice(b"Mario Kart Wii");
+        std::fs::write(&iso, &img).unwrap();
+        assert_eq!(
+            dolphin_disc_title(&iso).as_deref(),
+            Some("Mario Kart Wii")
+        );
+        // Garbage → no title (the stem fallback wins).
+        img.fill(0xAB);
+        std::fs::write(&iso, &img).unwrap();
+        assert!(dolphin_disc_title(&iso).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same header inside a WBFS container resolves through the
+    /// wlba→cluster indirection.
+    #[test]
+    fn dolphin_wbfs_reads_internal_title() {
+        let dir = std::env::temp_dir().join(format!("aes_test_wbfs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = vec![0u8; 600_000];
+        img[0..4].copy_from_slice(b"WBFS");
+        img[8] = 6; // hd sector shift → 64
+        img[9] = 15; // wbfs sector shift → 32768
+        img[12] = 1; // disc count
+        // wlba table at hd_size(64)+256=320; wlba[0]=1 → cluster @32768.
+        img[320..322].copy_from_slice(&1u16.to_be_bytes());
+        let h = 32768usize;
+        img[h..h + 6].copy_from_slice(b"GALE01");
+        img[h + 0x1C..h + 0x20].copy_from_slice(&GC_DISC_MAGIC.to_be_bytes());
+        img[h + 0x20..h + 0x20 + 20].copy_from_slice(b"Super Mario Sunshine");
+        let wbfs = dir.join("sms.wbfs");
+        std::fs::write(&wbfs, &img).unwrap();
+        assert_eq!(
+            dolphin_disc_title(&wbfs).as_deref(),
+            Some("Super Mario Sunshine")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GCZ block 0 is zlib-deflated — the header must decompress
+    /// before parsing.
+    #[test]
+    fn dolphin_gcz_reads_internal_title() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("aes_test_gcz_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut disc = vec![0u8; 4096];
+        disc[..6].copy_from_slice(b"GALE01");
+        disc[0x1C..0x20].copy_from_slice(&GC_DISC_MAGIC.to_be_bytes());
+        disc[0x20..0x20 + 20].copy_from_slice(b"Super Mario Sunshine");
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&disc).unwrap();
+        let comp = enc.finish().unwrap();
+        let mut img = Vec::new();
+        img.extend_from_slice(&GCZ_MAGIC.to_le_bytes());
+        img.extend_from_slice(&0u32.to_le_bytes()); // subtype
+        img.extend_from_slice(&(comp.len() as u64).to_le_bytes()); // compressed size
+        img.extend_from_slice(&(disc.len() as u64).to_le_bytes()); // data size
+        img.extend_from_slice(&(disc.len() as u32).to_le_bytes()); // block size
+        img.extend_from_slice(&1u32.to_le_bytes()); // num blocks
+        img.extend_from_slice(&0u64.to_le_bytes()); // block 0 ptr @0
+        img.extend_from_slice(&0u32.to_le_bytes()); // adler32
+        img.extend_from_slice(&comp);
+        let gcz = dir.join("sms.gcz");
+        std::fs::write(&gcz, &img).unwrap();
+        assert_eq!(
+            dolphin_disc_title(&gcz).as_deref(),
+            Some("Super Mario Sunshine")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CISO's used-block map routes disc block 0 to file offset
+    /// 0x8000.
+    #[test]
+    fn dolphin_ciso_reads_internal_title() {
+        let dir = std::env::temp_dir().join(format!("aes_test_ciso_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = vec![0u8; 0x8000 * 2];
+        img[0..4].copy_from_slice(b"CISO");
+        img[4..8].copy_from_slice(&0x8000u32.to_le_bytes());
+        img[8] = 1; // block 0 used → file block index 0
+        let h = 0x8000usize;
+        img[h..h + 6].copy_from_slice(b"RMCE01");
+        img[h + 0x18..h + 0x1C].copy_from_slice(&WII_DISC_MAGIC.to_be_bytes());
+        img[h + 0x20..h + 0x20 + 14].copy_from_slice(b"Mario Kart Wii");
+        let ciso = dir.join("mkwii.ciso");
+        std::fs::write(&ciso, &img).unwrap();
+        assert_eq!(
+            dolphin_disc_title(&ciso).as_deref(),
+            Some("Mario Kart Wii")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Serial normalization hits the DB through its variants —

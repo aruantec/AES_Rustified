@@ -44,6 +44,9 @@ const PSX_SECTION: &str = "PSX";
 const DUCKSTATION_HANDLER: &str = "duckstation";
 const PS2_SECTION: &str = "PS2";
 const PCSX2_HANDLER: &str = "pcsx2";
+const GCN_SECTION: &str = "GCN";
+const WII_SECTION: &str = "WII";
+const DOLPHIN_HANDLER: &str = "dolphin";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -130,6 +133,33 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             installed_exe: emu_dl::pcsx2_exe,
             download: emu_dl::download_pcsx2,
         },
+        // GameCube + Wii share one Dolphin install — Lacrima's
+        // DolphinHandler covers both album titles.
+        GCN_SECTION | WII_SECTION => HandlerSpec {
+            section: GCN_SECTION,
+            handler: DOLPHIN_HANDLER,
+            name: "Dolphin",
+            exe_hint: "Path to Dolphin.exe",
+            dialog_title: "Locate Dolphin.exe",
+            installed_exe: emu_dl::dolphin_exe,
+            download: emu_dl::download_dolphin,
+        },
+        _ => return None,
+    })
+}
+
+/// Handler id → launch kind. Shared by `launch` and the setup-gear
+/// so both resolve the same executable flavor.
+fn handler_kind(handler: Option<&str>) -> Option<xenia::Kind> {
+    Some(match handler {
+        Some(XENIA_HANDLER) => xenia::Kind::Xenia,
+        Some(FLYCAST_HANDLER) => xenia::Kind::Flycast,
+        Some(XEMU_HANDLER) => xenia::Kind::Xemu,
+        Some(RPCS3_HANDLER) => xenia::Kind::Rpcs3,
+        Some(SHADPS4_HANDLER) => xenia::Kind::Shadps4,
+        Some(DUCKSTATION_HANDLER) => xenia::Kind::DuckStation,
+        Some(PCSX2_HANDLER) => xenia::Kind::Pcsx2,
+        Some(DOLPHIN_HANDLER) => xenia::Kind::Dolphin,
         _ => return None,
     })
 }
@@ -884,6 +914,7 @@ impl EmuView {
             PS4_SECTION => Some(SHADPS4_HANDLER.to_string()),
             PSX_SECTION => Some(DUCKSTATION_HANDLER.to_string()),
             PS2_SECTION => Some(PCSX2_HANDLER.to_string()),
+            GCN_SECTION | WII_SECTION => Some(DOLPHIN_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -911,6 +942,7 @@ impl EmuView {
                     SHADPS4_HANDLER => emu_dl::shadps4_exe(),
                     DUCKSTATION_HANDLER => emu_dl::duckstation_exe(),
                     PCSX2_HANDLER => emu_dl::pcsx2_exe(),
+                    DOLPHIN_HANDLER => emu_dl::dolphin_exe(),
                     _ => None,
                 }
             };
@@ -924,16 +956,7 @@ impl EmuView {
     pub fn launch(&mut self, cfg: &settings::Emulation, game: &Path) {
         self.notice = None;
         let handler = self.active_handler(cfg);
-        let Some(kind) = (match handler.as_deref() {
-            Some(XENIA_HANDLER) => Some(xenia::Kind::Xenia),
-            Some(FLYCAST_HANDLER) => Some(xenia::Kind::Flycast),
-            Some(XEMU_HANDLER) => Some(xenia::Kind::Xemu),
-            Some(RPCS3_HANDLER) => Some(xenia::Kind::Rpcs3),
-            Some(SHADPS4_HANDLER) => Some(xenia::Kind::Shadps4),
-            Some(DUCKSTATION_HANDLER) => Some(xenia::Kind::DuckStation),
-            Some(PCSX2_HANDLER) => Some(xenia::Kind::Pcsx2),
-            _ => None,
-        }) else {
+        let Some(kind) = handler_kind(handler.as_deref()) else {
             self.notice = Some("No emulator handler configured for this section".into());
             return;
         };
@@ -945,6 +968,7 @@ impl EmuView {
             xenia::Kind::Shadps4 => "shadPS4",
             xenia::Kind::DuckStation => "DuckStation",
             xenia::Kind::Pcsx2 => "PCSX2",
+            xenia::Kind::Dolphin => "Dolphin",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
@@ -1613,7 +1637,8 @@ pub fn view(
         });
         if r.clicked() {
             if let Some(exe) = &setup_exe {
-                if let Err(e) = xenia::launch_setup(&exe.to_string_lossy()) {
+                let kind = handler_kind(emu.active_handler(cfg).as_deref());
+                if let Err(e) = xenia::launch_setup(&exe.to_string_lossy(), kind) {
                     emu.notice = Some(e);
                 }
             }

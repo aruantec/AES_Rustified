@@ -26,6 +26,11 @@ const DUCKSTATION_RELEASES_API: &str =
     "https://api.github.com/repos/stenzek/duckstation/releases?per_page=100";
 const PCSX2_RELEASES_API: &str =
     "https://api.github.com/repos/PCSX2/pcsx2/releases?per_page=100";
+// Dolphin publishes no GitHub releases and its own updater endpoints
+// are behind a bot challenge — Lacrima's EmuCR fallback is the same
+// chain: blog feed → post page → direct dl.dolphin-emu.org asset.
+const EMUCR_DOLPHIN_FEED: &str =
+    "https://www.emucr.com/feeds/posts/default/-/Dolphin?alt=json&max-results=30";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
@@ -38,6 +43,7 @@ const RPCS3_VERSION_MARKER: &str = "rpcs3_version.txt";
 const SHADPS4_VERSION_MARKER: &str = "shadps4_version.txt";
 const DUCKSTATION_VERSION_MARKER: &str = "duckstation_version.txt";
 const PCSX2_VERSION_MARKER: &str = "pcsx2_version.txt";
+const DOLPHIN_VERSION_MARKER: &str = "dolphin_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -92,6 +98,12 @@ pub fn pcsx2_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("PS2").join("PCSX2"))
 }
 
+/// `<data>/Emulators/GCN/Dolphin` — one managed install serves both
+/// the GameCube and Wii sections (DolphinHandler covers both).
+pub fn dolphin_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("GCN").join("Dolphin"))
+}
+
 /// Find the installed launcher (`ResolveLauncherPath`):
 /// `xenia_canary.exe`, then `xenia.exe`, then any *xenia* exe.
 pub fn xenia_exe() -> Option<PathBuf> {
@@ -142,6 +154,11 @@ pub fn duckstation_exe() -> Option<PathBuf> {
 /// Find the installed PCSX2 exe under the managed dir.
 pub fn pcsx2_exe() -> Option<PathBuf> {
     resolve_exe(&pcsx2_dir()?, &PCSX2_SPEC).ok()
+}
+
+/// Find the installed `Dolphin.exe` under the managed dir.
+pub fn dolphin_exe() -> Option<PathBuf> {
+    resolve_exe(&dolphin_dir()?, &DOLPHIN_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -396,6 +413,167 @@ const PCSX2_SPEC: EmuSpec = EmuSpec {
 
 pub fn download_pcsx2() -> Shared {
     download_emu(&PCSX2_SPEC)
+}
+
+const DOLPHIN_SPEC: EmuSpec = EmuSpec {
+    name: "Dolphin",
+    // No GitHub feed — work_dolphin scrapes EmuCR posts instead.
+    releases_api: EMUCR_DOLPHIN_FEED,
+    version_marker: DOLPHIN_VERSION_MARKER,
+    dir: dolphin_dir,
+    // dl.dolphin-emu.org asset names: dolphin-<ver>-x64.7z.
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("dolphin") && n.contains("x64") && (n.ends_with(".7z") || n.ends_with(".zip"))
+    },
+    // DolphinHandler's DolphinExecutableNames.
+    exe_names: &[
+        "Dolphin.exe",
+        "dolphin.exe",
+        "DolphinQt2.exe",
+        "dolphinqt2.exe",
+        "DolphinWx.exe",
+        "dolphinwx.exe",
+        "Dolphin-emu.exe",
+        "dolphin-emu.exe",
+    ],
+    exe_contains: "dolphin",
+    patches: false,
+    allow_prerelease: false,
+};
+
+pub fn download_dolphin() -> Shared {
+    let dl: Shared = Arc::new(Mutex::new(DlProgress {
+        stage: "Starting Dolphin download…".into(),
+        ..Default::default()
+    }));
+    let shared = dl.clone();
+    std::thread::spawn(move || {
+        let res = work_dolphin(&shared, &DOLPHIN_SPEC);
+        let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
+        p.done = Some(res);
+    });
+    dl
+}
+
+/// Lacrima's DolphinEmulatorUpdateService EmuCR fallback:
+/// feed entries → post HTML → the dl.dolphin-emu.org windows asset.
+/// "Dolphin XXXX[a]" posts are beta-track releases, "Dolphin Git
+/// XXXX-N" are dev builds — try the release posts first.
+fn work_dolphin(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
+    let Some(emu_dir) = (spec.dir)() else {
+        return Err("Could not resolve the emulators directory".into());
+    };
+    let update_dir = emu_dir.join("Emu_Update");
+    std::fs::create_dir_all(&update_dir).map_err(|e| format!("Emu dir not writable: {e}"))?;
+
+    set(dl, "Fetching Dolphin builds…", 0.0);
+    let feed = get_text(spec.releases_api)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&feed).map_err(|e| format!("Bad feed json: {e}"))?;
+    let mut posts: Vec<(String, String)> = json
+        .get("feed")
+        .and_then(|f| f.get("entry"))
+        .and_then(|e| e.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let title = e.get("title")?.get("$t")?.as_str()?.to_string();
+                    let url = e
+                        .get("link")?
+                        .as_array()?
+                        .iter()
+                        .find(|l| l.get("rel").and_then(|r| r.as_str()) == Some("alternate"))?
+                        .get("href")?
+                        .as_str()?
+                        .to_string();
+                    Some((title, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if posts.is_empty() {
+        return Err("No Dolphin builds found on the feed".into());
+    }
+    // Release posts ("Dolphin 2609a") before dev posts ("Dolphin Git
+    // 2609-81") — same beta-vs-dev split as the updater's tracks.
+    posts.sort_by_key(|(t, _)| t.to_lowercase().contains("git"));
+
+    // Each post links the dl.dolphin-emu.org archive directly; scan a
+    // few until one yields a windows x64 asset.
+    let mut asset: Option<(String, String)> = None;
+    for (title, url) in posts.iter().take(8) {
+        set(dl, &format!("Scanning {title}…"), 0.0);
+        let Ok(html) = get_text(url) else {
+            continue;
+        };
+        if let Some(a) = emucr_dolphin_asset(&html, spec) {
+            asset = Some(a);
+            break;
+        }
+    }
+    let (asset_name, asset_url) =
+        asset.ok_or_else(|| "No compatible Dolphin asset found".to_string())?;
+    // Marker tag: the /releases/<ver>/ or /builds/<maj>/<min>/ path
+    // component, else the asset stem.
+    let tag = asset_url
+        .split('/')
+        .nth_back(1)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| asset_name.trim_end_matches(".7z").to_string());
+
+    let stage = format!("Downloading {asset_name}…");
+    let zip_path = update_dir.join(&asset_name);
+    download(dl, &stage, &asset_url, &zip_path)?;
+
+    set(dl, "Extracting Dolphin…", 0.0);
+    let extracted = update_dir.join("extracted");
+    let _ = std::fs::remove_dir_all(&extracted);
+    std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
+    extract_archive(&zip_path, &extracted)?;
+    let root = normalize_root(&extracted);
+    copy_dir_contents(&root, &emu_dir, "Emu_Update")?;
+
+    let _ = std::fs::write(emu_dir.join(spec.version_marker), tag.trim());
+    let _ = std::fs::remove_dir_all(&update_dir);
+    let _ = std::fs::create_dir_all(&update_dir);
+
+    set(dl, "Done", 1.0);
+    resolve_exe(&emu_dir, spec).map(|p| p.to_string_lossy().into_owned())
+}
+
+fn get_text(url: &str) -> Result<String, String> {
+    let mut resp = agent()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| format!("Fetch failed: {e}"))?;
+    resp.body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Fetch failed: {e}"))
+}
+
+/// First `dl.dolphin-emu.org` href in an EmuCR post that matches the
+/// spec's windows-asset predicate (dolphin-<ver>-x64.7z — the .apk and
+/// arm/macos links fail the predicate).
+fn emucr_dolphin_asset(html: &str, spec: &EmuSpec) -> Option<(String, String)> {
+    let mut rest = html;
+    while let Some(at) = rest.find("href=\"") {
+        rest = &rest[at + 6..];
+        let Some(end) = rest.find('"') else { break };
+        let url = &rest[..end];
+        let low = url.to_lowercase();
+        if !low.contains("dl.dolphin-emu.org") {
+            continue;
+        }
+        let name = url.rsplit('/').next().unwrap_or(url);
+        if (spec.asset_ok)(name) {
+            return Some((name.to_string(), url.to_string()));
+        }
+    }
+    None
 }
 
 fn download_emu(spec: &'static EmuSpec) -> Shared {
@@ -689,4 +867,28 @@ fn install_patches(dl: &Shared, emu_dir: &Path, update_dir: &Path) -> Result<(),
     let _ = std::fs::remove_dir_all(&dst);
     copy_dir_contents(&src, &dst, "")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// EmuCR post pages mix the windows archive with apk/arm links —
+    /// the picker must land on dolphin-<ver>-x64.7z specifically.
+    #[test]
+    fn emucr_post_links_pick_windows_x64() {
+        let html = r#"
+            <a href="https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a.apk">android</a>
+            <a href="https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z">windows</a>
+            <a href="https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-arm64.7z">arm</a>
+            <a href="https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.dmg">mac</a>
+        "#;
+        let (name, url) = emucr_dolphin_asset(html, &DOLPHIN_SPEC).unwrap();
+        assert_eq!(name, "dolphin-2609a-x64.7z");
+        assert_eq!(
+            url,
+            "https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z"
+        );
+        assert!(emucr_dolphin_asset("<a href=\"https://example.com/x\">", &DOLPHIN_SPEC).is_none());
+    }
 }

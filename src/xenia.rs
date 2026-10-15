@@ -134,6 +134,7 @@ pub enum Kind {
     Shadps4,
     DuckStation,
     Pcsx2,
+    Dolphin,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -264,6 +265,17 @@ impl Session {
             Kind::Pcsx2 => {
                 ensure_pcsx2_pause_fix(&work_dir);
                 cmd.arg("-batch").arg("-nogui").arg("-portable").arg(game);
+            }
+            // Dolphin: `-u <exe dir>/User -b -e <rom>`
+            // (DolphinHandler's BuildStartInfo) — -u forces the
+            // portable user dir under the managed install, -b is
+            // batch mode (quit with the game). No -f: the window is
+            // hidden/cloaked anyway. PauseOnFocusLost/SkipNKitWarning/
+            // EnableCheats land in the portable Dolphin.ini first —
+            // a hidden window never gets focus.
+            Kind::Dolphin => {
+                let user = ensure_dolphin_setup(&work_dir);
+                cmd.arg("-u").arg(&user).arg("-b").arg("-e").arg(game);
             }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
@@ -706,6 +718,80 @@ fn ensure_pcsx2_pause_fix(exe_dir: &Path) {
     }
 }
 
+/// DolphinHandler's ApplyDolphinLaunchConfigOverrides — the portable
+/// `-u` user dir under the managed install is the only config root we
+/// touch (Lacrima also writes `Documents\Dolphin Emulator`; portable
+/// mode keeps everything beside the exe). PauseOnFocusLost must be
+/// off — a hidden window never gets focus.
+fn ensure_dolphin_setup(exe_dir: &Path) -> PathBuf {
+    let user = exe_dir.join("User");
+    let ini = user.join("Config").join("Dolphin.ini");
+    if let Some(d) = ini.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    set_ini_key(&ini, "Interface", "PauseOnFocusLost", "False");
+    set_ini_key(&ini, "Interface", "SkipNKitWarning", "True");
+    set_ini_key(&ini, "Core", "EnableCheats", "True");
+    // Lacrima doesn't ship this one, but the capture window never
+    // takes focus — without it Dolphin ignores the gamepad entirely
+    // while unfocused (Controller settings → "Background Input").
+    // Lives under [Input], not [Interface] (MAIN_INPUT_BACKGROUND_INPUT).
+    set_ini_key(&ini, "Input", "BackgroundInput", "True");
+    user
+}
+
+/// Set `key = value` inside `[section]` of an ini — add the section
+/// when missing (TrySetDolphinIniValue/TrySetDolphinCoreIniValue).
+fn set_ini_key(path: &Path, section: &str, key: &str, value: &str) {
+    let header = format!("[{section}]");
+    let mut lines: Vec<String> = match std::fs::read_to_string(path) {
+        Ok(c) => c.lines().map(str::to_string).collect(),
+        Err(_) => vec![header.clone()],
+    };
+    let new_line = format!("{key} = {value}");
+    let mut dirty = false;
+    // Replace every in-section key line (Dolphin can emit dupes).
+    let mut in_section = false;
+    let mut found = false;
+    for line in &mut lines {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_section = t.eq_ignore_ascii_case(&header);
+            continue;
+        }
+        if in_section
+            && line.contains('=')
+            && t
+                .get(..key.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(key))
+        {
+            found = true;
+            if t != new_line {
+                *line = new_line.clone();
+                dirty = true;
+            }
+        }
+    }
+    if !found {
+        let mut at = lines
+            .iter()
+            .position(|l| l.trim().eq_ignore_ascii_case(&header))
+            .map(|i| i + 1);
+        if at.is_none() {
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(header);
+            at = Some(lines.len());
+        }
+        lines.insert(at.unwrap_or(lines.len()), new_line);
+        dirty = true;
+    }
+    if dirty {
+        let _ = std::fs::write(path, lines.join("\n") + "\n");
+    }
+}
+
 /// Folder ROM → its EBOOT.BIN boot target
 /// (Ps3InstalledGameHelper.GetPreferredBootPath); files pass through.
 fn ps3_boot_path(game: &Path) -> PathBuf {
@@ -789,10 +875,15 @@ fn worker_main(
         // windows settle fast.
         Kind::DuckStation => 120,
         Kind::Pcsx2 => 200,
+        // Dolphin's CaptureStartupDelayMs — its Qt shell churns
+        // through several windows before the render surface exists.
+        Kind::Dolphin => 1800,
         _ => 0,
     };
-    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2)
-    {
+    let poll = if matches!(
+        kind,
+        Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin
+    ) {
         25
     } else {
         100
@@ -852,18 +943,25 @@ fn worker_main(
     // whether its 16:9 capture geometry has been applied yet.
     let mut rpcs3_geom = false;
     let mut rpcs3_size = (0i32, 0i32);
+    // Dolphin's gate counts same-hwnd-AND-size polls (its Qt windows
+    // resize through boot) — tracked separately from rpcs3's.
+    let mut dolphin_size = (0i32, 0i32);
     // 25ms polls for the Qt emulators keep the cloak gap sub-frame;
     // other kinds sweep at 50ms (window flash isn't an issue once
-    // captured).
+    // captured). Dolphin joins — its Qt shell otherwise flashes the
+    // launcher window before capture takes over.
     let poll = if matches!(
         kind,
-        Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2
+        Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin
     ) {
         25
     } else {
         50
     };
-    for _ in 0..240 {
+    // Dolphin gets Lacrima's 400×50ms resolve budget — its render
+    // window appears late after a long Qt boot.
+    let attempts = if kind == Kind::Dolphin { 400 } else { 240 };
+    for _ in 0..attempts {
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -974,6 +1072,48 @@ fn worker_main(
                     apply_aspect_ratio(hwnd, 4.0 / 3.0);
                 }
             }
+            if kind == Kind::Dolphin {
+                // IsStableCaptureCandidate + ResolveCaptureTargetAsync:
+                // captioned, not minimized, ≥640×360 client — then the
+                // same hwnd at the same client size for 8 consecutive
+                // polls (Dolphin's Qt windows resize through boot).
+                let (w, h) = client_size(hwnd).unwrap_or((0, 0));
+                if w < 640 || h < 360 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+                if (style & WS_CAPTION.0 as i64) != WS_CAPTION.0 as i64 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                if unsafe { IsIconic(hwnd) }.as_bool() {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                stable_count = if hwnd == stable_hwnd && (w, h) == dolphin_size {
+                    stable_count + 1
+                } else {
+                    stable_hwnd = hwnd;
+                    dolphin_size = (w, h);
+                    1
+                };
+                if stable_count < 8 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                // ApplyCaptureGeometryOnce: strip decorations, force
+                // the 16:9 capture aspect (base default — Dolphin has
+                // no override), then a short settle before attach.
+                hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                });
+                prepare_window_for_capture(hwnd);
+                apply_aspect_ratio(hwnd, 16.0 / 9.0);
+                std::thread::sleep(Duration::from_millis(120));
+            }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
         }
@@ -1009,7 +1149,45 @@ fn worker_main(
     let saved = hidden
         .remove(&(hwnd.0 as usize))
         .unwrap_or_else(|| prepare_window_for_capture(hwnd));
-    hide_window(hwnd);
+    if kind == Kind::Dolphin {
+        // hide_window's WS_EX_LAYERED + 0-alpha can stall Vulkan
+        // presentation (why Lacrima no-ops Dolphin's window prep).
+        // Park offscreen under the cloak instead — same offscreen
+        // corner, toolwindow'd out of the taskbar, no layering.
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                vx + (vw - 100).max(0),
+                vy + (vh - 100).max(0),
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i64;
+            let new_ex =
+                (ex | WS_EX_TOOLWINDOW.0 as i64) & !(WS_EX_APPWINDOW.0 as i64);
+            if new_ex != ex {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
+            }
+        }
+        set_cloaked(hwnd, true);
+    } else {
+        hide_window(hwnd);
+    }
     strip_menu(hwnd);
     // Catch anything that appeared since the last poll.
     sweep_hide(pid, hwnd, &mut hidden, kind);
@@ -1073,9 +1251,10 @@ fn worker_main(
                 2500
             }
             // Lacrima's ForceCloseTrackedEmulatorProcess kills
-            // shadPS4, DuckStation and PCSX2 outright — a WM_CLOSE
-            // pops their confirm-exit dialog on a hidden window.
-            Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 => 0,
+            // shadPS4, DuckStation, PCSX2 and Dolphin outright — a
+            // WM_CLOSE pops their confirm-exit dialog on a hidden
+            // window.
+            Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin => 0,
             _ => {
                 unsafe {
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1662,6 +1841,77 @@ fn is_likely_pcsx2_window(hwnd: HWND, main: HWND) -> bool {
     !looks_primary && (!has_caption || !t.is_empty())
 }
 
+/// IsLikelyDolphinRenderWindow — the game surface carries the
+/// "Dolphin <ver> | <game>" title pattern; Qt/wx-class windows and
+/// captioned dolphin-class windows count as candidates, while the
+/// config/audio/controller dialogs, IME helpers and the primary UI
+/// shell are rejected.
+fn is_likely_dolphin_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let t = window_title(hwnd).trim().to_lowercase();
+    let class = class_name(hwnd).to_lowercase();
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let has_thick = (style & WS_THICKFRAME.0 as i64) == WS_THICKFRAME.0 as i64;
+    let looks_primary = hwnd == main;
+    // Helper/system windows in the process tree.
+    if t.contains("diemwin")
+        || t.contains("temp window")
+        || t.contains("msctfime ui")
+        || t.contains("default ime")
+        || class.starts_with("temp_d3d_window")
+        || class.contains("diemwin")
+        || class.contains("ime")
+        || class.contains("screenchangeobserver")
+        || class.contains("themechangeobserver")
+    {
+        return false;
+    }
+    // "Dolphin 2503 | Metroid Prime" — the game's titlebar.
+    if t.contains("dolphin") && t.contains(" | ") {
+        return true;
+    }
+    let ui_title = [
+        "configuration",
+        "graphics",
+        "audio",
+        "controller",
+        "hotkey",
+        "tools",
+        "about",
+        "fifo",
+        "shader",
+        "memory card",
+        "netplay",
+    ]
+    .iter()
+    .any(|w| t.contains(w));
+    // The bare launcher window, e.g. "Dolphin 2503".
+    if t.starts_with("dolphin ") && !t.contains(" | ") {
+        return false;
+    }
+    if t.contains("dolphin") && !ui_title {
+        return true;
+    }
+    if !ui_title && t.chars().count() >= 3 {
+        if class.contains("qt") || class.contains("wx") || class.contains("dolphin") {
+            return true;
+        }
+    }
+    if t.is_empty()
+        && (class.contains("qt") || class.contains("wx") || class.contains("dolphin"))
+        && !looks_primary
+    {
+        return true;
+    }
+    if class.contains("dolphin") && has_caption && has_thick {
+        return !looks_primary;
+    }
+    false
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
@@ -1672,6 +1922,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::Shadps4 => return is_likely_shadps4_window(hwnd, main),
         Kind::DuckStation => return is_likely_duckstation_window(hwnd, main),
         Kind::Pcsx2 => return is_likely_pcsx2_window(hwnd, main),
+        Kind::Dolphin => return is_likely_dolphin_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -2170,15 +2421,16 @@ fn sweep_hide(
         // HMENU at all — it's ImGui-rendered in-frame, handled by the
         // show_menubar config patch.)
         strip_menu(hwnd);
-        // RPCS3/shadPS4/DuckStation/PCSX2: cloak EVERY window — a DWM
-        // cloak hides instantly with no geometry/style change for
-        // Qt/SDL to race, so nothing flashes between spawn and
-        // capture. (PCSX2's Lacrima handler no-ops window prep because
-        // park/restyle raced Qt — cloaking is geometry-free so it
+        // RPCS3/shadPS4/DuckStation/PCSX2/Dolphin: cloak EVERY window
+        // — a DWM cloak hides instantly with no geometry/style change
+        // for Qt/SDL to race, so nothing flashes between spawn and
+        // capture. (PCSX2's and Dolphin's Lacrima handlers no-op
+        // window prep because park/restyle raced Qt and minimizing
+        // stalls Vulkan presentation — cloaking does neither, so it
         // still hides safely.) Other kinds park aux windows.
         let cloak = matches!(
             kind,
-            Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2
+            Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin
         );
         hidden.entry(hwnd.0 as usize).or_insert_with(|| {
             if cloak {
@@ -2315,16 +2567,29 @@ pub fn apply_aspect_ratio(hwnd: HWND, aspect: f64) {
 /// Lacrima's LaunchCurrentSectionHandlerSetup — spawn the emulator
 /// executable with no game so its own settings UI opens. A plain
 /// shell launch: not captured, not tracked — but still job-guarded so
-/// a dying app can't leave an orphan emulator process.
-pub fn launch_setup(exe: &str) -> Result<(), String> {
+/// a dying app can't leave an orphan emulator process. Dolphin gets
+/// `-u <exe dir>/User` and PCSX2 `-portable` so the settings UI
+/// edits the same managed config the game launches use (Lacrima's
+/// BuildSetupStartInfo).
+pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
     let exe_path = PathBuf::from(exe);
-    let child = Command::new(exe)
-        .current_dir(
-            exe_path
-                .parent()
-                .map(|d| d.to_path_buf())
-                .unwrap_or_default(),
-        )
+    let work_dir = exe_path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_default();
+    let mut cmd = Command::new(exe);
+    match kind {
+        Some(Kind::Dolphin) => {
+            let user = ensure_dolphin_setup(&work_dir);
+            cmd.arg("-u").arg(&user);
+        }
+        Some(Kind::Pcsx2) => {
+            cmd.arg("-portable");
+        }
+        _ => {}
+    }
+    let child = cmd
+        .current_dir(work_dir)
         .spawn()
         .map_err(|e| format!("failed to start emulator: {e}"))?;
     if let Some(job) = JobGuard::new(&child) {

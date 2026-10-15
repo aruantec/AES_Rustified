@@ -159,6 +159,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "embed-resource",
+ "flate2",
  "image",
  "lofty",
  "naga",

@@ -44,6 +44,7 @@ ureq = "3.4.2"
 sha2 = "0.10"
 zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.24.0"
+flate2 = "1.1.10"
 
 # Native Windows Graphics Capture for emulator frame capture (the
 # WgcBridge-equivalent path — WinRT WGC + D3D11 staging readback) plus
