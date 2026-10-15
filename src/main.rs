@@ -19,6 +19,8 @@ mod meta_cache;
 mod paint;
 mod particles;
 mod rom_editor;
+mod rpcs3_overlay;
+mod rpcs3_patch;
 mod xenia_cfg;
 mod xenia_overlay;
 mod xenia_profile;
@@ -4169,6 +4171,7 @@ fn music_view(
         // ROM-mode actions never fire on the music carousel.
         carousel::Action::AddRoms
         | carousel::Action::ScanFolder
+        | carousel::Action::ClearCache
         | carousel::Action::Patches(_)
         | carousel::Action::CustomConfig(_) => None,
         carousel::Action::None => None,

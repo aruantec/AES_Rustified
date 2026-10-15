@@ -17,8 +17,8 @@ use eframe::egui::{
 };
 
 use crate::{
-    album_row, carousel, emu_dl, emu_meta, library, paint, rom_editor, search_pill, settings,
-    transport, xenia, xenia_cfg, xenia_overlay, xenia_profile,
+    album_row, carousel, emu_dl, emu_meta, library, paint, rom_editor, rpcs3_overlay,
+    search_pill, settings, transport, xenia, xenia_cfg, xenia_overlay, xenia_profile,
 };
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -36,6 +36,8 @@ const DC_SECTION: &str = "DC";
 const FLYCAST_HANDLER: &str = "flycast";
 const XBOX_SECTION: &str = "XBOX";
 const XEMU_HANDLER: &str = "xemu";
+const PS3_SECTION: &str = "PS3";
+const RPCS3_HANDLER: &str = "rpcs3";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -85,6 +87,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             dialog_title: "Locate xemu.exe",
             installed_exe: emu_dl::xemu_exe,
             download: emu_dl::download_xemu,
+        },
+        PS3_SECTION => HandlerSpec {
+            section: PS3_SECTION,
+            handler: RPCS3_HANDLER,
+            name: "RPCS3",
+            exe_hint: "Path to rpcs3.exe",
+            dialog_title: "Locate rpcs3.exe",
+            installed_exe: emu_dl::rpcs3_exe,
+            download: emu_dl::download_rpcs3,
         },
         _ => return None,
     })
@@ -260,7 +271,14 @@ pub struct EmuView {
     pub loaded_key: Option<String>,
     /// In-flight metadata/cover resolver for the loaded section —
     /// titles + downloaded covers stream back as they resolve.
-    pub meta_rxs: Vec<mpsc::Receiver<emu_meta::RomInfo>>,
+    /// In-flight cover/title resolvers — each paired with a cancel
+    /// flag so Clear Section Cache can stop the workers' sidecar
+    /// writes, not just drop their results (Lacrima's
+    /// CancelAllAlbumCoverScans).
+    pub meta_rxs: Vec<(
+        mpsc::Receiver<emu_meta::RomInfo>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
     /// Card-menu/Delete-key removals waiting on the shared delete
     /// confirmation (main.rs routes these through the dialog).
     pub pending_delete: Option<Vec<PathBuf>>,
@@ -328,6 +346,8 @@ pub struct EmuView {
     pub patches: xenia_overlay::PatchesOverlay,
     /// Xenia per-game Custom Config overlay (XeniaCustomConfigOverlay).
     pub cfg_ov: xenia_overlay::ConfigOverlay,
+    /// RPCS3 per-game Patches overlay (Rpcs3PatchesOverlay).
+    pub rpcs3_patches: rpcs3_overlay::Rpcs3PatchesOverlay,
     /// Xenia profile-creation prompt — opens when the X360 section is
     /// entered and no profile exists under the Xenia content dir.
     pub prof_prompt: xenia_overlay::ProfilePrompt,
@@ -338,6 +358,9 @@ pub struct EmuView {
     /// worker; the result lands here (Lacrima's LaunchEmulatorAsync
     /// Task.Run shape so template downloads never stall the UI).
     pub launch_rx: Option<mpsc::Receiver<Result<xenia::Session, String>>>,
+    /// ScanFolder — the directory walk runs on a worker (big trees
+    /// stall the UI otherwise); found ROMs land here.
+    pub scan_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
     /// Set when `cfg.emulators`/`cfg.games`/`cfg.section_order`/
     /// `cfg.default_handlers` changed — main persists.
     pub settings_dirty: bool,
@@ -487,9 +510,11 @@ impl EmuView {
             editor: rom_editor::RomEditor::new(),
             patches: xenia_overlay::PatchesOverlay::new(),
             cfg_ov: xenia_overlay::ConfigOverlay::new(),
+            rpcs3_patches: rpcs3_overlay::Rpcs3PatchesOverlay::new(),
             prof_prompt: xenia_overlay::ProfilePrompt::new(),
             prof_want: false,
             launch_rx: None,
+            scan_rx: None,
             settings_dirty: false,
             render_open: false,
             render: settings::RenderOpts::default(),
@@ -631,11 +656,20 @@ impl EmuView {
             .map(|g| g.iter().map(PathBuf::from).collect())
             .unwrap_or_default();
         self.sections[i].tracks = self.items.clone();
-        self.cards.open_roms(&self.sections[i], &rom_cover);
-        self.meta_rxs.push(emu_meta::spawn_resolver(
-            key,
-            self.sections[i].title.clone(),
-            self.items.clone(),
+        self.cards.open_roms(
+            &self.sections[i],
+            &rom_cover,
+            console_art(self.art_dir.as_deref(), &key).into_iter().next(),
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.meta_rxs.push((
+            emu_meta::spawn_resolver(
+                key,
+                self.sections[i].title.clone(),
+                self.items.clone(),
+                cancel.clone(),
+            ),
+            cancel,
         ));
         self.refresh_section_covers(cfg);
         self.notice = None;
@@ -649,7 +683,7 @@ impl EmuView {
         while i < self.meta_rxs.len() {
             let mut closed = false;
             loop {
-                match self.meta_rxs[i].try_recv() {
+                match self.meta_rxs[i].0.try_recv() {
                     Ok(info) => {
                         if let Some(title) = info.title {
                             self.cards.apply_info(
@@ -707,7 +741,9 @@ impl EmuView {
                 .find(|c| section_key(c) == key)
                 .map(|c| c.title.clone())
                 .unwrap_or_else(|| key.clone());
-            self.meta_rxs.push(emu_meta::spawn_resolver(key, platform, added));
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.meta_rxs
+                .push((emu_meta::spawn_resolver(key, platform, added, cancel.clone()), cancel));
             self.sync_games(cfg);
         }
     }
@@ -730,6 +766,52 @@ impl EmuView {
         self.sync_games(cfg);
     }
 
+    /// ClearAlbumCache — delete the fetch sidecars (`.img` cover +
+    /// `.title` name) for every loaded rom, reset the cards to their
+    /// fallback art, and re-run the resolver so titles/covers rebuild
+    /// from scratch (Lacrima's ClearAlbumCacheCommand). User data —
+    /// the `.meta` doc + editor images — is preserved.
+    pub fn clear_section_cache(&mut self) {
+        let Some(key) = self.loaded_key.clone() else {
+            return;
+        };
+        if self.items.is_empty() {
+            return;
+        }
+        // Stale in-flight results would re-apply covers we just
+        // deleted — drop the receivers AND cancel the workers so their
+        // sidecar writes can't race the fresh refetch (Lacrima's
+        // CancelAllAlbumCoverScans).
+        for (_, c) in &self.meta_rxs {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.meta_rxs.clear();
+        for p in &self.items {
+            emu_meta::clear_cache(p);
+        }
+        if let Some(i) = self.sections.iter().position(|c| section_key(c) == key) {
+            // Reload with no cached covers — cards show the fallback
+            // art until the resolver streams fresh results in.
+            self.cards.open_roms(
+                &self.sections[i],
+                &rom_cover,
+                console_art(self.art_dir.as_deref(), &key).into_iter().next(),
+            );
+        }
+        let platform = self
+            .sections
+            .iter()
+            .find(|c| section_key(c) == key)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| key.clone());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.meta_rxs.push((
+            emu_meta::spawn_resolver(key, platform, self.items.clone(), cancel.clone()),
+            cancel,
+        ));
+        self.notice = Some("Section cache cleared — refetching…".into());
+    }
+
     /// The handler id that launches the loaded section — Lacrima's
     /// `SelectedHandlerId` (the section's default handler), falling
     /// back to the one wired handler for X360.
@@ -742,6 +824,7 @@ impl EmuView {
             XENIA_SECTION => Some(XENIA_HANDLER.to_string()),
             DC_SECTION => Some(FLYCAST_HANDLER.to_string()),
             XBOX_SECTION => Some(XEMU_HANDLER.to_string()),
+            PS3_SECTION => Some(RPCS3_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -767,6 +850,7 @@ impl EmuView {
                     XENIA_HANDLER => emu_dl::xenia_exe(),
                     FLYCAST_HANDLER => emu_dl::flycast_exe(),
                     XEMU_HANDLER => emu_dl::xemu_exe(),
+                    RPCS3_HANDLER => emu_dl::rpcs3_exe(),
                     _ => None,
                 }
             };
@@ -784,6 +868,7 @@ impl EmuView {
             Some(XENIA_HANDLER) => Some(xenia::Kind::Xenia),
             Some(FLYCAST_HANDLER) => Some(xenia::Kind::Flycast),
             Some(XEMU_HANDLER) => Some(xenia::Kind::Xemu),
+            Some(RPCS3_HANDLER) => Some(xenia::Kind::Rpcs3),
             _ => None,
         }) else {
             self.notice = Some("No emulator handler configured for this section".into());
@@ -793,6 +878,7 @@ impl EmuView {
             xenia::Kind::Xenia => "Xenia",
             xenia::Kind::Flycast => "Flycast",
             xenia::Kind::Xemu => "xemu",
+            xenia::Kind::Rpcs3 => "RPCS3",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
@@ -906,6 +992,7 @@ pub fn view(
         && !emu.editor.is_open()
         && !emu.patches.is_open()
         && !emu.cfg_ov.is_open()
+        && !emu.rpcs3_patches.is_open()
         && !emu.prof_prompt.is_open();
 
     // open_section flagged a missing Xenia profile — open the prompt
@@ -946,6 +1033,20 @@ pub fn view(
             }
             Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
             Err(mpsc::TryRecvError::Disconnected) => emu.launch_rx = None,
+        }
+    }
+
+    // Folder scan finished on the worker — merge what it found.
+    if let Some(rx) = &emu.scan_rx {
+        match rx.try_recv() {
+            Ok(paths) => {
+                emu.scan_rx = None;
+                emu.notice = (paths.is_empty())
+                    .then(|| "No ROMs found in that folder".to_string());
+                emu.add_games(cfg, paths);
+            }
+            Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => emu.scan_rx = None,
         }
     }
 
@@ -1732,6 +1833,9 @@ pub fn view(
     if emu.cfg_ov.is_open() {
         emu.cfg_ov.ui(ui, content, s);
     }
+    if emu.rpcs3_patches.is_open() {
+        emu.rpcs3_patches.ui(ui, content, s);
+    }
     if emu.prof_prompt.is_open() {
         if let Some(Some(name)) = emu.prof_prompt.ui(ui, content, s) {
             emu.notice = Some(match xenia_storage(cfg) {
@@ -1772,6 +1876,29 @@ fn xenia_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
         .filter(|p| p.exists())
         .or_else(emu_dl::xenia_exe);
     xenia_cfg::storage_root(launcher.as_deref().and_then(|p| p.parent()))
+}
+
+/// Resolve the RPCS3 emulator directory for the patches overlay —
+/// Lacrima's `ResolveEmulatorDirectory`: prefer the AES-managed
+/// install when it already holds the patch DB, else the configured
+/// launcher's directory, else the managed dir anyway.
+fn rpcs3_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
+    let managed = emu_dl::rpcs3_dir();
+    let configured = cfg
+        .emulators
+        .get(RPCS3_HANDLER)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let managed_has_db = managed
+        .as_ref()
+        .is_some_and(|m| m.join("patches").join("patch.yml").is_file());
+    if managed_has_db {
+        return managed;
+    }
+    configured.or(managed)
 }
 
 /// Destination rect + UV for a captured frame in `rect`, blended by
@@ -2652,6 +2779,8 @@ fn draw_items(
     // section wired to the xenia handler.
     emu.cards.xenia_menu = key == XENIA_SECTION
         && emu.active_handler(cfg).as_deref() == Some(XENIA_HANDLER);
+    emu.cards.rpcs3_menu = key == PS3_SECTION
+        && emu.active_handler(cfg).as_deref() == Some(RPCS3_HANDLER);
     let mode = match cover_layout {
         1 => carousel::Mode::VerticalGrid,
         2 => carousel::Mode::HorizontalGrid,
@@ -2734,7 +2863,13 @@ fn draw_items(
         // Xenia per-game overlays — the storage root resolves the
         // same way a launch does (launcher dir ⇄ managed install).
         carousel::Action::Patches(p) => {
-            emu.patches.open(&p, &rom_title(&p), xenia_storage(cfg));
+            if key == PS3_SECTION
+                && emu.active_handler(cfg).as_deref() == Some(RPCS3_HANDLER)
+            {
+                emu.rpcs3_patches.open(&p, &rom_title(&p), rpcs3_storage(cfg));
+            } else {
+                emu.patches.open(&p, &rom_title(&p), xenia_storage(cfg));
+            }
         }
         carousel::Action::CustomConfig(p) => {
             emu.cfg_ov.open(&p, &rom_title(&p), xenia_storage(cfg));
@@ -2743,6 +2878,7 @@ fn draw_items(
         // main.rs runs them through the shared dialog.
         carousel::Action::Delete(paths) => emu.pending_delete = Some(paths),
         carousel::Action::Clear => emu.clear_games(cfg),
+        carousel::Action::ClearCache => emu.clear_section_cache(),
         carousel::Action::AddRoms => {
             let patterns = section_patterns(&key);
             let mut dlg = rfd::FileDialog::new().set_title("Add ROMs");
@@ -2761,17 +2897,32 @@ fn draw_items(
                 .set_title("Scan folder for ROMs")
                 .pick_folder()
             {
-                emu.add_games(cfg, scan_rom_folder(&dir, &key));
+                // The recursive walk can take seconds on a big tree —
+                // run it off-thread, the results drain in view().
+                let key2 = key.clone();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(scan_rom_folder(&dir, &key2));
+                });
+                emu.scan_rx = Some(rx);
+                emu.notice = Some("Scanning folder…".into());
             }
         }
         _ => {}
     }
 }
 
-/// ScanFolder — walk the picked folder recursively for the section's
-/// handler patterns (plus the archive extensions Lacrima always adds).
+/// ScanFolder — Lacrima's `ScanFolderForRomPaths`: depth-first walk
+/// for the section's handler patterns (plus the archive extensions
+/// Lacrima always adds), dot-files skipped. For PS3/PS4 an installed-
+/// game folder (`Ps3InstalledGameHelper.IsInstalledGameFolder`) is
+/// added whole as ONE rom and never descended into — its inner
+/// .pkg/.bin files are never scanned. Runs on a worker; the caller
+/// drains the result off the UI thread.
 fn scan_rom_folder(root: &Path, key: &str) -> Vec<PathBuf> {
     let pats = section_patterns(key);
+    // EmulationConsoleCatalog.SupportsFolderImport.
+    let folder_import = matches!(key, "PS3" | "PS4");
     let accept = |ext: &str| {
         // STEAM's AllFilePatterns — no extension gate at all.
         key == "STEAM"
@@ -2781,8 +2932,16 @@ fn scan_rom_folder(root: &Path, key: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if folder_import && emu_meta::ps3_is_installed_folder(&dir) {
+            out.push(dir);
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
+            // ShouldSkipFilesystemEntry — dot/hidden + macOS `._`.
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
@@ -2794,6 +2953,27 @@ fn scan_rom_folder(root: &Path, key: &str) -> Vec<PathBuf> {
                 out.push(p);
             }
         }
+    }
+    // CollapseDiscImageArtifacts — a cue/gdi/m3u descriptor owns its
+    // track files; they aren't separate roms.
+    let desc = |p: &Path| {
+        matches!(
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .as_deref(),
+            Some("cue" | "gdi" | "m3u")
+        )
+    };
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+    let referenced: std::collections::HashSet<String> = out
+        .iter()
+        .filter(|p| desc(p))
+        .flat_map(|p| emu_meta::descriptor_refs(p))
+        .map(|r| norm(&r))
+        .collect();
+    if !referenced.is_empty() {
+        out.retain(|p| desc(p) || !referenced.contains(&norm(p)));
     }
     out.sort();
     out

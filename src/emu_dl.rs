@@ -16,12 +16,19 @@ const FLYCAST_RELEASES_API: &str =
     "https://api.github.com/repos/flyinghead/flycast/releases?per_page=20";
 const XEMU_RELEASES_API: &str =
     "https://api.github.com/repos/xemu-project/xemu/releases?per_page=20";
+// RPCS3 doesn't publish on its main repo — the CI ships every build
+// to rpcs3-binaries-win instead (Lacrima's BinaryReleasesApiEndpoint).
+const RPCS3_RELEASES_API: &str =
+    "https://api.github.com/repos/RPCS3/rpcs3-binaries-win/releases?per_page=20";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
+/// Same agent string, exposed for the RPCS3 patch downloader.
+pub(crate) const USER_AGENT_PUBLIC: &str = USER_AGENT;
 const XENIA_VERSION_MARKER: &str = "xenia_version.txt";
 const FLYCAST_VERSION_MARKER: &str = "flycast_version.txt";
 const XEMU_VERSION_MARKER: &str = "xemu_version.txt";
+const RPCS3_VERSION_MARKER: &str = "rpcs3_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -54,6 +61,12 @@ pub fn xemu_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("XBOX").join("Xemu"))
 }
 
+/// `<data>/Emulators/PS3/RPCS3` — Lacrima's
+/// `EmulatorsDirectory/PS3/RPCS3`.
+pub fn rpcs3_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("PS3").join("RPCS3"))
+}
+
 /// Find the installed launcher (`ResolveLauncherPath`):
 /// `xenia_canary.exe`, then `xenia.exe`, then any *xenia* exe.
 pub fn xenia_exe() -> Option<PathBuf> {
@@ -84,6 +97,11 @@ pub fn flycast_exe() -> Option<PathBuf> {
 /// Find the installed `xemu.exe` under the managed dir.
 pub fn xemu_exe() -> Option<PathBuf> {
     resolve_exe(&xemu_dir()?, &XEMU_SPEC).ok()
+}
+
+/// Find the installed `rpcs3.exe` under the managed dir.
+pub fn rpcs3_exe() -> Option<PathBuf> {
+    resolve_exe(&rpcs3_dir()?, &RPCS3_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -224,8 +242,28 @@ pub fn download_flycast() -> Shared {
     download_emu(&FLYCAST_SPEC)
 }
 
+const RPCS3_SPEC: EmuSpec = EmuSpec {
+    name: "RPCS3",
+    releases_api: RPCS3_RELEASES_API,
+    version_marker: RPCS3_VERSION_MARKER,
+    dir: rpcs3_dir,
+    // Lacrima's SelectAssetForPlatform: a windows archive minus the
+    // symbols payload (rpcs3-v<ver>-<sha>_win64.7z).
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("win") && !n.contains("symbols")
+    },
+    exe_names: &["rpcs3.exe"],
+    exe_contains: "rpcs3",
+    patches: false,
+};
+
 pub fn download_xemu() -> Shared {
     download_emu(&XEMU_SPEC)
+}
+
+pub fn download_rpcs3() -> Shared {
+    download_emu(&RPCS3_SPEC)
 }
 
 fn download_emu(spec: &'static EmuSpec) -> Shared {

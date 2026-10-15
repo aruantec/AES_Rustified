@@ -21,17 +21,21 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HWND, LPARAM, POINT, RECT, WAIT_TIMEOUT, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
-use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MapVirtualKeyW, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, TerminateProcess,
+    WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -119,12 +123,14 @@ struct Shared {
 
 /// Which emulator a session wraps — controls the CLI args and the
 /// window-resolution heuristics (Xenia's render surface is a
-/// `temp_d3d_window` child; Flycast/xemu's is the main SDL window).
+/// `temp_d3d_window` child; Flycast/xemu's is the main SDL window;
+/// RPCS3's is the Qt `gs_frame` window).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Xenia,
     Flycast,
     Xemu,
+    Rpcs3,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -178,6 +184,14 @@ impl Session {
             .unwrap_or_default();
         let mut cmd = Command::new(exe);
         match kind {
+            // RPCS3: --no-gui skips the launcher/game-list shell so
+            // the gs_frame render window is the only surface (Lacrima's
+            // Rpcs3Handler.BuildStartInfo). Folder ROMs boot via their
+            // EBOOT.BIN (Ps3InstalledGameHelper.GetPreferredBootPath).
+            Kind::Rpcs3 => {
+                ensure_rpcs3_pause_fix(&work_dir);
+                cmd.arg("--no-gui").arg(ps3_boot_path(game));
+            }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
             Kind::Xemu
@@ -512,6 +526,59 @@ fn ensure_xemu_settings(launcher_dir: &Path) {
     }
 }
 
+/// Rpcs3Handler's EnsurePauseOnFocusLossDisabled: the captured window
+/// is hidden/unfocused, so "Pause emulation on RPCS3 focus loss"
+/// would freeze the game — force it off in config.yml (the GUI
+/// section, `config/` subdir or launcher root). RPCS3 writes the file
+/// itself on first run — only patch what exists.
+fn ensure_rpcs3_pause_fix(launcher_dir: &Path) {
+    const KEY: &str = "Pause emulation on RPCS3 focus loss";
+    for path in [
+        launcher_dir.join("config").join("config.yml"),
+        launcher_dir.join("config.yml"),
+    ] {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let updated: String = content
+            .lines()
+            .map(|l| {
+                if l.contains(KEY) && l.contains(':') {
+                    format!("  {KEY}: false")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if updated != content {
+            let _ = std::fs::write(&path, updated);
+        }
+    }
+}
+
+/// Folder ROM → its EBOOT.BIN boot target
+/// (Ps3InstalledGameHelper.GetPreferredBootPath); files pass through.
+fn ps3_boot_path(game: &Path) -> PathBuf {
+    if !game.is_dir() {
+        return game.to_path_buf();
+    }
+    for dir in [
+        game.to_path_buf(),
+        game.join("PS3_GAME"),
+        game.join("PS3_GAME").join("USRDIR"),
+        game.join("USRDIR"),
+    ] {
+        for name in ["EBOOT.BIN", "eboot.bin"] {
+            let p = dir.join(name);
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    game.to_path_buf()
+}
+
 /// Resolve window → prepare/hide → attach capture → monitor. Runs on
 /// its own thread so the UI never blocks on the ~12s resolve window.
 fn worker_main(
@@ -560,18 +627,36 @@ fn worker_main(
     //    capture-failure restore path.
     let mut hidden: std::collections::HashMap<usize, SavedWindow> =
         std::collections::HashMap::new();
-    if kind == Kind::Xemu {
-        for _ in 0..15 {
-            sweep_hide(pid, HWND::default(), &mut hidden);
-            if stop.load(Ordering::Relaxed) || !alive(proc) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+    // Lacrima's CaptureStartupDelayMs — xemu waits 1500ms for its
+    // early boot windows, RPCS3 2500ms (the gs_frame takes longer).
+    // RPCS3 sweeps at 25ms instead of 100ms so a freshly-spawned Qt
+    // window is cloaked within a frame or two — it must stay
+    // invisible from spawn to capture.
+    let delay = match kind {
+        Kind::Xemu => 1500,
+        Kind::Rpcs3 => 2500,
+        _ => 0,
+    };
+    let poll = if kind == Kind::Rpcs3 { 25 } else { 100 };
+    let mut waited = 0u64;
+    while waited < delay {
+        sweep_hide(pid, HWND::default(), &mut hidden, kind);
+        if stop.load(Ordering::Relaxed) || !alive(proc) {
+            break;
         }
+        std::thread::sleep(Duration::from_millis(poll));
+        waited += poll;
     }
     let mut hwnd = HWND::default();
     let mut stable_hwnd = HWND::default();
     let mut stable_count = 0u32;
+    // RPCS3's resolve state: the window's last stable client size and
+    // whether its 16:9 capture geometry has been applied yet.
+    let mut rpcs3_geom = false;
+    let mut rpcs3_size = (0i32, 0i32);
+    // 25ms polls for RPCS3 keep the cloak gap sub-frame; other kinds
+    // sweep at 50ms (window flash isn't an issue once captured).
+    let poll = if kind == Kind::Rpcs3 { 25 } else { 50 };
     for _ in 0..240 {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -582,7 +667,7 @@ fn worker_main(
         if !alive(proc) {
             break;
         }
-        sweep_hide(pid, HWND::default(), &mut hidden);
+        sweep_hide(pid, HWND::default(), &mut hidden, kind);
         hwnd = resolve_capture_target(pid, kind);
         if !hwnd.is_invalid() {
             if kind == Kind::Xemu {
@@ -597,12 +682,55 @@ fn worker_main(
                     continue;
                 }
             }
+            if kind == Kind::Rpcs3 {
+                // ResolveCaptureTargetAsync: the candidate must reach
+                // ≥960×540 before its 16:9 capture geometry is applied
+                // once, then survive 10 polls at ≥1280×720 with an
+                // unchanged size (Qt resizes gs_frame through boot).
+                let (w, h) = client_size(hwnd).unwrap_or((0, 0));
+                if !rpcs3_geom {
+                    if w < 960 || h < 540 {
+                        std::thread::sleep(Duration::from_millis(poll));
+                        continue;
+                    }
+                    // Originals on record (cloak-snapshotted if the
+                    // sweep already saw it), then strip decorations +
+                    // apply the 16:9 size once — ApplyCaptureGeometryOnce.
+                    hidden
+                        .entry(hwnd.0 as usize)
+                        .or_insert_with(|| {
+                            let s = snapshot_window(hwnd);
+                            set_cloaked(hwnd, true);
+                            s
+                        });
+                    prepare_window_for_capture(hwnd);
+                    apply_aspect_ratio(hwnd, 16.0 / 9.0);
+                    rpcs3_geom = true;
+                    stable_hwnd = HWND::default();
+                    stable_count = 0;
+                    rpcs3_size = (0, 0);
+                    std::thread::sleep(Duration::from_millis(150));
+                    continue;
+                }
+                if hwnd == stable_hwnd && (w, h) == rpcs3_size {
+                    stable_count += 1;
+                } else {
+                    stable_hwnd = hwnd;
+                    stable_count = 1;
+                    rpcs3_size = (w, h);
+                }
+                if stable_count < 10 || w < 1280 || h < 720 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                apply_aspect_ratio(hwnd, 16.0 / 9.0);
+            }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
         }
         stable_count = 0;
         stable_hwnd = HWND::default();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(poll));
     }
 
     if hwnd.is_invalid() {
@@ -635,7 +763,7 @@ fn worker_main(
     hide_window(hwnd);
     strip_menu(hwnd);
     // Catch anything that appeared since the last poll.
-    sweep_hide(pid, hwnd, &mut hidden);
+    sweep_hide(pid, hwnd, &mut hidden, kind);
 
     // 3. Attach WGC — frames land in the shared slots (CPU mirror +
     //    zero-copy GPU ring).
@@ -650,7 +778,7 @@ fn worker_main(
         if stop.load(Ordering::Relaxed) || !alive(proc) {
             break;
         }
-        sweep_hide(pid, hwnd, &mut hidden);
+        sweep_hide(pid, hwnd, &mut hidden, kind);
         // The capture target isn't swept — strip its menu too so a
         // late-attached menu bar can't leak into the captured frame.
         strip_menu(hwnd);
@@ -684,14 +812,29 @@ fn worker_main(
         return;
     }
 
-    // 5. Teardown — close Xenia: WM_CLOSE first, then force.
+    // 5. Teardown — Lacrima's ForceCloseTrackedEmulatorProcess policy.
+    //    RPCS3 gets its graceful stop shortcut first (TryRequestRpcs3-
+    //    Shutdown): a WM_CLOSE pops the confirm-quit dialog on a
+    //    hidden window and stalls shutdown. Everything else gets
+    //    WM_CLOSE; whatever survives the grace wait is force-killed.
+    //    (Lacrima's force-kill-first list — pcsx2/dolphin/duckstation/
+    //    shadps4 — maps to the same branch when those kinds land.)
     if alive(proc) {
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-        }
-        let deadline = Instant::now() + Duration::from_millis(2500);
+        let grace = if kind == Kind::Rpcs3 {
+            send_ctrl_s(hwnd);
+            // With --no-gui a landed Ctrl+S stops the game and exits
+            // within ~a second; if it didn't land, don't sit in the
+            // full 5s wait — cut to TerminateProcess sooner.
+            2500
+        } else {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            2500
+        };
+        let deadline = Instant::now() + Duration::from_millis(grace);
         while Instant::now() < deadline && alive(proc) {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(60));
         }
         if alive(proc) && !proc.is_invalid() {
             unsafe {
@@ -718,6 +861,10 @@ struct SavedWindow {
     exstyle: i64,
     rect: RECT,
     menu: Option<isize>,
+    /// Hidden via DWM cloaking instead of park+opacity (RPCS3's
+    /// render candidate — parking/restyling mid-construction races
+    /// Qt, per Rpcs3Handler's Prepare*ForCapture no-ops).
+    cloaked: bool,
 }
 
 struct EnumCtx {
@@ -756,13 +903,17 @@ fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
 
 struct ChildCtx {
     pid: u32,
+    kind: Kind,
     best: HWND,
     best_score: i64,
 }
 
 unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut ChildCtx);
-    let score = score_render_child(hwnd, ctx.pid);
+    let score = match ctx.kind {
+        Kind::Rpcs3 => score_rpcs3_child(hwnd, ctx.pid),
+        _ => score_render_child(hwnd, ctx.pid),
+    };
     if score > ctx.best_score {
         ctx.best_score = score;
         ctx.best = hwnd;
@@ -915,12 +1066,156 @@ fn is_likely_xemu_window(hwnd: HWND, main: HWND) -> bool {
     !(hwnd == main && has_caption && has_thick)
 }
 
+/// A window's client size in pixels (GetClientRect).
+fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut r = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut r) }.ok()?;
+    Some((r.right - r.left, r.bottom - r.top))
+}
+
+/// IsRpcs3DialogOrOverlayWindow — boot progress/trophy/shader
+/// dialogs that must never be picked as the render surface.
+fn is_rpcs3_dialog_title(t: &str) -> bool {
+    [
+        "trophy",
+        "checking",
+        "please wait",
+        "please do not turn off",
+        "do not turn off",
+        "pipeline object",
+        "compiling pipeline",
+        "loading pipeline",
+        "shader",
+        "preloading",
+        "installing",
+    ]
+    .iter()
+    .any(|w| t.contains(w))
+}
+
+/// IsRpcs3UiWindow — RPCS3's own chrome (settings/log/launcher),
+/// not a game surface.
+fn is_rpcs3_ui_title(t: &str) -> bool {
+    t.starts_with("rpcs3 ")
+        || [
+            "settings",
+            "configuration",
+            "controller",
+            "input",
+            "audio",
+            "video",
+            "about",
+            "help",
+            "log",
+            "debug",
+            "game list",
+            "launcher",
+            "master",
+            "alpha",
+        ]
+        .iter()
+        .any(|w| t.contains(w))
+}
+
+/// IsLikelyRpcs3RenderWindow — the gs_frame game window: a
+/// non-child window ≥480×270 (client) that isn't dialog/UI chrome.
+/// Render-ish titles (FPS:/vulkan/opengl/…) accept outright;
+/// otherwise a non-primary Qt/QWindow top-level with a title.
+fn is_likely_rpcs3_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let title = window_title(hwnd);
+    let t = title.trim().to_lowercase();
+    if is_rpcs3_dialog_title(&t) {
+        return false;
+    }
+    let class = class_name(hwnd).to_lowercase();
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    if (style & WS_CHILD.0 as i64) != 0 {
+        return false;
+    }
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let mut looks_primary = hwnd == main;
+    if is_rpcs3_ui_title(&t) {
+        looks_primary = true;
+    }
+    let Some((w, h)) = client_size(hwnd) else {
+        return false;
+    };
+    if w < 480 || h < 270 {
+        return false;
+    }
+    if t.starts_with("fps:")
+        || t.contains("vulkan")
+        || t.contains("opengl")
+        || t.contains("render")
+        || t.contains("gpu")
+        || t.contains("swapchain")
+    {
+        return true;
+    }
+    if t.contains("rpcs3") && !looks_primary && !has_caption {
+        return true;
+    }
+    // gs_frame: a separate QWindow titled after the game.
+    if !looks_primary
+        && !t.is_empty()
+        && (class.contains("qt") || class.contains("qwindow"))
+    {
+        return true;
+    }
+    !looks_primary && w >= 960 && h >= 540 && !t.is_empty()
+}
+
+/// ScoreRpcs3RenderChildWindow — gs_frame can also hang off the main
+/// window as a Qt child; same gates as the top-level path with
+/// render-class bonuses.
+fn score_rpcs3_child(hwnd: HWND, pid: u32) -> i64 {
+    if hwnd.is_invalid() {
+        return i64::MIN;
+    }
+    let mut wpid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+    }
+    if wpid != pid {
+        return i64::MIN;
+    }
+    let t = window_title(hwnd).trim().to_lowercase();
+    if is_rpcs3_dialog_title(&t) {
+        return i64::MIN;
+    }
+    let Some((w, h)) = client_size(hwnd) else {
+        return i64::MIN;
+    };
+    if w < 480 || h < 270 {
+        return i64::MIN;
+    }
+    let class = class_name(hwnd).to_lowercase();
+    if class.contains("ime") || class.contains("tooltip") || class.contains("titlebar") {
+        return i64::MIN;
+    }
+    let mut score = w as i64 * h as i64 * 10;
+    if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        score += 500_000;
+    }
+    if class.contains("qt") || class.contains("vulkan") || class.contains("opengl") {
+        score += 5_000_000;
+    }
+    if w >= 1280 && h >= 720 {
+        score += 25_000_000;
+    }
+    score
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
     match kind {
         Kind::Flycast => return is_likely_flycast_window(hwnd, main),
         Kind::Xemu => return is_likely_xemu_window(hwnd, main),
+        Kind::Rpcs3 => return is_likely_rpcs3_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -1030,11 +1325,13 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
         .unwrap_or_default();
 
     // Render-surface child windows win for Xenia (its temp_d3d_window
-    // lives under a top-level); Flycast renders in the top-level
-    // window itself — a Qt child could only be chrome, so skip.
-    if kind == Kind::Xenia {
+    // lives under a top-level) and RPCS3 (gs_frame can be a Qt child
+    // of the main window); Flycast/xemu render in the top-level
+    // window itself — a child could only be chrome, so skip.
+    if matches!(kind, Kind::Xenia | Kind::Rpcs3) {
         let mut ctx = ChildCtx {
             pid,
+            kind,
             best: HWND::default(),
             best_score: i64::MIN,
         };
@@ -1217,6 +1514,40 @@ fn prepare_window_for_capture(hwnd: HWND) -> SavedWindow {
         exstyle,
         rect,
         menu,
+        cloaked: false,
+    }
+}
+
+/// Read-only window snapshot — the same restore record
+/// `prepare_window_for_capture` makes, but without touching the
+/// window (for the cloak-only hide path).
+fn snapshot_window(hwnd: HWND) -> SavedWindow {
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as i64;
+    let mut rect = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    SavedWindow {
+        style,
+        exstyle,
+        rect,
+        menu: None,
+        cloaked: true,
+    }
+}
+
+/// Win32API.SetWindowCloaked (DwmSetWindowAttribute DWMWA_CLOAK=13):
+/// hides a window from the screen without touching its geometry,
+/// style or opacity — and DWM/WGC keep producing frames for it. The
+/// hide that can't race a still-constructing render window.
+fn set_cloaked(hwnd: HWND, on: bool) {
+    let v: BOOL = on.into();
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(13),
+            &v as *const _ as *const _,
+            std::mem::size_of::<BOOL>() as u32,
+        );
     }
 }
 
@@ -1273,6 +1604,9 @@ fn restore_window(hwnd: HWND, saved: &SavedWindow) {
     if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return;
     }
+    if saved.cloaked {
+        set_cloaked(hwnd, false);
+    }
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i64;
         if (ex & WS_EX_LAYERED.0 as i64) != 0 {
@@ -1308,7 +1642,19 @@ fn restore_window(hwnd: HWND, saved: &SavedWindow) {
 /// (the resolved capture target, whose original state lives in
 /// `saved`). Hidden windows stay `WS_VISIBLE` (opacity/position only)
 /// so they keep enumerating — the map dedups repeat visits.
-fn sweep_hide(pid: u32, skip: HWND, hidden: &mut std::collections::HashMap<usize, SavedWindow>) {
+///
+/// RPCS3's likely render window is *cloaked* instead of parked:
+/// Rpcs3Handler deliberately no-ops PrepareProcessForCapture/
+/// PrepareWindowForCapture because moving/restyling a gs_frame mid-
+/// construction races Qt and produces stale aspect ratios. Cloaking
+/// hides it without touching geometry — the real prepare+park runs
+/// once the window proves stable.
+fn sweep_hide(
+    pid: u32,
+    skip: HWND,
+    hidden: &mut std::collections::HashMap<usize, SavedWindow>,
+    kind: Kind,
+) {
     for hwnd in process_windows(pid, false) {
         if hwnd == skip || hwnd.is_invalid() {
             continue;
@@ -1318,13 +1664,68 @@ fn sweep_hide(pid: u32, skip: HWND, hidden: &mut std::collections::HashMap<usize
         // HMENU at all — it's ImGui-rendered in-frame, handled by the
         // show_menubar config patch.)
         strip_menu(hwnd);
+        // RPCS3: cloak EVERY window — a DWM cloak hides instantly with
+        // no geometry/style change for Qt to race, so nothing flashes
+        // between spawn and capture. Other kinds park aux windows.
+        let cloak = kind == Kind::Rpcs3;
         hidden
             .entry(hwnd.0 as usize)
             .or_insert_with(|| {
-                let saved = prepare_window_for_capture(hwnd);
-                hide_window(hwnd);
-                saved
+                if cloak {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                } else {
+                    let saved = prepare_window_for_capture(hwnd);
+                    hide_window(hwnd);
+                    saved
+                }
             });
+    }
+}
+
+/// Lacrima's TrySendControlS — RPCS3's graceful stop shortcut. Focus
+/// the window then push a real Ctrl+S through SendInput; posted
+/// WM_KEYDOWNs don't reach Qt's shortcut map on an inactive window.
+/// The window stays cloaked — SetForegroundWindow doesn't undo a DWM
+/// cloak, so nothing flashes while it stops.
+fn send_ctrl_s(hwnd: HWND) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    let key = |vk: u16, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                ..Default::default()
+            },
+        },
+    };
+    unsafe {
+        // SetForegroundWindow quietly fails when the caller isn't the
+        // foreground process — attaching to the target's input queue
+        // sidesteps the restriction so the shortcut actually lands
+        // instead of burning the whole grace period.
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+        let this_tid = GetCurrentThreadId();
+        let attached = target_tid != 0
+            && target_tid != this_tid
+            && AttachThreadInput(this_tid, target_tid, true).as_bool();
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        // Ctrl down, S down, S up, Ctrl up.
+        let inputs = [
+            key(0x11, false),
+            key(0x53, false),
+            key(0x53, true),
+            key(0x11, true),
+        ];
+        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        if attached {
+            let _ = AttachThreadInput(this_tid, target_tid, false);
+        }
     }
 }
 

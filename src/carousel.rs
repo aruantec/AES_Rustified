@@ -111,6 +111,10 @@ pub enum Action {
     /// "Clear Album" — empties the loaded album's children
     /// (Lacrima's ClearAlbumCommand; files are never touched).
     Clear,
+    /// ROM mode: "Clear Album Cache" — deletes the section's fetched
+    /// title/cover sidecars and re-runs the resolver (Lacrima's
+    /// ClearAlbumCacheCommand).
+    ClearCache,
     /// "Export Playlist" — write the album's URL items to an .apl
     /// file (Lacrima's ExportOnlinePlaylistCommand).
     Export,
@@ -269,6 +273,9 @@ pub struct Carousel {
     /// "Custom Config" item menu entries (XeniaPatchesMenuItem /
     /// XeniaCustomConfigMenuItem).
     pub xenia_menu: bool,
+    /// ROM mode + RPCS3 handler — shows the Lacrima "Patches" item
+    /// entry (Rpcs3PatchesMenuItem).
+    pub rpcs3_menu: bool,
 }
 
 impl Carousel {
@@ -307,6 +314,7 @@ impl Carousel {
             pop: 0.0,
             rom_mode: false,
             xenia_menu: false,
+            rpcs3_menu: false,
         }
     }
 
@@ -355,16 +363,16 @@ impl Carousel {
     /// item model, but covers come from the caller's resolver (a
     /// cached online box-art file when one was fetched, else the
     /// console-art fallback via the failed-decode path).
+    /// `fallback` is the section's console art — NOT `album.covers`:
+    /// the section tile can wear the first ROM's box art ("Use first
+    /// item cover"), and sharing that made every coverless card show
+    /// another game's cover.
     pub fn open_roms(
         &mut self,
         album: &Album,
         cover: &dyn Fn(&Path) -> Option<CoverSrc>,
+        fallback: Option<CoverSrc>,
     ) {
-        let fallback = album
-            .covers
-            .iter()
-            .find(|c| matches!(c, CoverSrc::File(_)))
-            .cloned();
         self.items = album
             .tracks
             .iter()
@@ -1656,6 +1664,12 @@ impl Carousel {
                         action = Action::Clear;
                         ui.close();
                     }
+                    // Lacrima's "Clear Album Cache" — wipe the fetched
+                    // sidecars so the resolver starts over.
+                    if self.rom_mode && ui.button("Clear Section Cache").clicked() {
+                        action = Action::ClearCache;
+                        ui.close();
+                    }
                 });
             }
             return action;
@@ -2020,19 +2034,21 @@ impl Carousel {
                         self.menu_item = None;
                         ui.close();
                     }
-                    // X360 + Xenia handler — Lacrima's per-game
-                    // Patches / Custom Config menu items.
-                    if self.rom_mode && self.xenia_menu {
-                        if ui.button("Patches").clicked() {
-                            action = Action::Patches(p.clone());
-                            self.menu_item = None;
-                            ui.close();
-                        }
-                        if ui.button("Custom Config").clicked() {
-                            action = Action::CustomConfig(p.clone());
-                            self.menu_item = None;
-                            ui.close();
-                        }
+                    // X360 + Xenia / PS3 + RPCS3 — Lacrima's per-game
+                    // Patches menu item (Xenia adds Custom Config).
+                    if self.rom_mode && (self.xenia_menu || self.rpcs3_menu)
+                        && ui.button("Patches").clicked()
+                    {
+                        action = Action::Patches(p.clone());
+                        self.menu_item = None;
+                        ui.close();
+                    }
+                    if self.rom_mode && self.xenia_menu
+                        && ui.button("Custom Config").clicked()
+                    {
+                        action = Action::CustomConfig(p.clone());
+                        self.menu_item = None;
+                        ui.close();
                     }
                     if ui
                         .button(if self.rom_mode { "Remove" } else { "Delete" })
@@ -2069,6 +2085,10 @@ impl Carousel {
                     .clicked()
                 {
                     action = Action::Clear;
+                    ui.close();
+                }
+                if self.rom_mode && ui.button("Clear Section Cache").clicked() {
+                    action = Action::ClearCache;
                     ui.close();
                 }
             });

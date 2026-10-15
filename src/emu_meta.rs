@@ -14,6 +14,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -53,7 +54,9 @@ pub fn cached_title(rom: &Path) -> Option<String> {
     std::fs::read_to_string(meta_path(rom))
         .ok()
         .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+        // U+FFFD = a sidecar written before the cp1252 decode — re-
+        // resolve so the clean title overwrites it (self-healing).
+        .filter(|t| !t.is_empty() && !t.contains('\u{FFFD}'))
 }
 
 fn save_cached_title(rom: &Path, title: &str) {
@@ -459,7 +462,10 @@ fn cue_track_files(path: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for line in text.lines() {
         let l = line.trim();
-        if !l.len().gt(&5) || !l[..5].eq_ignore_ascii_case("FILE ") {
+        if !l
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("FILE "))
+        {
             continue;
         }
         let rest = l[5..].trim();
@@ -556,6 +562,278 @@ fn dc_title(path: &Path) -> Option<String> {
 }
 
 // ------------------------------------------------------------------
+// PS3 — PARAM.SFO (Lacrima's Ps3InstalledGameHelper). SFO is a keyed
+// binary blob: a 20-byte header (magic, key/data table offsets,
+// entry count), 16-byte index entries, then the key + data tables.
+// ------------------------------------------------------------------
+/// The dirs a PARAM.SFO can live in relative to a game root —
+/// disc dumps keep it in `PS3_GAME`, installed pkgs in the dir
+/// root / `USRDIR` (GetCandidateDirectories).
+pub(crate) fn ps3_sfo_candidates(root: &Path) -> [PathBuf; 4] {
+    [
+        root.join("PARAM.SFO"),
+        root.join("PS3_GAME").join("PARAM.SFO"),
+        root.join("PS3_GAME").join("USRDIR").join("PARAM.SFO"),
+        root.join("USRDIR").join("PARAM.SFO"),
+    ]
+}
+
+/// Read `want` ("TITLE"/"TITLE_ID"/"APP_VER") out of a PARAM.SFO —
+/// a port of TryReadValueFromParamSfo.
+pub(crate) fn sfo_value(sfo: &Path, want: &str) -> Option<String> {
+    // SFOs are KBs — cap the read so a junk file can't burn memory.
+    let bytes = std::fs::read(sfo).ok()?;
+    let u32be = |o: usize| -> Option<usize> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+    };
+    if bytes.len() < 20 || bytes[0..4] != [0x00, 0x50, 0x53, 0x46] {
+        return None;
+    }
+    let key_table = u32be(8)?;
+    let data_table = u32be(12)?;
+    let count = u32be(16)?;
+    for i in 0..count {
+        let e = 20 + i * 16;
+        let Some(entry) = bytes.get(e..e + 16) else { break };
+        let key_off = u16::from_le_bytes(entry[0..2].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
+        let data_off = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+        let key: String = bytes
+            .get(key_table + key_off..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
+        if !key.eq_ignore_ascii_case(want) {
+            continue;
+        }
+        if data_len == 0 {
+            return None;
+        }
+        let raw = bytes.get(data_table + data_off..data_table + data_off + data_len)?;
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let value = decode_sfo_str(&raw[..end]).trim().to_string();
+        return (!value.is_empty()).then_some(value);
+    }
+    None
+}
+
+/// SFO strings aren't always UTF-8 — ™/® and other specials arrive
+/// as cp1252 bytes ("God of War\x99 III"), which from_utf8_lossy
+/// would mangle to U+FFFD and poison the cover-search queries.
+/// Decode UTF-8 first, else map each byte through cp1252 (0x80-9F
+/// table; the rest is latin1-identical).
+fn decode_sfo_str(raw: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        return s.to_string();
+    }
+    const CP1252: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž',
+        '\u{8F}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}',
+        'ž', 'Ÿ',
+    ];
+    raw.iter()
+        .map(|&b| match b {
+            0x80..=0x9F => CP1252[(b - 0x80) as usize],
+            _ => b as char,
+        })
+        .collect()
+}
+
+/// PS3 title — PARAM.SFO `TITLE` from the game dir (folder ROM or
+/// an extracted `EBOOT.BIN`); plain `.iso` dumps carry the name in
+/// the filename so the stem fallback covers them.
+fn ps3_title(path: &Path) -> Option<String> {
+    let roots: Vec<PathBuf> = if path.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        // A file ROM: walk up so .../PS3_GAME/USRDIR/EBOOT.BIN finds
+        // its sibling PARAM.SFO (file's dir → 3 ancestors max).
+        path.ancestors().skip(1).take(3).map(|d| d.to_path_buf()).collect()
+    };
+    for root in roots {
+        for sfo in ps3_sfo_candidates(&root) {
+            if let Some(title) = sfo_value(&sfo, "TITLE") {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+/// Lacrima's GetPreferredIconPath — a PS3 dump ships its own art
+/// (ICON0.PNG cover, PIC1.PNG back); used as the cover fallback
+/// when the web pipeline finds nothing.
+fn ps3_local_cover(path: &Path) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = if path.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        path.ancestors().skip(1).take(3).map(|d| d.to_path_buf()).collect()
+    };
+    for root in roots {
+        for dir in [
+            root.clone(),
+            root.join("PS3_GAME"),
+            root.join("PS3_GAME").join("USRDIR"),
+            root.join("USRDIR"),
+        ] {
+            for name in ["ICON0.PNG", "icon0.png", "PIC1.PNG", "pic1.png"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ps3InstalledGameHelper.IsInstalledGameFolder — a dir that owns a
+/// PARAM.SFO/ICON0 in the standard spots, or carries a title id
+/// (BLES12345 & co) in any path segment. Such a folder IS the ROM —
+/// scanners add it whole and never descend into it.
+pub fn ps3_is_installed_folder(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    if dir
+        .ancestors()
+        .filter_map(|a| a.file_name().and_then(|n| n.to_str()))
+        .any(ps3_title_id_in)
+    {
+        return true;
+    }
+    for d in [
+        dir.to_path_buf(),
+        dir.join("PS3_GAME"),
+        dir.join("PS3_GAME").join("USRDIR"),
+        dir.join("USRDIR"),
+    ] {
+        if d.join("PARAM.SFO").is_file()
+            || d.join("ICON0.PNG").is_file()
+            || d.join("icon0.png").is_file()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `(BLUS|BLES|BLJM|BLJS|NPUB|NPEB|NPJB|NPUJ|NPUX)\d{5}` — the disc/
+/// pkg title-id pattern PS3 dumps carry in their folder names.
+fn ps3_title_id_in(s: &str) -> bool {
+    const PRE: &[&[u8; 4]] = &[
+        b"BLUS", b"BLES", b"BLJM", b"BLJS", b"NPUB", b"NPEB", b"NPJB", b"NPUJ", b"NPUX",
+    ];
+    let b = s.as_bytes();
+    if b.len() < 9 {
+        return false;
+    }
+    (0..=b.len() - 9).any(|i| {
+        PRE.iter()
+            .any(|p| b[i..i + 4].eq_ignore_ascii_case(&p[..]))
+            && b[i + 4..i + 9].iter().all(|c| c.is_ascii_digit())
+    })
+}
+
+/// Extract a PS3 title-id token from free text — the RPCS3 patch
+/// service's wider `\b(BLUS|BLES|BLJM|BLJS|NPUB|NPEB|NPJB|NPUJ|NPUA|
+/// NPUX|BCUS|BCES|MRTC)\d{5}\b` (TitleIdTokenRegex), returned
+/// uppercased.
+pub(crate) fn ps3_title_id_token(s: &str) -> Option<String> {
+    const PRE: &[&[u8; 4]] = &[
+        b"BLUS", b"BLES", b"BLJM", b"BLJS", b"NPUB", b"NPEB", b"NPJB", b"NPUJ", b"NPUA",
+        b"NPUX", b"BCUS", b"BCES", b"MRTC",
+    ];
+    let b = s.as_bytes();
+    let word = |i: usize| {
+        (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+            && (i + 9 >= b.len() || !b[i + 9].is_ascii_alphanumeric())
+    };
+    (0..=b.len().saturating_sub(9))
+        .find(|&i| {
+            word(i)
+                && PRE.iter().any(|p| b[i..i + 4].eq_ignore_ascii_case(&p[..]))
+                && b[i + 4..i + 9].iter().all(|c| c.is_ascii_digit())
+        })
+        .map(|i| s[i..i + 9].to_uppercase())
+}
+
+/// TITLE_ID + APP_VER for a PS3 rom — PARAM.SFO first (Lacrima's
+/// `TryReadValueFromParamSfo`), then a title-id token from the path
+/// segments (ResolveTitleId's fallback). Used by the RPCS3 patches
+/// overlay.
+pub(crate) fn ps3_ids(path: &Path) -> (Option<String>, Option<String>) {
+    let roots: Vec<PathBuf> = if path.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        path.ancestors().skip(1).take(3).map(|d| d.to_path_buf()).collect()
+    };
+    let mut tid = None;
+    let mut ver = None;
+    for root in &roots {
+        for sfo in ps3_sfo_candidates(root) {
+            if tid.is_none() {
+                tid = sfo_value(&sfo, "TITLE_ID");
+            }
+            if ver.is_none() {
+                ver = sfo_value(&sfo, "APP_VER");
+            }
+        }
+    }
+    if tid.is_none() {
+        tid = path
+            .ancestors()
+            .filter_map(|a| a.file_name().and_then(|n| n.to_str()))
+            .find_map(ps3_title_id_token);
+    }
+    (tid, ver)
+}
+
+/// ClearAlbumCache — drop the fetch sidecars (`{key}.img` cover +
+/// `{key}.title` resolved name) so the resolver starts over. The
+/// `.meta` doc and `.k*` editor images are user data — preserved.
+pub fn clear_cache(rom: &Path) {
+    let _ = std::fs::remove_file(cover_path(rom));
+    let _ = std::fs::remove_file(meta_path(rom));
+}
+
+/// Files a disc descriptor references — the scanner collapses these
+/// so a cue/gdi/m3u owns its tracks instead of listing them as ROMs
+/// (CollapseDiscImageArtifacts).
+pub(crate) fn descriptor_refs(path: &Path) -> Vec<PathBuf> {
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+    else {
+        return Vec::new();
+    };
+    match ext.as_str() {
+        "cue" => cue_track_files(path),
+        "gdi" => gdi_track_files(path),
+        "m3u" => {
+            let Some(dir) = path.parent() else {
+                return Vec::new();
+            };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                return Vec::new();
+            };
+            text.lines()
+                .map(|l| l.trim().trim_matches('"'))
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| dir.join(l.replace('\\', "/")))
+                .filter(|p| p.is_file())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ------------------------------------------------------------------
 // LibRetro thumbnails (LibRetroThumbnailCoverService)
 // ------------------------------------------------------------------
 const LIBRETRO_BASE: &str = "https://thumbnails.libretro.com/";
@@ -620,8 +898,12 @@ fn escape(s: &str) -> String {
 
 fn strip_region(title: &str) -> &str {
     for suf in REGION_SUFFIXES {
+        // `get` — a suffix byte-len can cut inside a multi-byte char
+        // (titles end in ®/™ from PARAM.SFO) where `[]` slicing panics.
         if title.len() > suf.len()
-            && title[title.len() - suf.len()..].eq_ignore_ascii_case(suf)
+            && title
+                .get(title.len() - suf.len()..)
+                .is_some_and(|t| t.eq_ignore_ascii_case(suf))
         {
             return title[..title.len() - suf.len()].trim_end();
         }
@@ -636,7 +918,9 @@ pub(crate) fn display_title(title: &str) -> String {
         .iter()
         .find(|s| {
             title.len() > s.len()
-                && title[title.len() - s.len()..].eq_ignore_ascii_case(s)
+                && title
+                    .get(title.len() - s.len()..)
+                    .is_some_and(|t| t.eq_ignore_ascii_case(s))
         })
         .map(|s| (title[..title.len() - s.len()].trim_end(), *s))
         .unwrap_or((title, ""));
@@ -663,8 +947,22 @@ pub(crate) fn display_title(title: &str) -> String {
     }
 }
 
-/// `ExpandTitleVariants` — base + title-case variant, each also
-/// region-stripped and region-appended, in order.
+/// Libretro filename form of a title — `:` separates name/subtitle
+/// as " - " and ™®© are dropped ("Ratchet & Clank: Tools of
+/// Destruction™" → "Ratchet & Clank - Tools of Destruction"), the
+/// convention Named_Boxarts actually uses.
+fn libretro_name(t: &str) -> String {
+    let s = t
+        .replace(['™', '®', '©'], "")
+        .replace(':', " - ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    s.trim().to_string()
+}
+
+/// `ExpandTitleVariants` — base + title-case + libretro-name
+/// variants, each also region-stripped and region-appended, in order.
 fn title_variants(title: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let push = |v: String, out: &mut Vec<String>| {
@@ -672,18 +970,20 @@ fn title_variants(title: &str) -> Vec<String> {
             out.push(v);
         }
     };
-    for base in [title.trim().to_string(), display_title(title.trim())] {
-        if base.is_empty() {
-            continue;
-        }
-        push(base.clone(), &mut out);
-        let stripped = strip_region(&base).to_string();
-        if stripped != base {
-            push(stripped.clone(), &mut out);
-        }
-        if strip_region(&base) == base {
-            for suf in REGION_SUFFIXES {
-                push(format!("{stripped} {suf}"), &mut out);
+    for raw in [title.trim().to_string(), display_title(title.trim())] {
+        for base in [raw.clone(), libretro_name(&raw)] {
+            if base.is_empty() {
+                continue;
+            }
+            push(base.clone(), &mut out);
+            let stripped = strip_region(&base).to_string();
+            if stripped != base {
+                push(stripped.clone(), &mut out);
+            }
+            if strip_region(&base) == base {
+                for suf in REGION_SUFFIXES {
+                    push(format!("{stripped} {suf}"), &mut out);
+                }
             }
         }
     }
@@ -887,7 +1187,12 @@ fn bing_image_urls(html: &str) -> Vec<String> {
     let lower = decoded.to_lowercase();
     while let Some(i) = lower[pos..].find("http") {
         let start = pos + i;
-        let rest = &decoded[start..];
+        // `start` is an offset in `lower` — to_lowercase can shift
+        // byte lengths (İ etc.) so index `decoded` via `get`.
+        let Some(rest) = decoded.get(start..) else {
+            pos = start + 4;
+            continue;
+        };
         if !rest.starts_with("http://") && !rest.starts_with("https://") {
             pos = start + 4;
             continue;
@@ -994,41 +1299,136 @@ fn extract_vqd(html: &str) -> Option<String> {
     None
 }
 
+/// Query DuckDuckGo + Bing in parallel and merge — DDG hits first
+/// (its feed carries real dimensions for aspect ranking), unseen
+/// Bing URLs appended. Returns once both engines answer, ≥12 hits
+/// are in and the second engine had a short grace window, or the
+/// budget elapses — a dead/unreachable engine never stalls the
+/// search at its full timeout.
+fn image_candidates(agent: &ureq::Agent, q: &str, target: f32, budget: Duration) -> Vec<String> {
+    let (tx, rx) = mpsc::channel::<(u8, Vec<String>)>();
+    let a = agent.clone();
+    let q2 = q.to_string();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let _ = tx2.send((0, ddg_image_urls(&a, &q2, target)));
+    });
+    let a = agent.clone();
+    let q2 = q.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send((1, bing_candidates(&a, &q2).unwrap_or_default()));
+    });
+    let t0 = Instant::now();
+    let mut first_at: Option<Instant> = None;
+    let (mut ddg, mut bing) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let have = ddg.len() + bing.len();
+        // Enough hits — give the slower engine a short grace to
+        // supplement, then cut it off.
+        let left = if have >= 12 {
+            match first_at {
+                Some(f) if f.elapsed() >= Duration::from_millis(600) => break,
+                Some(f) => Duration::from_millis(600).saturating_sub(f.elapsed()),
+                None => Duration::from_millis(600),
+            }
+        } else {
+            budget.saturating_sub(t0.elapsed())
+        };
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((0, v)) => {
+                if !v.is_empty() {
+                    first_at.get_or_insert_with(Instant::now);
+                }
+                ddg = v;
+            }
+            Ok((_, v)) => {
+                if !v.is_empty() {
+                    first_at.get_or_insert_with(Instant::now);
+                }
+                bing = v;
+            }
+            Err(_) => break,
+        }
+    }
+    let mut out = ddg;
+    for u in bing {
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(&u)) {
+            out.push(u);
+        }
+    }
+    // Known art-host URLs download first, retail/photo listings last
+    // (stable — preserves each engine's own ranking inside a tier).
+    // A "physical case photographed on a table" almost always comes
+    // from a shop listing; mobygames & co are curated flat box art.
+    out.sort_by_key(|u| -cover_url_score(u));
+    out
+}
+
+/// Candidate-URL quality tier: + art archive, − retail/photo listing.
+fn cover_url_score(u: &str) -> i32 {
+    let u = u.to_lowercase();
+    if [
+        "mobygames", "thecoverproject", "coverproject", "launchbox",
+        "gamesdb", "gamefaqs", "giantbomb", "boxart", "box_art",
+        "packshot", "cover",
+    ]
+    .iter()
+    .any(|k| u.contains(k))
+    {
+        2
+    } else if [
+        "ebay", "walmartimages", "secondhand", "preowned", "pawn",
+        "auction", "cash-crusaders", "cash_converters",
+    ]
+    .iter()
+    .any(|k| u.contains(k))
+    {
+        -2
+    } else {
+        0
+    }
+}
+
 /// `FetchImageResults` → first validating download. Returns the saved
-/// sidecar path. Engine order mirrors Lacrima: DuckDuckGo, then Bing.
+/// sidecar path. Both image engines run in parallel (`image_candidates`)
+/// — Lacrima queries them sequentially, but a dead engine would burn
+/// its whole timeout per query otherwise.
 fn web_image_fetch(
     agent: &ureq::Agent,
     title: &str,
     platform: &str,
     rom: &Path,
     section_key: &str,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Option<PathBuf> {
+    let ok = || !cancel.load(std::sync::atomic::Ordering::Relaxed);
     let target = cover_target(section_key);
     for q in cover_queries(title, platform) {
-        // DuckDuckGo first (clean JSON feed)…
-        let mut candidates = ddg_image_urls(agent, &q, target);
-        // …then Bing's HTML page when DDG yields nothing.
-        if candidates.is_empty() {
-            if let Some(v) = bing_candidates(agent, &q) {
-                candidates = v;
-            }
+        if !ok() {
+            return None;
         }
+        let candidates = image_candidates(agent, &q, target, Duration::from_millis(4500));
         // First `Good` (flat front cover) wins. A landscape hit (flat
         // front+back+spine scan) and a product photo/3D mockup are
         // still saved as last-resort fallbacks — a real front cover
         // beats either whenever one lands.
-        let mut photo: Option<PathBuf> = None;
-        let mut landscape: Option<PathBuf> = None;
+        let mut photo: Option<Vec<u8>> = None;
+        let mut landscape: Option<Vec<u8>> = None;
         for img in candidates {
-            match download_validated(agent, &img, rom, section_key) {
-                Some((p, CoverClass::Good)) => return Some(p),
-                Some((p, CoverClass::Photo)) if photo.is_none() => photo = Some(p),
-                Some((p, CoverClass::Landscape)) if landscape.is_none() => landscape = Some(p),
+            match download_classify(agent, &img, section_key) {
+                Some((b, CoverClass::Good)) => {
+                    return ok().then(|| save_cover(rom, &b)).flatten();
+                }
+                Some((b, CoverClass::Photo)) if photo.is_none() => photo = Some(b),
+                Some((b, CoverClass::Landscape)) if landscape.is_none() => landscape = Some(b),
                 _ => {}
             }
         }
-        if let Some(p) = landscape.or(photo) {
-            return Some(p);
+        if let Some(b) = landscape.or(photo) {
+            return ok().then(|| save_cover(rom, &b)).flatten();
         }
     }
     None
@@ -1071,16 +1471,18 @@ fn cover_target(section_key: &str) -> f32 {
     }
 }
 
-/// GET + decode/size gate (Lacrima's `TryValidateAutoCoverImageBytes`)
-/// + sidecar write. Returns `(path, class)` — `Good` marks a clean
-/// front cover; `Photo`/`Landscape` still save but come back marked
-/// so the caller can keep looking for a real front cover.
-fn download_validated(
+/// GET + decode/size gate (Lacrima's `TryValidateAutoCoverImageBytes`).
+/// Returns `(bytes, class)` — the final image payload (trimmed &
+/// re-encoded when borders were cut), classified `Good`/`Photo`/
+/// `Landscape`. Nothing is written here: the caller saves only the
+/// winning candidate — the old per-candidate save churned `.img`
+/// mid-fetch and the card decode pool could cache an early loser
+/// permanently (card showed a photo while `.img` held the real art).
+fn download_classify(
     agent: &ureq::Agent,
     url: &str,
-    rom: &Path,
     section_key: &str,
-) -> Option<(PathBuf, CoverClass)> {
+) -> Option<(Vec<u8>, CoverClass)> {
     let mut r = agent
         .get(url)
         .header("User-Agent", BING_UA)
@@ -1105,45 +1507,59 @@ fn download_validated(
         // flat scan or banner (this also catches box photos whose
         // white margins hid a landscape object).
         CoverClass::Landscape
-    } else if sides.all() {
+    } else if sides.all() || has_inset_vertical_edges(d) {
         // Uniform borders on every edge — the object floats on a
-        // backdrop, i.e. a product photo or 3D mockup, not flat art.
+        // backdrop, i.e. a product photo or 3D mockup — or a sharp
+        // inset rectangle edge on both sides: a physical case
+        // photographed inside the frame. Both are photos, not flat
+        // art.
         CoverClass::Photo
     } else {
         CoverClass::Good
     };
-    let p = match trimmed {
+    let bytes = match trimmed {
         Some(t) => {
             // Re-encode so the sidecar carries the cropped art.
             let mut buf = Vec::new();
             image::DynamicImage::ImageRgba8(t.clone())
                 .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
                 .ok()?;
-            save_cover(rom, &buf)?
+            buf
         }
-        None => save_cover(rom, &bytes)?,
+        None => bytes,
     };
-    Some((p, class))
+    Some((bytes, class))
 }
 
-/// Per-side uniform-border widths detected by `trim_borders` —
+/// Per-side border widths detected by `trim_borders` — `l/r/t/b` are
+/// near-white/near-black bar widths (what gets physically trimmed);
+/// `ul/ur/ut/ub` are uniform-of-any-luminance widths (a dark photo
+/// backdrop counts here even though it isn't a bar).
 /// `all()` means the image is an object floating on a backdrop.
 struct Sides {
     l: u32,
     r: u32,
     t: u32,
     b: u32,
+    ul: u32,
+    ur: u32,
+    ut: u32,
+    ub: u32,
     w: u32,
     h: u32,
 }
 
 impl Sides {
     /// Meaningful uniform border on *every* side (≥4% of that
-    /// dimension, ≥4px) — the product-photo/mockup signature.
+    /// dimension, ≥4px) — the product-photo/mockup signature. Either
+    /// a flat bar or a consistent-color backdrop band counts.
     fn all(&self) -> bool {
         let x = (self.w / 25).max(4);
         let y = (self.h / 25).max(4);
-        self.l >= x && self.r >= x && self.t >= y && self.b >= y
+        self.l.max(self.ul) >= x
+            && self.r.max(self.ur) >= x
+            && self.t.max(self.ut) >= y
+            && self.b.max(self.ub) >= y
     }
 }
 
@@ -1155,7 +1571,18 @@ impl Sides {
 /// never reduces to a sliver.
 fn trim_borders(img: &image::RgbaImage) -> (Option<image::RgbaImage>, Sides) {
     let (w, h) = img.dimensions();
-    let none = Sides { l: 0, r: 0, t: 0, b: 0, w, h };
+    let none = Sides {
+        l: 0,
+        r: 0,
+        t: 0,
+        b: 0,
+        ul: 0,
+        ur: 0,
+        ut: 0,
+        ub: 0,
+        w,
+        h,
+    };
     if w < 40 || h < 40 {
         return (None, none);
     }
@@ -1194,6 +1621,32 @@ fn trim_borders(img: &image::RgbaImage) -> (Option<image::RgbaImage>, Sides) {
         }
         ok >= N * 9 / 10
     };
+    // Uniform-of-any-luminance band — a photographed backdrop (dark
+    // table, wall, gradient-free surface) holds a tight luminance
+    // band, so ≥80% of samples sit within ±20 of the column median.
+    // Only feeds `Sides::all` (photo detection), never the trim.
+    let uni_col = |x: u32| {
+        let mut v = [0i32; N as usize];
+        for (i, s) in v.iter_mut().enumerate() {
+            let y = (((i as f32 + 0.5) / N as f32) * h as f32) as u32;
+            let p = img.get_pixel(x, y.min(h - 1));
+            *s = (p[0] as i32 + p[1] as i32 + p[2] as i32) / 3;
+        }
+        v.sort_unstable();
+        let med = v[N as usize / 2];
+        v.iter().filter(|&&l| (l - med).abs() <= 20).count() >= N as usize * 8 / 10
+    };
+    let uni_row = |y: u32| {
+        let mut v = [0i32; N as usize];
+        for (i, s) in v.iter_mut().enumerate() {
+            let x = (((i as f32 + 0.5) / N as f32) * w as f32) as u32;
+            let p = img.get_pixel(x.min(w - 1), y);
+            *s = (p[0] as i32 + p[1] as i32 + p[2] as i32) / 3;
+        }
+        v.sort_unstable();
+        let med = v[N as usize / 2];
+        v.iter().filter(|&&l| (l - med).abs() <= 20).count() >= N as usize * 8 / 10
+    };
     let cap_x = w * 35 / 100;
     let cap_y = h * 35 / 100;
     let mut l = 0u32;
@@ -1212,7 +1665,23 @@ fn trim_borders(img: &image::RgbaImage) -> (Option<image::RgbaImage>, Sides) {
     while t + b < cap_y && row_is_bar(h - 1 - b) {
         b += 1;
     }
-    let sides = Sides { l, r, t, b, w, h };
+    let mut ul = 0u32;
+    while ul < cap_x && (ul < l || uni_col(ul)) {
+        ul += 1;
+    }
+    let mut ur = 0u32;
+    while ul + ur < cap_x && (ur < r || uni_col(w - 1 - ur)) {
+        ur += 1;
+    }
+    let mut ut = 0u32;
+    while ut < cap_y && (ut < t || uni_row(ut)) {
+        ut += 1;
+    }
+    let mut ub = 0u32;
+    while ut + ub < cap_y && (ub < b || uni_row(h - 1 - ub)) {
+        ub += 1;
+    }
+    let sides = Sides { l, r, t, b, ul, ur, ut, ub, w, h };
     let (cw, ch) = (w - l - r, h - t - b);
     if (l + r < 4 && t + b < 4) || cw < w / 3 || ch < h / 3 {
         return (None, sides);
@@ -1235,6 +1704,7 @@ pub fn spawn_resolver(
     section_key: String,
     platform_name: String,
     items: Vec<PathBuf>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> mpsc::Receiver<RomInfo> {
     let (tx, rx) = mpsc::channel();
     if items.is_empty() {
@@ -1244,12 +1714,13 @@ pub fn spawn_resolver(
     let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let workers = 6usize.min(items.len());
     for _ in 0..workers {
-        let (tx, items, cursor, key, platform) = (
+        let (tx, items, cursor, key, platform, cancel) = (
             tx.clone(),
             items.clone(),
             cursor.clone(),
             section_key.clone(),
             platform_name.clone(),
+            cancel.clone(),
         );
         std::thread::Builder::new()
             .name("aes-emu-meta".into())
@@ -1265,7 +1736,19 @@ pub fn spawn_resolver(
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(path) = items.get(i) else { break };
                     let path = path.clone();
-                    let info = resolve_one(&agent, &key, &platform, index.as_deref(), &path);
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    // A bad item must not kill the worker — one
+                    // panic here previously zeroed the whole section.
+                    let info = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        resolve_one(&agent, &key, &platform, index.as_deref(), &path, &cancel)
+                    }))
+                    .unwrap_or_else(|_| RomInfo {
+                        path: path.clone(),
+                        title: None,
+                        cover: None,
+                    });
                     if info.title.is_some() || info.cover.is_some() {
                         if tx.send(info).is_err() {
                             break;
@@ -1284,17 +1767,25 @@ fn resolve_one(
     platform: &str,
     index: Option<&HashSet<String>>,
     path: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> RomInfo {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ok = || !cancel.load(Relaxed);
     let cached = cover_path(path);
     // Title: sidecar → database/binary → stem.
     let title = cached_title(path).or_else(|| {
         let t = match section_key {
             "X360" => x360_title(path),
             "DC" => dc_title(path),
+            "PS3" => ps3_title(path),
             _ => None,
         };
         if let Some(t) = &t {
-            save_cached_title(path, t);
+            // A canceled worker (Clear Section Cache) must not write
+            // sidecars over the fresh refetch.
+            if ok() {
+                save_cached_title(path, t);
+            }
         }
         t
     });
@@ -1302,45 +1793,106 @@ fn resolve_one(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // PS3 dumps ship their own art — ICON0.PNG is the icon RPCS3's
+    // game list shows (PIC1.PNG the full back art). Guaranteed
+    // correct and instant; it wins over the web lottery, which can
+    // land case photos — the "good cover replaced by a photo" churn.
+    let ps3_local = || -> Option<PathBuf> {
+        if section_key != "PS3" || !ok() {
+            return None;
+        }
+        let icon = ps3_local_cover(path)?;
+        let dst = cover_path(path);
+        if let Some(d) = dst.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        std::fs::copy(&icon, &dst).ok().map(|_| dst)
+    };
     let cover = if cached.exists() && cached_is_front(&cached, section_key) {
         Some(cached)
     } else {
-        // Title candidates in Lacrima's order: resolved title first,
-        // then the stem and its region-stripped form.
-        let mut cands: Vec<String> = Vec::new();
-        if let Some(t) = &title {
-            cands.push(t.clone());
-        }
-        let clean = strip_region(&stem).to_string();
-        if !clean.is_empty() && !cands.iter().any(|c| c.eq_ignore_ascii_case(&clean)) {
-            cands.push(clean.clone());
-        }
-        // 1. LibRetro via the platform index — a local match, not a
-        //    URL ladder.
-        let mut hit = index.and_then(|idx| libretro_match(idx, section_key, &cands));
-        if hit.is_none() && index.is_none() {
-            // No index at all — fall back to a *trimmed* ladder (the
-            // top region suffixes only) rather than the full 96-URL
-            // crawl.
-            hit = ladder_fallback(agent, section_key, &cands);
-        }
-        let dl = hit.and_then(|url| download_cover(agent, url.as_str(), path));
-        dl.or_else(|| {
-            // 2. Search-engine image lookup (Lacrima's web-search
-            //    fallback) — the real X360 coverage source.
-            let t = title.as_deref().unwrap_or(&clean);
-            web_image_fetch(agent, t, platform, path, section_key)
+        ps3_local().or_else(|| {
+            // Title candidates in Lacrima's order: resolved title
+            // first, then the stem and its region-stripped form.
+            let mut cands: Vec<String> = Vec::new();
+            if let Some(t) = &title {
+                cands.push(t.clone());
+            }
+            let clean = strip_region(&stem).to_string();
+            if !clean.is_empty() && !cands.iter().any(|c| c.eq_ignore_ascii_case(&clean)) {
+                cands.push(clean.clone());
+            }
+            // 1. LibRetro via the platform index — a local match, not
+            //    a URL ladder.
+            let mut hit = index.and_then(|idx| libretro_match(idx, section_key, &cands));
+            if hit.is_none() && index.is_none() {
+                // No index at all — fall back to a *trimmed* ladder
+                // (the top region suffixes only) rather than the full
+                // 96-URL crawl.
+                hit = ladder_fallback(agent, section_key, &cands);
+            }
+            let dl = hit.and_then(|url| download_cover(agent, url.as_str(), path, cancel));
+            dl.or_else(|| {
+                // 2. Search-engine image lookup (Lacrima's web-search
+                //    fallback) — the real X360 coverage source.
+                let t = title.as_deref().unwrap_or(&clean);
+                web_image_fetch(agent, t, platform, path, section_key, cancel)
+            })
         })
     };
     RomInfo { path: path.to_path_buf(), title, cover }
 }
 
+/// Photo-of-an-object detection: a physical case photographed
+/// straight-on leaves a sharp luminance step where the case ends and
+/// the backdrop begins — a long continuous vertical edge sitting
+/// *inside* the frame (flat scans run edge-to-edge, so they don't
+/// have an inset rectangle's edges). Needs one on each side.
+fn has_inset_vertical_edges(img: &image::RgbaImage) -> bool {
+    let (w, h) = img.dimensions();
+    if w < 60 || h < 60 {
+        return false;
+    }
+    let lum = |x: u32, y: u32| -> i32 {
+        let p = img.get_pixel(x, y);
+        (p[0] as i32 * 3 + p[1] as i32 * 4 + p[2] as i32) >> 3
+    };
+    // A column is a case-edge when ≥60% of sampled rows have a
+    // strong horizontal luminance step across it.
+    let need = (h / 2) * 6 / 10;
+    let edge_col = |x: u32| -> bool {
+        let mut strong = 0u32;
+        for y in (0..h).step_by(2) {
+            if (lum(x, y) - lum(x - 1, y)).abs() > 28 {
+                strong += 1;
+                if strong >= need {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let margin = (w / 16).max(4);
+    (margin..w * 45 / 100).any(|x| edge_col(x))
+        && (w * 55 / 100..w - margin).any(|x| edge_col(x))
+}
+
 /// A cached cover is only trusted while it classifies `Good` — a
 /// landscape sidecar is almost always a flat front+back+spine scan
-/// and an all-bordered one a product photo, both from the old dumb
-/// fetch, so they re-resolve and self-heal.
-fn cached_is_front(p: &Path, section_key: &str) -> bool {
-    let Ok(d) = image::open(p).map(|d| d.to_rgba8()) else {
+/// and an all-bordered/inset-edged one a product photo, both from
+/// the old dumb fetch, so they re-resolve and self-heal.
+/// Should the cached `.img` be trusted as-is? Bytes + load_from_memory
+/// (extension-based `image::open` can't always identify `.img`).
+/// Photos are rejected — a cached case photo re-resolves. Shape is
+/// NOT gated: saved art was already classified at fetch time, and a
+/// landscape cover (a last-resort flat scan, or PS3 ICON0/PIC1 which
+/// are landscape by nature) is still correct art — rejecting it just
+/// refetched on every launch and let worse images win the retry.
+fn cached_is_front(p: &Path, _section_key: &str) -> bool {
+    let Ok(bytes) = std::fs::read(p) else {
+        return false;
+    };
+    let Ok(d) = image::load_from_memory(&bytes).map(|d| d.to_rgba8()) else {
         return false;
     };
     let (trimmed, sides) = trim_borders(&d);
@@ -1348,8 +1900,7 @@ fn cached_is_front(p: &Path, section_key: &str) -> bool {
     if d.width() < 120 || d.height() < 120 {
         return false;
     }
-    let max_ratio = cover_target(section_key) + 0.12;
-    d.width() as f32 <= d.height() as f32 * max_ratio && !sides.all()
+    !sides.all() && !has_inset_vertical_edges(d)
 }
 
 /// Network-less guess ladder used only when the libretro index can't
@@ -1409,10 +1960,18 @@ fn title_variants_lite(title: &str) -> Vec<String> {
     out
 }
 
-fn download_cover(agent: &ureq::Agent, url: &str, rom: &Path) -> Option<PathBuf> {
+fn download_cover(
+    agent: &ureq::Agent,
+    url: &str,
+    rom: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<PathBuf> {
     let mut resp = agent.get(url).call().ok()?;
     let bytes = resp.body_mut().read_to_vec().ok()?;
     if bytes.len() < 64 || image::load_from_memory(&bytes).is_err() {
+        return None;
+    }
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     save_cover(rom, &bytes)
@@ -1583,12 +2142,7 @@ pub fn gather_image_candidates(query: &str) -> Vec<String> {
         .http_status_as_error(true)
         .build()
         .into();
-    let mut out = ddg_image_urls(&agent, query, 0.72);
-    if out.is_empty() {
-        if let Some(v) = bing_candidates(&agent, query) {
-            out = v;
-        }
-    }
+    let mut out = image_candidates(&agent, query, 0.72, Duration::from_millis(5000));
     out.truncate(24);
     out
 }
@@ -1707,4 +2261,77 @@ fn unescape_json(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(3)))
+            .build()
+            .into()
+    }
+
+    /// PS3 dumps resolve to their own ICON0 art — the flag bug that
+    /// inverted `cancel` and silently dropped every cover.
+    #[test]
+    fn ps3_dump_prefers_icon0() {
+        let dir = std::env::temp_dir().join(format!("aes_test_ps3_{}", std::process::id()));
+        let game = dir.join("BLES99999");
+        let ps3_game = game.join("PS3_GAME");
+        std::fs::create_dir_all(&ps3_game).unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(150, 200)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(ps3_game.join("ICON0.PNG"), &png).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let info = resolve_one(&agent(), "PS3", "PlayStation 3", None, &game, &cancel);
+        let dst = cover_path(&game);
+        assert_eq!(info.cover.as_deref(), Some(dst.as_path()));
+        assert_eq!(std::fs::read(&dst).unwrap(), png);
+
+        let _ = std::fs::remove_file(&dst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Titles ending in multi-byte chars (®/™ from PARAM.SFO cp1252)
+    /// must not panic the byte-indexed suffix checks — this killed
+    /// every resolver worker and zeroed a whole section's covers.
+    #[test]
+    fn multibyte_suffix_titles_dont_panic() {
+        for t in [
+            "Dante's Inferno®",
+            "Ratchet & Clank: Tools of Destruction™",
+            "Killzone®3",
+            "God of War® III",
+        ] {
+            let _ = strip_region(t);
+            let _ = display_title(t);
+            let _ = libretro_name(t);
+            let _ = title_variants(t);
+        }
+        // Sanity: an ASCII region suffix still strips.
+        assert_eq!(strip_region("Halo (USA)"), "Halo");
+    }
+
+    /// A canceled resolver must bail before any network or sidecar
+    /// write — Clear Section Cache relies on this to stop stale
+    /// workers racing the fresh refetch.
+    #[test]
+    fn canceled_fetch_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("aes_test_cancel_{}", std::process::id()));
+        let rom = dir.join("Game BLES99998");
+        std::fs::create_dir_all(&rom).unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(web_image_fetch(&agent(), "Game", "PS3", &rom, "PS3", &cancel).is_none());
+        assert!(download_cover(&agent(), "http://127.0.0.1:1/x.png", &rom, &cancel).is_none());
+        assert!(!cover_path(&rom).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -103,6 +103,28 @@ enum CoverTex {
     Failed,
 }
 
+/// File-version signature for `File`/`Tag` covers — mtime+len mixed.
+/// A cover file re-saved after decode (the fetch ladder overwriting
+/// `.img`, an editor Save) must invalidate the cached texture, not
+/// serve the old decode forever. `Web` has no file → constant.
+fn cover_sig(src: &CoverSrc) -> u64 {
+    let p = match src {
+        CoverSrc::File(p) | CoverSrc::Tag(p) => p,
+        CoverSrc::Web(_) => return u64::MAX,
+    };
+    std::fs::metadata(p)
+        .map(|m| {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            m.len() ^ t.rotate_left(32)
+        })
+        .unwrap_or(0)
+}
+
 /// Per-album fan animation state: a spring-driven 0..1 spread factor
 /// that all layer offsets derive from (equivalent to Lacrima's
 /// per-layer lerp — every target moves proportionally).
@@ -215,7 +237,10 @@ pub struct AlbumRow {
     drag: Option<Drag>,
     /// Album index the context menu was opened on (PointedFolder).
     menu_album: Option<usize>,
-    textures: HashMap<CoverSrc, CoverTex>,
+    /// Cached cover decodes keyed by source, stamped with the file
+    /// signature read at decode time (`cover_sig`) — a changed file
+    /// re-decodes instead of serving the stale frame forever.
+    textures: HashMap<CoverSrc, (CoverTex, u64)>,
     /// Lacrima's `PlaceholderGenerator` music-note cover, used for any
     /// layer with no real art (uploaded lazily on first use).
     placeholder: Option<egui::TextureHandle>,
@@ -228,7 +253,7 @@ pub struct AlbumRow {
     web_queue: Arc<(Mutex<VecDeque<CoverSrc>>, Condvar)>,
     /// Finished decodes, drained on the UI thread (texture upload is
     /// cheap — it's the image decode that stalls).
-    cover_results: mpsc::Receiver<(CoverSrc, Option<egui::ColorImage>)>,
+    cover_results: mpsc::Receiver<(CoverSrc, u64, Option<egui::ColorImage>)>,
     /// Sources already queued or being decoded — avoids duplicate jobs.
     cover_pending: HashSet<CoverSrc>,
     /// Set when a drop glide lands and `albums` was reordered; the app
@@ -296,7 +321,11 @@ impl AlbumRow {
                                 g = cv.wait(g).unwrap();
                             }
                         };
-                        if tx.send((src.clone(), library::decode_cover(&src)))
+                        // Sig BEFORE decode — a mid-decode rewrite
+                        // leaves the stored sig stale so the next
+                        // check re-decodes (self-healing TOCTOU).
+                        if tx
+                            .send((src.clone(), cover_sig(&src), library::decode_cover(&src)))
                             .is_err()
                         {
                             return;
@@ -755,7 +784,7 @@ impl AlbumRow {
     /// Upload covers the decode workers finished. Shared by the album
     /// row and the cover view so both see freshly decoded textures.
     fn drain_cover_results(&mut self, ctx: &egui::Context) {
-        while let Ok((src, img)) = self.cover_results.try_recv() {
+        while let Ok((src, sig, img)) = self.cover_results.try_recv() {
             self.cover_pending.remove(&src);
             let entry = match img {
                 Some(img) => CoverTex::Ready(ctx.load_texture(
@@ -765,7 +794,7 @@ impl AlbumRow {
                 )),
                 None => CoverTex::Failed,
             };
-            self.textures.insert(src, entry);
+            self.textures.insert(src, (entry, sig));
         }
     }
 
@@ -790,9 +819,16 @@ impl AlbumRow {
         src: &CoverSrc,
     ) -> Option<egui::TextureHandle> {
         self.drain_cover_results(ctx);
+        let sig = cover_sig(src);
         match self.textures.get(src) {
-            Some(CoverTex::Ready(t)) => return Some(t.clone()),
-            Some(CoverTex::Failed) | None => {}
+            Some((CoverTex::Ready(t), s)) if *s == sig => return Some(t.clone()),
+            // The file changed since the last decode (or a stale
+            // Failed) — drop it and let the decode re-run below.
+            Some((_, s)) if *s != sig => {
+                self.textures.remove(src);
+                self.cover_pending.remove(src);
+            }
+            _ => {}
         }
         if self.cover_pending.insert(src.clone()) {
             self.submit_cover(src.clone());
@@ -804,7 +840,10 @@ impl AlbumRow {
     /// Whether `src` failed to decode — callers fall back to another
     /// cover or the placeholder instead of waiting forever.
     pub fn cover_failed(&self, src: &CoverSrc) -> bool {
-        matches!(self.textures.get(src), Some(CoverTex::Failed))
+        matches!(
+            self.textures.get(src),
+            Some((CoverTex::Failed, s)) if *s == cover_sig(src)
+        )
     }
 
     /// Upload covers the decode workers finished, then queue any still
@@ -819,7 +858,10 @@ impl AlbumRow {
             .skip(range.0)
         {
             for src in &album.covers {
-                if self.textures.contains_key(src) || !self.cover_pending.insert(src.clone()) {
+                let sig = cover_sig(src);
+                if matches!(self.textures.get(src), Some((_, s)) if *s == sig)
+                    || !self.cover_pending.insert(src.clone())
+                {
                     continue;
                 }
                 self.submit_cover(src.clone());
@@ -1793,7 +1835,7 @@ impl AlbumRow {
         let n = album.covers.len().min(MAX_COVERS);
         let top_tex = album.covers.get(n - 1).and_then(|src| {
             match self.textures.get(src) {
-                Some(CoverTex::Ready(t)) => Some(t.clone()),
+                Some((CoverTex::Ready(t), _)) => Some(t.clone()),
                 _ => None,
             }
         });
@@ -1801,7 +1843,7 @@ impl AlbumRow {
         let mut draw_i = 0usize;
         for (i, src) in album.covers.iter().take(n).enumerate() {
             let own = match self.textures.get(src) {
-                Some(CoverTex::Ready(t)) => Some(t.clone()),
+                Some((CoverTex::Ready(t), _)) => Some(t.clone()),
                 _ => None,
             };
             let tex = own

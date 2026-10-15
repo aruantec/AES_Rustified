@@ -41,6 +41,7 @@ naga = { version = "30", features = ["glsl-in", "wgsl-out"] }
 # shipping a dxcompiler.dll alongside the binary.
 wgpu = { version = "30.0.1", features = ["static-dxc"] }
 ureq = "3.4.2"
+sha2 = "0.10"
 zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.24.0"
 
@@ -55,6 +56,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
