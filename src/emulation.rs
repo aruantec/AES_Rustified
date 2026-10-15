@@ -50,6 +50,8 @@ const WII_SECTION: &str = "WII";
 const DOLPHIN_HANDLER: &str = "dolphin";
 const WIIU_SECTION: &str = "WIIU";
 const CEMU_HANDLER: &str = "cemu";
+const SWITCH_SECTION: &str = "SWITCH";
+const EDEN_HANDLER: &str = "eden";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -156,6 +158,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             installed_exe: emu_dl::cemu_exe,
             download: emu_dl::download_cemu,
         },
+        SWITCH_SECTION => HandlerSpec {
+            section: SWITCH_SECTION,
+            handler: EDEN_HANDLER,
+            name: "Eden",
+            exe_hint: "Path to eden.exe",
+            dialog_title: "Locate eden.exe",
+            installed_exe: emu_dl::eden_exe,
+            download: emu_dl::download_eden,
+        },
         _ => return None,
     })
 }
@@ -173,6 +184,7 @@ fn handler_kind(handler: Option<&str>) -> Option<xenia::Kind> {
         Some(PCSX2_HANDLER) => xenia::Kind::Pcsx2,
         Some(DOLPHIN_HANDLER) => xenia::Kind::Dolphin,
         Some(CEMU_HANDLER) => xenia::Kind::Cemu,
+        Some(EDEN_HANDLER) => xenia::Kind::Eden,
         _ => return None,
     })
 }
@@ -939,6 +951,7 @@ impl EmuView {
             PS2_SECTION => Some(PCSX2_HANDLER.to_string()),
             GCN_SECTION | WII_SECTION => Some(DOLPHIN_HANDLER.to_string()),
             WIIU_SECTION => Some(CEMU_HANDLER.to_string()),
+            SWITCH_SECTION => Some(EDEN_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -968,6 +981,7 @@ impl EmuView {
                     PCSX2_HANDLER => emu_dl::pcsx2_exe(),
                     DOLPHIN_HANDLER => emu_dl::dolphin_exe(),
                     CEMU_HANDLER => emu_dl::cemu_exe(),
+                    EDEN_HANDLER => emu_dl::eden_exe(),
                     _ => None,
                 }
             };
@@ -995,6 +1009,7 @@ impl EmuView {
             xenia::Kind::Pcsx2 => "PCSX2",
             xenia::Kind::Dolphin => "Dolphin",
             xenia::Kind::Cemu => "Cemu",
+            xenia::Kind::Eden => "Eden",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(

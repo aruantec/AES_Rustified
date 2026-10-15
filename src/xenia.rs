@@ -23,6 +23,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+    TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -136,6 +140,7 @@ pub enum Kind {
     Pcsx2,
     Dolphin,
     Cemu,
+    Eden,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -182,7 +187,10 @@ impl Session {
         profile_xuid: Option<u64>,
         kind: Kind,
     ) -> Result<Self, String> {
-        let exe_path = PathBuf::from(exe);
+        // EdenHandler.BuildStartInfo — a configured eden.exe boots
+        // its eden-cli sibling for capture when present (the cli
+        // frontend logs "RenderReady" and has no shell window).
+        let exe_path = eden_cli_sibling(exe, kind);
         let work_dir = exe_path
             .parent()
             .map(|d| d.to_path_buf())
@@ -191,7 +199,7 @@ impl Session {
         // scans for [Core.Linker] before resolving the render window
         // (WaitForCoreLinkerOutputAsync).
         let mut transcript: Option<PathBuf> = None;
-        let mut cmd = Command::new(exe);
+        let mut cmd = Command::new(&exe_path);
         match kind {
             // RPCS3: --no-gui skips the launcher/game-list shell so
             // the gs_frame render window is the only surface (Lacrima's
@@ -292,6 +300,44 @@ impl Session {
             Kind::Cemu => {
                 ensure_cemu_setup(&work_dir);
                 transcript = Some(work_dir.clone());
+                cmd.arg("-g").arg(game);
+            }
+            // Eden (EdenHandler.BuildStartInfo): the cli frontend
+            // gets `--config <qt-config.ini> -g <rom>`; the Qt gui
+            // exe just `-g <rom>` (no -f — the window is cloaked
+            // anyway). ensure_eden_setup writes the qt-config.ini
+            // overrides first (fullscreen off, status bar off,
+            // pause_on_focus_loss off — a hidden window never has
+            // focus). stdout/stderr go to a transcript the worker
+            // scans for "RenderReady" (WaitForRenderReadyOutputAsync)
+            // — only the cli emits it — and CREATE_NO_WINDOW keeps
+            // the console-subsystem exe from flashing a cmd window.
+            Kind::Eden => {
+                ensure_eden_setup();
+                let stem = exe_path
+                    .file_stem()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if stem.contains("eden-cli") || stem.contains("edencli") {
+                    cmd.arg("--config").arg(eden_config_path());
+                    let log_dir = eden_config_dir();
+                    let _ = std::fs::create_dir_all(&log_dir);
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let tp = log_dir.join(format!("eden_launch_{nanos:x}.log"));
+                    if let Ok(out) = std::fs::File::create(&tp) {
+                        if let Ok(err) = out.try_clone() {
+                            cmd.stdout(std::process::Stdio::from(out))
+                                .stderr(std::process::Stdio::from(err));
+                            transcript = Some(tp);
+                        }
+                    }
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
                 cmd.arg("-g").arg(game);
             }
             // xemu mounts disc images via -dvd_path (XemuHandler's
@@ -782,6 +828,146 @@ fn cemu_log_candidates(exe_dir: &Path) -> [PathBuf; 3] {
     ]
 }
 
+/// EdenHandler.BuildStartInfo — a configured `eden.exe` launches
+/// its `eden-cli.exe` sibling for capture when present (the cli
+/// frontend emits the "RenderReady" stdout token the resolve gate
+/// waits on and boots straight into the game, no Qt shell). Non-
+/// Eden kinds pass through untouched.
+fn eden_cli_sibling(exe: &str, kind: Kind) -> PathBuf {
+    let p = PathBuf::from(exe);
+    if kind == Kind::Eden
+        && p.file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.eq_ignore_ascii_case("eden.exe"))
+    {
+        if let Some(dir) = p.parent() {
+            let cli = dir.join("eden-cli.exe");
+            if cli.is_file() {
+                return cli;
+            }
+        }
+    }
+    p
+}
+
+/// The inverse for the setup gear — `eden-cli.exe` has no settings
+/// UI, so a cli-resolved launcher swaps to its `eden.exe` sibling.
+fn eden_gui_sibling(exe: &str) -> PathBuf {
+    let p = PathBuf::from(exe);
+    let name = p
+        .file_stem()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    if name.contains("eden-cli") || name.contains("edencli") {
+        if let Some(dir) = p.parent() {
+            let gui = dir.join("eden.exe");
+            if gui.is_file() {
+                return gui;
+            }
+        }
+    }
+    p
+}
+
+/// EdenHandler.ResolveEdenConfigPath — `%APPDATA%/eden/config`.
+fn eden_config_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("eden")
+        .join("config")
+}
+
+fn eden_config_path() -> PathBuf {
+    eden_config_dir().join("qt-config.ini")
+}
+
+/// EdenHandler.EnsureEdenConfigOverrides — the ini keys a hidden
+/// launch needs: fullscreen off, the status bar off, and
+/// pause_on_focus_loss off (a cloaked window never has focus — left
+/// on, Eden would pause the game the moment it boots). Writes a
+/// missing file, rewrites matching `key=value` lines in place, and
+/// appends whatever's absent — the file keeps everything else.
+fn ensure_eden_setup() {
+    let path = eden_config_path();
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut desired: Vec<(&str, &str)> = vec![
+        ("fullscreen\\default", "false"),
+        ("fullscreen", "false"),
+        ("showStatusBar\\default", "false"),
+        ("showStatusBar", "false"),
+        ("pause_on_focus_loss\\default", "false"),
+        ("pause_on_focus_loss", "false"),
+    ];
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        let body: String = desired
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect();
+        let _ = std::fs::write(&path, body);
+        return;
+    };
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut updated = false;
+    for line in &mut lines {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || !t.contains('=') {
+            continue;
+        }
+        let key = t.splitn(2, '=').next().unwrap_or("").trim();
+        if let Some(pos) = desired.iter().position(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            let (_, v) = desired.remove(pos);
+            let new_line = format!("{key}={v}");
+            if t != new_line {
+                *line = new_line;
+                updated = true;
+            }
+        }
+    }
+    if !desired.is_empty() {
+        for (k, v) in desired {
+            lines.push(format!("{k}={v}"));
+        }
+        updated = true;
+    }
+    if updated {
+        let _ = std::fs::write(&path, lines.join("\n") + "\n");
+    }
+}
+
+/// EdenHandler's WaitForRenderReadyOutputAsync — eden-cli logs
+/// "RenderReady" once the render surface exists; the resolve gate
+/// reads the launch transcript incrementally so the token can skip
+/// the remaining stability polls.
+fn eden_render_ready(transcript: Option<&Path>, pos: &mut u64) -> bool {
+    let Some(tp) = transcript else {
+        return false;
+    };
+    use std::io::{Read, Seek};
+    let Ok(meta) = std::fs::metadata(tp) else {
+        return false;
+    };
+    if meta.len() < *pos {
+        *pos = 0;
+    }
+    if meta.len() == *pos {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(tp) else {
+        return false;
+    };
+    let _ = f.seek(std::io::SeekFrom::Start(*pos));
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    *pos += buf.len() as u64;
+    String::from_utf8_lossy(&buf)
+        .to_lowercase()
+        .contains("renderready")
+}
+
 /// Set `key = value` inside `[section]` of an ini — add the section
 /// when missing (TrySetDolphinIniValue/TrySetDolphinCoreIniValue).
 fn set_ini_key(path: &Path, section: &str, key: &str, value: &str) {
@@ -874,7 +1060,7 @@ fn worker_main(
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
     };
 
-    let proc = unsafe {
+    let mut proc = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
             false,
@@ -882,6 +1068,12 @@ fn worker_main(
         )
     }
     .unwrap_or_default();
+    // Eden's launcher can hand off to a child process and exit
+    // (ResolveRuntimeProcessAsync → TryResolveChildProcess) — `pid`
+    // tracks the live descendant when that happens.
+    let mut pid = pid;
+    let mut eden_ready = false;
+    let mut eden_pos = 0u64;
 
     let alive = |proc: HANDLE| -> bool {
         if proc.is_invalid() {
@@ -920,8 +1112,9 @@ fn worker_main(
         // Dolphin's CaptureStartupDelayMs — its Qt shell churns
         // through several windows before the render surface exists.
         Kind::Dolphin => 1800,
-        // CemuHandler.CaptureStartupDelayMs = 250.
-        Kind::Cemu => 250,
+        // CemuHandler.CaptureStartupDelayMs = 250; Eden's is 250
+        // too (EdenHandler.CaptureStartupDelayMs).
+        Kind::Cemu | Kind::Eden => 250,
         _ => 0,
     };
     let poll = if matches!(
@@ -932,6 +1125,7 @@ fn worker_main(
             | Kind::Pcsx2
             | Kind::Dolphin
             | Kind::Cemu
+            | Kind::Eden
     ) {
         25
     } else {
@@ -940,7 +1134,9 @@ fn worker_main(
     let mut waited = 0u64;
     while waited < delay {
         sweep_hide(pid, HWND::default(), &mut hidden, kind);
-        if stop.load(Ordering::Relaxed) || !alive(proc) {
+        if stop.load(Ordering::Relaxed)
+            || (!alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)))
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(poll));
@@ -1036,6 +1232,7 @@ fn worker_main(
             | Kind::Pcsx2
             | Kind::Dolphin
             | Kind::Cemu
+            | Kind::Eden
     ) {
         25
     } else {
@@ -1056,7 +1253,7 @@ fn worker_main(
         if kind == Kind::Xenia {
             dismiss_warning_dialogs(pid);
         }
-        if !alive(proc) {
+        if !alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)) {
             break;
         }
         sweep_hide(pid, HWND::default(), &mut hidden, kind);
@@ -1245,6 +1442,41 @@ fn worker_main(
                 apply_aspect_ratio(hwnd, 16.0 / 9.0);
                 std::thread::sleep(Duration::from_millis(150));
             }
+            if kind == Kind::Eden {
+                // EdenHandler.ResolveCaptureTargetAsync: the same
+                // hwnd across 2 consecutive polls
+                // (stableAttemptsBeforeAssign) — or immediate assign
+                // once the cli transcript emits "RenderReady".
+                stable_count = if hwnd == stable_hwnd {
+                    stable_count + 1
+                } else {
+                    stable_hwnd = hwnd;
+                    1
+                };
+                if !eden_ready {
+                    eden_ready = eden_render_ready(transcript.as_deref(), &mut eden_pos);
+                }
+                if stable_count < 2 && !eden_ready {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                // PrepareProcess/WindowForCapture are no-ops for
+                // Eden (the sweep must not touch its windows), but
+                // the capture host still strips the resolved
+                // target's decorations at session start —
+                // EnsureSessionCore's `HasWindowCaption →
+                // RemoveWindowDecorations`, which runs for every
+                // handler. Without it WGC frames include the
+                // title bar. Post-resolve the window's UI thread is
+                // pumping, so the SetMenu/SetWindowPos calls inside
+                // return promptly.
+                hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                });
+                prepare_window_for_capture(hwnd);
+            }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
         }
@@ -1279,8 +1511,17 @@ fn worker_main(
     //    stripped/hidden style and break the failure-path restore.
     let saved = hidden
         .remove(&(hwnd.0 as usize))
-        .unwrap_or_else(|| prepare_window_for_capture(hwnd));
-    if matches!(kind, Kind::Dolphin | Kind::Cemu) {
+        .unwrap_or_else(|| {
+            // PrepareWindowForCapture is a no-op for Eden — an
+            // unswept target just gets state-snapshotted, never
+            // restyled mid-boot (same reason Lacrima no-ops it).
+            if kind == Kind::Eden {
+                snapshot_window(hwnd)
+            } else {
+                prepare_window_for_capture(hwnd)
+            }
+        });
+    if matches!(kind, Kind::Dolphin | Kind::Cemu | Kind::Eden) {
         // hide_window's WS_EX_LAYERED + 0-alpha can stall Vulkan/
         // OpenGL presentation (why Lacrima no-ops Dolphin's and
         // Cemu's window prep). Park offscreen under the cloak instead
@@ -1339,7 +1580,9 @@ fn worker_main(
     //    emulator creates after the target resolved.
     let mut capture_err: Option<String> = None;
     loop {
-        if stop.load(Ordering::Relaxed) || !alive(proc) {
+        if stop.load(Ordering::Relaxed)
+            || (!alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)))
+        {
             break;
         }
         sweep_hide(pid, hwnd, &mut hidden, kind);
@@ -1413,6 +1656,18 @@ fn worker_main(
             }
         }
     }
+    // Eden may have rehomed the tracked pid to a child — kill any
+    // surviving descendants too (the tree is the emulator).
+    if kind == Kind::Eden {
+        for dp in descendant_pids(pid) {
+            if let Ok(h) = unsafe { OpenProcess(PROCESS_TERMINATE, false, dp) } {
+                unsafe {
+                    let _ = TerminateProcess(h, 0);
+                    let _ = CloseHandle(h);
+                }
+            }
+        }
+    }
     if !proc.is_invalid() {
         unsafe {
             let _ = CloseHandle(proc);
@@ -1439,7 +1694,7 @@ struct SavedWindow {
 }
 
 struct EnumCtx {
-    pid: u32,
+    pids: Vec<u32>,
     include_hidden: bool,
     out: Vec<HWND>,
 }
@@ -1451,15 +1706,19 @@ unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
     let mut wpid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut wpid));
-    if wpid == ctx.pid {
+    if ctx.pids.contains(&wpid) {
         ctx.out.push(hwnd);
     }
     BOOL(1)
 }
 
 fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
+    process_windows_of(&[pid], include_hidden)
+}
+
+fn process_windows_of(pids: &[u32], include_hidden: bool) -> Vec<HWND> {
     let mut ctx = EnumCtx {
-        pid,
+        pids: pids.to_vec(),
         include_hidden,
         out: Vec::new(),
     };
@@ -1467,6 +1726,87 @@ fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
         let _ = EnumWindows(Some(enum_top), LPARAM(&mut ctx as *mut EnumCtx as isize));
     }
     ctx.out
+}
+
+/// The pids whose windows belong to this launch — `pid` alone for
+/// every emulator except Eden, which can render on a child process
+/// (ResolveRuntimeProcessAsync walks descendants for the same
+/// reason): pid + every live descendant.
+fn win_pids(pid: u32, kind: Kind) -> Vec<u32> {
+    if kind != Kind::Eden {
+        return vec![pid];
+    }
+    let mut v = vec![pid];
+    v.extend(descendant_pids(pid));
+    v
+}
+
+/// Lacrima's EnumerateDescendantProcesses — a Toolhelp32 snapshot
+/// BFS over parent-pid edges (children of children included).
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut all = Vec::new();
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                all.push((e.th32ProcessID, e.th32ParentProcessID));
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        let mut queue = vec![root];
+        let mut seen = std::collections::HashSet::from([root]);
+        while let Some(p) = queue.pop() {
+            for &(cpid, ppid) in &all {
+                if ppid == p && seen.insert(cpid) {
+                    out.push(cpid);
+                    queue.push(cpid);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// EdenHandler.ResolveRuntimeProcessAsync → TryResolveChildProcess —
+/// when the spawned eden.exe/eden-cli.exe hands off to a child and
+/// exits, re-home the tracked handle to a live descendant so window
+/// enumeration, the alive check, and teardown keep working.
+fn eden_rehome(proc: &mut HANDLE, pid: &mut u32) -> bool {
+    for dp in descendant_pids(*pid) {
+        let Ok(h) = (unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                false,
+                dp,
+            )
+        }) else {
+            continue;
+        };
+        if unsafe { WaitForSingleObject(h, 0) } == WAIT_TIMEOUT {
+            if !proc.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(*proc);
+                }
+            }
+            *proc = h;
+            *pid = dp;
+            return true;
+        }
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+    false
 }
 
 struct ChildCtx {
@@ -2105,6 +2445,53 @@ fn is_likely_cemu_window(hwnd: HWND, main: HWND) -> bool {
     hwnd == main && !t.is_empty() && t != "cemu"
 }
 
+/// EdenHandler's IsLikelyEdenRenderWindow — settings/tool dialogs
+/// out (their titles carry the dialog kind), then SDL/GLFW/Qt/Eden
+/// classes, an "eden"-titled window, the main window, or a window
+/// missing caption/thick-frame chrome (a bare render surface).
+fn is_likely_eden_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let title = window_title(hwnd).trim().to_lowercase();
+    let class = class_name(hwnd).to_lowercase();
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let has_thick = (style & WS_THICKFRAME.0 as i64) == WS_THICKFRAME.0 as i64;
+    if !title.is_empty()
+        && [
+            "settings",
+            "audio",
+            "video",
+            "input",
+            "controller",
+            "cheat",
+            "shader",
+            "about",
+        ]
+        .iter()
+        .any(|t| title.contains(t))
+    {
+        return false;
+    }
+    if !class.is_empty() {
+        if class.contains("sdl") || class.contains("glfw") {
+            return true;
+        }
+        // Recent builds can render in the Qt main window itself.
+        if class.contains("qt") || class.contains("eden") {
+            return true;
+        }
+    }
+    if title.contains("eden") {
+        return true;
+    }
+    if hwnd == main {
+        return true;
+    }
+    !has_caption || !has_thick
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
@@ -2117,6 +2504,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::Pcsx2 => return is_likely_pcsx2_window(hwnd, main),
         Kind::Dolphin => return is_likely_dolphin_window(hwnd, main),
         Kind::Cemu => return is_likely_cemu_window(hwnd, main),
+        Kind::Eden => return is_likely_eden_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -2166,7 +2554,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
 }
 
 /// ScoreProcessWindowCandidate (base) restricted to render windows.
-fn score_top_level(hwnd: HWND, pid: u32, main: HWND, kind: Kind) -> i64 {
+fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
     if hwnd.is_invalid() {
         return i64::MIN;
     }
@@ -2175,7 +2563,7 @@ fn score_top_level(hwnd: HWND, pid: u32, main: HWND, kind: Kind) -> i64 {
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&mut wpid));
     }
-    if wpid != pid {
+    if !pids.contains(&wpid) {
         return i64::MIN;
     }
     let mut r = RECT::default();
@@ -2218,7 +2606,8 @@ fn score_top_level(hwnd: HWND, pid: u32, main: HWND, kind: Kind) -> i64 {
 /// best render-like top-level window. `main` ≈ the biggest titled
 /// visible top-level (Process.MainWindowHandle approximation).
 fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
-    let tops = process_windows(pid, true);
+    let pids = win_pids(pid, kind);
+    let tops = process_windows_of(&pids, true);
     if tops.is_empty() {
         return HWND::default();
     }
@@ -2244,7 +2633,7 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
         let top = tops
             .iter()
             .copied()
-            .map(|h| (h, score_top_level(h, pid, main, kind)))
+            .map(|h| (h, score_top_level(h, &pids, main, kind)))
             .filter(|(_, s)| *s > i64::MIN)
             .max_by_key(|(_, s)| *s)
             .map(|(h, _)| h)
@@ -2299,7 +2688,7 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
 
     tops.iter()
         .copied()
-        .map(|h| (h, score_top_level(h, pid, main, kind)))
+        .map(|h| (h, score_top_level(h, &pids, main, kind)))
         .filter(|(_, s)| *s > i64::MIN)
         .max_by_key(|(_, s)| *s)
         .map(|(h, _)| h)
@@ -2606,7 +2995,7 @@ fn sweep_hide(
     hidden: &mut std::collections::HashMap<usize, SavedWindow>,
     kind: Kind,
 ) {
-    for hwnd in process_windows(pid, false) {
+    for hwnd in process_windows_of(&win_pids(pid, kind), false) {
         if hwnd == skip || hwnd.is_invalid() {
             continue;
         }
@@ -2621,13 +3010,14 @@ fn sweep_hide(
         if kind != Kind::Cemu {
             strip_menu(hwnd);
         }
-        // RPCS3/shadPS4/DuckStation/PCSX2/Dolphin: cloak EVERY window
-        // — a DWM cloak hides instantly with no geometry/style change
-        // for Qt/SDL to race, so nothing flashes between spawn and
-        // capture. (PCSX2's and Dolphin's Lacrima handlers no-op
-        // window prep because park/restyle raced Qt and minimizing
-        // stalls Vulkan presentation — cloaking does neither, so it
-        // still hides safely.) Other kinds park aux windows.
+        // RPCS3/shadPS4/DuckStation/PCSX2/Dolphin/Cemu/Eden: cloak
+        // EVERY window — a DWM cloak hides instantly with no
+        // geometry/style change for Qt/SDL to race, so nothing
+        // flashes between spawn and capture. (PCSX2's and Dolphin's
+        // Lacrima handlers no-op window prep because park/restyle
+        // raced Qt and minimizing stalls Vulkan presentation —
+        // cloaking does neither, so it still hides safely.) Other
+        // kinds park aux windows.
         let cloak = matches!(
             kind,
             Kind::Rpcs3
@@ -2636,6 +3026,7 @@ fn sweep_hide(
                 | Kind::Pcsx2
                 | Kind::Dolphin
                 | Kind::Cemu
+                | Kind::Eden
         );
         hidden.entry(hwnd.0 as usize).or_insert_with(|| {
             if cloak {
@@ -2777,12 +3168,19 @@ pub fn apply_aspect_ratio(hwnd: HWND, aspect: f64) {
 /// edits the same managed config the game launches use (Lacrima's
 /// BuildSetupStartInfo).
 pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
-    let exe_path = PathBuf::from(exe);
+    // The gear needs the Qt settings UI — an eden-cli-resolved
+    // launcher swaps to its eden.exe sibling (eden-cli has no UI
+    // without -g).
+    let exe_path = if kind == Some(Kind::Eden) {
+        eden_gui_sibling(exe)
+    } else {
+        PathBuf::from(exe)
+    };
     let work_dir = exe_path
         .parent()
         .map(|d| d.to_path_buf())
         .unwrap_or_default();
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(&exe_path);
     match kind {
         Some(Kind::Dolphin) => {
             let user = ensure_dolphin_setup(&work_dir);
@@ -2796,6 +3194,11 @@ pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
         // portable/ beside the exe — there is no -c flag).
         Some(Kind::Cemu) => {
             ensure_cemu_setup(&work_dir);
+        }
+        // The gear opens Eden's Qt settings UI — prime the same
+        // qt-config.ini overrides game launches use.
+        Some(Kind::Eden) => {
+            ensure_eden_setup();
         }
         _ => {}
     }

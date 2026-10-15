@@ -34,6 +34,12 @@ const EMUCR_DOLPHIN_FEED: &str =
 // CemuEmulatorUpdateService's ReleasesApiEndpoint.
 const CEMU_RELEASES_API: &str =
     "https://api.github.com/repos/cemu-project/Cemu/releases?per_page=100";
+// EdenEmulatorUpdateService's default repo — Eden publishes on its
+// own Forgejo instance, not GitHub; the releases API returns the
+// same tag_name/prerelease/assets(browser_download_url) shape the
+// generic GitHub parse reads.
+const EDEN_RELEASES_API: &str =
+    "https://git.eden-emu.dev/api/v1/repos/eden-emu/eden/releases?limit=20";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
@@ -48,6 +54,7 @@ const DUCKSTATION_VERSION_MARKER: &str = "duckstation_version.txt";
 const PCSX2_VERSION_MARKER: &str = "pcsx2_version.txt";
 const DOLPHIN_VERSION_MARKER: &str = "dolphin_version.txt";
 const CEMU_VERSION_MARKER: &str = "cemu_version.txt";
+const EDEN_VERSION_MARKER: &str = "eden_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -171,9 +178,41 @@ pub fn cemu_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("WIIU").join("Cemu"))
 }
 
+/// `<data>/Emulators/SWITCH/Eden` — EdenEmulatorUpdateService's
+/// EnsureDirectories.
+pub fn eden_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("SWITCH").join("Eden"))
+}
+
 /// Find the installed `Cemu.exe` under the managed dir.
 pub fn cemu_exe() -> Option<PathBuf> {
     resolve_exe(&cemu_dir()?, &CEMU_SPEC).ok()
+}
+
+/// Launch resolution — EdenEmulatorUpdateService's
+/// ResolveLauncherPath prefers `eden-cli.exe` (its stdout emits the
+/// "RenderReady" token Lacrima's capture gate waits on, and it boots
+/// straight into the game without the Qt shell), then `eden.exe`.
+pub fn eden_exe() -> Option<PathBuf> {
+    resolve_exe(&eden_dir()?, &EDEN_SPEC).ok()
+}
+
+/// The settings gear wants the Qt GUI, not the game-boot cli exe —
+/// `eden-cli.exe` with no `-g` exits printing usage. (The gear
+/// resolves via `eden_exe` then swaps the filename in
+/// `xenia::launch_setup`; kept for a direct gui-path lookup.)
+#[allow(dead_code)]
+pub fn eden_gui_exe() -> Option<PathBuf> {
+    let dir = eden_dir()?;
+    let mut all = Vec::new();
+    walk(&dir, &mut all);
+    all.into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case("eden.exe"))
+        })
+        .or_else(eden_exe)
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -492,6 +531,34 @@ const CEMU_SPEC: EmuSpec = EmuSpec {
 
 pub fn download_cemu() -> Shared {
     download_emu(&CEMU_SPEC)
+}
+
+const EDEN_SPEC: EmuSpec = EmuSpec {
+    name: "Eden",
+    releases_api: EDEN_RELEASES_API,
+    version_marker: EDEN_VERSION_MARKER,
+    dir: eden_dir,
+    // SelectAssetForPlatform: Lacrima's windows+x64 filter actually
+    // misses Eden's real names — the zips are
+    // `Eden-Windows-v<ver>-amd64-<toolchain>.zip` — so it lands on
+    // the first `win`+.zip by list order (amd64-clang-pgo). Match the
+    // desktop amd64 builds explicitly; arm64/rog-ally/zsync/torrent
+    // fail the amd64+zip pair on their own.
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("windows")
+            && (n.contains("amd64") || n.contains("x64"))
+            && n.ends_with(".zip")
+    },
+    // ResolveLauncherPath — eden-cli.exe first, then the Qt gui.
+    exe_names: &["eden-cli.exe", "eden.exe"],
+    exe_contains: "eden",
+    patches: false,
+    allow_prerelease: false,
+};
+
+pub fn download_eden() -> Shared {
+    download_emu(&EDEN_SPEC)
 }
 
 /// Lacrima's DolphinEmulatorUpdateService EmuCR fallback:

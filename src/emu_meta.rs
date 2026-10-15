@@ -1709,6 +1709,502 @@ fn wiiu_title_id_in(text: &str) -> Option<String> {
 }
 
 // ------------------------------------------------------------------
+// Nintendo Switch (SwitchRomMetadataReader + SwitchNcaHeaderReader +
+// SwitchPartitionReader + SwitchNacpReader — cleartext only; the
+// LibHac/NCA-decrypt path needs prod.keys and yields nothing without
+// them, same as Lacrima on a keyless machine)
+// ------------------------------------------------------------------
+const NCA_HEADER_START: u64 = 0x200;
+const NCA_TITLE_ID: u64 = 0x210;
+const NCA_CONTENT_TYPE: u64 = 0x205;
+const NCA_CT_PROGRAM: u8 = 0x00;
+const NCA_CT_META: u8 = 0x01;
+const NCA_CT_CONTROL: u8 = 0x02;
+
+fn switch_read_at(f: &mut std::fs::File, off: u64, buf: &mut [u8]) -> Option<()> {
+    let len = f.metadata().ok()?.len();
+    if off.checked_add(buf.len() as u64)? > len {
+        return None;
+    }
+    f.seek(SeekFrom::Start(off)).ok()?;
+    f.read_exact(buf).ok()
+}
+
+/// SwitchNcaHeaderReader.TryReadAt — "NCA"[0-3] at `nca+0x200`,
+/// content type at `nca+0x205` (≤0x05), LE u64 title id at `nca+0x210`.
+fn switch_nca_header(f: &mut std::fs::File, nca: u64) -> Option<(String, u8)> {
+    let mut magic = [0u8; 4];
+    switch_read_at(f, nca + NCA_HEADER_START, &mut magic)?;
+    if !matches!(&magic, b"NCA3" | b"NCA2" | b"NCA1" | b"NCA0") {
+        return None;
+    }
+    let mut ct = [0u8; 1];
+    switch_read_at(f, nca + NCA_CONTENT_TYPE, &mut ct)?;
+    if ct[0] > 0x05 {
+        return None;
+    }
+    let mut tid = [0u8; 8];
+    switch_read_at(f, nca + NCA_TITLE_ID, &mut tid)?;
+    let v = u64::from_le_bytes(tid);
+    if v == 0 || v == u64::MAX {
+        return None;
+    }
+    Some((format!("{v:016X}"), ct[0]))
+}
+
+/// SwitchNcaHeaderReader.IsValidTitleId — 16 hex digits starting 01.
+fn switch_tid_valid(tid: &str) -> bool {
+    tid.len() == 16
+        && tid.chars().all(|c| c.is_ascii_hexdigit())
+        && tid[..2].eq_ignore_ascii_case("01")
+}
+
+/// SwitchPartitionReader.TryRead — PFS0/HFS0 header at `base`:
+/// magic, fileCount, stringTableSize, then per-entry
+/// (offset,size,nameOff) triples; names are NUL-terminated ASCII in
+/// the string table. Returns (name, data_offset, size).
+fn switch_partition(
+    f: &mut std::fs::File,
+    base: u64,
+) -> Option<Vec<(String, u64, u64)>> {
+    let mut head = [0u8; 0x10];
+    switch_read_at(f, base, &mut head)?;
+    let magic = u32::from_le_bytes(head[0..4].try_into().ok()?);
+    if magic != 0x3053_4650 && magic != 0x3053_4648 {
+        return None; // "PFS0" / "HFS0"
+    }
+    let count = i32::from_le_bytes(head[4..8].try_into().ok()?);
+    let str_size = i32::from_le_bytes(head[8..12].try_into().ok()?);
+    if !(1..=512).contains(&count) || !(0..=0x400000).contains(&str_size) {
+        return None;
+    }
+    let entry_size = count as usize * 0x18;
+    let mut table = vec![0u8; entry_size + str_size as usize];
+    switch_read_at(f, base + 0x10, &mut table)?;
+    let strs = &table[entry_size..];
+    let data_base = base + 0x10 + table.len() as u64;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let e = &table[i * 0x18..];
+        let file_off = u64::from_le_bytes(e[0..8].try_into().ok()?);
+        let file_size = u64::from_le_bytes(e[8..16].try_into().ok()?);
+        let name_off = u32::from_le_bytes(e[16..20].try_into().ok()?) as usize;
+        if name_off >= strs.len() {
+            continue;
+        }
+        let raw = &strs[name_off..];
+        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        let name = String::from_utf8_lossy(&raw[..end]).into_owned();
+        if name.trim().is_empty() {
+            continue;
+        }
+        out.push((name, data_base + file_off, file_size));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// TryReadFromPartitionEntries — first program-NCA title id, else
+/// control, else meta, else any NCA in the partition.
+fn switch_tid_from_entries(
+    f: &mut std::fs::File,
+    entries: &[(String, u64, u64)],
+) -> Option<String> {
+    let len = f.metadata().ok()?.len();
+    let (mut program, mut control, mut meta, mut any) = (None, None, None, None);
+    for (name, off, size) in entries {
+        if !name.to_lowercase().ends_with(".nca") || *size < 0x400 {
+            continue;
+        }
+        if off.checked_add(0x400)? > len {
+            continue;
+        }
+        let Some((tid, ct)) = switch_nca_header(f, *off) else {
+            continue;
+        };
+        any.get_or_insert(tid.clone());
+        match ct {
+            NCA_CT_PROGRAM => program.get_or_insert(tid),
+            NCA_CT_CONTROL => control.get_or_insert(tid),
+            NCA_CT_META => meta.get_or_insert(tid),
+            _ => continue,
+        };
+    }
+    program.or(control).or(meta).or(any)
+}
+
+/// TryFindPartitionMagicOffset — a LE u32 magic scan over the first
+/// 32MB in 4MB chunks (PFS0 buried in an NSP/XCI variant layout).
+fn switch_find_magic(f: &mut std::fs::File, magic: u32) -> Option<u64> {
+    let len = f.metadata().ok()?.len().min(32 * 1024 * 1024);
+    if len < 0x10 {
+        return None;
+    }
+    let want = magic.to_le_bytes();
+    let mut buf = vec![0u8; len.min(4 * 1024 * 1024) as usize];
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut total = 0u64;
+    while total < len {
+        let take = (len - total).min(buf.len() as u64) as usize;
+        let read = f.read(&mut buf[..take]).ok()?;
+        if read == 0 {
+            break;
+        }
+        for (i, w) in buf[..read].windows(4).enumerate() {
+            if w == want {
+                return Some(total + i as u64);
+            }
+        }
+        total += read as u64;
+        if read < take {
+            break;
+        }
+    }
+    None
+}
+
+/// TryScanForNcaHeaders — a byte scan for "NCA" + version digit over
+/// the first 64MB; a program NCA wins, else the first valid header.
+fn switch_scan_ncas(f: &mut std::fs::File) -> Option<String> {
+    let len = f.metadata().ok()?.len().min(64 * 1024 * 1024);
+    if len < 0x400 {
+        return None;
+    }
+    let mut buf = vec![0u8; len.min(4 * 1024 * 1024) as usize];
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut total = 0u64;
+    let mut best = None;
+    while total < len {
+        let take = (len - total).min(buf.len() as u64) as usize;
+        let read = f.read(&mut buf[..take]).ok()?;
+        if read == 0 {
+            break;
+        }
+        for i in 0..read.saturating_sub(3) {
+            if &buf[i..i + 3] != b"NCA" || !matches!(buf[i + 3], b'0'..=b'3') {
+                continue;
+            }
+            let Some(nca) = (total + i as u64).checked_sub(NCA_HEADER_START) else {
+                continue;
+            };
+            let Some((tid, ct)) = switch_nca_header(f, nca) else {
+                continue;
+            };
+            if ct == NCA_CT_PROGRAM {
+                return Some(tid);
+            }
+            best.get_or_insert(tid);
+        }
+        total += read as u64;
+        if read < take {
+            break;
+        }
+    }
+    best
+}
+
+/// TryReadPartitionedPackage — NSP/NSZ/XCZ: PFS0 at 0 → entries;
+/// a PFS0 magic buried deeper → entries; else the raw NCA scan.
+fn switch_read_package(f: &mut std::fs::File) -> Option<String> {
+    if let Some(entries) = switch_partition(f, 0) {
+        if let Some(tid) = switch_tid_from_entries(f, &entries) {
+            return Some(tid);
+        }
+    }
+    if let Some(off) = switch_find_magic(f, 0x3053_4650) {
+        if let Some(entries) = switch_partition(f, off) {
+            if let Some(tid) = switch_tid_from_entries(f, &entries) {
+                return Some(tid);
+            }
+        }
+    }
+    switch_scan_ncas(f)
+}
+
+/// TryReadXci — the HFS0 "secure" partition sits at one of the
+/// fixed offsets (gamecard headers vary), else the raw scan.
+fn switch_read_xci(f: &mut std::fs::File) -> Option<String> {
+    let len = f.metadata().ok()?.len();
+    for off in [0xF000u64, 0x10000, 0xE000, 0x1000] {
+        if off >= len {
+            continue;
+        }
+        if let Some(entries) = switch_partition(f, off) {
+            if let Some(tid) = switch_tid_from_entries(f, &entries) {
+                return Some(tid);
+            }
+        }
+    }
+    switch_scan_ncas(f)
+}
+
+/// SwitchNacpReader — the first non-empty application name across
+/// the 0x300-byte language blocks (American English first).
+fn switch_nacp_title(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 0x300 + 0x200 {
+        return None;
+    }
+    let mut off = 0x300;
+    while off + 0x200 <= bytes.len() && off < 0x4000 {
+        let raw = &bytes[off..off + 0x200];
+        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        let t = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+        off += 0x300;
+    }
+    None
+}
+
+/// ExtractTitleIdFromText — a bracketed `[16hex]` token first, then
+/// a bare `01…` 16-hex run anywhere in the text.
+fn switch_tid_in(text: &str) -> Option<String> {
+    let up = text.to_uppercase();
+    let bytes = up.as_bytes();
+    // [XXXXXXXXXXXXXXXX]
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'[' || i + 17 >= bytes.len() || bytes[i + 17] != b']' {
+            continue;
+        }
+        let cand = &up[i + 1..i + 17];
+        if switch_tid_valid(cand) {
+            return Some(cand.to_string());
+        }
+    }
+    // 01XXXXXXXXXXXXXX — every 16-hex window, leftmost first
+    // (EmbeddedTitleIdRegex's `01[0-9A-Fa-f]{14}` order).
+    let mut i = 0;
+    while i + 16 <= bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        if i - start >= 16 {
+            for s in start..=i - 16 {
+                let cand = &up[s..s + 16];
+                if switch_tid_valid(cand) {
+                    return Some(cand.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// CleanDisplayTitleFromFileName — strip the title id, `[vN]` and
+/// other bracket tags, `_`/`.`→space, collapse whitespace.
+fn switch_clean_title(name: &str, tid: Option<&str>) -> Option<String> {
+    let mut s = name.to_string();
+    if let Some(tid) = tid {
+        // Case-insensitive removal of [tid] then the bare id.
+        for needle in [format!("[{tid}]"), tid.to_string()] {
+            while let Some(pos) = s.to_uppercase().find(&needle.to_uppercase()) {
+                s.replace_range(pos..pos + needle.len(), "");
+            }
+        }
+    }
+    // [vN] then any remaining […] groups.
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    let cleaned: String = out
+        .replace('_', " ")
+        .replace('.', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned = cleaned.trim_matches([' ', '-']).to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// TryReadInstalledDirectory — a `*.nacp` anywhere under the dir
+/// gives the title (tid from the dir name or the nacp's filename);
+/// else the first top-level `*.nca` (cnmt preferred) reads as a
+/// single NCA.
+fn switch_read_installed_dir(dir: &Path) -> (Option<String>, Option<String>) {
+    fn walk_nacp(d: &Path) -> Option<PathBuf> {
+        for e in std::fs::read_dir(d).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(found) = walk_nacp(&p) {
+                    return Some(found);
+                }
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("nacp"))
+            {
+                return Some(p);
+            }
+        }
+        None
+    }
+    if let Some(nacp) = walk_nacp(dir) {
+        let title = std::fs::read(&nacp)
+            .ok()
+            .and_then(|b| switch_nacp_title(&b));
+        let tid = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(switch_tid_in)
+            .or_else(|| {
+                nacp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(switch_tid_in)
+            });
+        if tid.is_some() || title.is_some() {
+            return (tid, title);
+        }
+    }
+    // Top-level *.cnmt.nca first, then any *.nca.
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|x| x.eq_ignore_ascii_case("nca"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by_key(|p| {
+        (!p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().ends_with(".cnmt.nca"))) as u8
+    });
+    for nca in entries {
+        if let Some(tid) = std::fs::File::open(&nca)
+            .ok()
+            .and_then(|mut f| switch_nca_header(&mut f, 0))
+        {
+            return (Some(tid.0), None);
+        }
+    }
+    (None, None)
+}
+
+/// SwitchRomMetadataReader.TryRead — (title_id, display_title).
+/// Containers first, filename tokens merged in; the LibHac leg is
+/// skipped (it needs prod.keys/title.keys and returns None without
+/// them — same net result here).
+fn switch_read(path: &Path) -> (Option<String>, Option<String>) {
+    let from_name = |p: &Path| -> (Option<String>, Option<String>) {
+        // EnumeratePathSegmentsForTitleId: stem, then each ancestor
+        // dir name up the tree, then the full path.
+        let mut segs: Vec<String> = Vec::new();
+        if let Some(s) = p.file_stem().and_then(|s| s.to_str()) {
+            segs.push(s.to_string());
+        }
+        let mut d = p.parent();
+        while let Some(dir) = d {
+            if let Some(n) = dir.file_name().and_then(|n| n.to_str()) {
+                segs.push(n.to_string());
+            }
+            d = dir.parent();
+        }
+        segs.push(p.to_string_lossy().into_owned());
+        for seg in segs {
+            if let Some(tid) = switch_tid_in(&seg) {
+                let title = switch_clean_title(&seg, Some(&tid));
+                return (Some(tid), title);
+            }
+        }
+        (None, None)
+    };
+
+    if path.is_dir() {
+        let (tid, title) = switch_read_installed_dir(path);
+        if tid.is_some() || title.is_some() {
+            return (tid, title);
+        }
+    } else if !path.is_file() {
+        return (None, None);
+    }
+
+    let container_tid = if path.is_file() {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return (None, None),
+        };
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref()
+        {
+            Some("nca") => switch_nca_header(&mut f, 0).map(|h| h.0),
+            Some("xci") => switch_read_xci(&mut f),
+            _ => switch_read_package(&mut f),
+        }
+    } else {
+        None
+    };
+
+    let (name_tid, name_title) = from_name(path);
+    let tid = container_tid.or(name_tid).filter(|t| switch_tid_valid(t));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let title = name_title.or_else(|| switch_clean_title(stem, tid.as_deref()));
+    if tid.is_none() && title.is_none() {
+        return (None, None);
+    }
+    (tid, title)
+}
+
+/// resolve_one's SWITCH arm — the display title out of
+/// `switch_read`, with the title id persisted into the `.meta` doc
+/// (Lacrima's `metadata.SwitchTitleId` cache write).
+fn switch_title(path: &Path) -> Option<String> {
+    let (tid, title) = switch_read(path);
+    if let Some(tid) = tid {
+        let mut doc = load_meta(path).unwrap_or_default();
+        if doc.switch_title_id.trim().is_empty() {
+            doc.switch_title_id = tid;
+            let _ = save_meta(path, &doc);
+        }
+    }
+    title
+}
+
+/// The ROM's Switch title id — metadata cache first, live read
+/// after, persisted back (`ResolveSwitchTitleId` shape). Reserved
+/// for a Switch overlay/metadata UI — `switch_title` already
+/// persists the id on the resolve pass.
+#[allow(dead_code)]
+pub fn switch_title_id_cached(rom: &Path) -> Option<String> {
+    if let Some(doc) = load_meta(rom) {
+        if switch_tid_valid(doc.switch_title_id.trim()) {
+            return Some(doc.switch_title_id.trim().to_string());
+        }
+    }
+    let (tid, _) = switch_read(rom);
+    let tid = tid?;
+    let mut doc = load_meta(rom).unwrap_or_default();
+    if doc.switch_title_id.trim().is_empty() {
+        doc.switch_title_id = tid.clone();
+        let _ = save_meta(rom, &doc);
+    }
+    Some(tid)
+}
+
+// ------------------------------------------------------------------
 // LibRetro thumbnails (LibRetroThumbnailCoverService)
 // ------------------------------------------------------------------
 const LIBRETRO_BASE: &str = "https://thumbnails.libretro.com/";
@@ -2675,6 +3171,7 @@ fn resolve_one(
             // Wii U installed folders carry meta.xml; bare files
             // resolve via their package dir or stem.
             "WIIU" => wiiu_title(path),
+            "SWITCH" => switch_title(path),
             "PS3" => ps3_title(path),
             "PS4" => ps4_title(path),
             _ => None,
@@ -2907,6 +3404,10 @@ pub struct RomMetaDoc {
     /// `metadata.WiiUTitleId` cache field the graphic-packs overlay
     /// reads before re-extracting from meta.xml.
     pub wiiu_title_id: String,
+    /// Switch title id (16 hex, `01…`) — Lacrima's
+    /// `metadata.SwitchTitleId` cache, filled by the NCA/partition
+    /// reader so the container walk doesn't re-run.
+    pub switch_title_id: String,
     pub user_edited: bool,
     /// ArcadeLockedPillarboxCrop{Left,Right,FrameWidth} — a
     /// user-locked pillarbox crop measured at `crop_fw` pixels wide;
@@ -3565,6 +4066,145 @@ mod tests {
         let plain = dir.join("No Id Here.wud");
         std::fs::write(&plain, b"bin").unwrap();
         assert_eq!(wiiu_title_id(&plain), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------------------------------------------
+    // Nintendo Switch (SwitchRomMetadataReader port)
+    // ----------------------------------------------------------
+
+    /// An NCA blob: "NCA3" at 0x200, content type at 0x205, LE u64
+    /// title id at 0x210.
+    fn nca_bytes(tid: u64, content_type: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 0x400];
+        b[0x200..0x204].copy_from_slice(b"NCA3");
+        b[0x205] = content_type;
+        b[0x210..0x218].copy_from_slice(&tid.to_le_bytes());
+        b
+    }
+
+    /// A PFS0 image holding `entries` — (name, payload) pairs laid
+    /// out per SwitchPartitionReader.
+    fn pfs0_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut names = Vec::new();
+        let mut name_offs = Vec::new();
+        for (n, _) in entries {
+            name_offs.push(names.len() as u32);
+            names.extend_from_slice(n.as_bytes());
+            names.push(0);
+        }
+        let count = entries.len();
+        let head_size = 0x10 + count * 0x18 + names.len();
+        let mut out = Vec::with_capacity(head_size);
+        out.extend_from_slice(b"PFS0");
+        out.extend_from_slice(&(count as i32).to_le_bytes());
+        out.extend_from_slice(&(names.len() as i32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        let mut data_off = 0u64;
+        for ((_, payload), noff) in entries.iter().zip(&name_offs) {
+            out.extend_from_slice(&data_off.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&noff.to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            data_off += payload.len() as u64;
+        }
+        out.extend_from_slice(&names);
+        for (_, payload) in entries {
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    #[test]
+    fn switch_title_id_tokens() {
+        // Bracketed + bare forms (TitleIdInNameRegex /
+        // EmbeddedTitleIdRegex).
+        assert_eq!(
+            switch_tid_in("Super Game [0100ABCDEF123456] [v0]"),
+            Some("0100ABCDEF123456".into())
+        );
+        assert_eq!(
+            switch_tid_in("dump_0100F2C0115B6000_v65536"),
+            Some("0100F2C0115B6000".into())
+        );
+        // A non-01 16-hex token is not a Switch application id.
+        assert_eq!(switch_tid_in("[0005000010101A00]"), None);
+        assert_eq!(switch_tid_in("Game 1234"), None);
+        assert_eq!(switch_tid_in("nothing"), None);
+    }
+
+    #[test]
+    fn switch_clean_title_strips_tags() {
+        assert_eq!(
+            switch_clean_title(
+                "Super_Mario_Odyssey [0100000000010000][v65536]",
+                Some("0100000000010000")
+            )
+            .as_deref(),
+            Some("Super Mario Odyssey")
+        );
+        assert_eq!(
+            switch_clean_title("Zelda.TOTK.0100A00000000000", Some("0100A00000000000"))
+                .as_deref(),
+            Some("Zelda TOTK")
+        );
+        // No id → separators still collapse.
+        assert_eq!(
+            switch_clean_title("Animal_Crossing.New_Horizons", None).as_deref(),
+            Some("Animal Crossing New Horizons")
+        );
+    }
+
+    #[test]
+    fn switch_nsp_container_resolution() {
+        let dir = std::env::temp_dir().join(format!("aes_test_nsw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Meta NCA first, program NCA second — the program type must
+        // win regardless of entry order (TryReadFromPartitionEntries).
+        let meta = nca_bytes(0x0100BBBB00000002, NCA_CT_META);
+        let prog = nca_bytes(0x0100AAAA00000001, NCA_CT_PROGRAM);
+        let nsp = pfs0_bytes(&[
+            ("pack.cnmt.nca", &meta),
+            ("main.program.nca", &prog),
+        ]);
+        let rom = dir.join("garbage_name.nsp");
+        std::fs::write(&rom, &nsp).unwrap();
+        let (tid, title) = switch_read(&rom);
+        assert_eq!(tid.as_deref(), Some("0100AAAA00000001"));
+        // Filename has no id → cleaned stem fallback.
+        assert_eq!(title.as_deref(), Some("garbage name"));
+
+        // A bare .nca reads its own header.
+        let nca = dir.join("single.nca");
+        std::fs::write(&nca, &prog).unwrap();
+        let (tid, _) = switch_read(&nca);
+        assert_eq!(tid.as_deref(), Some("0100AAAA00000001"));
+
+        // An XCI with its secure partition at the standard 0xF000.
+        let mut xci = vec![0u8; 0xF000];
+        xci.extend_from_slice(&pfs0_bytes(&[("sec.program.nca", &prog)]));
+        let rom = dir.join("cart.xci");
+        std::fs::write(&rom, &xci).unwrap();
+        let (tid, _) = switch_read(&rom);
+        assert_eq!(tid.as_deref(), Some("0100AAAA00000001"));
+
+        // Filename tokens fill in for opaque/encrypted containers.
+        let blob = dir.join("Some Game [0100C0FFEE0000AA].nsp");
+        std::fs::write(&blob, b"not-a-partition").unwrap();
+        let (tid, title) = switch_read(&blob);
+        assert_eq!(tid.as_deref(), Some("0100C0FFEE0000AA"));
+        assert_eq!(title.as_deref(), Some("Some Game"));
+
+        // Installed dir: a .nacp gives the real title, the dir name
+        // the id.
+        let inst = dir.join("Cool Game [0100DEADBEEF0100]");
+        std::fs::create_dir_all(inst.join("control")).unwrap();
+        let mut nacp = vec![0u8; 0x4000];
+        nacp[0x300..0x300 + 9].copy_from_slice(b"Cool Game");
+        std::fs::write(inst.join("control").join("game.nacp"), &nacp).unwrap();
+        let (tid, title) = switch_read(&inst);
+        assert_eq!(tid.as_deref(), Some("0100DEADBEEF0100"));
+        assert_eq!(title.as_deref(), Some("Cool Game"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
