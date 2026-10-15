@@ -17,8 +17,9 @@ use eframe::egui::{
 };
 
 use crate::{
-    album_row, carousel, emu_dl, emu_meta, library, paint, rom_editor, rpcs3_overlay, search_pill,
-    settings, shadps4, shadps4_overlay, transport, xenia, xenia_cfg, xenia_overlay, xenia_profile,
+    album_row, carousel, cemu_overlay, emu_dl, emu_meta, library, paint, rom_editor,
+    rpcs3_overlay, search_pill, settings, shadps4, shadps4_overlay, transport, xenia, xenia_cfg,
+    xenia_overlay, xenia_profile,
 };
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -47,6 +48,8 @@ const PCSX2_HANDLER: &str = "pcsx2";
 const GCN_SECTION: &str = "GCN";
 const WII_SECTION: &str = "WII";
 const DOLPHIN_HANDLER: &str = "dolphin";
+const WIIU_SECTION: &str = "WIIU";
+const CEMU_HANDLER: &str = "cemu";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -144,6 +147,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             installed_exe: emu_dl::dolphin_exe,
             download: emu_dl::download_dolphin,
         },
+        WIIU_SECTION => HandlerSpec {
+            section: WIIU_SECTION,
+            handler: CEMU_HANDLER,
+            name: "Cemu",
+            exe_hint: "Path to Cemu.exe",
+            dialog_title: "Locate Cemu.exe",
+            installed_exe: emu_dl::cemu_exe,
+            download: emu_dl::download_cemu,
+        },
         _ => return None,
     })
 }
@@ -160,6 +172,7 @@ fn handler_kind(handler: Option<&str>) -> Option<xenia::Kind> {
         Some(DUCKSTATION_HANDLER) => xenia::Kind::DuckStation,
         Some(PCSX2_HANDLER) => xenia::Kind::Pcsx2,
         Some(DOLPHIN_HANDLER) => xenia::Kind::Dolphin,
+        Some(CEMU_HANDLER) => xenia::Kind::Cemu,
         _ => return None,
     })
 }
@@ -425,6 +438,8 @@ pub struct EmuView {
     pub shad_patches: shadps4_overlay::ShadPs4PatchesOverlay,
     /// shadPS4 per-game Cheats overlay (ShadPs4CheatsOverlay).
     pub shad_cheats: shadps4_overlay::ShadPs4CheatsOverlay,
+    /// Cemu per-game Graphic Packs overlay (CemuGraphicPacksOverlay).
+    pub cemu_packs: cemu_overlay::CemuGraphicPacksOverlay,
     /// Xenia profile-creation prompt — opens when the X360 section is
     /// entered and no profile exists under the Xenia content dir.
     pub prof_prompt: xenia_overlay::ProfilePrompt,
@@ -592,6 +607,7 @@ impl EmuView {
             rpcs3_patches: rpcs3_overlay::Rpcs3PatchesOverlay::new(),
             shad_patches: shadps4_overlay::ShadPs4PatchesOverlay::new(),
             shad_cheats: shadps4_overlay::ShadPs4CheatsOverlay::new(),
+            cemu_packs: cemu_overlay::CemuGraphicPacksOverlay::new(),
             prof_prompt: xenia_overlay::ProfilePrompt::new(),
             prof_want: false,
             launch_rx: None,
@@ -922,6 +938,7 @@ impl EmuView {
             PSX_SECTION => Some(DUCKSTATION_HANDLER.to_string()),
             PS2_SECTION => Some(PCSX2_HANDLER.to_string()),
             GCN_SECTION | WII_SECTION => Some(DOLPHIN_HANDLER.to_string()),
+            WIIU_SECTION => Some(CEMU_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -950,6 +967,7 @@ impl EmuView {
                     DUCKSTATION_HANDLER => emu_dl::duckstation_exe(),
                     PCSX2_HANDLER => emu_dl::pcsx2_exe(),
                     DOLPHIN_HANDLER => emu_dl::dolphin_exe(),
+                    CEMU_HANDLER => emu_dl::cemu_exe(),
                     _ => None,
                 }
             };
@@ -976,6 +994,7 @@ impl EmuView {
             xenia::Kind::DuckStation => "DuckStation",
             xenia::Kind::Pcsx2 => "PCSX2",
             xenia::Kind::Dolphin => "Dolphin",
+            xenia::Kind::Cemu => "Cemu",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
@@ -1100,6 +1119,7 @@ pub fn view(
         && !emu.rpcs3_patches.is_open()
         && !emu.shad_patches.is_open()
         && !emu.shad_cheats.is_open()
+        && !emu.cemu_packs.is_open()
         && !emu.prof_prompt.is_open();
 
     // open_section flagged a missing Xenia profile — open the prompt
@@ -1962,6 +1982,9 @@ pub fn view(
     if emu.shad_cheats.is_open() {
         emu.shad_cheats.ui(ui, content, s);
     }
+    if emu.cemu_packs.is_open() {
+        emu.cemu_packs.ui(ui, content, s);
+    }
     if emu.prof_prompt.is_open() {
         if let Some(Some(name)) = emu.prof_prompt.ui(ui, content, s) {
             emu.notice = Some(match xenia_storage(cfg) {
@@ -2041,6 +2064,21 @@ fn shadps4_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
         .map(|p| shadps4::resolve_exe_path(&p));
     let exe = configured.or_else(emu_dl::shadps4_exe);
     exe.and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// Resolve the Cemu emulator directory for the graphic-packs overlay
+/// — `CemuPathsService.ResolveEmulatorDirectory`: the configured
+/// launcher's directory first, else the managed install.
+fn cemu_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
+    let configured = cfg
+        .emulators
+        .get(CEMU_HANDLER)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    configured.or_else(|| emu_dl::cemu_dir().filter(|d| d.is_dir()))
 }
 
 /// Destination rect + UV for a captured frame in `rect`, blended by
@@ -2962,6 +3000,8 @@ fn draw_items(
         key == PS3_SECTION && emu.active_handler(cfg).as_deref() == Some(RPCS3_HANDLER);
     emu.cards.shadps4_menu =
         key == PS4_SECTION && emu.active_handler(cfg).as_deref() == Some(SHADPS4_HANDLER);
+    emu.cards.cemu_menu =
+        key == WIIU_SECTION && emu.active_handler(cfg).as_deref() == Some(CEMU_HANDLER);
     let mode = match cover_layout {
         1 => carousel::Mode::VerticalGrid,
         2 => carousel::Mode::HorizontalGrid,
@@ -3066,6 +3106,14 @@ fn draw_items(
         }
         carousel::Action::CustomConfig(p) => {
             emu.cfg_ov.open(&p, &rom_title(&p), xenia_storage(cfg));
+        }
+        // WIIU + cemu — the CemuGraphicPacksOverlay (Lacrima's
+        // CemuGraphicPacksMenuItem).
+        carousel::Action::GraphicPacks(p) => {
+            if key == WIIU_SECTION && emu.active_handler(cfg).as_deref() == Some(CEMU_HANDLER) {
+                emu.cemu_packs
+                    .open(&p, &rom_title(&p), cemu_storage(cfg));
+            }
         }
         // Confirmed deletes come back through `pending_delete` —
         // main.rs runs them through the shared dialog.

@@ -135,6 +135,7 @@ pub enum Kind {
     DuckStation,
     Pcsx2,
     Dolphin,
+    Cemu,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -276,6 +277,22 @@ impl Session {
             Kind::Dolphin => {
                 let user = ensure_dolphin_setup(&work_dir);
                 cmd.arg("-u").arg(&user).arg("-b").arg("-e").arg(game);
+            }
+            // Cemu: `-g <rom>` (CemuHandler's BuildStartInfo minus
+            // the Cemu 1.x `-c/-mlc` flags — 2.x's LaunchSettings has
+            // no -c and parses `-mlc` as `-m lc`). Portable mode in
+            // 2.x is runtime-detected: a `portable/` dir next to the
+            // exe redirects settings.xml/log.txt/mlc01 into it
+            // (CemuPathsService's same check). No -f: the window is
+            // hidden/cloaked anyway, and the fullscreen scaling
+            // workaround only matters there. The transcript carries
+            // the exe dir — the worker watches portable/log.txt +
+            // log.txt for "------- Run title -------"
+            // (WaitForRenderReadyLogAsync / ResolveCemuLogFilePath).
+            Kind::Cemu => {
+                ensure_cemu_setup(&work_dir);
+                transcript = Some(work_dir.clone());
+                cmd.arg("-g").arg(game);
             }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
@@ -740,6 +757,31 @@ fn ensure_dolphin_setup(exe_dir: &Path) -> PathBuf {
     user
 }
 
+/// Cemu 2.x has no `-c` config flag — portable mode is detected at
+/// runtime: a `portable/` directory (or settings.xml) beside
+/// `Cemu.exe` redirects settings.xml/log.txt/mlc01/controllerProfiles
+/// into it (CemuPathsService's ResolveUserDataDirectory). Creating
+/// the dir is all the "setup" a launch needs.
+fn ensure_cemu_setup(exe_dir: &Path) {
+    let _ = std::fs::create_dir_all(exe_dir.join("portable"));
+}
+
+/// CemuHandler's ResolveCemuLogFilePath candidates for a spawn at
+/// `exe_dir`: portable-mode log first (what our `-g` launch writes),
+/// then the exe dir, then the %APPDATA% fallback for un-portable
+/// configured exes.
+fn cemu_log_candidates(exe_dir: &Path) -> [PathBuf; 3] {
+    [
+        exe_dir.join("portable").join("log.txt"),
+        exe_dir.join("log.txt"),
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("Cemu")
+            .join("log.txt"),
+    ]
+}
+
 /// Set `key = value` inside `[section]` of an ini — add the section
 /// when missing (TrySetDolphinIniValue/TrySetDolphinCoreIniValue).
 fn set_ini_key(path: &Path, section: &str, key: &str, value: &str) {
@@ -878,11 +920,18 @@ fn worker_main(
         // Dolphin's CaptureStartupDelayMs — its Qt shell churns
         // through several windows before the render surface exists.
         Kind::Dolphin => 1800,
+        // CemuHandler.CaptureStartupDelayMs = 250.
+        Kind::Cemu => 250,
         _ => 0,
     };
     let poll = if matches!(
         kind,
-        Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin
+        Kind::Rpcs3
+            | Kind::Shadps4
+            | Kind::DuckStation
+            | Kind::Pcsx2
+            | Kind::Dolphin
+            | Kind::Cemu
     ) {
         25
     } else {
@@ -936,6 +985,34 @@ fn worker_main(
             }
         }
     }
+    // CemuHandler.WaitForRenderReadyLogAsync — Cemu's shell windows
+    // appear long before the render surface, so resolution waits on
+    // the emulator's own log.txt for "------- Run title -------"
+    // (90s cap, 100ms polls, cloaking so the shell stays hidden the
+    // whole wait). transcript carries the exe dir — portable mode
+    // writes portable/log.txt, a 1.x/non-portable exe writes
+    // log.txt or %APPDATA%/Cemu/log.txt (ResolveCemuLogFilePath).
+    if kind == Kind::Cemu {
+        if let Some(dir) = &transcript {
+            let logs = cemu_log_candidates(dir);
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while Instant::now() < deadline {
+                if stop.load(Ordering::Relaxed) || !alive(proc) {
+                    break;
+                }
+                sweep_hide(pid, HWND::default(), &mut hidden, kind);
+                let ready = logs.iter().any(|p| {
+                    std::fs::read_to_string(p)
+                        .map(|t| t.to_lowercase().contains("run title"))
+                        .unwrap_or(false)
+                });
+                if ready {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
     let mut hwnd = HWND::default();
     let mut stable_hwnd = HWND::default();
     let mut stable_count = 0u32;
@@ -943,24 +1020,35 @@ fn worker_main(
     // whether its 16:9 capture geometry has been applied yet.
     let mut rpcs3_geom = false;
     let mut rpcs3_size = (0i32, 0i32);
-    // Dolphin's gate counts same-hwnd-AND-size polls (its Qt windows
-    // resize through boot) — tracked separately from rpcs3's.
-    let mut dolphin_size = (0i32, 0i32);
+    // Dolphin's/Cemu's gates count same-hwnd-AND-size polls (their
+    // Qt windows resize through boot) — tracked separately from
+    // rpcs3's.
+    let mut stable_size = (0i32, 0i32);
     // 25ms polls for the Qt emulators keep the cloak gap sub-frame;
     // other kinds sweep at 50ms (window flash isn't an issue once
     // captured). Dolphin joins — its Qt shell otherwise flashes the
     // launcher window before capture takes over.
     let poll = if matches!(
         kind,
-        Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin
+        Kind::Rpcs3
+            | Kind::Shadps4
+            | Kind::DuckStation
+            | Kind::Pcsx2
+            | Kind::Dolphin
+            | Kind::Cemu
     ) {
         25
     } else {
         50
     };
-    // Dolphin gets Lacrima's 400×50ms resolve budget — its render
-    // window appears late after a long Qt boot.
-    let attempts = if kind == Kind::Dolphin { 400 } else { 240 };
+    // Dolphin/Cemu get Lacrima's 400×50ms resolve budget — their
+    // render windows appear late after a long Qt boot (Cemu's
+    // resolve runs after the log-ready gate anyway).
+    let attempts = if matches!(kind, Kind::Dolphin | Kind::Cemu) {
+        400
+    } else {
+        240
+    };
     for _ in 0..attempts {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1091,11 +1179,11 @@ fn worker_main(
                     std::thread::sleep(Duration::from_millis(poll));
                     continue;
                 }
-                stable_count = if hwnd == stable_hwnd && (w, h) == dolphin_size {
+                stable_count = if hwnd == stable_hwnd && (w, h) == stable_size {
                     stable_count + 1
                 } else {
                     stable_hwnd = hwnd;
-                    dolphin_size = (w, h);
+                    stable_size = (w, h);
                     1
                 };
                 if stable_count < 8 {
@@ -1113,6 +1201,49 @@ fn worker_main(
                 prepare_window_for_capture(hwnd);
                 apply_aspect_ratio(hwnd, 16.0 / 9.0);
                 std::thread::sleep(Duration::from_millis(120));
+            }
+            if kind == Kind::Cemu {
+                // CemuHandler.ResolveCaptureTargetAsync +
+                // IsStableCaptureCandidate: not minimized, ≥640×360
+                // client, then the same hwnd at the SAME size for 8
+                // consecutive polls (its Qt render surface resizes
+                // through boot). No caption requirement — the title
+                // filters already did that work.
+                let (w, h) = client_size(hwnd).unwrap_or((0, 0));
+                if w < 640 || h < 360 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                if unsafe { IsIconic(hwnd) }.as_bool() {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                stable_count = if hwnd == stable_hwnd && (w, h) == stable_size {
+                    stable_count + 1
+                } else {
+                    stable_hwnd = hwnd;
+                    stable_size = (w, h);
+                    1
+                };
+                if stable_count < 8 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                // ApplyCaptureGeometryOnce: strip decorations + the
+                // wx menu bar + 16:9 capture aspect, then Lacrima's
+                // 150ms settle. The one-shot menu strip is safe HERE
+                // — the window's title/FPS updates every frame, so
+                // its UI thread is pumping (unlike mid-sweep during
+                // boot, where SetMenu can block for good).
+                hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                });
+                prepare_window_for_capture(hwnd);
+                strip_menu(hwnd);
+                apply_aspect_ratio(hwnd, 16.0 / 9.0);
+                std::thread::sleep(Duration::from_millis(150));
             }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
@@ -1149,11 +1280,12 @@ fn worker_main(
     let saved = hidden
         .remove(&(hwnd.0 as usize))
         .unwrap_or_else(|| prepare_window_for_capture(hwnd));
-    if kind == Kind::Dolphin {
-        // hide_window's WS_EX_LAYERED + 0-alpha can stall Vulkan
-        // presentation (why Lacrima no-ops Dolphin's window prep).
-        // Park offscreen under the cloak instead — same offscreen
-        // corner, toolwindow'd out of the taskbar, no layering.
+    if matches!(kind, Kind::Dolphin | Kind::Cemu) {
+        // hide_window's WS_EX_LAYERED + 0-alpha can stall Vulkan/
+        // OpenGL presentation (why Lacrima no-ops Dolphin's and
+        // Cemu's window prep). Park offscreen under the cloak instead
+        // — same offscreen corner, toolwindow'd out of the taskbar,
+        // no layering.
         unsafe {
             let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -1188,7 +1320,12 @@ fn worker_main(
     } else {
         hide_window(hwnd);
     }
-    strip_menu(hwnd);
+    // Cemu: never send into the wx UI thread (SetMenu blocks while
+    // it's busy) — the menubar goes away under RemoveWindow-
+    // Decorations + the game render anyway.
+    if kind != Kind::Cemu {
+        strip_menu(hwnd);
+    }
     // Catch anything that appeared since the last poll.
     sweep_hide(pid, hwnd, &mut hidden, kind);
 
@@ -1208,7 +1345,11 @@ fn worker_main(
         sweep_hide(pid, hwnd, &mut hidden, kind);
         // The capture target isn't swept — strip its menu too so a
         // late-attached menu bar can't leak into the captured frame.
-        strip_menu(hwnd);
+        // (Skipped for Cemu — SetMenu/DrawMenuBar can block on wx's
+        // busy UI thread.)
+        if kind != Kind::Cemu {
+            strip_menu(hwnd);
+        }
         if let Some(err) = frames.lock().unwrap_or_else(|p| p.into_inner()).err.clone() {
             capture_err = Some(err);
             break;
@@ -1912,6 +2053,58 @@ fn is_likely_dolphin_window(hwnd: HWND, main: HWND) -> bool {
     false
 }
 
+/// IsLikelyCemuRenderWindow — Cemu keeps its shell (title list,
+/// settings, getting-started) alive alongside the render surface;
+/// reject the shell/dialog titles, accept "fps:/loading/compiling"
+/// boot titles and any well-formed game title, and fall back to a
+/// Qt-class non-main window with a real client size.
+fn is_likely_cemu_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let title = window_title(hwnd).trim().to_string();
+    let t = title.to_lowercase();
+    // Helper/system windows in the process tree (Cemu spawns a
+    // hidden temp_d3d_window + IME/tooltips surface).
+    if t.contains("temp window") || t.contains("msctfime ui") || t.contains("default ime") {
+        return false;
+    }
+    // IsCemuShellWindow.
+    if t.is_empty()
+        || t == "cemu"
+        || t.contains("title list")
+        || t.contains("getting started")
+        || t.contains("graphic pack")
+        || t.contains("input settings")
+        || t.contains("general settings")
+    {
+        return false;
+    }
+    if t.contains("settings")
+        || t.contains("about")
+        || t.contains("profile")
+        || t.contains("update")
+        || t.contains("options")
+        || t.contains("cemu hook")
+    {
+        return false;
+    }
+    if t.contains("fps:") || t.contains("loading") || t.contains("compiling") {
+        return true;
+    }
+    if title.chars().count() > 5 {
+        return true;
+    }
+    let class = class_name(hwnd).to_lowercase();
+    if (class.contains("qwindow") || class.contains("qt6")) && hwnd != main {
+        let (w, h) = client_size(hwnd).unwrap_or((0, 0));
+        if w >= 480 && h >= 270 {
+            return true;
+        }
+    }
+    hwnd == main && !t.is_empty() && t != "cemu"
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
@@ -1923,6 +2116,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::DuckStation => return is_likely_duckstation_window(hwnd, main),
         Kind::Pcsx2 => return is_likely_pcsx2_window(hwnd, main),
         Kind::Dolphin => return is_likely_dolphin_window(hwnd, main),
+        Kind::Cemu => return is_likely_cemu_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -2419,8 +2613,14 @@ fn sweep_hide(
         // A real HMENU can be attached after the window's first
         // sweep, so re-strip on every pass. (xemu's menubar isn't an
         // HMENU at all — it's ImGui-rendered in-frame, handled by the
-        // show_menubar config patch.)
-        strip_menu(hwnd);
+        // show_menubar config patch.) SKIPPED for Cemu: SetMenu/
+        // DrawMenuBar send messages into wx's UI thread, which is
+        // busy through boot/shader compile — the send blocks, the
+        // sweep freezes, and nothing ever gets cloaked. CemuHandler's
+        // Prepare*ForCapture are no-ops for the same reason.
+        if kind != Kind::Cemu {
+            strip_menu(hwnd);
+        }
         // RPCS3/shadPS4/DuckStation/PCSX2/Dolphin: cloak EVERY window
         // — a DWM cloak hides instantly with no geometry/style change
         // for Qt/SDL to race, so nothing flashes between spawn and
@@ -2430,7 +2630,12 @@ fn sweep_hide(
         // still hides safely.) Other kinds park aux windows.
         let cloak = matches!(
             kind,
-            Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation | Kind::Pcsx2 | Kind::Dolphin
+            Kind::Rpcs3
+                | Kind::Shadps4
+                | Kind::DuckStation
+                | Kind::Pcsx2
+                | Kind::Dolphin
+                | Kind::Cemu
         );
         hidden.entry(hwnd.0 as usize).or_insert_with(|| {
             if cloak {
@@ -2585,6 +2790,12 @@ pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
         }
         Some(Kind::Pcsx2) => {
             cmd.arg("-portable");
+        }
+        // BuildSetupStartInfo: the settings gear opens Cemu in the
+        // same portable dir a game launch uses (2.x detects
+        // portable/ beside the exe — there is no -c flag).
+        Some(Kind::Cemu) => {
+            ensure_cemu_setup(&work_dir);
         }
         _ => {}
     }

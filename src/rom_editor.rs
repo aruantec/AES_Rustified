@@ -545,6 +545,7 @@ impl RomEditor {
             video_url: self.video_url.trim().to_string(),
             x360_title_id: self.tid.clone(),
             x360_media_id: self.mid.clone(),
+            wiiu_title_id: prev.wiiu_title_id.clone(),
             user_edited: true,
             crop_left: prev.crop_left,
             crop_right: prev.crop_right,

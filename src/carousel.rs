@@ -127,6 +127,8 @@ pub enum Action {
     CustomConfig(PathBuf),
     /// PS4 ROM menu: "Cheats" — the ShadPs4CheatsOverlay.
     Cheats(PathBuf),
+    /// WIIU ROM menu: "Graphic Packs" — the CemuGraphicPacksOverlay.
+    GraphicPacks(PathBuf),
 }
 
 /// One carousel/grid item = one track of the loaded album.
@@ -280,6 +282,9 @@ pub struct Carousel {
     /// ROM mode + shadPS4 handler — shows the "Patches" + "Cheats"
     /// entries (ShadPs4PatchesMenuItem / ShadPs4CheatsMenuItem).
     pub shadps4_menu: bool,
+    /// ROM mode + cemu handler — shows the "Graphic Packs" entry
+    /// (ShowCurrentSectionCemuGraphicPacksMenuItem).
+    pub cemu_menu: bool,
 }
 
 impl Carousel {
@@ -320,6 +325,7 @@ impl Carousel {
             xenia_menu: false,
             rpcs3_menu: false,
             shadps4_menu: false,
+            cemu_menu: false,
         }
     }
 
@@ -1998,6 +2004,13 @@ impl Carousel {
                     }
                     if self.rom_mode && self.xenia_menu && ui.button("Custom Config").clicked() {
                         action = Action::CustomConfig(p.clone());
+                        self.menu_item = None;
+                        ui.close();
+                    }
+                    // WIIU + cemu — Lacrima's "Graphic Packs" menu
+                    // item (sits after Patches/Custom Config).
+                    if self.rom_mode && self.cemu_menu && ui.button("Graphic Packs").clicked() {
+                        action = Action::GraphicPacks(p.clone());
                         self.menu_item = None;
                         ui.close();
                     }

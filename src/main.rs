@@ -5,6 +5,8 @@ mod apl;
 mod audio;
 mod cap_shader;
 mod carousel;
+mod cemu_gpack;
+mod cemu_overlay;
 mod edge_border;
 mod emu_dl;
 mod emu_meta;
@@ -4148,7 +4150,8 @@ fn music_view(
         | carousel::Action::ClearCache
         | carousel::Action::Patches(_)
         | carousel::Action::CustomConfig(_)
-        | carousel::Action::Cheats(_) => None,
+        | carousel::Action::Cheats(_)
+        | carousel::Action::GraphicPacks(_) => None,
         carousel::Action::None => None,
     };
     // Transport prev/next resolve against the loaded album's items

@@ -31,6 +31,9 @@ const PCSX2_RELEASES_API: &str =
 // chain: blog feed → post page → direct dl.dolphin-emu.org asset.
 const EMUCR_DOLPHIN_FEED: &str =
     "https://www.emucr.com/feeds/posts/default/-/Dolphin?alt=json&max-results=30";
+// CemuEmulatorUpdateService's ReleasesApiEndpoint.
+const CEMU_RELEASES_API: &str =
+    "https://api.github.com/repos/cemu-project/Cemu/releases?per_page=100";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
@@ -44,6 +47,7 @@ const SHADPS4_VERSION_MARKER: &str = "shadps4_version.txt";
 const DUCKSTATION_VERSION_MARKER: &str = "duckstation_version.txt";
 const PCSX2_VERSION_MARKER: &str = "pcsx2_version.txt";
 const DOLPHIN_VERSION_MARKER: &str = "dolphin_version.txt";
+const CEMU_VERSION_MARKER: &str = "cemu_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -159,6 +163,17 @@ pub fn pcsx2_exe() -> Option<PathBuf> {
 /// Find the installed `Dolphin.exe` under the managed dir.
 pub fn dolphin_exe() -> Option<PathBuf> {
     resolve_exe(&dolphin_dir()?, &DOLPHIN_SPEC).ok()
+}
+
+/// `<data>/Emulators/WIIU/Cemu` — CemuEmulatorUpdateService's
+/// EnsureDirectories.
+pub fn cemu_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("WIIU").join("Cemu"))
+}
+
+/// Find the installed `Cemu.exe` under the managed dir.
+pub fn cemu_exe() -> Option<PathBuf> {
+    resolve_exe(&cemu_dir()?, &CEMU_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -454,6 +469,29 @@ pub fn download_dolphin() -> Shared {
         p.done = Some(res);
     });
     dl
+}
+
+const CEMU_SPEC: EmuSpec = EmuSpec {
+    name: "Cemu",
+    releases_api: CEMU_RELEASES_API,
+    version_marker: CEMU_VERSION_MARKER,
+    dir: cemu_dir,
+    // SelectAssetForPlatform: cemu-<ver>-windows-x64.zip — the
+    // windows archive (mac .dmg/linux zips are filtered by the
+    // windows+zip pair).
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("windows") && n.ends_with(".zip")
+    },
+    // CemuHandler's CemuExecutableNames.
+    exe_names: &["Cemu.exe", "cemu.exe"],
+    exe_contains: "cemu",
+    patches: false,
+    allow_prerelease: false,
+};
+
+pub fn download_cemu() -> Shared {
+    download_emu(&CEMU_SPEC)
 }
 
 /// Lacrima's DolphinEmulatorUpdateService EmuCR fallback:
@@ -890,5 +928,16 @@ mod tests {
             "https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z"
         );
         assert!(emucr_dolphin_asset("<a href=\"https://example.com/x\">", &DOLPHIN_SPEC).is_none());
+    }
+
+    /// SelectAssetForPlatform — Cemu ships windows/macos/linux per
+    /// release; only the `windows` `.zip` must pass the filter.
+    #[test]
+    fn cemu_asset_prefers_windows_zip() {
+        let ok = |n: &str| (CEMU_SPEC.asset_ok)(n);
+        assert!(ok("cemu-2.6-windows-x64.zip"));
+        assert!(!ok("cemu-2.6-macos-15-arm64.dmg"));
+        assert!(!ok("cemu-2.6-linux-x86_64.zip"));
+        assert!(!ok("cemu-2.6-windows-x64.zip.sig"));
     }
 }

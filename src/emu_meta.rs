@@ -1469,6 +1469,246 @@ fn dolphin_disc_title(path: &Path) -> Option<String> {
 }
 
 // ------------------------------------------------------------------
+// Wii U (WiiUInstalledGameHelper): installed-game folders carry
+// code/content/meta with a meta.xml — longname_en wins, then the
+// other locales, then any longname_*. Bare wud/wux/wua/rpx files
+// check the parent + grandparent dirs for that layout (an .rpx sits
+// in `code/`), then fall back to a cleaned filename stem.
+// ------------------------------------------------------------------
+fn wiiu_installed_dir(path: &Path) -> Option<&Path> {
+    let is_pkg = |d: &Path| {
+        d.join("code").is_dir()
+            && d.join("content").is_dir()
+            && d.join("meta").is_dir()
+            && wiiu_meta_xml(d).is_some()
+    };
+    if path.is_dir() {
+        return is_pkg(path).then_some(path);
+    }
+    // A bare file — its parent (or grandparent for `code/*.rpx`)
+    // may be the package root; Lacrima's GetCandidateDirectories
+    // yields exactly those two.
+    for dir in [path.parent(), path.parent().and_then(Path::parent)]
+        .into_iter()
+        .flatten()
+    {
+        if is_pkg(dir) {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+fn wiiu_meta_xml(dir: &Path) -> Option<PathBuf> {
+    let meta = dir.join("meta");
+    let direct = meta.join("meta.xml");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    // Case-insensitive fallback (Lacrima enumerates meta\*).
+    std::fs::read_dir(&meta).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        (p.file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.eq_ignore_ascii_case("meta.xml")))
+        .then_some(p)
+    })
+}
+
+/// Flat `<key>value</key>` pull — meta.xml is flat enough that a tag
+/// scan beats pulling in an XML crate. Real meta.xml tags carry
+/// `type`/`length` attributes (`<title_id type="hexBinary"
+/// length="8">`), so the match is prefix + boundary, not the literal
+/// `<key>`.
+fn wiiu_tag(xml: &str, key: &str) -> Option<String> {
+    let needle = format!("<{key}");
+    let close = format!("</{key}>");
+    let mut rest = xml;
+    while let Some(i) = rest.find(&needle) {
+        let after = &rest[i + needle.len()..];
+        let boundary = after
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '>' || c == '/');
+        if !boundary {
+            rest = after;
+            continue;
+        }
+        // `>` must come after the needle — an earlier tag's close
+        // can precede the match in `rest`.
+        let Some(tag_end) = rest[i + needle.len()..]
+            .find('>')
+            .map(|e| e + i + needle.len())
+        else {
+            return None;
+        };
+        // Self-closing tag → no body; keep scanning.
+        if rest[i + needle.len()..tag_end].ends_with('/') {
+            rest = &rest[tag_end + 1..];
+            continue;
+        }
+        let body = &rest[tag_end + 1..];
+        let Some(end) = body.find(&close) else { return None };
+        let v = body[..end].trim();
+        if !v.is_empty() {
+            return Some(v.replace(['\r', '\n'], " ").trim().to_string());
+        }
+        rest = &rest[tag_end + 1..];
+    }
+    None
+}
+
+fn wiiu_meta_title(dir: &Path) -> Option<String> {
+    let xml = std::fs::read_to_string(wiiu_meta_xml(dir)?).ok()?;
+    let grab = |key: &str| wiiu_tag(&xml, key);
+    for k in [
+        "longname_en",
+        "longname_us",
+        "longname_ja",
+        "longname_fr",
+        "longname_de",
+        "longname_es",
+        "longname_it",
+    ] {
+        if let Some(t) = grab(k) {
+            return Some(t);
+        }
+    }
+    // Any remaining longname_* (scan tags so attribute-order can't
+    // matter).
+    let mut rest = xml.as_str();
+    while let Some(i) = rest.find("<longname_") {
+        rest = &rest[i + 1..];
+        let Some(tag_end) = rest.find('>') else {
+            break;
+        };
+        let key = &rest["longname_".len()..tag_end];
+        let Some(key) = key.split([' ', '/', '\t']).next() else {
+            break;
+        };
+        let open_end = rest.find('>').unwrap() + 1;
+        let body = &rest[open_end..];
+        let Some(close) = body.find(&format!("</longname_{key}>")) else {
+            rest = &rest[open_end..];
+            continue;
+        };
+        let v = body[..close].trim();
+        if !v.is_empty() {
+            return Some(v.replace(['\r', '\n'], " ").trim().to_string());
+        }
+        rest = &rest[open_end..];
+    }
+    None
+}
+
+fn wiiu_title(path: &Path) -> Option<String> {
+    if let Some(dir) = wiiu_installed_dir(path) {
+        if let Some(t) = wiiu_meta_title(dir) {
+            return Some(t);
+        }
+    }
+    // Cleaned filename stem: drop the title-id token + region/paren
+    // noise (ExtractTitleNameFromFilePath).
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let mut out = String::with_capacity(stem.len());
+    let mut last_space = false;
+    for w in stem.split([' ', '_', '-', '[', ']', '(', ')']) {
+        let hex = w.len() >= 16 && w.chars().all(|c| c.is_ascii_hexdigit())
+            || w.len() == 17
+                && w.chars().filter(|c| c.is_ascii_hexdigit()).count() == 16;
+        if w.is_empty() || hex {
+            continue;
+        }
+        if last_space {
+            out.push(' ');
+        }
+        out.push_str(w);
+        last_space = true;
+    }
+    let t = out.trim();
+    (t.len() >= 2).then(|| t.to_string())
+}
+
+/// `WiiUInstalledGameHelper.GetTitleId` + `ExtractTitleIdFromText` —
+/// `<title_id>` out of the installed package's meta.xml first, else a
+/// 16-hex (or `XXXXXXXX-_XXXXXXXX`) token embedded in the path.
+/// Normalized to Cemu's `XXXXXXXX-XXXXXXXX` display form
+/// (CemuTitleIdHelper.NormalizeDisplayTitleId).
+pub fn wiiu_title_id(path: &Path) -> Option<String> {
+    if let Some(dir) = wiiu_installed_dir(path) {
+        if let Some(xml_path) = wiiu_meta_xml(dir) {
+            if let Ok(xml) = std::fs::read_to_string(xml_path) {
+                if let Some(v) = wiiu_tag(&xml, "title_id") {
+                    if let Some(tid) = crate::cemu_gpack::normalize_display_title_id(&v) {
+                        return Some(tid);
+                    }
+                }
+            }
+        }
+    }
+    wiiu_title_id_in(&path.to_string_lossy()).or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(wiiu_title_id_in)
+    })
+}
+
+/// Cached-first variant for the overlay — Lacrima's
+/// `ResolveWiiUTitleId`: metadata cache (`WiiUTitleId`) wins, then
+/// the live helper, persisted back into the `.meta` doc.
+pub fn wiiu_title_id_cached(rom: &Path) -> Option<String> {
+    if let Some(doc) = load_meta(rom) {
+        if let Some(tid) = crate::cemu_gpack::normalize_display_title_id(&doc.wiiu_title_id) {
+            return Some(tid);
+        }
+    }
+    let live = wiiu_title_id(rom)?;
+    // Persist like GenericAlbumNormalizer's metadata cache write.
+    let mut doc = load_meta(rom).unwrap_or_default();
+    if doc.wiiu_title_id.trim().is_empty() {
+        doc.wiiu_title_id = live.clone();
+        let _ = save_meta(rom, &doc);
+    }
+    Some(live)
+}
+
+/// `TitleIdTextRegex` — a maximal hex/`-`/`_` run whose hex digits
+/// total exactly 16, with at most one separator sitting at position
+/// 8 (the `XXXXXXXX-XXXXXXXX` / contiguous forms).
+fn wiiu_title_id_in(text: &str) -> Option<String> {
+    let is_tok = |c: char| c.is_ascii_hexdigit() || c == '-' || c == '_';
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_tok(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && is_tok(chars[i]) {
+            i += 1;
+        }
+        let run: String = chars[start..i].iter().collect();
+        let hex: String = run.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let seps: Vec<usize> = run
+            .char_indices()
+            .filter(|(_, c)| *c == '-' || *c == '_')
+            .map(|(i, _)| i)
+            .collect();
+        let ok = hex.len() == 16
+            && match seps.as_slice() {
+                [] => true,
+                [pos] => *pos == 8,
+                _ => false,
+            };
+        if ok {
+            return crate::cemu_gpack::normalize_display_title_id(&hex);
+        }
+    }
+    None
+}
+
+// ------------------------------------------------------------------
 // LibRetro thumbnails (LibRetroThumbnailCoverService)
 // ------------------------------------------------------------------
 const LIBRETRO_BASE: &str = "https://thumbnails.libretro.com/";
@@ -2432,6 +2672,9 @@ fn resolve_one(
             // GC + Wii share Dolphin's volume-header reader — the
             // disc magic picks the console, not the section.
             "GCN" | "WII" => dolphin_disc_title(path),
+            // Wii U installed folders carry meta.xml; bare files
+            // resolve via their package dir or stem.
+            "WIIU" => wiiu_title(path),
             "PS3" => ps3_title(path),
             "PS4" => ps4_title(path),
             _ => None,
@@ -2660,6 +2903,10 @@ pub struct RomMetaDoc {
     pub video_url: String,
     pub x360_title_id: String,
     pub x360_media_id: String,
+    /// Wii U title id (`XXXXXXXX-XXXXXXXX`) — Lacrima's
+    /// `metadata.WiiUTitleId` cache field the graphic-packs overlay
+    /// reads before re-extracting from meta.xml.
+    pub wiiu_title_id: String,
     pub user_edited: bool,
     /// ArcadeLockedPillarboxCrop{Left,Right,FrameWidth} — a
     /// user-locked pillarbox crop measured at `crop_fw` pixels wide;
@@ -3269,6 +3516,56 @@ mod tests {
                 .as_deref(),
             Some("SLUS00594")
         );
+    }
+
+    /// WiiUInstalledGameHelper: an installed folder (code/content/
+    /// meta + meta.xml) yields its localized longname; a bare .rpx
+    /// in `code/` resolves via the package grandparent; bare files
+    /// fall back to a title-id-stripped stem.
+    #[test]
+    fn wiiu_title_resolution() {
+        let dir = std::env::temp_dir().join(format!("aes_test_wiiu_{}", std::process::id()));
+        let pkg = dir.join("Some Game [0005000010101A00]");
+        for sub in ["code", "content", "meta"] {
+            std::fs::create_dir_all(pkg.join(sub)).unwrap();
+        }
+        std::fs::write(
+            pkg.join("meta").join("meta.xml"),
+            // Real meta.xml tags carry type/length attributes.
+            "<menu type=\"complex\" access=\"777\">\
+             <title_id type=\"hexBinary\" length=\"8\">0005000010101A00</title_id>\
+             <longname_en type=\"string\" length=\"512\">Test Quest</longname_en>\
+             <longname_fr type=\"string\" length=\"512\">Test Quête FR</longname_fr></menu>",
+        )
+        .unwrap();
+        // Package dir itself.
+        assert_eq!(wiiu_title(&pkg).as_deref(), Some("Test Quest"));
+        assert_eq!(
+            wiiu_title_id(&pkg).as_deref(),
+            Some("00050000-10101A00")
+        );
+        // The .rpx inside code/ resolves via the grandparent walk.
+        let rpx = pkg.join("code").join("game.rpx");
+        std::fs::write(&rpx, b"bin").unwrap();
+        assert_eq!(wiiu_title(&rpx).as_deref(), Some("Test Quest"));
+        assert_eq!(
+            wiiu_title_id(&rpx).as_deref(),
+            Some("00050000-10101A00")
+        );
+        // A bare .wud outside a package → cleaned stem.
+        let wud = dir.join("Great Game 00050000101ABC00.wud");
+        std::fs::write(&wud, b"bin").unwrap();
+        assert_eq!(wiiu_title(&wud).as_deref(), Some("Great Game"));
+        // …and its title id comes from the filename token.
+        assert_eq!(
+            wiiu_title_id(&wud).as_deref(),
+            Some("00050000-101ABC00")
+        );
+        // Hex noise under 16 digits is not a title id.
+        let plain = dir.join("No Id Here.wud");
+        std::fs::write(&plain, b"bin").unwrap();
+        assert_eq!(wiiu_title_id(&plain), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
