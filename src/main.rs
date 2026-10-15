@@ -3161,6 +3161,10 @@ fn lacrima_window_frame(
     };
     let corner_radius = CornerRadius::same(radius);
 
+    // The panel's outer rect, INCLUDING the 1px frame stroke — `ui.max_rect()`
+    // inside `show` is inset by it, and the corner button reaches past that
+    // inset so its face is flush with the actual window edge.
+    let panel_rect = ui.max_rect();
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -3248,29 +3252,79 @@ fn lacrima_window_frame(
             // Back button at the top-left of the bar, like Lacrima's
             // arrow button bound to NavigationService.NavigateBackCommand.
             if back_alpha > 0.0 {
-                // 35x30 button, 15px left margin, 24px icon (MainTopBar).
+                // The whole title-bar corner IS the button — a square
+                // face flush against the WINDOW corner (past the 1px
+                // panel-stroke inset), its top-left rounded to the
+                // window corner. Hit area stays the full corner even
+                // while the face scales on press.
                 let btn = Rect::from_min_size(
-                    Pos2::new(
-                        title_bar_rect.min.x + 15.0 * scale,
-                        title_bar_rect.min.y + (title_bar_rect.height() - 30.0 * scale) / 2.0,
-                    ),
-                    Vec2::new(35.0 * scale, 30.0 * scale),
+                    panel_rect.min,
+                    Vec2::splat(title_bar_rect.max.y - panel_rect.min.y),
                 );
                 let back_resp = ui.interact(btn, ui.id().with("back"), Sense::click());
                 if back_resp.hovered() {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
-                    painter.rect_filled(
-                        btn,
-                        CornerRadius::same((6.0 * scale).round() as u8),
-                        Color32::from_white_alpha((20.0 * back_alpha) as u8),
-                    );
                 }
-                painter.image(
+                // Push feedback: the face+icon scale down ~6% while
+                // held (animated), like a physical key travel.
+                let press = ctx.animate_bool_with_time(
+                    ui.id().with("back_press"),
+                    back_resp.is_pointer_button_down_on(),
+                    0.1,
+                );
+                let k = 1.0 - 0.06 * press;
+                let face = Rect::from_center_size(btn.center(), btn.size() * k);
+                let face_cr = CornerRadius {
+                    nw: (f32::from(radius) * k).round() as u8,
+                    ne: 0,
+                    sw: 0,
+                    se: 0,
+                };
+                let (fill, line) = if press > 0.5 {
+                    (
+                        Color32::from_white_alpha((14.0 * back_alpha) as u8),
+                        Color32::from_white_alpha((45.0 * back_alpha) as u8),
+                    )
+                } else if back_resp.hovered() {
+                    (
+                        Color32::from_white_alpha((30.0 * back_alpha) as u8),
+                        Color32::from_white_alpha((80.0 * back_alpha) as u8),
+                    )
+                } else {
+                    (
+                        Color32::from_white_alpha((18.0 * back_alpha) as u8),
+                        Color32::from_white_alpha((60.0 * back_alpha) as u8),
+                    )
+                };
+                // The face reaches past `app_rect`'s clip (it covers the
+                // frame-stroke inset), so paint it with the panel clip.
+                let btn_painter = ui.painter().clone().with_clip_rect(panel_rect);
+                btn_painter.rect(
+                    face,
+                    face_cr,
+                    fill,
+                    Stroke::new((1.0 * scale).max(1.0), line),
+                    StrokeKind::Inside,
+                );
+                // Arrow fills ~58% of the face and scales with it.
+                btn_painter.image(
                     back_icon,
-                    Rect::from_center_size(btn.center(), Vec2::splat(24.0 * scale)),
+                    Rect::from_center_size(face.center(), Vec2::splat(face.width() * 0.58)),
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE.gamma_multiply(back_alpha),
                 );
+                // Repaint the window's frame border over the button —
+                // the translucent face would otherwise leave the gray
+                // edge arc ghosted through it. Identical stroke as the
+                // panel frame, so it's a no-op outside the corner.
+                if !maximized {
+                    btn_painter.rect_stroke(
+                        panel_rect,
+                        corner_radius,
+                        Stroke::new(1.0, Color32::from_rgb(105, 105, 105)),
+                        StrokeKind::Inside,
+                    );
+                }
                 if back_resp.clicked() {
                     *back_clicked = true;
                 }
