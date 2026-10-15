@@ -117,6 +117,15 @@ struct Shared {
     status: Status,
 }
 
+/// Which emulator a session wraps — controls the CLI args and the
+/// window-resolution heuristics (Xenia's render surface is a
+/// `temp_d3d_window` child; Flycast's is its main SDL/Qt window).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Xenia,
+    Flycast,
+}
+
 /// A running Xenia launch: owns the child process, the
 /// resolve/capture worker thread, and the WGC frame slot.
 pub struct Session {
@@ -145,19 +154,21 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawn Xenia with the game and start the resolve/capture
-    /// worker. Lacrima inserts `--fullscreen` for fullscreen launches
-    /// — we launch windowed instead since the window is hidden anyway
-    /// and a windowed surface stays captureable when moved off-screen.
+    /// Spawn the emulator (`kind`) with the game and start the
+    /// resolve/capture worker. Lacrima inserts `--fullscreen` for
+    /// fullscreen launches — we launch windowed instead since the
+    /// window is hidden anyway and a windowed surface stays
+    /// captureable when moved off-screen.
     /// `low_latency` shrinks the WGC frame pool to a single buffer.
-    /// `profile_xuid` is passed as `--logged_profile_slot_0_xuid` so a
-    /// provisioned profile signs in without the (unclickable through
-    /// capture) NoProfileDialog.
+    /// `profile_xuid` (Xenia only) is passed as
+    /// `--logged_profile_slot_0_xuid` so a provisioned profile signs
+    /// in without the (unclickable through capture) NoProfileDialog.
     pub fn start(
         exe: &str,
         game: &Path,
         low_latency: bool,
         profile_xuid: Option<u64>,
+        kind: Kind,
     ) -> Result<Self, String> {
         let exe_path = PathBuf::from(exe);
         let work_dir = exe_path
@@ -172,7 +183,7 @@ impl Session {
         let child = cmd
             .current_dir(work_dir)
             .spawn()
-            .map_err(|e| format!("failed to start Xenia: {e}"))?;
+            .map_err(|e| format!("failed to start emulator: {e}"))?;
 
         // Kill-on-close job FIRST — if anything below panics the
         // guard unwinds and the OS reaps the emulator for us.
@@ -203,7 +214,7 @@ impl Session {
                     // degrade to a failed session — never take the
                     // whole app down with the emulator.
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        worker_main(pid, status, frames, gpu, stop, render, hwnd, low_latency)
+                        worker_main(pid, status, frames, gpu, stop, render, hwnd, low_latency, kind)
                     }))
                     .is_err()
                     {
@@ -412,6 +423,7 @@ fn worker_main(
     render: Arc<wgc::RenderShared>,
     hwnd_out: Arc<std::sync::atomic::AtomicUsize>,
     low_latency: bool,
+    kind: Kind,
 ) {
     let set_status = |s: Status| {
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
@@ -440,11 +452,13 @@ fn worker_main(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        dismiss_warning_dialogs(pid);
+        if kind == Kind::Xenia {
+            dismiss_warning_dialogs(pid);
+        }
         if !alive(proc) {
             break;
         }
-        hwnd = resolve_capture_target(pid);
+        hwnd = resolve_capture_target(pid, kind);
         if !hwnd.is_invalid() {
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
@@ -666,9 +680,67 @@ fn score_render_child(hwnd: HWND, pid: u32) -> i64 {
     score
 }
 
+/// IsLikelyFlyCastRenderWindow — the render window is a top-level
+/// SDL/Qt surface; dialogs (settings/audio/video/…) are filtered by
+/// title, and Flycast's own chrome gets excluded the same way
+/// Lacrima does.
+fn is_likely_flycast_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    const BAD: &[&str] = &[
+        "settings",
+        "audio",
+        "video",
+        "input",
+        "controller",
+        "cheat",
+        "shader",
+        "about",
+    ];
+    let title = window_title(hwnd);
+    let t = title.trim().to_lowercase();
+    let class = class_name(hwnd).to_lowercase();
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let has_thick = (style & WS_THICKFRAME.0 as i64) == WS_THICKFRAME.0 as i64;
+    let mut looks_primary = hwnd == main;
+    let has_bad = BAD.iter().any(|w| t.contains(w));
+
+    if !t.is_empty() {
+        if t.contains("flycast") && !has_bad {
+            looks_primary = false;
+        }
+        if has_bad {
+            looks_primary = true;
+        }
+        if !looks_primary && t.chars().count() >= 2 {
+            return true;
+        }
+    }
+    if !class.is_empty()
+        && (class.contains("sdl")
+            || class.contains("glfw")
+            || class.contains("qt")
+            || class.contains("flycast"))
+    {
+        if !looks_primary {
+            return true;
+        }
+        if !t.is_empty() && !has_bad {
+            return true;
+        }
+        looks_primary |= has_caption && has_thick;
+    }
+    !looks_primary && (!has_caption || !t.is_empty())
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
-fn is_likely_render_window(hwnd: HWND, main: HWND) -> bool {
+fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
+    if kind == Kind::Flycast {
+        return is_likely_flycast_window(hwnd, main);
+    }
     if hwnd.is_invalid() {
         return false;
     }
@@ -708,7 +780,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND) -> bool {
 }
 
 /// ScoreProcessWindowCandidate (base) restricted to render windows.
-fn score_top_level(hwnd: HWND, pid: u32, main: HWND) -> i64 {
+fn score_top_level(hwnd: HWND, pid: u32, main: HWND, kind: Kind) -> i64 {
     if hwnd.is_invalid() {
         return i64::MIN;
     }
@@ -730,7 +802,12 @@ fn score_top_level(hwnd: HWND, pid: u32, main: HWND) -> i64 {
         return i64::MIN;
     }
     // preferSpecificRenderWindow — non-render candidates are rejected.
-    if !is_likely_render_window(hwnd, main) {
+    if !is_likely_render_window(hwnd, main, kind) {
+        return i64::MIN;
+    }
+    // Flycast requires a real client area before assign
+    // (IsStableCaptureCandidate — the UI settles at ≥640×360).
+    if kind == Kind::Flycast && (w < 640 || h < 360) {
         return i64::MIN;
     }
     let mut score = w as i64 * h as i64 * 10;
@@ -754,7 +831,7 @@ fn score_top_level(hwnd: HWND, pid: u32, main: HWND) -> i64 {
 /// One poll of ResolveCaptureTargetAsync: best render child, else
 /// best render-like top-level window. `main` ≈ the biggest titled
 /// visible top-level (Process.MainWindowHandle approximation).
-fn resolve_capture_target(pid: u32) -> HWND {
+fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
     let tops = process_windows(pid, true);
     if tops.is_empty() {
         return HWND::default();
@@ -770,32 +847,35 @@ fn resolve_capture_target(pid: u32) -> HWND {
         })
         .unwrap_or_default();
 
-    // Render-surface child windows win (Xenia's temp_d3d_window lives
-    // under a top-level).
-    let mut ctx = ChildCtx {
-        pid,
-        best: HWND::default(),
-        best_score: i64::MIN,
-    };
-    for &top in tops.iter().chain(std::iter::once(&main)) {
-        if top.is_invalid() {
-            continue;
+    // Render-surface child windows win for Xenia (its temp_d3d_window
+    // lives under a top-level); Flycast renders in the top-level
+    // window itself — a Qt child could only be chrome, so skip.
+    if kind == Kind::Xenia {
+        let mut ctx = ChildCtx {
+            pid,
+            best: HWND::default(),
+            best_score: i64::MIN,
+        };
+        for &top in tops.iter().chain(std::iter::once(&main)) {
+            if top.is_invalid() {
+                continue;
+            }
+            unsafe {
+                let _ = EnumChildWindows(
+                    Some(top),
+                    Some(enum_child),
+                    LPARAM(&mut ctx as *mut ChildCtx as isize),
+                );
+            }
         }
-        unsafe {
-            let _ = EnumChildWindows(
-                Some(top),
-                Some(enum_child),
-                LPARAM(&mut ctx as *mut ChildCtx as isize),
-            );
+        if ctx.best_score > i64::MIN && !ctx.best.is_invalid() {
+            return ctx.best;
         }
-    }
-    if ctx.best_score > i64::MIN && !ctx.best.is_invalid() {
-        return ctx.best;
     }
 
     tops.iter()
         .copied()
-        .map(|h| (h, score_top_level(h, pid, main)))
+        .map(|h| (h, score_top_level(h, pid, main, kind)))
         .filter(|(_, s)| *s > i64::MIN)
         .max_by_key(|(_, s)| *s)
         .map(|(h, _)| h)

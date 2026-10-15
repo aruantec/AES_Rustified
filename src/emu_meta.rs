@@ -399,6 +399,163 @@ fn walkdir_find_xex(dir: &Path) -> Option<PathBuf> {
 }
 
 // ------------------------------------------------------------------
+// Dreamcast titles (RomInspector's IP.BIN extraction)
+// ------------------------------------------------------------------
+/// Printable ASCII + latin-1, NUL-terminated — CleanDreamcastText.
+fn dc_text(b: &[u8]) -> String {
+    let mut out = String::new();
+    for &c in b {
+        if c == 0 {
+            break;
+        }
+        if (32..=126).contains(&c) || c >= 160 {
+            out.push(c as char);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty())
+        .then(|| hay.windows(needle.len()).position(|w| w == needle))
+        .flatten()
+}
+
+/// IP.BIN sits at the start of the last session's data track:
+/// hardware id "SEGA SEGAKATANA"/"SEGA ENTERPRISES" at +0, product
+/// code at +0x40 (10B), game title at +0x80 (128B). Scanned rather
+/// than seeked so raw 2352-byte tracks work without sector math —
+/// the signature and its fields are contiguous inside one sector's
+/// data payload.
+fn ipbin_title_in(f: &mut std::fs::File, limit: u64) -> Option<String> {
+    let mut buf = Vec::new();
+    f.take(limit).read_to_end(&mut buf).ok()?;
+    let buf = &buf[..];
+    let pos = [
+        b"SEGA SEGAKATANA".as_slice(),
+        b"SEGA ENTERPRISES".as_slice(),
+    ]
+    .iter()
+    .find_map(|s| find_bytes(buf, s))?;
+    let ip = &buf[pos..];
+    if ip.len() < 0x100 {
+        return None;
+    }
+    let title = dc_text(&ip[0x80..0x100]);
+    if title.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+        return Some(title);
+    }
+    let prod = dc_text(&ip[0x40..0x4A]);
+    (!prod.is_empty()).then_some(prod)
+}
+
+/// `FILE "track.bin" BINARY` / `FILE track.bin BINARY` names from a
+/// cue sheet, resolved against the cue's directory.
+fn cue_track_files(path: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if !l.len().gt(&5) || !l[..5].eq_ignore_ascii_case("FILE ") {
+            continue;
+        }
+        let rest = l[5..].trim();
+        let name = if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.split('"').next())
+        {
+            inner
+        } else {
+            rest.split_whitespace().next().unwrap_or("")
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let p = dir.join(name.replace('\\', "/"));
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Track filenames from a .gdi sheet — fields are
+/// `<track> <lba> <type> <sectorsize> <file> <offset>` with the file
+/// optionally quoted (Lacrima's regex reads field 2 by mistake; real
+/// GDIs carry the LBA there).
+fn gdi_track_files(path: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with(';') {
+            continue;
+        }
+        // Field 5 is the filename (may be quoted); skip the first
+        // four fields then read the quoted span or first word.
+        let mut rest = l;
+        let mut ok = true;
+        for _ in 0..4 {
+            rest = rest.trim_start();
+            match rest.find(char::is_whitespace) {
+                Some(sp) => rest = &rest[sp..],
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        rest = rest.trim_start();
+        let file = if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.split('"').next())
+        {
+            inner
+        } else {
+            rest.split_whitespace().next().unwrap_or("")
+        };
+        if file.is_empty() {
+            continue;
+        }
+        let p = dir.join(file.replace('\\', "/"));
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Dreamcast title — IP.BIN out of the data track for gdi/cue/
+/// cdi/iso/bin/img. CHD is compressed (unsupported here, like
+/// Lacrima) → stem fallback covers it.
+fn dc_title(path: &Path) -> Option<String> {
+    const SCAN: u64 = 8 * 1024 * 1024;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+    let targets: Vec<PathBuf> = match ext.as_str() {
+        "gdi" => gdi_track_files(path),
+        "cue" => cue_track_files(path),
+        "cdi" | "iso" | "bin" | "img" => vec![path.to_path_buf()],
+        _ => return None,
+    };
+    for t in targets {
+        if let Ok(mut f) = std::fs::File::open(&t) {
+            if let Some(title) = ipbin_title_in(&mut f, SCAN) {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+// ------------------------------------------------------------------
 // LibRetro thumbnails (LibRetroThumbnailCoverService)
 // ------------------------------------------------------------------
 const LIBRETRO_BASE: &str = "https://thumbnails.libretro.com/";
@@ -754,7 +911,7 @@ fn bing_image_urls(html: &str) -> Vec<String> {
 
 /// DuckDuckGo image API — fetch the search page once to grab the VQD
 /// token, then the `i.js` JSON feed (`results[].image`).
-fn ddg_image_urls(agent: &ureq::Agent, q: &str) -> Vec<String> {
+fn ddg_image_urls(agent: &ureq::Agent, q: &str, target: f32) -> Vec<String> {
     let main = format!(
         "https://duckduckgo.com/?q={}&iax=images&ia=images",
         escape(q)
@@ -799,14 +956,16 @@ fn ddg_image_urls(agent: &ureq::Agent, q: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut results = feed.results;
-    // The feed carries the image's real dimensions — box fronts are
-    // portrait, so rank portrait first, square/unknown middle, and
-    // landscape (flat scans, banners) last. Actual pixel validation
-    // still happens post-download; this just orders the downloads.
+    // The feed carries the image's real dimensions — rank candidates
+    // by distance from the section's box-front aspect (Dreamcast
+    // jewel-case fronts are ~square, keep-case boxes portrait).
+    // Unknown dims sort mid-pack; actual pixel validation still
+    // happens post-download, this just orders the downloads.
     results.sort_by_key(|e| match (e.width, e.height) {
-        (Some(w), Some(h)) if w > h => 2,
-        (Some(w), Some(h)) if w < h => 0,
-        _ => 1,
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            ((w as f32 / h as f32 - target).abs() * 1000.0) as i64
+        }
+        _ => 400,
     });
     results
         .into_iter()
@@ -842,29 +1001,34 @@ fn web_image_fetch(
     title: &str,
     platform: &str,
     rom: &Path,
+    section_key: &str,
 ) -> Option<PathBuf> {
+    let target = cover_target(section_key);
     for q in cover_queries(title, platform) {
         // DuckDuckGo first (clean JSON feed)…
-        let mut candidates = ddg_image_urls(agent, &q);
+        let mut candidates = ddg_image_urls(agent, &q, target);
         // …then Bing's HTML page when DDG yields nothing.
         if candidates.is_empty() {
             if let Some(v) = bing_candidates(agent, &q) {
                 candidates = v;
             }
         }
-        // First validating portrait/square image wins; a landscape hit
-        // (flat scan, banner) is saved as the last-resort fallback for
-        // this query — a real front cover beats it whenever one lands.
-        let mut fallback: Option<PathBuf> = None;
+        // First `Good` (flat front cover) wins. A landscape hit (flat
+        // front+back+spine scan) and a product photo/3D mockup are
+        // still saved as last-resort fallbacks — a real front cover
+        // beats either whenever one lands.
+        let mut photo: Option<PathBuf> = None;
+        let mut landscape: Option<PathBuf> = None;
         for img in candidates {
-            match download_validated(agent, &img, rom) {
-                Some((p, true)) => return Some(p),
-                Some((p, false)) if fallback.is_none() => fallback = Some(p),
+            match download_validated(agent, &img, rom, section_key) {
+                Some((p, CoverClass::Good)) => return Some(p),
+                Some((p, CoverClass::Photo)) if photo.is_none() => photo = Some(p),
+                Some((p, CoverClass::Landscape)) if landscape.is_none() => landscape = Some(p),
                 _ => {}
             }
         }
-        if fallback.is_some() {
-            return fallback;
+        if let Some(p) = landscape.or(photo) {
+            return Some(p);
         }
     }
     None
@@ -887,15 +1051,36 @@ fn bing_candidates(agent: &ureq::Agent, q: &str) -> Option<Vec<String>> {
     (!urls.is_empty()).then_some(urls)
 }
 
+/// Cover quality tiers — `Good` is a flat front cover filling the
+/// frame; `Photo` is a product shot/3D mockup (the object floats on
+/// a uniform background, so all four edges have uniform borders);
+/// `Landscape` is a flat front+back+spine scan or a banner.
+enum CoverClass {
+    Good,
+    Photo,
+    Landscape,
+}
+
+/// The box-front aspect ratio the section's real covers cluster
+/// around — Dreamcast/PSX/Saturn jewel-case fronts are ~square, the
+/// keep-case boxes (X360, PS2, …) portrait.
+fn cover_target(section_key: &str) -> f32 {
+    match section_key {
+        "DC" | "PSX" | "SATURN" => 1.0,
+        _ => 0.72,
+    }
+}
+
 /// GET + decode/size gate (Lacrima's `TryValidateAutoCoverImageBytes`)
-/// + sidecar write. Returns `(path, good)` — `good` marks a clean
-/// portrait/square front cover; landscape images still save but come
-/// back `false` so the caller can keep looking for a real front cover.
+/// + sidecar write. Returns `(path, class)` — `Good` marks a clean
+/// front cover; `Photo`/`Landscape` still save but come back marked
+/// so the caller can keep looking for a real front cover.
 fn download_validated(
     agent: &ureq::Agent,
     url: &str,
     rom: &Path,
-) -> Option<(PathBuf, bool)> {
+    section_key: &str,
+) -> Option<(PathBuf, CoverClass)> {
     let mut r = agent
         .get(url)
         .header("User-Agent", BING_UA)
@@ -909,14 +1094,24 @@ fn download_validated(
     if d.width() < 120 || d.height() < 120 {
         return None;
     }
-    let trimmed = trim_side_bars(&d);
+    let (trimmed, sides) = trim_borders(&d);
     let d = trimmed.as_ref().unwrap_or(&d);
-    if d.width() < 120 {
+    if d.width() < 120 || d.height() < 120 {
         return None;
     }
-    // Real box fronts are portrait (or square) — a landscape result is
-    // a flat front+back+spine scan or a banner: usable, not preferred.
-    let good = d.width() <= d.height();
+    let max_ratio = cover_target(section_key) + 0.12;
+    let class = if d.width() as f32 > d.height() as f32 * max_ratio {
+        // Landscape beyond the section's box-front tolerance — a
+        // flat scan or banner (this also catches box photos whose
+        // white margins hid a landscape object).
+        CoverClass::Landscape
+    } else if sides.all() {
+        // Uniform borders on every edge — the object floats on a
+        // backdrop, i.e. a product photo or 3D mockup, not flat art.
+        CoverClass::Photo
+    } else {
+        CoverClass::Good
+    };
     let p = match trimmed {
         Some(t) => {
             // Re-encode so the sidecar carries the cropped art.
@@ -928,50 +1123,104 @@ fn download_validated(
         }
         None => save_cover(rom, &bytes)?,
     };
-    Some((p, good))
+    Some((p, class))
 }
 
-/// Crop uniform near-white/near-black side bars — search results often
-/// pillarbox box fronts onto a wider canvas. A column counts as a bar
-/// when ≥90% of 17 sampled rows are uniformly white or black; the trim
-/// is capped at 35% of the width and never reduces to a sliver.
-fn trim_side_bars(img: &image::RgbaImage) -> Option<image::RgbaImage> {
+/// Per-side uniform-border widths detected by `trim_borders` —
+/// `all()` means the image is an object floating on a backdrop.
+struct Sides {
+    l: u32,
+    r: u32,
+    t: u32,
+    b: u32,
+    w: u32,
+    h: u32,
+}
+
+impl Sides {
+    /// Meaningful uniform border on *every* side (≥4% of that
+    /// dimension, ≥4px) — the product-photo/mockup signature.
+    fn all(&self) -> bool {
+        let x = (self.w / 25).max(4);
+        let y = (self.h / 25).max(4);
+        self.l >= x && self.r >= x && self.t >= y && self.b >= y
+    }
+}
+
+/// Crop uniform near-white/near-black borders on all four sides —
+/// search results pillar/letterbox box fronts onto a wider canvas,
+/// and product photos float the object on a uniform backdrop. A
+/// column/row counts as a border when ≥90% of 17 sampled pixels are
+/// uniformly white or black; the trim is capped at 35% per axis and
+/// never reduces to a sliver.
+fn trim_borders(img: &image::RgbaImage) -> (Option<image::RgbaImage>, Sides) {
     let (w, h) = img.dimensions();
+    let none = Sides { l: 0, r: 0, t: 0, b: 0, w, h };
     if w < 40 || h < 40 {
-        return None;
+        return (None, none);
     }
     const N: u32 = 17;
-    let row_y = |i: u32| ((i as f32 + 0.5) / N as f32 * h as f32) as u32;
+    let is_bar_px = |p: &image::Rgba<u8>| -> Option<bool> {
+        let mx = p[0].max(p[1]).max(p[2]);
+        let mn = p[0].min(p[1]).min(p[2]);
+        if mx - mn > 14 {
+            return None;
+        }
+        if mx >= 235 {
+            Some(true)
+        } else {
+            Some(mx <= 20)
+        }
+    };
     let col_is_bar = |x: u32| {
-        let (mut white, mut dark) = (0u32, 0u32);
+        let mut ok = 0u32;
         for i in 0..N {
-            let p = img.get_pixel(x, row_y(i).min(h - 1));
-            let mx = p[0].max(p[1]).max(p[2]);
-            let mn = p[0].min(p[1]).min(p[2]);
-            if mx - mn > 14 {
-                return false;
-            }
-            if mx >= 235 {
-                white += 1;
-            } else if mx <= 20 {
-                dark += 1;
+            let y = (((i as f32 + 0.5) / N as f32) * h as f32) as u32;
+            match is_bar_px(img.get_pixel(x, y.min(h - 1))) {
+                Some(true) => ok += 1,
+                Some(false) | None => {}
             }
         }
-        white >= N * 9 / 10 || dark >= N * 9 / 10
+        ok >= N * 9 / 10
     };
-    let cap = w * 35 / 100;
+    let row_is_bar = |y: u32| {
+        let mut ok = 0u32;
+        for i in 0..N {
+            let x = (((i as f32 + 0.5) / N as f32) * w as f32) as u32;
+            match is_bar_px(img.get_pixel(x.min(w - 1), y)) {
+                Some(true) => ok += 1,
+                Some(false) | None => {}
+            }
+        }
+        ok >= N * 9 / 10
+    };
+    let cap_x = w * 35 / 100;
+    let cap_y = h * 35 / 100;
     let mut l = 0u32;
-    while l < cap && col_is_bar(l) {
+    while l < cap_x && col_is_bar(l) {
         l += 1;
     }
     let mut r = 0u32;
-    while l + r < cap && col_is_bar(w - 1 - r) {
+    while l + r < cap_x && col_is_bar(w - 1 - r) {
         r += 1;
     }
-    if l + r < 4 || l + r >= w / 2 {
-        return None;
+    let mut t = 0u32;
+    while t < cap_y && row_is_bar(t) {
+        t += 1;
     }
-    Some(image::imageops::crop_imm(img, l, 0, w - l - r, h).to_image())
+    let mut b = 0u32;
+    while t + b < cap_y && row_is_bar(h - 1 - b) {
+        b += 1;
+    }
+    let sides = Sides { l, r, t, b, w, h };
+    let (cw, ch) = (w - l - r, h - t - b);
+    if (l + r < 4 && t + b < 4) || cw < w / 3 || ch < h / 3 {
+        return (None, sides);
+    }
+    (
+        Some(image::imageops::crop_imm(img, l, t, cw, ch).to_image()),
+        sides,
+    )
 }
 
 // ------------------------------------------------------------------
@@ -1039,10 +1288,10 @@ fn resolve_one(
     let cached = cover_path(path);
     // Title: sidecar → database/binary → stem.
     let title = cached_title(path).or_else(|| {
-        let t = if section_key == "X360" {
-            x360_title(path)
-        } else {
-            None
+        let t = match section_key {
+            "X360" => x360_title(path),
+            "DC" => dc_title(path),
+            _ => None,
         };
         if let Some(t) = &t {
             save_cached_title(path, t);
@@ -1053,7 +1302,7 @@ fn resolve_one(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let cover = if cached.exists() && cached_is_front(&cached) {
+    let cover = if cached.exists() && cached_is_front(&cached, section_key) {
         Some(cached)
     } else {
         // Title candidates in Lacrima's order: resolved title first,
@@ -1080,19 +1329,27 @@ fn resolve_one(
             // 2. Search-engine image lookup (Lacrima's web-search
             //    fallback) — the real X360 coverage source.
             let t = title.as_deref().unwrap_or(&clean);
-            web_image_fetch(agent, t, platform, path)
+            web_image_fetch(agent, t, platform, path, section_key)
         })
     };
     RomInfo { path: path.to_path_buf(), title, cover }
 }
 
-/// A cached cover is only trusted while it's portrait/square — a
+/// A cached cover is only trusted while it classifies `Good` — a
 /// landscape sidecar is almost always a flat front+back+spine scan
-/// from the old dumb fetch, so it re-resolves and self-heals.
-fn cached_is_front(p: &Path) -> bool {
-    image::image_dimensions(p)
-        .map(|(w, h)| w <= h)
-        .unwrap_or(false)
+/// and an all-bordered one a product photo, both from the old dumb
+/// fetch, so they re-resolve and self-heal.
+fn cached_is_front(p: &Path, section_key: &str) -> bool {
+    let Ok(d) = image::open(p).map(|d| d.to_rgba8()) else {
+        return false;
+    };
+    let (trimmed, sides) = trim_borders(&d);
+    let d = trimmed.as_ref().unwrap_or(&d);
+    if d.width() < 120 || d.height() < 120 {
+        return false;
+    }
+    let max_ratio = cover_target(section_key) + 0.12;
+    d.width() as f32 <= d.height() as f32 * max_ratio && !sides.all()
 }
 
 /// Network-less guess ladder used only when the libretro index can't
@@ -1326,7 +1583,7 @@ pub fn gather_image_candidates(query: &str) -> Vec<String> {
         .http_status_as_error(true)
         .build()
         .into();
-    let mut out = ddg_image_urls(&agent, query);
+    let mut out = ddg_image_urls(&agent, query, 0.72);
     if out.is_empty() {
         if let Some(v) = bing_candidates(&agent, query) {
             out = v;

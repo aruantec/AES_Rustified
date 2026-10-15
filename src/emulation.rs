@@ -27,10 +27,57 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
-/// Section keys that have a playable handler — only Xenia/X360 is
-/// wired; the other cards stay browse/collect placeholders.
+/// Section keys that have a playable handler — Xenia/X360 and
+/// Flycast/DC are wired; the other cards stay browse/collect
+/// placeholders.
 const XENIA_SECTION: &str = "X360";
 const XENIA_HANDLER: &str = "xenia";
+const DC_SECTION: &str = "DC";
+const FLYCAST_HANDLER: &str = "flycast";
+
+/// The settings-card handler row for a section — the emulator's
+/// display name, managed-install lookup, and download starter
+/// (Lacrima's per-section `EmulationHandlerAppItem`).
+struct HandlerSpec {
+    /// Section key the row defaults to ("X360", "DC").
+    section: &'static str,
+    /// `cfg.emulators` / `default_handlers` id ("xenia", "flycast").
+    handler: &'static str,
+    /// Display name ("Xenia", "Flycast").
+    name: &'static str,
+    /// Textbox hint for the launcher path.
+    exe_hint: &'static str,
+    /// File-dialog title for Browse.
+    dialog_title: &'static str,
+    /// Managed-install exe lookup (`emu_dl::*_exe`).
+    installed_exe: fn() -> Option<PathBuf>,
+    /// Kick the GitHub-release install (`emu_dl::download_*`).
+    download: fn() -> emu_dl::Shared,
+}
+
+fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
+    Some(match section_key {
+        XENIA_SECTION => HandlerSpec {
+            section: XENIA_SECTION,
+            handler: XENIA_HANDLER,
+            name: "Xenia",
+            exe_hint: "Path to xenia.exe",
+            dialog_title: "Locate xenia.exe",
+            installed_exe: emu_dl::xenia_exe,
+            download: emu_dl::download_xenia,
+        },
+        DC_SECTION => HandlerSpec {
+            section: DC_SECTION,
+            handler: FLYCAST_HANDLER,
+            name: "Flycast",
+            exe_hint: "Path to flycast.exe",
+            dialog_title: "Locate flycast.exe",
+            installed_exe: emu_dl::flycast_exe,
+            download: emu_dl::download_flycast,
+        },
+        _ => return None,
+    })
+}
 
 /// Lacrima's EmulationConsoleCatalog FilePatterns — what a section's
 /// handler accepts (the handler *is* the file-type filter). Archives
@@ -680,7 +727,11 @@ impl EmuView {
         if let Some(h) = cfg.default_handlers.get(key) {
             return Some(h.clone());
         }
-        (key == XENIA_SECTION).then(|| XENIA_HANDLER.to_string())
+        match key {
+            XENIA_SECTION => Some(XENIA_HANDLER.to_string()),
+            DC_SECTION => Some(FLYCAST_HANDLER.to_string()),
+            _ => None,
+        }
     }
 
     /// Resolve the section handler's executable — the configured
@@ -700,9 +751,11 @@ impl EmuView {
             self.setup_exe = if valid(&configured) {
                 Some(PathBuf::from(configured.trim()))
             } else {
-                (handler == XENIA_HANDLER)
-                    .then(emu_dl::xenia_exe)
-                    .flatten()
+                match handler.as_str() {
+                    XENIA_HANDLER => emu_dl::xenia_exe(),
+                    FLYCAST_HANDLER => emu_dl::flycast_exe(),
+                    _ => None,
+                }
             };
         }
         self.setup_exe.clone()
@@ -714,49 +767,59 @@ impl EmuView {
     pub fn launch(&mut self, cfg: &settings::Emulation, game: &Path) {
         self.notice = None;
         let handler = self.active_handler(cfg);
-        match handler.as_deref() {
-            Some(XENIA_HANDLER) => {
-                let Some(exe) = self.setup_exe(cfg) else {
-                    self.notice = Some(
-                        "No Xenia executable — set a path or press Download in Settings → Emulation → Xbox 360".into(),
-                    );
-                    return;
-                };
-                // Per-section capture pool depth (Lacrima's
-                // LowLatencyCapture → FramePoolSize 1 vs 2).
-                let low_latency = self
-                    .loaded_key
-                    .as_deref()
-                    .and_then(|k| cfg.render.get(k))
-                    .map(|r| r.low_latency)
-                    .unwrap_or(true);
-                // LaunchEmulatorAsync: PrepareConfigForLaunch merges the
-                // game's custom config onto the template before boot —
-                // on a worker since the first run may download it.
-                let (tx, rx) = mpsc::channel();
-                let g = game.to_path_buf();
-                std::thread::spawn(move || {
-                    // Signed-in slot 0 — the profile we provisioned
-                    // (or any existing one) logs in without Xenia's
-                    // NoProfileDialog, which can't be clicked through
-                    // the hidden capture window.
-                    let mut xuid = None;
-                    if let Some(root) = xenia_cfg::storage_root(exe.parent()) {
-                        xenia_cfg::prepare_for_launch(&root, xenia_cfg::title_id(&g).as_deref());
-                        xuid = xenia_profile::find_xuids(&root).first().copied();
-                    }
-                    let _ = tx.send(xenia::Session::start(
-                        &exe.to_string_lossy(),
-                        &g,
-                        low_latency,
-                        xuid,
-                    ));
-                });
-                self.launch_rx = Some(rx);
-                self.notice = Some("Preparing Xenia…".into());
+        let Some(kind) = (match handler.as_deref() {
+            Some(XENIA_HANDLER) => Some(xenia::Kind::Xenia),
+            Some(FLYCAST_HANDLER) => Some(xenia::Kind::Flycast),
+            _ => None,
+        }) else {
+            self.notice = Some("No emulator handler configured for this section".into());
+            return;
+        };
+        let name = match kind {
+            xenia::Kind::Xenia => "Xenia",
+            xenia::Kind::Flycast => "Flycast",
+        };
+        let Some(exe) = self.setup_exe(cfg) else {
+            self.notice = Some(format!(
+                "No {name} executable — set a path or press Download in Settings → Emulation"
+            ));
+            return;
+        };
+        // Per-section capture pool depth (Lacrima's LowLatencyCapture
+        // → FramePoolSize 1 vs 2).
+        let low_latency = self
+            .loaded_key
+            .as_deref()
+            .and_then(|k| cfg.render.get(k))
+            .map(|r| r.low_latency)
+            .unwrap_or(true);
+        // LaunchEmulatorAsync: PrepareConfigForLaunch merges the
+        // game's custom config onto the template before boot —
+        // on a worker since the first run may download it.
+        let (tx, rx) = mpsc::channel();
+        let g = game.to_path_buf();
+        std::thread::spawn(move || {
+            // Signed-in slot 0 — the profile we provisioned (or any
+            // existing one) logs in without Xenia's NoProfileDialog,
+            // which can't be clicked through the hidden capture
+            // window.
+            let mut xuid = None;
+            if kind == xenia::Kind::Xenia {
+                if let Some(root) = xenia_cfg::storage_root(exe.parent()) {
+                    xenia_cfg::prepare_for_launch(&root, xenia_cfg::title_id(&g).as_deref());
+                    xuid = xenia_profile::find_xuids(&root).first().copied();
+                }
             }
-            _ => self.notice = Some("No emulator handler configured for this section".into()),
-        }
+            let _ = tx.send(xenia::Session::start(
+                &exe.to_string_lossy(),
+                &g,
+                low_latency,
+                xuid,
+                kind,
+            ));
+        });
+        self.launch_rx = Some(rx);
+        self.notice = Some(format!("Preparing {name}…"));
     }
 
     /// Ask the running session to close the emulator.
@@ -2608,6 +2671,31 @@ fn draw_items(
             Color32::from_rgb(0xE0, 0x9A, 0x5A).gamma_multiply(alpha),
         );
     }
+    // Covers stream in on resolver threads — a rotating arc plus a
+    // one-line label (Lacrima's LoadingControl idiom) at the item
+    // area's bottom edge while fetches are still in flight.
+    if !emu.meta_rxs.is_empty() {
+        ui.ctx().request_repaint();
+        let col = Color32::from_rgb(0x2E, 0xB5, 0xFF).gamma_multiply(alpha);
+        let r = 9.0 * s;
+        let cy = rect.max.y - 34.0 * s;
+        let cx = rect.center().x - 58.0 * s;
+        let t0 = (ui.ctx().input(|i| i.time) as f32) * std::f32::consts::TAU * 0.7;
+        let pts: Vec<Pos2> = (0..=20)
+            .map(|i| {
+                let a = t0 + i as f32 / 20.0 * std::f32::consts::TAU * 0.78;
+                Pos2::new(cx + a.cos() * r, cy + a.sin() * r)
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(pts, Stroke::new(2.2 * s, col)));
+        ui.painter().text(
+            Pos2::new(cx + r + 8.0 * s, cy),
+            Align2::LEFT_CENTER,
+            "Fetching covers…",
+            FontId::proportional(13.0 * s),
+            col,
+        );
+    }
     match action {
         // One session at a time — Play while a game runs in the
         // background just brings the capture viewport back.
@@ -2896,10 +2984,10 @@ pub fn settings_tab(
         let key = key.as_str();
         let open = emu.expanded.contains(key);
         let head_h = 88.0 * s;
-        // X360's body hosts the Xenia handler row — a bit taller than
-        // the empty-state cards.
+        // Sections with a wired handler host the handler row — a bit
+        // taller than the empty-state cards.
         let body_h = if open {
-            if key == XENIA_SECTION {
+            if handler_spec(key).is_some() {
                 196.0 * s
             } else {
                 74.0 * s
@@ -2998,8 +3086,8 @@ pub fn settings_tab(
                 Stroke::new(1.0, Color32::from_rgb(0x34, 0x34, 0x34).gamma_multiply(t)),
                 StrokeKind::Inside,
             );
-            if key == XENIA_SECTION {
-                // Xenia handler row — Lacrima's EmulationHandlerAppItem:
+            if let Some(spec) = handler_spec(key) {
+                // Handler row — Lacrima's EmulationHandlerAppItem:
                 // name, launcher path, then the right-aligned
                 // Set-default/Browse/Clear/Download row, with the
                 // download progress block underneath.
@@ -3009,12 +3097,12 @@ pub fn settings_tab(
                 painter.text(
                     Pos2::new(inner.min.x + m, ry + 2.0 * s),
                     Align2::LEFT_TOP,
-                    "Xenia",
+                    spec.name,
                     FontId::proportional(18.0 * s),
                     whitesmoke.gamma_multiply(t),
                 );
                 // Installed/version hint next to the name.
-                if let Some(exe) = emu_dl::xenia_exe() {
+                if let Some(exe) = (spec.installed_exe)() {
                     painter.text(
                         Pos2::new(inner.min.x + m + 64.0 * s, ry + 7.0 * s),
                         Align2::LEFT_TOP,
@@ -3032,7 +3120,7 @@ pub fn settings_tab(
                     Pos2::new(inner.min.x + m, ry + 32.0 * s),
                     Vec2::new(inner.width() - m * 2.0, 26.0 * s),
                 );
-                let entry = cfg.emulators.entry(XENIA_HANDLER.to_string()).or_default();
+                let entry = cfg.emulators.entry(spec.handler.to_string()).or_default();
                 let mut tui = cui.new_child(
                     UiBuilder::new()
                         .max_rect(box_rect)
@@ -3043,7 +3131,7 @@ pub fn settings_tab(
                     egui::TextEdit::singleline(entry)
                         .desired_width(box_rect.width())
                         .hint_text(
-                            egui::RichText::new("Path to xenia.exe")
+                            egui::RichText::new(spec.exe_hint)
                                 .font(font14.clone()),
                         )
                         .font(font14.clone()),
@@ -3065,11 +3153,11 @@ pub fn settings_tab(
                 let downloading = emu.dl.is_some();
                 let is_default = cfg
                     .default_handlers
-                    .get(XENIA_SECTION)
-                    .is_some_and(|h| h == XENIA_HANDLER);
+                    .get(spec.section)
+                    .is_some_and(|h| h == spec.handler);
                 let has_path = cfg
                     .emulators
-                    .get(XENIA_HANDLER)
+                    .get(spec.handler)
                     .is_some_and(|p| !p.trim().is_empty());
                 let btn_font = FontId::proportional(14.0 * s);
                 let measure = |p: &egui::Painter, text: &str| {
@@ -3095,7 +3183,7 @@ pub fn settings_tab(
                     t,
                 );
                 if dl_clicked {
-                    emu.dl = Some(emu_dl::download_xenia());
+                    emu.dl = Some((spec.download)());
                     emu.dl_msg = None;
                 }
                 bx -= 12.0 * s;
@@ -3116,7 +3204,7 @@ pub fn settings_tab(
                         t,
                     );
                     if clr {
-                        cfg.emulators.remove(XENIA_HANDLER);
+                        cfg.emulators.remove(spec.handler);
                         emu.settings_dirty = true;
                     }
                     bx -= 12.0 * s;
@@ -3137,12 +3225,12 @@ pub fn settings_tab(
                 );
                 if browse {
                     if let Some(file) = rfd::FileDialog::new()
-                        .set_title("Locate xenia.exe")
-                        .add_filter("Xenia", &["exe"])
+                        .set_title(spec.dialog_title)
+                        .add_filter(spec.name, &["exe"])
                         .pick_file()
                     {
                         cfg.emulators
-                            .insert(XENIA_HANDLER.into(), file.to_string_lossy().into_owned());
+                            .insert(spec.handler.into(), file.to_string_lossy().into_owned());
                         emu.settings_dirty = true;
                     }
                 }
@@ -3172,7 +3260,7 @@ pub fn settings_tab(
                     );
                     if set_def {
                         cfg.default_handlers
-                            .insert(XENIA_SECTION.into(), XENIA_HANDLER.into());
+                            .insert(spec.section.into(), spec.handler.into());
                         emu.settings_dirty = true;
                     }
                 }
@@ -3189,9 +3277,9 @@ pub fn settings_tab(
                     if let Some(res) = done {
                         match res {
                             Ok(exe) => {
-                                cfg.emulators.insert(XENIA_HANDLER.into(), exe);
+                                cfg.emulators.insert(spec.handler.into(), exe);
                                 emu.settings_dirty = true;
-                                status_line = Some("Xenia installed".into());
+                                status_line = Some(format!("{} installed", spec.name));
                             }
                             Err(e) => status_line = Some(e),
                         }

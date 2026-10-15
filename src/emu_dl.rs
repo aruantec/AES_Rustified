@@ -10,12 +10,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const RELEASES_API: &str =
+const XENIA_RELEASES_API: &str =
     "https://api.github.com/repos/xenia-canary/xenia-canary/releases?per_page=20";
+const FLYCAST_RELEASES_API: &str =
+    "https://api.github.com/repos/flyinghead/flycast/releases?per_page=20";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
-const VERSION_MARKER: &str = "xenia_version.txt";
+const XENIA_VERSION_MARKER: &str = "xenia_version.txt";
+const FLYCAST_VERSION_MARKER: &str = "flycast_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -34,6 +37,12 @@ pub type Shared = Arc<Mutex<DlProgress>>;
 /// `ApplicationPaths.EmulatorsDirectory/<SectionKey>/Xenia`.
 pub fn xenia_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("X360").join("Xenia"))
+}
+
+/// `<data>/Emulators/DC/Flycast` — same layout for the Dreamcast
+/// handler.
+pub fn flycast_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("DC").join("Flycast"))
 }
 
 /// Find the installed launcher (`ResolveLauncherPath`):
@@ -56,6 +65,11 @@ pub fn xenia_exe() -> Option<PathBuf> {
             .and_then(|f| f.to_str())
             .is_some_and(|f| f.to_lowercase().contains("xenia") && f.ends_with(".exe"))
     })
+}
+
+/// Find the installed `flycast.exe` under the managed dir.
+pub fn flycast_exe() -> Option<PathBuf> {
+    resolve_exe(&flycast_dir()?, &FLYCAST_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -125,31 +139,84 @@ pub fn download_patches(root: PathBuf) -> Shared {
     dl
 }
 
+/// Handler-agnostic download spec — which release feed, which asset
+/// marks the windows build, which exe names the install is complete.
+struct EmuSpec {
+    name: &'static str,
+    releases_api: &'static str,
+    version_marker: &'static str,
+    dir: fn() -> Option<PathBuf>,
+    /// True when the release asset is the windows archive.
+    asset_ok: fn(&str) -> bool,
+    /// Preferred exe filenames, in order, then any exe containing
+    /// `exe_contains`.
+    exe_names: &'static [&'static str],
+    exe_contains: &'static str,
+    /// Pull the game-patches pack too (Xenia only).
+    patches: bool,
+}
+
+const XENIA_SPEC: EmuSpec = EmuSpec {
+    name: "Xenia",
+    releases_api: XENIA_RELEASES_API,
+    version_marker: XENIA_VERSION_MARKER,
+    dir: xenia_dir,
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("windows") && n.contains("canary")
+    },
+    exe_names: &["xenia_canary.exe", "xenia.exe"],
+    exe_contains: "xenia",
+    patches: true,
+};
+
+const FLYCAST_SPEC: EmuSpec = EmuSpec {
+    name: "Flycast",
+    releases_api: FLYCAST_RELEASES_API,
+    version_marker: FLYCAST_VERSION_MARKER,
+    dir: flycast_dir,
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("win64") || n.contains("windows")
+    },
+    exe_names: &["flycast.exe"],
+    exe_contains: "flycast",
+    patches: false,
+};
+
 pub fn download_xenia() -> Shared {
+    download_emu(&XENIA_SPEC)
+}
+
+pub fn download_flycast() -> Shared {
+    download_emu(&FLYCAST_SPEC)
+}
+
+fn download_emu(spec: &'static EmuSpec) -> Shared {
     let dl: Shared = Arc::new(Mutex::new(DlProgress {
-        stage: "Starting Xenia download…".into(),
+        stage: format!("Starting {} download…", spec.name),
         ..Default::default()
     }));
     let shared = dl.clone();
     std::thread::spawn(move || {
-        let res = work(&shared);
+        let res = work(&shared, spec);
         let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
         p.done = Some(res);
     });
     dl
 }
 
-fn work(dl: &Shared) -> Result<String, String> {
-    let Some(emu_dir) = xenia_dir() else {
+fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
+    let Some(emu_dir) = (spec.dir)() else {
         return Err("Could not resolve the emulators directory".into());
     };
     let update_dir = emu_dir.join("Emu_Update");
     std::fs::create_dir_all(&update_dir).map_err(|e| format!("Emu dir not writable: {e}"))?;
 
     // Fetch releases — newest non-prerelease first.
-    set(dl, "Fetching Xenia releases…", 0.0);
+    set(dl, &format!("Fetching {} releases…", spec.name), 0.0);
     let mut resp = agent()
-        .get(RELEASES_API)
+        .get(spec.releases_api)
         .header("User-Agent", USER_AGENT)
         .header("Accept", "application/vnd.github+json")
         .call()
@@ -172,15 +239,15 @@ fn work(dl: &Shared) -> Result<String, String> {
     });
     let release = releases
         .first()
-        .ok_or_else(|| "No Xenia Canary releases found".to_string())?;
+        .ok_or_else(|| format!("No {} releases found", spec.name))?;
     let tag = release
         .get("tag_name")
         .and_then(|t| t.as_str())
         .unwrap_or("unknown")
         .to_string();
 
-    // Pick the windows canary archive (Lacrima's
-    // SelectAssetForPlatform — current releases ship .7z).
+    // Pick the windows archive (Lacrima's SelectAssetForPlatform —
+    // Xenia ships .7z, Flycast a win64 .zip).
     let assets: Vec<(String, String)> = release
         .get("assets")
         .and_then(|a| a.as_array())
@@ -198,12 +265,11 @@ fn work(dl: &Shared) -> Result<String, String> {
     let is_archive = |n: &str| n.ends_with(".zip") || n.ends_with(".7z");
     let pick = |pred: &dyn Fn(&str) -> bool| assets.iter().find(|(n, _)| pred(n)).cloned();
     let (asset_name, asset_url) = pick(&|n: &str| {
-        let n = n.to_lowercase();
-        n.contains("windows") && n.contains("canary") && is_archive(&n)
+        (spec.asset_ok)(n) && is_archive(&n.to_lowercase())
     })
     .or_else(|| pick(&|n: &str| n.to_lowercase().contains("win") && is_archive(&n.to_lowercase())))
     .or_else(|| pick(&|n: &str| is_archive(&n.to_lowercase())))
-    .ok_or_else(|| "No compatible Xenia Canary asset found".to_string())?;
+    .ok_or_else(|| format!("No compatible {} asset found", spec.name))?;
 
     // Download the zip.
     let stage = format!("Downloading {asset_name} ({tag})…");
@@ -212,7 +278,7 @@ fn work(dl: &Shared) -> Result<String, String> {
 
     // Extract to a staging dir, normalize a single root folder, then
     // copy into the emulator dir (skipping Emu_Update payloads).
-    set(dl, "Extracting Xenia…", 0.0);
+    set(dl, &format!("Extracting {}…", spec.name), 0.0);
     let extracted = update_dir.join("extracted");
     let _ = std::fs::remove_dir_all(&extracted);
     std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
@@ -221,23 +287,26 @@ fn work(dl: &Shared) -> Result<String, String> {
     copy_dir_contents(&root, &emu_dir, "Emu_Update")?;
 
     // Game patches — best effort (Lacrima tolerates failure here too).
-    set(dl, "Downloading game patches…", 0.0);
-    let _ = install_patches(dl, &emu_dir, &update_dir);
+    if spec.patches {
+        set(dl, "Downloading game patches…", 0.0);
+        let _ = install_patches(dl, &emu_dir, &update_dir);
+    }
 
     // Version marker + cleanup.
-    let _ = std::fs::write(emu_dir.join(VERSION_MARKER), tag.trim());
+    let _ = std::fs::write(emu_dir.join(spec.version_marker), tag.trim());
     let _ = std::fs::remove_dir_all(&update_dir);
     let _ = std::fs::create_dir_all(&update_dir);
 
     set(dl, "Done", 1.0);
-    resolve_exe(&emu_dir).map(|p| p.to_string_lossy().into_owned())
+    resolve_exe(&emu_dir, spec).map(|p| p.to_string_lossy().into_owned())
 }
 
-/// `xenia_canary.exe` → `xenia.exe` → any *xenia*.exe under the dir.
-fn resolve_exe(dir: &Path) -> Result<PathBuf, String> {
+/// Preferred exe names in order, then any exe containing
+/// `spec.exe_contains` under the dir.
+fn resolve_exe(dir: &Path, spec: &EmuSpec) -> Result<PathBuf, String> {
     let mut all = Vec::new();
     walk(dir, &mut all);
-    for want in ["xenia_canary.exe", "xenia.exe"] {
+    for want in spec.exe_names {
         if let Some(p) = all.iter().find(|p| {
             p.file_name()
                 .and_then(|f| f.to_str())
@@ -250,9 +319,11 @@ fn resolve_exe(dir: &Path) -> Result<PathBuf, String> {
         .find(|p| {
             p.file_name()
                 .and_then(|f| f.to_str())
-                .is_some_and(|f| f.to_lowercase().contains("xenia") && f.ends_with(".exe"))
+                .is_some_and(|f| {
+                    f.to_lowercase().contains(spec.exe_contains) && f.ends_with(".exe")
+                })
         })
-        .ok_or_else(|| "xenia.exe not found after install".to_string())
+        .ok_or_else(|| format!("{} exe not found after install", spec.name))
 }
 
 fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), String> {
