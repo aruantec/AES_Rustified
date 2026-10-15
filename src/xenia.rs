@@ -119,11 +119,12 @@ struct Shared {
 
 /// Which emulator a session wraps — controls the CLI args and the
 /// window-resolution heuristics (Xenia's render surface is a
-/// `temp_d3d_window` child; Flycast's is its main SDL/Qt window).
+/// `temp_d3d_window` child; Flycast/xemu's is the main SDL window).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Xenia,
     Flycast,
+    Xemu,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -176,9 +177,34 @@ impl Session {
             .map(|d| d.to_path_buf())
             .unwrap_or_default();
         let mut cmd = Command::new(exe);
-        cmd.arg(game);
-        if let Some(xuid) = profile_xuid {
+        match kind {
+            // xemu mounts disc images via -dvd_path (XemuHandler's
+            // BuildStartInfo); other file types pass bare.
+            Kind::Xemu
+                if matches!(
+                    game.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_lowercase())
+                        .as_deref(),
+                    Some("iso") | Some("xiso")
+                ) =>
+            {
+                cmd.arg("-dvd_path").arg(game);
+            }
+            _ => {
+                cmd.arg(game);
+            }
+        }
+        if let Some(xuid) = profile_xuid.filter(|_| kind == Kind::Xenia) {
             cmd.arg(format!("--logged_profile_slot_0_xuid={xuid:016X}"));
+        }
+        if kind == Kind::Xemu {
+            // The captured window is hidden and unfocused — xemu must
+            // capture controller input in the background or the game
+            // gets no pad input at all (Lacrima's
+            // EnsureBackgroundInputCaptureEnabled). Same mechanism
+            // hides the in-frame menubar and the first-run welcome.
+            ensure_xemu_settings(&work_dir);
         }
         let child = cmd
             .current_dir(work_dir)
@@ -412,6 +438,80 @@ fn set_process_suspended(pid: u32, on: bool) -> bool {
     }
 }
 
+/// Launcher-managed xemu.toml settings — patched next to the exe on
+/// every launch (Lacrima's EnsureBackgroundInputCaptureEnabled,
+/// extended). `background_input_capture` keeps the pad alive while
+/// the window is hidden/unfocused; `show_menubar` hides xemu's
+/// in-frame ImGui menubar (unreachable through capture anyway);
+/// `show_welcome` skips the first-run welcome screen, which would
+/// stall a launch on an unclickable dialog.
+const XEMU_SETTINGS: &[(&str, &str, &str)] = &[
+    ("input", "background_input_capture", "true"),
+    ("display.ui", "show_menubar", "false"),
+    ("general", "show_welcome", "false"),
+];
+
+/// Set `section.key = value` in xemu.toml — replaces the key in place
+/// when it exists inside its section, inserts it right after the
+/// section header, or appends `[section]\nkey = value` at EOF.
+fn toml_set(content: &str, section: &str, key: &str, value: &str) -> String {
+    let header = format!("[{section}]");
+    let mut out = String::with_capacity(content.len() + 64);
+    let mut in_sec = false;
+    let mut wrote = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            // Leaving the target section without having seen the key
+            // — insert just before the next header.
+            if in_sec && !wrote {
+                out.push_str(&format!("{key} = {value}\n"));
+                wrote = true;
+            }
+            in_sec = t.eq_ignore_ascii_case(&header);
+        } else if in_sec
+            && !wrote
+            && t.find('=')
+                .is_some_and(|eq| t[..eq].trim().eq_ignore_ascii_case(key))
+        {
+            out.push_str(&format!("{key} = {value}\n"));
+            wrote = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !wrote {
+        if in_sec {
+            // The section runs to EOF.
+            out.push_str(&format!("{key} = {value}\n"));
+        } else {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{header}\n{key} = {value}\n"));
+        }
+    }
+    out
+}
+
+/// Apply `XEMU_SETTINGS` to `xemu.toml` next to the launcher —
+/// created when absent (xemu would write defaults over the top).
+fn ensure_xemu_settings(launcher_dir: &Path) {
+    let path = launcher_dir.join("xemu.toml");
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut updated = content.clone();
+    for (sec, key, val) in XEMU_SETTINGS {
+        updated = toml_set(&updated, sec, key, val);
+    }
+    if updated != content {
+        let _ = std::fs::write(&path, updated);
+    }
+}
+
 /// Resolve window → prepare/hide → attach capture → monitor. Runs on
 /// its own thread so the UI never blocks on the ~12s resolve window.
 fn worker_main(
@@ -447,7 +547,31 @@ fn worker_main(
 
     // 1. Resolve the render window (Lacrima: up to 240 attempts at
     //    50ms — Xenia creates the d3d window lazily on game boot).
+    //    xemu additionally requires the same candidate to win 3
+    //    consecutive polls (ResolveCaptureTargetAsync's stable
+    //    attempts) so a splash/transition window isn't captured, and
+    //    gets Lacrima's 1500ms CaptureStartupDelay before we start
+    //    looking — its early boot windows aren't the render surface.
+    //
+    //    HideUntilCaptured: every top-level window the process spawns
+    //    is parked (offscreen, 0% opacity) on the poll after it
+    //    appears — ~50ms of visibility instead of the whole resolve
+    //    window. `hidden` keeps each window's original state for the
+    //    capture-failure restore path.
+    let mut hidden: std::collections::HashMap<usize, SavedWindow> =
+        std::collections::HashMap::new();
+    if kind == Kind::Xemu {
+        for _ in 0..15 {
+            sweep_hide(pid, HWND::default(), &mut hidden);
+            if stop.load(Ordering::Relaxed) || !alive(proc) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     let mut hwnd = HWND::default();
+    let mut stable_hwnd = HWND::default();
+    let mut stable_count = 0u32;
     for _ in 0..240 {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -458,11 +582,26 @@ fn worker_main(
         if !alive(proc) {
             break;
         }
+        sweep_hide(pid, HWND::default(), &mut hidden);
         hwnd = resolve_capture_target(pid, kind);
         if !hwnd.is_invalid() {
+            if kind == Kind::Xemu {
+                stable_count = if hwnd == stable_hwnd {
+                    stable_count + 1
+                } else {
+                    stable_hwnd = hwnd;
+                    1
+                };
+                if stable_count < 3 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
         }
+        stable_count = 0;
+        stable_hwnd = HWND::default();
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -487,10 +626,16 @@ fn worker_main(
     //    the target, PrepareProcessForCapture on every top-level
     //    window of the process (the render child lives inside a parent
     //    window — hiding only the child would leave Xenia's shell
-    //    visible).
-    let saved = prepare_window_for_capture(hwnd);
+    //    visible). A target already parked by the sweep keeps its
+    //    ORIGINAL saved state — re-preparing would snapshot the
+    //    stripped/hidden style and break the failure-path restore.
+    let saved = hidden
+        .remove(&(hwnd.0 as usize))
+        .unwrap_or_else(|| prepare_window_for_capture(hwnd));
     hide_window(hwnd);
-    let mut hidden_others = hide_process_windows(pid, hwnd);
+    strip_menu(hwnd);
+    // Catch anything that appeared since the last poll.
+    sweep_hide(pid, hwnd, &mut hidden);
 
     // 3. Attach WGC — frames land in the shared slots (CPU mirror +
     //    zero-copy GPU ring).
@@ -498,19 +643,17 @@ fn worker_main(
     set_status(Status::Capturing);
 
     // 4. Monitor: stop request, process exit, or capture failure.
-    //    One delayed re-hide sweep catches windows Xenia creates
-    //    after the target resolved (late console/dialog surfaces).
-    let started = Instant::now();
-    let mut rehidden = false;
+    //    The sweep keeps parking late windows (dialogs, consoles) the
+    //    emulator creates after the target resolved.
     let mut capture_err: Option<String> = None;
     loop {
         if stop.load(Ordering::Relaxed) || !alive(proc) {
             break;
         }
-        if !rehidden && started.elapsed() > Duration::from_millis(600) {
-            rehidden = true;
-            hidden_others.extend(hide_process_windows(pid, hwnd));
-        }
+        sweep_hide(pid, hwnd, &mut hidden);
+        // The capture target isn't swept — strip its menu too so a
+        // late-attached menu bar can't leak into the captured frame.
+        strip_menu(hwnd);
         if let Some(err) = frames
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -529,8 +672,8 @@ fn worker_main(
         // Capture died but the game may still run — put the windows
         // back so the user can interact with/close it.
         restore_window(hwnd, &saved);
-        for (h, s) in hidden_others {
-            restore_window(h, &s);
+        for (h, s) in hidden {
+            restore_window(HWND(h as *mut _), &s);
         }
         set_status(Status::Failed(err));
         if !proc.is_invalid() {
@@ -735,11 +878,50 @@ fn is_likely_flycast_window(hwnd: HWND, main: HWND) -> bool {
     !looks_primary && (!has_caption || !t.is_empty())
 }
 
+/// IsLikelyXemuRenderWindow — xemu renders in its SDL top-level
+/// window; dialog-ish titles (settings/monitor/about/…) are
+/// rejected, xemu/xbox titles and SDL-class windows win, and a
+/// non-primary top-level is accepted as the last resort.
+fn is_likely_xemu_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    const BAD: &[&str] = &[
+        "settings",
+        "monitor",
+        "about",
+        "input",
+        "controller",
+        "network",
+        "display",
+    ];
+    let title = window_title(hwnd);
+    let t = title.trim().to_lowercase();
+    let class = class_name(hwnd).to_lowercase();
+    if !t.is_empty() {
+        if BAD.iter().any(|w| t.contains(w)) {
+            return false;
+        }
+        if t.contains("xemu") || t.contains("xbox") {
+            return true;
+        }
+    }
+    if !class.is_empty() && (class.contains("sdl") || class.contains("xemu")) {
+        return hwnd != main || !t.is_empty();
+    }
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let has_thick = (style & WS_THICKFRAME.0 as i64) == WS_THICKFRAME.0 as i64;
+    !(hwnd == main && has_caption && has_thick)
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
-    if kind == Kind::Flycast {
-        return is_likely_flycast_window(hwnd, main);
+    match kind {
+        Kind::Flycast => return is_likely_flycast_window(hwnd, main),
+        Kind::Xemu => return is_likely_xemu_window(hwnd, main),
+        Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
         return false;
@@ -805,9 +987,9 @@ fn score_top_level(hwnd: HWND, pid: u32, main: HWND, kind: Kind) -> i64 {
     if !is_likely_render_window(hwnd, main, kind) {
         return i64::MIN;
     }
-    // Flycast requires a real client area before assign
+    // Flycast/xemu require a real client area before assign
     // (IsStableCaptureCandidate — the UI settles at ≥640×360).
-    if kind == Kind::Flycast && (w < 640 || h < 360) {
+    if kind != Kind::Xenia && (w < 640 || h < 360) {
         return i64::MIN;
     }
     let mut score = w as i64 * h as i64 * 10;
@@ -1121,21 +1303,40 @@ fn restore_window(hwnd: HWND, saved: &SavedWindow) {
 // ------------------------------------------------------------------
 // Small Win32 text helpers.
 
-/// PrepareProcessForCapture — hide every visible top-level window of
-/// the process (strip decorations, park at the virtual-desktop
-/// corner, opacity 0), except the capture target itself. Returns the
-/// saved states for failure-path restore.
-fn hide_process_windows(pid: u32, skip: HWND) -> Vec<(HWND, SavedWindow)> {
-    let mut out = Vec::new();
+/// PrepareProcessForCapture on a sweep cadence — prepare + hide every
+/// top-level window of the process not already parked, except `skip`
+/// (the resolved capture target, whose original state lives in
+/// `saved`). Hidden windows stay `WS_VISIBLE` (opacity/position only)
+/// so they keep enumerating — the map dedups repeat visits.
+fn sweep_hide(pid: u32, skip: HWND, hidden: &mut std::collections::HashMap<usize, SavedWindow>) {
     for hwnd in process_windows(pid, false) {
         if hwnd == skip || hwnd.is_invalid() {
             continue;
         }
-        let saved = prepare_window_for_capture(hwnd);
-        hide_window(hwnd);
-        out.push((hwnd, saved));
+        // A real HMENU can be attached after the window's first
+        // sweep, so re-strip on every pass. (xemu's menubar isn't an
+        // HMENU at all — it's ImGui-rendered in-frame, handled by the
+        // show_menubar config patch.)
+        strip_menu(hwnd);
+        hidden
+            .entry(hwnd.0 as usize)
+            .or_insert_with(|| {
+                let saved = prepare_window_for_capture(hwnd);
+                hide_window(hwnd);
+                saved
+            });
     }
-    out
+}
+
+/// Remove a window's menu bar if it has one — a no-op when there
+/// isn't (cheap enough to run on every sweep).
+fn strip_menu(hwnd: HWND) {
+    unsafe {
+        if !GetMenu(hwnd).is_invalid() {
+            let _ = SetMenu(hwnd, None);
+            let _ = DrawMenuBar(hwnd);
+        }
+    }
 }
 
 fn window_title(hwnd: HWND) -> String {

@@ -191,6 +191,16 @@ fn url_label(u: &str) -> String {
         .unwrap_or_else(|| u.to_string())
 }
 
+/// The sidecar + binary scan bundle the editor needs — computed on
+/// a worker since `x360_ids` can walk a multi-GB ISO's filesystem.
+struct LoadedDoc {
+    doc: Option<emu_meta::RomMetaDoc>,
+    ids: Option<(String, String)>,
+    cached_title: Option<String>,
+    cover: Option<Vec<u8>>,
+    images: Vec<(String, Vec<u8>)>,
+}
+
 // ------------------------------------------------------------------
 // The editor
 // ------------------------------------------------------------------
@@ -200,6 +210,9 @@ pub struct RomEditor {
     saved: Option<PathBuf>,
     path: PathBuf,
     platform: String,
+    /// In-flight metadata load — fields/images/Save stay disabled
+    /// until the doc lands (editing early could clobber real data).
+    load_rx: Option<mpsc::Receiver<LoadedDoc>>,
     title: String,
     developer: String,
     year: String,
@@ -235,6 +248,7 @@ impl RomEditor {
             saved: None,
             path: PathBuf::new(),
             platform: String::new(),
+            load_rx: None,
             title: String::new(),
             developer: String::new(),
             year: String::new(),
@@ -264,6 +278,10 @@ impl RomEditor {
 
     /// `platform` is the section's display title — the Platform
     /// field's initial value and the web-search qualifier.
+    ///
+    /// Opens instantly with the stem-derived title; the doc + xex id
+    /// scan + images arrive on `load_rx` — inputs stay disabled until
+    /// then so an early Save can't clobber unloaded fields.
     pub fn open(&mut self, ctx: &egui::Context, path: PathBuf, platform: String) {
         *self = Self::new();
         self.open = true;
@@ -272,25 +290,64 @@ impl RomEditor {
         self.platform = platform;
         ctx.animate_bool(egui::Id::new("rom_editor").with(&self.path), false);
 
-        let doc = emu_meta::load_meta(&self.path);
-        self.title = doc
+        self.title = self
+            .path
+            .file_stem()
+            .map(|s| emu_meta::display_title(&s.to_string_lossy()))
+            .unwrap_or_default();
+        self.search_q = format!("{} {} cover", self.title, self.platform)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let (tx, rx) = mpsc::channel();
+        self.load_rx = Some(rx);
+        let path = self.path.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let doc = emu_meta::load_meta(&path);
+            let images = doc
+                .as_ref()
+                .map(|d| {
+                    d.images
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, r)| {
+                            std::fs::read(emu_meta::meta_image_path(&path, i))
+                                .ok()
+                                .map(|b| (r.kind.clone(), b))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let _ = tx.send(LoadedDoc {
+                ids: emu_meta::x360_ids(&path),
+                cached_title: emu_meta::cached_title(&path),
+                cover: std::fs::read(emu_meta::cover_path(&path)).ok(),
+                doc,
+                images,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Apply the worker's bundle — mirrors the field precedence the
+    /// synchronous loader used: doc title → cached title → stem.
+    fn apply_doc(&mut self, l: LoadedDoc) {
+        if let Some(t) = l
+            .doc
             .as_ref()
             .map(|d| d.title.clone())
             .filter(|t| !t.trim().is_empty())
-            .or_else(|| emu_meta::cached_title(&self.path))
-            .or_else(|| {
-                self.path
-                    .file_stem()
-                    .map(|s| emu_meta::display_title(&s.to_string_lossy()))
-            })
-            .unwrap_or_default();
-        if let Some(d) = &doc {
+            .or(l.cached_title)
+        {
+            self.title = t;
+        }
+        if let Some(d) = &l.doc {
             self.developer = d.developer.clone();
-            self.platform = if d.platform.trim().is_empty() {
-                self.platform.clone()
-            } else {
-                d.platform.clone()
-            };
+            if !d.platform.trim().is_empty() {
+                self.platform = d.platform.clone();
+            }
             self.year = (d.year > 0).then(|| d.year.to_string()).unwrap_or_default();
             self.genre = d.genre.clone();
             self.comment = d.comment.clone();
@@ -299,7 +356,7 @@ impl RomEditor {
             self.mid = d.x360_media_id.clone();
         }
         if self.tid.is_empty() {
-            if let Some((t, m)) = emu_meta::x360_ids(&self.path) {
+            if let Some((t, m)) = l.ids {
                 (self.tid, self.mid) = (t, m);
             }
         }
@@ -308,7 +365,7 @@ impl RomEditor {
             .collect::<Vec<_>>()
             .join(" ");
         // Cover sidecar → the active Cover entry; meta images follow.
-        if let Ok(data) = std::fs::read(emu_meta::cover_path(&self.path)) {
+        if let Some(data) = l.cover {
             self.images.push(Img {
                 kind: ImgKind::Cover,
                 data,
@@ -316,17 +373,13 @@ impl RomEditor {
                 tex_failed: false,
             });
         }
-        if let Some(d) = &doc {
-            for (i, r) in d.images.iter().enumerate() {
-                if let Ok(data) = std::fs::read(emu_meta::meta_image_path(&self.path, i)) {
-                    self.images.push(Img {
-                        kind: ImgKind::from_str(&r.kind),
-                        data,
-                        tex: None,
-                        tex_failed: false,
-                    });
-                }
-            }
+        for (kind, data) in l.images {
+            self.images.push(Img {
+                kind: ImgKind::from_str(&kind),
+                data,
+                tex: None,
+                tex_failed: false,
+            });
         }
     }
 
@@ -421,7 +474,20 @@ impl RomEditor {
     // --------------------------------------------------------------
     pub fn ui(&mut self, ui: &mut egui::Ui, content: Rect, s: f32) {
         let ctx = ui.ctx().clone();
-        // Async results: Add URL bytes, search hits, thumbs, picks.
+        // Async results: doc load, Add URL bytes, search hits/picks.
+        if let Some(rx) = &self.load_rx {
+            match rx.try_recv() {
+                Ok(l) => {
+                    self.apply_doc(l);
+                    self.load_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.load_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.load_rx.is_some() {
+            ctx.request_repaint();
+        }
         if let Some(rx) = &self.url_rx {
             if let Ok(data) = rx.try_recv() {
                 self.url_rx = None;
@@ -550,12 +616,27 @@ impl RomEditor {
 
     fn details(&mut self, ui: &mut egui::Ui, s: f32) {
         ui.spacing_mut().item_spacing.y = 8.0 * s;
-        ui.label(
-            egui::RichText::new("Details")
-                .size(22.0 * s)
-                .strong()
-                .color(egui::Color32::WHITE),
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0 * s;
+            ui.label(
+                egui::RichText::new("Details")
+                    .size(22.0 * s)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            );
+            if self.load_rx.is_some() {
+                ui.add(
+                    egui::Spinner::new()
+                        .size(16.0 * s)
+                        .color(egui::Color32::from_rgb(0x2E, 0xB5, 0xFF)),
+                );
+                ui.label(
+                    egui::RichText::new("Loading metadata…")
+                        .size(13.0 * s)
+                        .color(egui::Color32::from_rgb(0x2E, 0xB5, 0xFF)),
+                );
+            }
+        });
         egui::ScrollArea::vertical()
             .id_salt("rom_details_scroll")
             .auto_shrink([false, false])
@@ -648,6 +729,7 @@ impl RomEditor {
         let left_w = (340.0 * s).min((inner.width() - gap) * 0.5);
         let details = Rect::from_min_size(inner.min, egui::vec2(left_w, inner.height()));
         let images = Rect::from_min_max(egui::pos2(details.max.x + gap, inner.min.y), inner.max);
+        let loading = self.load_rx.is_some();
         for (r, left) in [(details, true), (images, false)] {
             ui.scope_builder(
                 UiBuilder::new()
@@ -655,11 +737,15 @@ impl RomEditor {
                     .layout(egui::Layout::top_down(egui::Align::Min)),
                 |ui| {
                     ui.set_clip_rect(r.expand(2.0).intersect(ui.clip_rect()));
-                    if left {
-                        self.details(ui, s);
-                    } else {
-                        self.images_ui(ui, s);
-                    }
+                    // Fields stay greyed while the doc is loading so an
+                    // early edit/Save can't clobber unloaded values.
+                    ui.add_enabled_ui(!loading, |ui| {
+                        if left {
+                            self.details(ui, s);
+                        } else {
+                            self.images_ui(ui, s);
+                        }
+                    });
                 },
             );
         }
@@ -919,12 +1005,17 @@ impl RomEditor {
             |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0 * s;
                 let pad = egui::vec2(14.0, 8.0) * s;
+                let loading = self.load_rx.is_some();
                 if T::button(ui, "Close", egui::Vec2::ZERO, pad).clicked() {
                     clicked = Some(0);
                 }
-                if T::button(ui, "Save", egui::Vec2::ZERO, pad).clicked() {
-                    clicked = Some(1);
-                }
+                // Save stays off until the doc lands — saving half-
+                // loaded fields would write them back over real data.
+                ui.add_enabled_ui(!loading, |ui| {
+                    if T::button(ui, "Save", egui::Vec2::ZERO, pad).clicked() {
+                        clicked = Some(1);
+                    }
+                });
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(
                         egui::Label::new(

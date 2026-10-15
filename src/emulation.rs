@@ -27,13 +27,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
-/// Section keys that have a playable handler — Xenia/X360 and
-/// Flycast/DC are wired; the other cards stay browse/collect
-/// placeholders.
+/// Section keys that have a playable handler — Xenia/X360,
+/// Flycast/DC and xemu/XBOX are wired; the other cards stay
+/// browse/collect placeholders.
 const XENIA_SECTION: &str = "X360";
 const XENIA_HANDLER: &str = "xenia";
 const DC_SECTION: &str = "DC";
 const FLYCAST_HANDLER: &str = "flycast";
+const XBOX_SECTION: &str = "XBOX";
+const XEMU_HANDLER: &str = "xemu";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -74,6 +76,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             dialog_title: "Locate flycast.exe",
             installed_exe: emu_dl::flycast_exe,
             download: emu_dl::download_flycast,
+        },
+        XBOX_SECTION => HandlerSpec {
+            section: XBOX_SECTION,
+            handler: XEMU_HANDLER,
+            name: "xemu",
+            exe_hint: "Path to xemu.exe",
+            dialog_title: "Locate xemu.exe",
+            installed_exe: emu_dl::xemu_exe,
+            download: emu_dl::download_xemu,
         },
         _ => return None,
     })
@@ -730,6 +741,7 @@ impl EmuView {
         match key {
             XENIA_SECTION => Some(XENIA_HANDLER.to_string()),
             DC_SECTION => Some(FLYCAST_HANDLER.to_string()),
+            XBOX_SECTION => Some(XEMU_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -754,6 +766,7 @@ impl EmuView {
                 match handler.as_str() {
                     XENIA_HANDLER => emu_dl::xenia_exe(),
                     FLYCAST_HANDLER => emu_dl::flycast_exe(),
+                    XEMU_HANDLER => emu_dl::xemu_exe(),
                     _ => None,
                 }
             };
@@ -770,6 +783,7 @@ impl EmuView {
         let Some(kind) = (match handler.as_deref() {
             Some(XENIA_HANDLER) => Some(xenia::Kind::Xenia),
             Some(FLYCAST_HANDLER) => Some(xenia::Kind::Flycast),
+            Some(XEMU_HANDLER) => Some(xenia::Kind::Xemu),
             _ => None,
         }) else {
             self.notice = Some("No emulator handler configured for this section".into());
@@ -778,6 +792,7 @@ impl EmuView {
         let name = match kind {
             xenia::Kind::Xenia => "Xenia",
             xenia::Kind::Flycast => "Flycast",
+            xenia::Kind::Xemu => "xemu",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(

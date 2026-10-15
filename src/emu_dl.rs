@@ -14,11 +14,14 @@ const XENIA_RELEASES_API: &str =
     "https://api.github.com/repos/xenia-canary/xenia-canary/releases?per_page=20";
 const FLYCAST_RELEASES_API: &str =
     "https://api.github.com/repos/flyinghead/flycast/releases?per_page=20";
+const XEMU_RELEASES_API: &str =
+    "https://api.github.com/repos/xemu-project/xemu/releases?per_page=20";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
 const XENIA_VERSION_MARKER: &str = "xenia_version.txt";
 const FLYCAST_VERSION_MARKER: &str = "flycast_version.txt";
+const XEMU_VERSION_MARKER: &str = "xemu_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -43,6 +46,12 @@ pub fn xenia_dir() -> Option<PathBuf> {
 /// handler.
 pub fn flycast_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("DC").join("Flycast"))
+}
+
+/// `<data>/Emulators/XBOX/Xemu` — Lacrima's
+/// `EmulatorsDirectory/<SectionKey>/Xemu`.
+pub fn xemu_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("XBOX").join("Xemu"))
 }
 
 /// Find the installed launcher (`ResolveLauncherPath`):
@@ -70,6 +79,11 @@ pub fn xenia_exe() -> Option<PathBuf> {
 /// Find the installed `flycast.exe` under the managed dir.
 pub fn flycast_exe() -> Option<PathBuf> {
     resolve_exe(&flycast_dir()?, &FLYCAST_SPEC).ok()
+}
+
+/// Find the installed `xemu.exe` under the managed dir.
+pub fn xemu_exe() -> Option<PathBuf> {
+    resolve_exe(&xemu_dir()?, &XEMU_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -184,12 +198,34 @@ const FLYCAST_SPEC: EmuSpec = EmuSpec {
     patches: false,
 };
 
+const XEMU_SPEC: EmuSpec = EmuSpec {
+    name: "xemu",
+    releases_api: XEMU_RELEASES_API,
+    version_marker: XEMU_VERSION_MARKER,
+    dir: xemu_dir,
+    // Lacrima's SelectAssetForPlatform: xemu-win-x86_64-release.zip
+    // first, then any win+x86_64 zip that isn't debug symbols.
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        (n == "xemu-win-x86_64-release.zip" || (n.contains("win") && n.contains("x86_64")))
+            && !n.contains("dbg")
+            && !n.contains("pdb")
+    },
+    exe_names: &["xemu.exe"],
+    exe_contains: "xemu",
+    patches: false,
+};
+
 pub fn download_xenia() -> Shared {
     download_emu(&XENIA_SPEC)
 }
 
 pub fn download_flycast() -> Shared {
     download_emu(&FLYCAST_SPEC)
+}
+
+pub fn download_xemu() -> Shared {
+    download_emu(&XEMU_SPEC)
 }
 
 fn download_emu(spec: &'static EmuSpec) -> Shared {
