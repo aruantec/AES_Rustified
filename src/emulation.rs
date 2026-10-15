@@ -42,6 +42,8 @@ const PS4_SECTION: &str = "PS4";
 const SHADPS4_HANDLER: &str = "shadps4";
 const PSX_SECTION: &str = "PSX";
 const DUCKSTATION_HANDLER: &str = "duckstation";
+const PS2_SECTION: &str = "PS2";
+const PCSX2_HANDLER: &str = "pcsx2";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -118,6 +120,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             dialog_title: "Locate DuckStation",
             installed_exe: emu_dl::duckstation_exe,
             download: emu_dl::download_duckstation,
+        },
+        PS2_SECTION => HandlerSpec {
+            section: PS2_SECTION,
+            handler: PCSX2_HANDLER,
+            name: "PCSX2",
+            exe_hint: "Path to pcsx2-qt.exe",
+            dialog_title: "Locate pcsx2-qt.exe",
+            installed_exe: emu_dl::pcsx2_exe,
+            download: emu_dl::download_pcsx2,
         },
         _ => return None,
     })
@@ -872,6 +883,7 @@ impl EmuView {
             PS3_SECTION => Some(RPCS3_HANDLER.to_string()),
             PS4_SECTION => Some(SHADPS4_HANDLER.to_string()),
             PSX_SECTION => Some(DUCKSTATION_HANDLER.to_string()),
+            PS2_SECTION => Some(PCSX2_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -898,6 +910,7 @@ impl EmuView {
                     RPCS3_HANDLER => emu_dl::rpcs3_exe(),
                     SHADPS4_HANDLER => emu_dl::shadps4_exe(),
                     DUCKSTATION_HANDLER => emu_dl::duckstation_exe(),
+                    PCSX2_HANDLER => emu_dl::pcsx2_exe(),
                     _ => None,
                 }
             };
@@ -918,6 +931,7 @@ impl EmuView {
             Some(RPCS3_HANDLER) => Some(xenia::Kind::Rpcs3),
             Some(SHADPS4_HANDLER) => Some(xenia::Kind::Shadps4),
             Some(DUCKSTATION_HANDLER) => Some(xenia::Kind::DuckStation),
+            Some(PCSX2_HANDLER) => Some(xenia::Kind::Pcsx2),
             _ => None,
         }) else {
             self.notice = Some("No emulator handler configured for this section".into());
@@ -930,6 +944,7 @@ impl EmuView {
             xenia::Kind::Rpcs3 => "RPCS3",
             xenia::Kind::Shadps4 => "shadPS4",
             xenia::Kind::DuckStation => "DuckStation",
+            xenia::Kind::Pcsx2 => "PCSX2",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
@@ -1786,11 +1801,22 @@ pub fn view(
                 // Like the music album row: a single click only selects
                 // the tile — opening a section requires a double-click.
                 album_row::Action::Opened(i) => {
+                    let switching = emu.active != Some(i);
                     emu.active = Some(i);
                     // Load the section's persisted games into the card
                     // view on first activation — the key travels on the
                     // tile's `emu:` dir so reordering can't miskey it.
                     emu.open_section(i, cfg);
+                    // Opening a different section while a game is being
+                    // captured means the user wants the list — dismiss
+                    // the presentation so the newly opened section
+                    // shows (the game keeps running underneath). Same
+                    // side effects as the band's viewport toggle.
+                    if switching && emu.session.is_some() && !emu.viewport_dismissed {
+                        emu.viewport_dismissed = true;
+                        emu.game_fs = false;
+                        emu.input_tun = false;
+                    }
                 }
                 _ => {}
             }

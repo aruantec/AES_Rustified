@@ -24,6 +24,8 @@ const SHADPS4_RELEASES_API: &str =
     "https://api.github.com/repos/shadps4-emu/shadPS4/releases?per_page=20";
 const DUCKSTATION_RELEASES_API: &str =
     "https://api.github.com/repos/stenzek/duckstation/releases?per_page=100";
+const PCSX2_RELEASES_API: &str =
+    "https://api.github.com/repos/PCSX2/pcsx2/releases?per_page=100";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
@@ -35,6 +37,7 @@ const XEMU_VERSION_MARKER: &str = "xemu_version.txt";
 const RPCS3_VERSION_MARKER: &str = "rpcs3_version.txt";
 const SHADPS4_VERSION_MARKER: &str = "shadps4_version.txt";
 const DUCKSTATION_VERSION_MARKER: &str = "duckstation_version.txt";
+const PCSX2_VERSION_MARKER: &str = "pcsx2_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -84,6 +87,11 @@ pub fn duckstation_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("PSX").join("DuckStation"))
 }
 
+/// `<data>/Emulators/PS2/PCSX2`.
+pub fn pcsx2_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("PS2").join("PCSX2"))
+}
+
 /// Find the installed launcher (`ResolveLauncherPath`):
 /// `xenia_canary.exe`, then `xenia.exe`, then any *xenia* exe.
 pub fn xenia_exe() -> Option<PathBuf> {
@@ -129,6 +137,11 @@ pub fn shadps4_exe() -> Option<PathBuf> {
 /// Find the installed DuckStation exe under the managed dir.
 pub fn duckstation_exe() -> Option<PathBuf> {
     resolve_exe(&duckstation_dir()?, &DUCKSTATION_SPEC).ok()
+}
+
+/// Find the installed PCSX2 exe under the managed dir.
+pub fn pcsx2_exe() -> Option<PathBuf> {
+    resolve_exe(&pcsx2_dir()?, &PCSX2_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -217,6 +230,9 @@ struct EmuSpec {
     exe_contains: &'static str,
     /// Pull the game-patches pack too (Xenia only).
     patches: bool,
+    /// Accept `prerelease` releases — PCSX2 marks every rolling
+    /// build prerelease, so a strict filter finds nothing.
+    allow_prerelease: bool,
 }
 
 const XENIA_SPEC: EmuSpec = EmuSpec {
@@ -231,6 +247,7 @@ const XENIA_SPEC: EmuSpec = EmuSpec {
     exe_names: &["xenia_canary.exe", "xenia.exe"],
     exe_contains: "xenia",
     patches: true,
+    allow_prerelease: false,
 };
 
 const FLYCAST_SPEC: EmuSpec = EmuSpec {
@@ -245,6 +262,7 @@ const FLYCAST_SPEC: EmuSpec = EmuSpec {
     exe_names: &["flycast.exe"],
     exe_contains: "flycast",
     patches: false,
+    allow_prerelease: false,
 };
 
 const XEMU_SPEC: EmuSpec = EmuSpec {
@@ -263,6 +281,7 @@ const XEMU_SPEC: EmuSpec = EmuSpec {
     exe_names: &["xemu.exe"],
     exe_contains: "xemu",
     patches: false,
+    allow_prerelease: false,
 };
 
 pub fn download_xenia() -> Shared {
@@ -287,6 +306,7 @@ const RPCS3_SPEC: EmuSpec = EmuSpec {
     exe_names: &["rpcs3.exe"],
     exe_contains: "rpcs3",
     patches: false,
+    allow_prerelease: false,
 };
 
 pub fn download_xemu() -> Shared {
@@ -311,6 +331,7 @@ const SHADPS4_SPEC: EmuSpec = EmuSpec {
     exe_names: &["shadPS4.exe", "shadps4.exe", "shadPS4QtLauncher.exe"],
     exe_contains: "shad",
     patches: false,
+    allow_prerelease: false,
 };
 
 pub fn download_shadps4() -> Shared {
@@ -344,10 +365,37 @@ const DUCKSTATION_SPEC: EmuSpec = EmuSpec {
     ],
     exe_contains: "duckstation",
     patches: false,
+    allow_prerelease: false,
 };
 
 pub fn download_duckstation() -> Shared {
     download_emu(&DUCKSTATION_SPEC)
+}
+
+const PCSX2_SPEC: EmuSpec = EmuSpec {
+    name: "PCSX2",
+    releases_api: PCSX2_RELEASES_API,
+    version_marker: PCSX2_VERSION_MARKER,
+    dir: pcsx2_dir,
+    // SelectAssetForPlatform: the windows Qt 7z minus symbols
+    // (pcsx2-v<ver>-windows-x64-Qt.7z).
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("windows") && n.contains("qt") && !n.contains("symbols") && n.ends_with(".7z")
+    },
+    exe_names: &[
+        "pcsx2-qt.exe",
+        "pcsx2-qtx64-avx2.exe",
+        "pcsx2-qtx64.exe",
+        "pcsx2.exe",
+    ],
+    exe_contains: "pcsx2",
+    patches: false,
+    allow_prerelease: true,
+};
+
+pub fn download_pcsx2() -> Shared {
+    download_emu(&PCSX2_SPEC)
 }
 
 fn download_emu(spec: &'static EmuSpec) -> Shared {
@@ -388,7 +436,10 @@ fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
     let releases = json.as_array().cloned().unwrap_or_default();
     let mut releases: Vec<&serde_json::Value> = releases
         .iter()
-        .filter(|r| r.get("prerelease").and_then(|p| p.as_bool()) != Some(true))
+        .filter(|r| {
+            spec.allow_prerelease
+                || r.get("prerelease").and_then(|p| p.as_bool()) != Some(true)
+        })
         .collect();
     releases.sort_by(|a, b| {
         let pa = a.get("published_at").and_then(|p| p.as_str()).unwrap_or("");

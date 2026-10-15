@@ -552,6 +552,39 @@ impl DeletePrompt {
     }
 }
 
+/// `del_prompt` re-injects a confirmed delete *before* the view runs
+/// each frame — the view's idle `Action::None` result must not
+/// clobber it (the delete-confirm regression: Confirm deleted
+/// nothing). A real action from the frame still wins.
+fn or_row_action(
+    pending: album_row::Action,
+    frame: album_row::Action,
+) -> album_row::Action {
+    if matches!(frame, album_row::Action::None) {
+        pending
+    } else {
+        frame
+    }
+}
+
+/// Same rule for the Option-valued action channels (`delete_path`):
+/// `None` from the view leaves a pending value alone.
+fn or_pending<T>(pending: Option<T>, frame: Option<T>) -> Option<T> {
+    frame.or(pending)
+}
+
+/// Multi-album .apl export: two albums can sanitize to the same file
+/// name — claim `base`, `base (2)`, `base (3)`, … first-come.
+fn claim_export_name(base: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let mut name = base.to_string();
+    let mut k = 2;
+    while !used.insert(name.clone()) {
+        name = format!("{base} ({k})");
+        k += 1;
+    }
+    name
+}
+
 impl AesRustApp {
     fn new(cc: &eframe::CreationContext<'_>, settings: settings::Settings) -> Self {
         // Lacrima renders its title in Consolas Bold and widgets in Segoe UI
@@ -1544,12 +1577,21 @@ impl eframe::App for AesRustApp {
                                         row_armed,
                                         cards_armed,
                                     );
-                                    row_action = ra;
+                                    // A confirmed delete re-injects
+                                    // its action *before* this view
+                                    // ran — the view's idle
+                                    // `None`/`Action::None` result must
+                                    // not clobber it (the
+                                    // delete-confirm regression).
+                                    row_action = or_row_action(
+                                        std::mem::replace(&mut row_action, album_row::Action::None),
+                                        ra,
+                                    );
                                     seek_secs = sk;
                                     play_path = play;
                                     edit_path = ed;
                                     prompt_kind = pr;
-                                    delete_path = del;
+                                    delete_path = or_pending(delete_path.take(), del);
                                     clear_album = cl;
                                     export_album = ex;
                                 }
@@ -1716,7 +1758,10 @@ impl eframe::App for AesRustApp {
                         }
                         SelOwner::Cards => {
                             let paths = carousel.selected_paths();
-                            delete_path = (!paths.is_empty()).then_some(paths);
+                            delete_path = or_pending(
+                                delete_path.take(),
+                                (!paths.is_empty()).then_some(paths),
+                            );
                         }
                         SelOwner::None => {}
                     }
@@ -2142,21 +2187,23 @@ impl eframe::App for AesRustApp {
                         }
                         settings::save(settings);
                     }
-                    album_row::Action::Export(dir) => {
+                    album_row::Action::Export(dirs) => {
                         // The tile menu's export — same document as the
                         // cover-view export; labels come from the
                         // loaded carousel when this album is open,
-                        // persisted urls otherwise.
-                        if let Some(i) = albums.iter().position(|a| a.dir.to_string_lossy() == dir)
-                        {
+                        // persisted urls otherwise. A multi-selection
+                        // exports one .apl per album into a folder.
+                        let items_for = |dir: &str| -> Option<(String, Vec<apl::Item>)> {
+                            let i =
+                                albums.iter().position(|a| a.dir.to_string_lossy() == dir)?;
                             let title = albums[i].title.clone();
-                            let items = if carousel.album_key() == Some(dir.as_str()) {
+                            let items = if carousel.album_key() == Some(dir) {
                                 carousel.export_items()
                             } else {
                                 settings
                                     .library
                                     .url_items
-                                    .get(&dir)
+                                    .get(dir)
                                     .cloned()
                                     .unwrap_or_default()
                                     .into_iter()
@@ -2166,7 +2213,10 @@ impl eframe::App for AesRustApp {
                                     })
                                     .collect()
                             };
-                            if !items.is_empty() {
+                            (!items.is_empty()).then_some((title, items))
+                        };
+                        if dirs.len() == 1 {
+                            if let Some((title, items)) = items_for(&dirs[0]) {
                                 let file_name = {
                                     let n = apl::sanitize_file_name(&title);
                                     if n.is_empty() {
@@ -2186,18 +2236,49 @@ impl eframe::App for AesRustApp {
                                     }
                                 }
                             }
+                        } else if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Export Online Playlists")
+                            .pick_folder()
+                        {
+                            let mut used: std::collections::HashSet<String> =
+                                Default::default();
+                            for dir in &dirs {
+                                let Some((title, items)) = items_for(dir) else {
+                                    continue;
+                                };
+                                let base = {
+                                    let n = apl::sanitize_file_name(&title);
+                                    if n.is_empty() {
+                                        "playlist".to_string()
+                                    } else {
+                                        n
+                                    }
+                                };
+                                let name = claim_export_name(&base, &mut used);
+                                let file = folder.join(format!("{name}.apl"));
+                                if let Err(e) = apl::write(&file, &title, items) {
+                                    eprintln!("apl export failed: {e}");
+                                }
+                            }
                         }
                     }
                     album_row::Action::Import => {
-                        // Lacrima's ImportPlaylistAsync: pick an .apl,
-                        // add a uniquely-titled album of its URL items
-                        // (deduped like IsMediaDuplicate), then open it.
-                        if let Some(file) = rfd::FileDialog::new()
-                            .set_title("Import Online Playlist")
+                        // Lacrima's ImportPlaylistAsync, plural: pick
+                        // one or more .apl files — each adds a uniquely
+                        // -titled album of its URL items (deduped like
+                        // IsMediaDuplicate); the last import opens.
+                        if let Some(files) = rfd::FileDialog::new()
+                            .set_title("Import Online Playlists")
                             .add_filter("AES Online Playlist", &["apl"])
-                            .pick_file()
+                            .pick_files()
                         {
-                            if let Ok(doc) = apl::read(&file) {
+                            // urls + doc items of the last album added —
+                            // it becomes the open target below.
+                            let mut opened: Option<(Vec<String>, Vec<apl::Item>)> = None;
+                            for file in &files {
+                                let Ok(doc) = apl::read(file) else {
+                                    continue;
+                                };
                                 let base = doc
                                     .name
                                     .as_deref()
@@ -2226,78 +2307,98 @@ impl eframe::App for AesRustApp {
                                         urls.push(u.to_string());
                                     }
                                 }
-                                if !urls.is_empty() {
-                                    let dir = format!("{}{}", library::VIRTUAL_SCHEME, title);
-                                    albums.push(library::Album::virtual_album(
-                                        &dir,
-                                        title.clone(),
-                                        &urls,
-                                    ));
-                                    let lib = &mut settings.library;
-                                    lib.virtual_albums.push(settings::VirtualAlbum {
-                                        dir: dir.clone(),
-                                        title,
-                                    });
-                                    lib.url_items.insert(dir, urls.clone());
-                                    settings::save(settings);
-                                    // Open it (the album tile's web
-                                    // covers load on their own worker
-                                    // threads — no synchronous fetch).
-                                    if let Some(album) = albums.last() {
-                                        let album_title = album.title.clone();
-                                        let (tracks, t) = carousel.open(album, &urls);
-                                        // The .apl carries display
-                                        // labels — seed them now;
-                                        // workers still re-resolve
-                                        // fresh metadata + thumbnails.
-                                        for u in &urls {
-                                            let Some(it) =
-                                                doc.items.iter().find(|i| i.url.trim() == u)
-                                            else {
-                                                continue;
-                                            };
-                                            let title = it
-                                                .title
-                                                .as_deref()
-                                                .map(str::trim)
-                                                .filter(|s| !s.is_empty());
-                                            let artist = it.artist.clone().unwrap_or_default();
-                                            if title.is_none() && artist.trim().is_empty() {
-                                                continue;
-                                            }
-                                            // Persist into the
-                                            // metadata cache too — the
-                                            // .apl's labels are the
-                                            // imported source of truth,
-                                            // so reloads need no fetch.
-                                            meta_cache::save(
-                                                u,
-                                                &meta_cache::CachedMeta {
-                                                    title: title.unwrap_or(u).to_string(),
-                                                    artist: artist.clone(),
-                                                    thumb: None,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                            carousel.apply_info(
-                                                std::path::Path::new(u.as_str()),
-                                                &library::TrackInfo {
-                                                    title: title.unwrap_or(u).to_string(),
-                                                    artist,
-                                                    album: it
-                                                        .album
-                                                        .clone()
-                                                        .unwrap_or_else(|| album_title.clone()),
-                                                    number: None,
-                                                    cover_url: None,
-                                                },
-                                            );
-                                        }
-                                        *url_info_rx = Some(library::spawn_url_info(tracks, t));
+                                if urls.is_empty() {
+                                    continue;
+                                }
+                                let dir = format!("{}{}", library::VIRTUAL_SCHEME, title);
+                                albums.push(library::Album::virtual_album(
+                                    &dir,
+                                    title.clone(),
+                                    &urls,
+                                ));
+                                let lib = &mut settings.library;
+                                lib.virtual_albums.push(settings::VirtualAlbum {
+                                    dir: dir.clone(),
+                                    title,
+                                });
+                                lib.url_items.insert(dir, urls.clone());
+                                // The .apl carries display labels —
+                                // persist them into the metadata cache
+                                // for every imported album (the .apl is
+                                // the imported source of truth) whether
+                                // or not it ends up the open one.
+                                for u in &urls {
+                                    let Some(it) =
+                                        doc.items.iter().find(|i| i.url.trim() == u)
+                                    else {
+                                        continue;
+                                    };
+                                    let title = it
+                                        .title
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty());
+                                    let artist = it.artist.clone().unwrap_or_default();
+                                    if title.is_none() && artist.trim().is_empty() {
+                                        continue;
                                     }
-                                    ui.ctx().request_repaint();
+                                    meta_cache::save(
+                                        u,
+                                        &meta_cache::CachedMeta {
+                                            title: title.unwrap_or(u).to_string(),
+                                            artist,
+                                            thumb: None,
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                                opened = Some((urls, doc.items));
+                            }
+                            if opened.is_some() {
+                                settings::save(settings);
+                            }
+                            // Open the last import (tile web covers
+                            // load on their own worker threads).
+                            if let Some((urls, doc_items)) = opened {
+                                if let Some(album) = albums.last() {
+                                    let album_title = album.title.clone();
+                                    let (tracks, t) = carousel.open(album, &urls);
+                                    // Seed the .apl's display labels on
+                                    // the open view; workers still
+                                    // re-resolve fresh metadata.
+                                    for u in &urls {
+                                        let Some(it) =
+                                            doc_items.iter().find(|i| i.url.trim() == u)
+                                        else {
+                                            continue;
+                                        };
+                                        let title = it
+                                            .title
+                                            .as_deref()
+                                            .map(str::trim)
+                                            .filter(|s| !s.is_empty());
+                                        let artist = it.artist.clone().unwrap_or_default();
+                                        if title.is_none() && artist.trim().is_empty() {
+                                            continue;
+                                        }
+                                        carousel.apply_info(
+                                            std::path::Path::new(u.as_str()),
+                                            &library::TrackInfo {
+                                                title: title.unwrap_or(u).to_string(),
+                                                artist,
+                                                album: it
+                                                    .album
+                                                    .clone()
+                                                    .unwrap_or_else(|| album_title.clone()),
+                                                number: None,
+                                                cover_url: None,
+                                            },
+                                        );
+                                    }
+                                    *url_info_rx = Some(library::spawn_url_info(tracks, t));
                                 }
                             }
+                            ui.ctx().request_repaint();
                         }
                     }
                     album_row::Action::Create => {
@@ -6165,5 +6266,88 @@ fn ui_tab_libraries(ui: &mut egui::Ui, panel: Rect, t: f32, ytdlp: &mut ytdlp::Y
             );
         }
         ui.ctx().request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `row_action = ra` used to overwrite the confirmed
+    /// `DeleteAlbum` the delete prompt re-injected, because the view
+    /// returns `Action::None` on idle frames — Confirm deleted nothing.
+    #[test]
+    fn confirmed_album_delete_survives_idle_frame() {
+        let pending = album_row::Action::DeleteAlbum(vec!["d:/games".into()]);
+        let merged = or_row_action(pending, album_row::Action::None);
+        assert!(matches!(
+            merged,
+            album_row::Action::DeleteAlbum(d) if d == ["d:/games"]
+        ));
+    }
+
+    /// A real action from the current frame still wins over a pending
+    /// one — the merge only protects against the idle result.
+    #[test]
+    fn frame_action_beats_pending() {
+        let merged = or_row_action(
+            album_row::Action::DeleteAlbum(vec!["a".into()]),
+            album_row::Action::Opened(2),
+        );
+        assert!(matches!(merged, album_row::Action::Opened(2)));
+    }
+
+    /// Same regression for item deletes: a `None` from the view must
+    /// not clobber a confirmed `delete_path`.
+    #[test]
+    fn confirmed_item_delete_survives_idle_frame() {
+        let p = vec![std::path::PathBuf::from("x.mp3")];
+        assert_eq!(or_pending(Some(p.clone()), None), Some(p));
+    }
+
+    /// A fresh delete request in the same frame takes precedence.
+    #[test]
+    fn frame_items_beat_pending() {
+        let a = vec![std::path::PathBuf::from("a")];
+        let b = vec![std::path::PathBuf::from("b")];
+        assert_eq!(or_pending(Some(a), Some(b.clone())), Some(b));
+    }
+
+    /// The prompt stashes the payload while open, releases it exactly
+    /// once on confirm, and clears everything on dismiss.
+    #[test]
+    fn delete_prompt_lifecycle() {
+        let ctx = egui::Context::default();
+        let mut p = DeletePrompt::default();
+        p.request(PendingDelete::Albums(vec!["x".into()]), &ctx);
+        assert!(p.open && p.pending.is_some() && p.confirmed.is_none());
+        assert_eq!(p.sel, 1); // safe default: Cancel focused
+
+        // What DialogAction::Confirm does at the dialog site.
+        p.open = false;
+        p.confirmed = p.pending.take();
+        assert!(p.pending.is_none());
+        assert!(matches!(
+            p.confirmed.take(),
+            Some(PendingDelete::Albums(d)) if d == ["x"]
+        ));
+        // Taken once — a second frame sees nothing.
+        assert!(p.confirmed.take().is_none());
+
+        p.request(PendingDelete::Items(vec![]), &ctx);
+        p.dismiss();
+        assert!(!p.open && p.pending.is_none() && p.confirmed.is_none());
+    }
+
+    /// Multi-export file naming: identical album titles must not
+    /// overwrite each other's .apl — second claims ` (2)`, third ` (3)`.
+    #[test]
+    fn export_names_dedupe_collisions() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(claim_export_name("Mix", &mut used), "Mix");
+        assert_eq!(claim_export_name("Mix", &mut used), "Mix (2)");
+        assert_eq!(claim_export_name("Mix", &mut used), "Mix (3)");
+        assert_eq!(claim_export_name("Other", &mut used), "Other");
+        assert_eq!(used.len(), 4);
     }
 }

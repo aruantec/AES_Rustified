@@ -83,8 +83,10 @@ pub enum Action {
     /// Delete key pushes every selected album.
     DeleteAlbum(Vec<String>),
     /// "Export Playlist" on the pointed tile — write its URL items
-    /// to an .apl file (Lacrima's ExportOnlinePlaylistCommand).
-    Export(String),
+    /// to an .apl file (Lacrima's ExportOnlinePlaylistCommand). When
+    /// the pointed tile sits inside a multi-selection the payload is
+    /// every selected album's dir (one .apl each), like Delete.
+    Export(Vec<String>),
     /// "Import Playlist" — pick an .apl file to add as an album
     /// (Lacrima's ImportOnlinePlaylistCommand).
     Import,
@@ -1732,14 +1734,30 @@ impl AlbumRow {
                 self.menu_album = None;
                 ui.close();
             }
-            if albums.get(i).map(|a| a.url_count > 0).unwrap_or(false)
-                && ui.button("Export Playlist").clicked()
-            {
-                *action = Action::Export(
-                    albums[i].dir.to_string_lossy().into_owned(),
-                );
-                self.menu_album = None;
-                ui.close();
+            if albums.get(i).map(|a| a.url_count > 0).unwrap_or(false) {
+                let hit = albums[i].dir.to_string_lossy().into_owned();
+                let multi = self.sel_dirs.contains(hit.as_str()) && self.sel_dirs.len() > 1;
+                let label = if multi { "Export Playlists" } else { "Export Playlist" };
+                if ui.button(label).clicked() {
+                    // Pointing at a member of a multi-selection exports
+                    // the whole selection (Delete's rule); .apl only
+                    // holds URL items, so non-url albums are skipped.
+                    let dirs: Vec<String> = if multi {
+                        albums
+                            .iter()
+                            .filter(|a| {
+                                a.url_count > 0
+                                    && self.sel_dirs.contains(a.dir.to_string_lossy().as_ref())
+                            })
+                            .map(|a| a.dir.to_string_lossy().into_owned())
+                            .collect()
+                    } else {
+                        vec![hit]
+                    };
+                    *action = Action::Export(dirs);
+                    self.menu_album = None;
+                    ui.close();
+                }
             }
             if ui.button("Delete Album").clicked() {
                 *action = Action::DeleteAlbum(vec![
