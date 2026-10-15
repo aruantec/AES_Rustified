@@ -1,6 +1,6 @@
-# AES - Rustified
+# AES Lacrima [Rust]
 
-**AES Rustified is a Rust/egui port of [AES_Lacrima](https://github.com/aruantec/AES_Lacrima).**
+**AES Lacrima [Rust] is a Rust/egui port of [AES_Lacrima](https://github.com/aruantec/AES_Lacrima).**
 
 AES stands for **"Aruan's Entertainment Software"**, formerly known as **@ES** in a small emulation
 community. AES_Lacrima is a personal research project, emulation frontend and multimedia app

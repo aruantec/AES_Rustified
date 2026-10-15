@@ -791,12 +791,24 @@ fn ddg_image_urls(agent: &ureq::Agent, q: &str) -> Vec<String> {
     #[derive(Deserialize)]
     struct Entry {
         image: String,
+        width: Option<u32>,
+        height: Option<u32>,
     }
     let Ok(feed) = serde_json::from_str::<Feed>(&r.body_mut().read_to_string().unwrap_or_default())
     else {
         return Vec::new();
     };
-    feed.results
+    let mut results = feed.results;
+    // The feed carries the image's real dimensions — box fronts are
+    // portrait, so rank portrait first, square/unknown middle, and
+    // landscape (flat scans, banners) last. Actual pixel validation
+    // still happens post-download; this just orders the downloads.
+    results.sort_by_key(|e| match (e.width, e.height) {
+        (Some(w), Some(h)) if w > h => 2,
+        (Some(w), Some(h)) if w < h => 0,
+        _ => 1,
+    });
+    results
         .into_iter()
         .map(|e| e.image)
         .filter(|u| u.starts_with("http"))
@@ -840,10 +852,19 @@ fn web_image_fetch(
                 candidates = v;
             }
         }
+        // First validating portrait/square image wins; a landscape hit
+        // (flat scan, banner) is saved as the last-resort fallback for
+        // this query — a real front cover beats it whenever one lands.
+        let mut fallback: Option<PathBuf> = None;
         for img in candidates {
-            if let Some(p) = download_validated(agent, &img, rom) {
-                return Some(p);
+            match download_validated(agent, &img, rom) {
+                Some((p, true)) => return Some(p),
+                Some((p, false)) if fallback.is_none() => fallback = Some(p),
+                _ => {}
             }
+        }
+        if fallback.is_some() {
+            return fallback;
         }
     }
     None
@@ -867,8 +888,14 @@ fn bing_candidates(agent: &ureq::Agent, q: &str) -> Option<Vec<String>> {
 }
 
 /// GET + decode/size gate (Lacrima's `TryValidateAutoCoverImageBytes`)
-/// + sidecar write.
-fn download_validated(agent: &ureq::Agent, url: &str, rom: &Path) -> Option<PathBuf> {
+/// + sidecar write. Returns `(path, good)` — `good` marks a clean
+/// portrait/square front cover; landscape images still save but come
+/// back `false` so the caller can keep looking for a real front cover.
+fn download_validated(
+    agent: &ureq::Agent,
+    url: &str,
+    rom: &Path,
+) -> Option<(PathBuf, bool)> {
     let mut r = agent
         .get(url)
         .header("User-Agent", BING_UA)
@@ -878,11 +905,73 @@ fn download_validated(agent: &ureq::Agent, url: &str, rom: &Path) -> Option<Path
     if bytes.len() < 2 * 1024 {
         return None;
     }
-    match image::load_from_memory(&bytes) {
-        Ok(d) if d.width() >= 120 && d.height() >= 120 => {}
-        _ => return None,
+    let d = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    if d.width() < 120 || d.height() < 120 {
+        return None;
     }
-    save_cover(rom, &bytes)
+    let trimmed = trim_side_bars(&d);
+    let d = trimmed.as_ref().unwrap_or(&d);
+    if d.width() < 120 {
+        return None;
+    }
+    // Real box fronts are portrait (or square) — a landscape result is
+    // a flat front+back+spine scan or a banner: usable, not preferred.
+    let good = d.width() <= d.height();
+    let p = match trimmed {
+        Some(t) => {
+            // Re-encode so the sidecar carries the cropped art.
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(t.clone())
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .ok()?;
+            save_cover(rom, &buf)?
+        }
+        None => save_cover(rom, &bytes)?,
+    };
+    Some((p, good))
+}
+
+/// Crop uniform near-white/near-black side bars — search results often
+/// pillarbox box fronts onto a wider canvas. A column counts as a bar
+/// when ≥90% of 17 sampled rows are uniformly white or black; the trim
+/// is capped at 35% of the width and never reduces to a sliver.
+fn trim_side_bars(img: &image::RgbaImage) -> Option<image::RgbaImage> {
+    let (w, h) = img.dimensions();
+    if w < 40 || h < 40 {
+        return None;
+    }
+    const N: u32 = 17;
+    let row_y = |i: u32| ((i as f32 + 0.5) / N as f32 * h as f32) as u32;
+    let col_is_bar = |x: u32| {
+        let (mut white, mut dark) = (0u32, 0u32);
+        for i in 0..N {
+            let p = img.get_pixel(x, row_y(i).min(h - 1));
+            let mx = p[0].max(p[1]).max(p[2]);
+            let mn = p[0].min(p[1]).min(p[2]);
+            if mx - mn > 14 {
+                return false;
+            }
+            if mx >= 235 {
+                white += 1;
+            } else if mx <= 20 {
+                dark += 1;
+            }
+        }
+        white >= N * 9 / 10 || dark >= N * 9 / 10
+    };
+    let cap = w * 35 / 100;
+    let mut l = 0u32;
+    while l < cap && col_is_bar(l) {
+        l += 1;
+    }
+    let mut r = 0u32;
+    while l + r < cap && col_is_bar(w - 1 - r) {
+        r += 1;
+    }
+    if l + r < 4 || l + r >= w / 2 {
+        return None;
+    }
+    Some(image::imageops::crop_imm(img, l, 0, w - l - r, h).to_image())
 }
 
 // ------------------------------------------------------------------
@@ -964,7 +1053,7 @@ fn resolve_one(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let cover = if cached.exists() {
+    let cover = if cached.exists() && cached_is_front(&cached) {
         Some(cached)
     } else {
         // Title candidates in Lacrima's order: resolved title first,
@@ -995,6 +1084,15 @@ fn resolve_one(
         })
     };
     RomInfo { path: path.to_path_buf(), title, cover }
+}
+
+/// A cached cover is only trusted while it's portrait/square — a
+/// landscape sidecar is almost always a flat front+back+spine scan
+/// from the old dumb fetch, so it re-resolves and self-heals.
+fn cached_is_front(p: &Path) -> bool {
+    image::image_dimensions(p)
+        .map(|(w, h)| w <= h)
+        .unwrap_or(false)
 }
 
 /// Network-less guess ladder used only when the libretro index can't

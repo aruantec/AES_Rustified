@@ -21,6 +21,7 @@ mod particles;
 mod rom_editor;
 mod xenia_cfg;
 mod xenia_overlay;
+mod xenia_profile;
 mod settings;
 mod shadertoy;
 mod search_pill;
@@ -276,7 +277,7 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         wgpu_options,
         viewport: egui::ViewportBuilder::default()
-            .with_title("AES Rustified")
+            .with_title("AES Lacrima [Rust]")
             // Taskbar/alt-tab icon (the file icon comes from app.rc).
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/AES.png"))
@@ -291,7 +292,7 @@ fn main() -> eframe::Result<()> {
 
     boot_mark("run_native enter");
     eframe::run_native(
-        "AES Rustified",
+        "AES Lacrima [Rust]",
         native_options,
         Box::new(move |cc| {
             boot_mark("creation ctx (window+wgpu device ready)");
@@ -827,7 +828,7 @@ impl eframe::App for AesRustApp {
             // crossfade stalls until the next OS event arrives.
             ui.ctx().request_repaint();
         }
-        self.logo.advance(dt, "AES Rustified");
+        self.logo.advance(dt, "AES Lacrima [Rust]");
 
         let radius = if maximized || is_fullscreen {
             0
@@ -1362,7 +1363,7 @@ impl eframe::App for AesRustApp {
         };
         lacrima_window_frame(
             ui,
-            "AES Rustified",
+            "AES Lacrima [Rust]",
             logo,
             elapsed,
             back_icon,
@@ -1659,6 +1660,7 @@ impl eframe::App for AesRustApp {
                     && !emu.editor.is_open()
                     && !emu.patches.is_open()
                     && !emu.cfg_ov.is_open()
+                    && !emu.prof_prompt.is_open()
                     && !emu.render_open
                     && !ui.ctx().text_edit_focused()
                     && ui.ctx().input_mut(|i| {
@@ -1683,6 +1685,7 @@ impl eframe::App for AesRustApp {
                     && !emu.editor.is_open()
                     && !emu.patches.is_open()
                     && !emu.cfg_ov.is_open()
+                    && !emu.prof_prompt.is_open()
                     && !emu.render_open
                     && !ui.ctx().text_edit_focused()
                 {
@@ -1945,6 +1948,13 @@ impl eframe::App for AesRustApp {
                             // The capture render-options panel closes
                             // like the other overlays.
                             emu.render_open = false;
+                        } else if nav.target() == View::Emulation && emu.input_tun {
+                            // Esc is the tunnel's release key — it
+                            // returns control to the app without ever
+                            // reaching the emulator (which Esc would
+                            // otherwise close via the session branch
+                            // below).
+                            emu.input_tun = false;
                         } else if nav.target() == View::Emulation
                             && emu.session.is_some()
                             && emu.game_fs

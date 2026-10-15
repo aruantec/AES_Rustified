@@ -18,7 +18,13 @@ use eframe::egui::{
 
 use crate::{
     album_row, carousel, emu_dl, emu_meta, library, paint, rom_editor, search_pill, settings,
-    transport, xenia, xenia_cfg, xenia_overlay,
+    transport, xenia, xenia_cfg, xenia_overlay, xenia_profile,
+};
+
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
 /// Section keys that have a playable handler — only Xenia/X360 is
@@ -264,6 +270,12 @@ pub struct EmuView {
     pub patches: xenia_overlay::PatchesOverlay,
     /// Xenia per-game Custom Config overlay (XeniaCustomConfigOverlay).
     pub cfg_ov: xenia_overlay::ConfigOverlay,
+    /// Xenia profile-creation prompt — opens when the X360 section is
+    /// entered and no profile exists under the Xenia content dir.
+    pub prof_prompt: xenia_overlay::ProfilePrompt,
+    /// Set by open_section when the prompt should fire once `view()`
+    /// runs (open needs a Context for the fade seed).
+    prof_want: bool,
     /// Launch pipeline — config prep + Session::start run on a
     /// worker; the result lands here (Lacrima's LaunchEmulatorAsync
     /// Task.Run shape so template downloads never stall the UI).
@@ -335,6 +347,23 @@ pub struct EmuView {
     /// Whether the saved aspect_key was applied to this session's
     /// window (the HWND resolves asynchronously after launch).
     aspect_applied: bool,
+    /// Input tunnel — pointer/keys over the capture forward to the
+    /// hidden emulator window via PostMessage so its own UI (Xenia's
+    /// sign-in prompts etc.) is reachable. Session-only; Esc or the
+    /// band button releases it.
+    pub input_tun: bool,
+    /// The live frame mapping the tunnel needs — `(dest, uv)` —
+    /// refreshed every frame the session draw path computes them.
+    tun_map: Option<(Rect, Rect)>,
+    /// Held mouse-button mask (MK_* bits) + tracked modifier state so
+    /// tunneled wParams carry correct key flags.
+    tun_buttons: u8,
+    tun_mods: u8,
+    /// Diagnostics — forwarded-event count + last post result, shown
+    /// in the stats overlay so tunnel issues are visible instead of
+    /// silently dead.
+    pub tun_sent: u32,
+    pub tun_dbg: Option<String>,
 }
 
 impl EmuView {
@@ -400,6 +429,8 @@ impl EmuView {
             editor: rom_editor::RomEditor::new(),
             patches: xenia_overlay::PatchesOverlay::new(),
             cfg_ov: xenia_overlay::ConfigOverlay::new(),
+            prof_prompt: xenia_overlay::ProfilePrompt::new(),
+            prof_want: false,
             launch_rx: None,
             settings_dirty: false,
             render_open: false,
@@ -430,6 +461,12 @@ impl EmuView {
             pillar_lock: None,
             reboot: false,
             aspect_applied: false,
+            input_tun: false,
+            tun_map: None,
+            tun_buttons: 0,
+            tun_mods: 0,
+            tun_sent: 0,
+            tun_dbg: None,
         }
     }
 
@@ -519,6 +556,14 @@ impl EmuView {
             return;
         }
         self.loaded_key = Some(key.clone());
+        // Xenia can't show its own "create a profile" dialog through
+        // the hidden capture window — if no profile exists on disk,
+        // surface our own prompt once per section entry. (Computed
+        // before `key` moves into the resolver below.)
+        self.prof_want = key == XENIA_SECTION
+            && self.active_handler(cfg).as_deref() == Some(XENIA_HANDLER)
+            && !self.prof_prompt.is_open()
+            && xenia_storage(cfg).is_some_and(|r| xenia_profile::find_xuids(&r).is_empty());
         // Per-section render options (Lacrima's SectionSettings) —
         // the panel edits this live copy.
         self.render = cfg.render.get(&key).cloned().unwrap_or_default();
@@ -691,13 +736,20 @@ impl EmuView {
                 let (tx, rx) = mpsc::channel();
                 let g = game.to_path_buf();
                 std::thread::spawn(move || {
+                    // Signed-in slot 0 — the profile we provisioned
+                    // (or any existing one) logs in without Xenia's
+                    // NoProfileDialog, which can't be clicked through
+                    // the hidden capture window.
+                    let mut xuid = None;
                     if let Some(root) = xenia_cfg::storage_root(exe.parent()) {
                         xenia_cfg::prepare_for_launch(&root, xenia_cfg::title_id(&g).as_deref());
+                        xuid = xenia_profile::find_xuids(&root).first().copied();
                     }
                     let _ = tx.send(xenia::Session::start(
                         &exe.to_string_lossy(),
                         &g,
                         low_latency,
+                        xuid,
                     ));
                 });
                 self.launch_rx = Some(rx);
@@ -775,7 +827,15 @@ pub fn view(
     let interactive = interactive
         && !emu.editor.is_open()
         && !emu.patches.is_open()
-        && !emu.cfg_ov.is_open();
+        && !emu.cfg_ov.is_open()
+        && !emu.prof_prompt.is_open();
+
+    // open_section flagged a missing Xenia profile — open the prompt
+    // (deferred to here because open() seeds the fade on the ctx).
+    if emu.prof_want {
+        emu.prof_want = false;
+        emu.prof_prompt.open(ui.ctx());
+    }
 
     // Async launch — the worker merged the custom config and spawned
     // Xenia; the session lands here.
@@ -843,6 +903,7 @@ pub fn view(
         emu.session = None;
         emu.viewport_dismissed = false;
         emu.game_fs = false;
+        emu.input_tun = false;
     }
 
     // The opaque capture layer fades in/out over the carousel —
@@ -1028,12 +1089,14 @@ pub fn view(
             emu.motion_log = None;
         }
     }
-    // Hide the OS cursor while the game owns the screen; it comes
-    // back the moment fullscreen exits (any path).
-    if fs != emu.cursor_hidden {
-        emu.cursor_hidden = fs;
+    // Hide the OS cursor while the game owns the screen — except
+    // while the input tunnel owns it, when the cursor is the user's
+    // pointer into the emulator's own UI.
+    let want_hidden = fs && !emu.input_tun;
+    if want_hidden != emu.cursor_hidden {
+        emu.cursor_hidden = want_hidden;
         ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::CursorVisible(!fs));
+            .send_viewport_cmd(egui::ViewportCommand::CursorVisible(!want_hidden));
     }
     if emu.cap_t > 0.0 {
         // `stable` is the destination the slide is heading TO — the
@@ -1043,6 +1106,12 @@ pub fn view(
         let stable = if fs { content } else { settled_upper };
         draw_session(ui, &painter, pres_rect, stable, emu, alpha * cap_a, s);
     }
+    // The input tunnel — while it owns the session, pointer/key
+    // events inside the frame rect PostMessage to the hidden
+    // emulator window so its own UI is reachable. Esc releases it
+    // (handled in the global Esc chain, which runs after this — the
+    // forward loop just never sends Escape).
+    tunnel_input(ui, emu, interactive && cap_a > 0.5);
     // Gestures on the capture layer (Lacrima's CaptureContextMenuLayer
     // + double-click): double-click toggles game-fullscreen, right-
     // click opens the session menu. The interact region also stops
@@ -1053,7 +1122,7 @@ pub fn view(
             ui.id().with("emu-capture-layer"),
             Sense::click(),
         );
-        if cap.double_clicked() {
+        if cap.double_clicked() && !emu.input_tun {
             emu.game_fs = !emu.game_fs;
         }
         let mut open_editor = false;
@@ -1212,9 +1281,9 @@ pub fn view(
     transport::icon_album_list(&painter, btn, emu.list_open, alpha);
 
     // Right cluster packs from the edge — session-only buttons take
-    // the outer slots: [layout][setup][sliders][power], shrinking to
-    // [layout][setup] while no capture runs (the capture-settings
-    // toggle only exists while a game is being captured).
+    // the outer slots: [layout][setup][sliders][tun][power], shrinking
+    // to [layout][setup] while no capture runs (the capture-settings
+    // and input-tunnel toggles only exist while a game is captured).
     let mut rx = band.max.x - 50.0 * s - 30.0 * s;
     let mut slot = |cond: bool| -> f32 {
         let x = rx;
@@ -1226,6 +1295,7 @@ pub fn view(
         }
     };
     let pw_x = slot(emu.session.is_some());
+    let tun_x = slot(emu.session.is_some());
     let sliders_x = slot(emu.session.is_some());
     let setup_x = rx;
     let layout_x = rx - 110.0 * s;
@@ -1250,6 +1320,30 @@ pub fn view(
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         transport::icon_sliders(&painter, rb, emu.render_open, alpha);
+    }
+
+    // Input-tunnel toggle — while lit, clicks/keys inside the frame
+    // reach the emulator's hidden window so its own dialogs are
+    // usable in the captured stream.
+    if !tun_x.is_nan() {
+        let tb = Rect::from_center_size(Pos2::new(tun_x, cy), Vec2::splat(60.0 * s));
+        let r = if interactive {
+            ui.interact(tb, ui.id().with("emu-tun"), Sense::click())
+        } else {
+            ui.interact(tb, ui.id().with("emu-tun"), Sense::hover())
+        }
+        .on_hover_text(if emu.input_tun {
+            "Stop Controlling Emulator (Esc)"
+        } else {
+            "Control Emulator — clicks and keys reach the game"
+        });
+        if r.clicked() {
+            emu.input_tun = !emu.input_tun;
+        }
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        transport::icon_pointer(&painter, tb, emu.input_tun, alpha);
     }
 
     // Handler-setup launch (LaunchCurrentSectionHandlerSetup) —
@@ -1414,6 +1508,8 @@ pub fn view(
         emu.viewport_dismissed = !emu.viewport_dismissed;
         if emu.viewport_dismissed {
             emu.game_fs = false;
+            // The capture isn't on screen — nothing to tunnel into.
+            emu.input_tun = false;
         }
     }
     if toggle_pause {
@@ -1558,6 +1654,19 @@ pub fn view(
     if emu.cfg_ov.is_open() {
         emu.cfg_ov.ui(ui, content, s);
     }
+    if emu.prof_prompt.is_open() {
+        if let Some(Some(name)) = emu.prof_prompt.ui(ui, content, s) {
+            emu.notice = Some(match xenia_storage(cfg) {
+                Some(root) => match xenia_profile::create(&root, &name) {
+                    Ok(_) => format!(
+                        "Xenia profile \"{name}\" created — it will sign in on launch."
+                    ),
+                    Err(e) => format!("Failed to create the Xenia profile: {e}"),
+                },
+                None => "Failed to create the Xenia profile — no storage root.".into(),
+            });
+        }
+    }
 }
 
 /// Overlay header title — the resolved/custom title when present,
@@ -1641,6 +1750,207 @@ fn frame_dest_uv(
     (dest, uv)
 }
 
+/// The input tunnel — the emulator window is parked invisible and
+/// offscreen, so focus-based input can't reach it. While
+/// `input_tun` is on, every pointer/key event over the frame rect is
+/// re-mapped through the same dest→uv transform the draw used and
+/// posted into the emulator's WndProc (client coords), so its own
+/// UI — sign-in dialogs, menus, text fields — is fully usable in
+/// the captured stream. LMB/MMB/wheel/keys forward; RMB keeps the
+/// app context menu and Esc releases the tunnel (it never reaches
+/// the game — see the Esc chain in main.rs).
+fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
+    if !emu.input_tun || !active {
+        return;
+    }
+    let Some((dest, uv)) = emu.tun_map else {
+        emu.input_tun = false;
+        return;
+    };
+    let Some(session) = &emu.session else {
+        emu.input_tun = false;
+        return;
+    };
+    if !matches!(session.status(), xenia::Status::Capturing) {
+        return;
+    }
+    let Some((cw, ch)) = session.client_size() else {
+        emu.tun_dbg = Some("no client rect".into());
+        return;
+    };
+    emu.tun_dbg = None;
+    // egui point → emulator client pixel. `uv` is the sampled frame
+    // window (pillar crops included) normalized 0..1, so a fraction
+    // of the client size lands on the right texel without needing
+    // the frame's own DPI scale.
+    // Callers gate `dest.contains` themselves; the map clamps so
+    // drags/releases that leave the frame still resolve to an edge.
+    let map = |p: Pos2| -> Option<(i32, i32)> {
+        if dest.width() <= 0.0 || dest.height() <= 0.0 {
+            return None;
+        }
+        let p = Pos2::new(p.x.clamp(dest.min.x, dest.max.x), p.y.clamp(dest.min.y, dest.max.y));
+        let tx = (p.x - dest.min.x) / dest.width();
+        let ty = (p.y - dest.min.y) / dest.height();
+        Some((
+            ((uv.min.x + tx * uv.width()) * cw as f32).round() as i32,
+            ((uv.min.y + ty * uv.height()) * ch as f32).round() as i32,
+        ))
+    };
+    let btns = &mut emu.tun_buttons;
+    let mods = &mut emu.tun_mods;
+    let sent = &mut emu.tun_sent;
+    ui.input(|i| {
+        // MK_* wParam flags (stable Win32 values — MK_SHIFT=0x04,
+        // MK_CONTROL=0x08; the held-button bits match MK_LBUTTON/
+        // MK_RBUTTON/MK_MBUTTON numbering).
+        let mk = |b: u8, m: egui::Modifiers| -> usize {
+            let mut w = b as usize;
+            if m.shift {
+                w |= 0x04;
+            }
+            if m.ctrl {
+                w |= 0x08;
+            }
+            w
+        };
+        for ev in &i.events {
+            match ev {
+                egui::Event::PointerMoved(p) => {
+                    // Hover feeds the emulator's UI even with no
+                    // buttons; while dragging, clamp so drags that
+                    // leave the frame still track.
+                    let in_dest = dest.contains(*p);
+                    if in_dest || *btns != 0 {
+                        if let Some((x, y)) = map(*p) {
+                            *sent += session.post_at(
+                                WM_MOUSEMOVE,
+                                WPARAM(mk(*btns, i.modifiers)),
+                                x,
+                                y,
+                            ) as u32;
+                        }
+                    }
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                } => {
+                    // RMB keeps the app's session menu — the tunnel
+                    // forwards LMB/MMB only.
+                    let (down, up, bit) = match button {
+                        egui::PointerButton::Primary => (WM_LBUTTONDOWN, WM_LBUTTONUP, 0x01u8),
+                        egui::PointerButton::Middle => (WM_MBUTTONDOWN, WM_MBUTTONUP, 0x10u8),
+                        _ => continue,
+                    };
+                    let held = *btns & bit != 0;
+                    if *pressed {
+                        *btns |= bit;
+                    } else {
+                        *btns &= !bit;
+                    }
+                    // Presses need a point inside the frame; releases
+                    // always forward when the button was held so a
+                    // drag-out can't leave it stuck.
+                    if (*pressed && dest.contains(*pos)) || (!*pressed && held) {
+                        if let Some((x, y)) = map(*pos) {
+                            *sent += session.post_at(
+                                if *pressed { down } else { up },
+                                WPARAM(mk(*btns, *modifiers)),
+                                x,
+                                y,
+                            ) as u32;
+                        }
+                    }
+                }
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } => {
+                    if let Some(p) = i.pointer.latest_pos() {
+                        if let Some((x, y)) = map(p) {
+                            if !dest.contains(p) {
+                                continue;
+                            }
+                            // Wheel deltas are in 1/120 units in
+                            // wParam's high word; screen coords in
+                            // lParam.
+                            let d = match unit {
+                                egui::MouseWheelUnit::Line => delta.y * 40.0,
+                                egui::MouseWheelUnit::Page => delta.y * 480.0,
+                                _ => delta.y * 3.0,
+                            }
+                            .clamp(i16::MIN as f32, i16::MAX as f32)
+                            as i16;
+                            if d != 0 {
+                                let (sx, sy) = session.client_to_screen(x, y);
+                                *sent += session.post(
+                                    WM_MOUSEWHEEL,
+                                    WPARAM(((d as u16) as usize) << 16 | mk(*btns, *modifiers)),
+                                    LPARAM(sx as isize & 0xFFFF | (sy as isize) << 16),
+                                ) as u32;
+                            }
+                        }
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    // Esc is the app's release key — never forwarded.
+                    if *key == egui::Key::Escape {
+                        continue;
+                    }
+                    let Some(vk) = xenia::key_vk(*key) else {
+                        continue;
+                    };
+                    xenia::sync_mods(session, modifiers, mods);
+                    *sent += session.post(
+                        if *pressed { WM_KEYDOWN } else { WM_KEYUP },
+                        WPARAM(vk as usize),
+                        xenia::key_lparam(vk, *pressed, *repeat),
+                    ) as u32;
+                }
+                egui::Event::Text(t) => {
+                    for cu in t.encode_utf16() {
+                        *sent += session.post(WM_CHAR, WPARAM(cu as usize), LPARAM(1)) as u32;
+                    }
+                }
+                egui::Event::ModifiersChanged(m) => {
+                    xenia::sync_mods(session, m, mods);
+                }
+                _ => {}
+            }
+        }
+    });
+    // While the game owns input the app's live shortcuts must not
+    // also fire — Backspace would navigate back mid-game, F12 would
+    // toggle fullscreen, Ctrl+F opens search, Ctrl+arrows seek the
+    // player. They run after this view, so consuming here preempts
+    // them; Esc is deliberately left — it releases the tunnel.
+    ui.ctx().input_mut(|i| {
+        i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
+        i.consume_key(egui::Modifiers::NONE, egui::Key::F12);
+        i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+        for k in [
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+        ] {
+            i.consume_key(egui::Modifiers::CTRL, k);
+            i.consume_key(egui::Modifiers::NONE, k);
+        }
+    });
+}
+
 /// Live render adjustments for the zero-copy path — the GPU-side
 /// shader/passthrough applies these since no CPU swizzle ran.
 fn render_adjust(emu: &EmuView) -> (f32, f32, [f32; 4]) {
@@ -1693,6 +2003,7 @@ fn draw_session(
     painter.rect_filled(rect, 0.0, Color32::BLACK.gamma_multiply(alpha));
 
     let Some(session) = &emu.session else {
+        emu.tun_map = None;
         // Session ended — the last frame (if any) still fades out.
         // The imported GPU ring stays alive (its wgpu textures hold
         // the shared allocation) so the zero-copy path fades too.
@@ -2001,6 +2312,9 @@ fn draw_session(
             emu.render.stretch,
             emu.pillar_cur,
         );
+        // The tunnel maps screen → frame → client through this same
+        // transform — refresh it wherever the draw moved to.
+        emu.tun_map = Some((dest, uv));
         // The zero-copy ring drives the draw when imported — the
         // newest signaled slot is sampled in place after the D3D12
         // queue waits on the cross-API fence. Otherwise the CPU
@@ -2099,6 +2413,24 @@ fn draw_session(
     // frametime, optional GPU info, and the frametime graph.
     if emu.render.stats_overlay && matches!(session.status(), xenia::Status::Capturing) {
         draw_stats_overlay(painter, rect, emu, alpha, s);
+    }
+
+    // Input-tunnel state badge — bottom-right, doubles as the
+    // diagnostic (the counter must rise on input; if it doesn't, our
+    // side is dead; if it does, the emulator side ignores them).
+    if emu.input_tun {
+        let label = match &emu.tun_dbg {
+            Some(e) => format!("INPUT → EMULATOR — {e}"),
+            None => format!("INPUT → EMULATOR — {} msgs", emu.tun_sent),
+        };
+        let pos = Pos2::new(rect.max.x - 16.0 * s, rect.max.y - 16.0 * s);
+        painter.text(
+            pos,
+            Align2::RIGHT_BOTTOM,
+            label,
+            FontId::proportional(15.0 * s),
+            Color32::from_rgb(0x60, 0xD8, 0x80).gamma_multiply(alpha),
+        );
     }
 }
 

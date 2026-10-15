@@ -19,8 +19,10 @@ use std::os::windows::io::AsRawHandle;
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{
-    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, RECT, WAIT_TIMEOUT, WPARAM,
+    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, POINT, RECT, WAIT_TIMEOUT, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -32,6 +34,8 @@ use windows::Win32::System::Threading::{
     PROCESS_TERMINATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+use eframe::egui;
 
 use crate::wgc;
 
@@ -146,14 +150,26 @@ impl Session {
     /// — we launch windowed instead since the window is hidden anyway
     /// and a windowed surface stays captureable when moved off-screen.
     /// `low_latency` shrinks the WGC frame pool to a single buffer.
-    pub fn start(exe: &str, game: &Path, low_latency: bool) -> Result<Self, String> {
+    /// `profile_xuid` is passed as `--logged_profile_slot_0_xuid` so a
+    /// provisioned profile signs in without the (unclickable through
+    /// capture) NoProfileDialog.
+    pub fn start(
+        exe: &str,
+        game: &Path,
+        low_latency: bool,
+        profile_xuid: Option<u64>,
+    ) -> Result<Self, String> {
         let exe_path = PathBuf::from(exe);
         let work_dir = exe_path
             .parent()
             .map(|d| d.to_path_buf())
             .unwrap_or_default();
-        let child = Command::new(exe)
-            .arg(game)
+        let mut cmd = Command::new(exe);
+        cmd.arg(game);
+        if let Some(xuid) = profile_xuid {
+            cmd.arg(format!("--logged_profile_slot_0_xuid={xuid:016X}"));
+        }
+        let child = cmd
             .current_dir(work_dir)
             .spawn()
             .map_err(|e| format!("failed to start Xenia: {e}"))?;
@@ -271,6 +287,83 @@ impl Session {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// The windows tunneled input goes to. The capture target may be
+    /// a bare surface window (`temp_d3d_window`) that ignores input,
+    /// while the process's main window (where the ImGui/WndProc input
+    /// listeners live) is its root or owner — so events go to the
+    /// hwnd, its root ancestor AND its root-owner ancestor, deduped.
+    /// Each WndProc ignores what isn't its own, so multiple targets
+    /// are harmless.
+    fn input_targets(&self) -> Vec<HWND> {
+        let hwnd = self.hwnd();
+        if hwnd.is_invalid() {
+            return Vec::new();
+        }
+        let mut out = vec![hwnd];
+        for mode in [GA_ROOT, GA_ROOTOWNER] {
+            let anc = unsafe { GetAncestor(hwnd, mode) };
+            if !anc.is_invalid() && !out.contains(&anc) {
+                out.push(anc);
+            }
+        }
+        out
+    }
+
+    /// Post a pointer message (`(x, y)` = client coords of the
+    /// captured window) to every input target, each translated into
+    /// its own client space. Returns how many windows got a post.
+    pub fn post_at(&self, msg: u32, w: WPARAM, x: i32, y: i32) -> usize {
+        let targets = self.input_targets();
+        let n = targets.len();
+        for t in targets {
+            let mut pt = POINT { x, y };
+            // Client→screen is relative to OUR capture window first,
+            // then screen→client into the target's space.
+            unsafe {
+                let _ = ClientToScreen(self.hwnd(), &mut pt);
+                let _ = ScreenToClient(t, &mut pt);
+            }
+            let lp = LPARAM((pt.x as isize & 0xFFFF) | ((pt.y as isize) << 16));
+            let _ = unsafe { PostMessageW(Some(t), msg, w, lp) };
+        }
+        n
+    }
+
+    /// Key/char messages carry no coords — post the same lParam to
+    /// every input target. Returns how many windows got a post.
+    pub fn post(&self, msg: u32, w: WPARAM, l: LPARAM) -> usize {
+        let targets = self.input_targets();
+        let n = targets.len();
+        for t in targets {
+            let _ = unsafe { PostMessageW(Some(t), msg, w, l) };
+        }
+        n
+    }
+
+    /// The render window's client size in its own pixel space — the
+    /// tunnel scales captured-frame coords by client/frame rather
+    /// than assuming they're equal.
+    pub fn client_size(&self) -> Option<(i32, i32)> {
+        let hwnd = self.hwnd();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut r = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut r) }.ok()?;
+        Some((r.right - r.left, r.bottom - r.top))
+    }
+
+    /// WM_MOUSEWHEEL takes *screen* coords in lParam — translate a
+    /// client point for it.
+    pub fn client_to_screen(&self, x: i32, y: i32) -> (i32, i32) {
+        let hwnd = self.hwnd();
+        let mut p = POINT { x, y };
+        unsafe {
+            let _ = ClientToScreen(hwnd, &mut p);
+        }
+        (p.x, p.y)
     }
 
     /// True once the emulator process is gone (UI can drop the
@@ -1045,4 +1138,98 @@ pub fn launch_setup(exe: &str) -> Result<(), String> {
             .push(job);
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------
+// Input tunnel — the emulator window is parked invisible/offscreen,
+// so clicks and keys can't reach it via SendInput/focus; the tunnel
+// maps the on-screen capture rect to client coords and PostMessages
+// the events straight into its WndProc instead.
+// ------------------------------------------------------------------
+/// egui::Key → Win32 virtual-key code. Punctuation maps to the OEM
+/// VK the char lives on — the *shifted* char itself arrives through
+/// the tunneled WM_CHAR stream, so the VK only needs the right key.
+pub fn key_vk(key: egui::Key) -> Option<u16> {
+    use egui::Key as K;
+    // Letter/digit/F-key runs are contiguous in the enum — range
+    // arithmetic on the discriminant keeps the table compact.
+    let d = key as u32;
+    let between = |lo: K, hi: K| (lo as u32..=hi as u32).contains(&d);
+    if between(K::A, K::Z) {
+        return Some(0x41 + (d - K::A as u32) as u16);
+    }
+    if between(K::Num0, K::Num9) {
+        return Some(0x30 + (d - K::Num0 as u32) as u16);
+    }
+    if between(K::F1, K::F20) {
+        return Some(0x70 + (d - K::F1 as u32) as u16);
+    }
+    Some(match key {
+        K::ArrowDown => 0x28,
+        K::ArrowLeft => 0x25,
+        K::ArrowRight => 0x27,
+        K::ArrowUp => 0x26,
+        K::Tab => 0x09,
+        K::Backspace => 0x08,
+        K::Enter => 0x0D,
+        K::Space => 0x20,
+        K::Insert => 0x2D,
+        K::Delete => 0x2E,
+        K::Home => 0x24,
+        K::End => 0x23,
+        K::PageUp => 0x21,
+        K::PageDown => 0x22,
+        K::Colon | K::Semicolon => 0xBA,     // OEM_1 (;:)
+        K::Plus | K::Equals => 0xBB,       // OEM_PLUS (=+)
+        K::Comma => 0xBC,
+        K::Minus => 0xBD,
+        K::Period => 0xBE,
+        K::Slash | K::Questionmark => 0xBF, // OEM_2 (/?)
+        K::Backtick => 0xC0,
+        K::OpenBracket | K::OpenCurlyBracket => 0xDB,
+        K::Backslash | K::Pipe => 0xDC,
+        K::CloseBracket | K::CloseCurlyBracket => 0xDD,
+        K::Quote => 0xDE,
+        K::Exclamationmark => 0x31, // shift+1 — the char rides WM_CHAR
+        _ => return None,
+    })
+}
+
+/// WM_KEYDOWN/UP lParam: repeat count 1, the real scancode, the
+/// extended bit for the nav cluster/arrows, and the state bits
+/// (previous-state for repeats, transition for releases). WndProcs
+/// that only read wParam (Xenia's ImGui) don't care, but proper
+/// lParams keep anyone who does honest.
+pub fn key_lparam(vk: u16, pressed: bool, repeat: bool) -> LPARAM {
+    let sc = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) };
+    let ext = matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E
+    ) as isize;
+    let mut l = 1isize | ((sc as isize) << 16) | (ext << 24);
+    if pressed && repeat {
+        l |= 1 << 30;
+    }
+    if !pressed {
+        l |= 0xC000_0000;
+    }
+    LPARAM(l)
+}
+
+/// WM_KEYDOWN for a held modifier while the tunnel runs — Xenia's UI
+/// tracks Shift/Ctrl/Alt via their own key messages, so transitions
+/// post too.
+pub fn sync_mods(session: &Session, m: &egui::Modifiers, cur: &mut u8) {
+    let want = m.shift as u8 | (m.ctrl as u8) << 1 | (m.alt as u8) << 2;
+    for (bit, vk) in [(0x01u8, 0x10u16), (0x02, 0x11), (0x04, 0x12)] {
+        if want & bit != *cur & bit {
+            let down = want & bit != 0;
+            session.post(
+                if down { WM_KEYDOWN } else { WM_KEYUP },
+                WPARAM(vk as usize),
+                key_lparam(vk, down, false),
+            );
+        }
+    }
+    *cur = want;
 }

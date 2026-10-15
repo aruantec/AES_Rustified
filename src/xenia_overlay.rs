@@ -1278,3 +1278,193 @@ impl ConfigOverlay {
         changed
     }
 }
+
+// ======================================================================
+// Profile prompt — shown when the X360 section has no Xenia profile.
+// A centered textbox that creates the profile on disk; the launcher
+// then auto-signs it in via --logged_profile_slot_0_xuid so Xenia's
+// NoProfileDialog never appears (it can't be clicked through the
+// hidden capture window).
+// ======================================================================
+pub struct ProfilePrompt {
+    text: String,
+    open: bool,
+    shown: bool,
+    want_focus: bool,
+    /// Set by open() once the fade-out finishes — Some(submitted
+    /// gamertag) on Enter/Create, None on Esc dismissal.
+    result: Option<Option<String>>,
+}
+
+impl ProfilePrompt {
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            open: false,
+            shown: false,
+            want_focus: false,
+            result: None,
+        }
+    }
+
+    pub fn open(&mut self, ctx: &egui::Context) {
+        self.text.clear();
+        self.open = true;
+        self.shown = true;
+        self.want_focus = true;
+        self.result = None;
+        ctx.animate_bool(egui::Id::new("xenia-profile-fade"), false);
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Paint + input. Returns the submit outcome exactly once, after
+    /// the dismiss fade completes: Some(name) to create the profile,
+    /// Some("") on cancel.
+    pub fn ui(&mut self, ui: &mut egui::Ui, content: Rect, s: f32) -> Option<Option<String>> {
+        if !self.open {
+            return None;
+        }
+        let ctx = ui.ctx().clone();
+        let fade = ctx.animate_bool_with_time_and_easing(
+            egui::Id::new("xenia-profile-fade"),
+            self.shown,
+            0.35,
+            egui::emath::easing::cubic_out,
+        );
+        if fade <= 0.001 && !self.shown {
+            self.open = false;
+            return self.result.take();
+        }
+        ctx.request_repaint();
+
+        // Scrim — swallows the item area, does not dismiss on click.
+        let painter = ui.painter().clone();
+        painter.rect_filled(
+            content,
+            CornerRadius::ZERO,
+            egui::Color32::from_black_alpha(230).gamma_multiply(fade),
+        );
+        let _ = ui.interact(content, ui.id().with("xenia-profile-scrim"), egui::Sense::click());
+
+        let valid = crate::xenia_profile::is_valid_gamertag(self.text.trim());
+        let mut submit = false;
+        let mut cancel = false;
+
+        // Centered column: title, subtitle, pill textbox, hint.
+        let box_w = 450.0 * s;
+        let box_h = 45.0 * s;
+        let title_h = 34.0 * s;
+        let sub_h = 22.0 * s;
+        let hint_h = 18.0 * s;
+        let gap = 14.0 * s;
+        let total_h = title_h + sub_h + gap + box_h + hint_h;
+        let cx = content.center().x;
+        let mut cy = content.center().y - total_h * 0.5;
+
+        painter.text(
+            egui::Pos2::new(cx, cy + title_h * 0.5),
+            egui::Align2::CENTER_CENTER,
+            "Create Xenia Profile",
+            egui::FontId::proportional(26.0 * s),
+            egui::Color32::WHITE.gamma_multiply(0.92 * fade),
+        );
+        cy += title_h;
+        painter.text(
+            egui::Pos2::new(cx, cy + sub_h * 0.5),
+            egui::Align2::CENTER_CENTER,
+            "No Xbox 360 profile found — pick a gamertag and Xenia will sign in automatically.",
+            egui::FontId::proportional(13.0 * s),
+            SUBTEXT.gamma_multiply(0.85 * fade),
+        );
+        cy += sub_h + gap;
+
+        let box_rect = Rect::from_center_size(
+            egui::Pos2::new(cx, cy + box_h * 0.5),
+            egui::vec2(box_w, box_h),
+        );
+        painter.rect_filled(
+            box_rect,
+            box_h * 0.5,
+            egui::Color32::from_black_alpha(204).gamma_multiply(fade),
+        );
+        painter.rect_stroke(
+            box_rect,
+            box_h * 0.5,
+            Stroke::new(
+                1.5 * s,
+                egui::Color32::from_white_alpha(68).gamma_multiply(fade),
+            ),
+            egui::StrokeKind::Inside,
+        );
+
+        let text_rect = Rect::from_min_max(
+            egui::Pos2::new(box_rect.min.x + 24.0 * s, box_rect.min.y + 2.0 * s),
+            egui::Pos2::new(box_rect.max.x - 16.0 * s, box_rect.max.y - 2.0 * s),
+        );
+        let mut tui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        tui.visuals_mut().override_text_color =
+            Some(egui::Color32::WHITE.gamma_multiply(0.92 * fade));
+        tui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
+        tui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        tui.visuals_mut().widgets.hovered.weak_bg_fill = egui::Color32::TRANSPARENT;
+        tui.visuals_mut().widgets.active.weak_bg_fill = egui::Color32::TRANSPARENT;
+        let resp = tui.add(
+            egui::TextEdit::singleline(&mut self.text)
+                .hint_text("Enter gamertag (1-15 chars, letters and digits)")
+                .font(egui::FontId::proportional(16.0 * s))
+                .text_color(egui::Color32::WHITE.gamma_multiply(0.92 * fade))
+                .desired_width(text_rect.width() - 4.0 * s)
+                .frame(egui::Frame::NONE),
+        );
+        if self.want_focus {
+            resp.request_focus();
+            self.want_focus = false;
+        }
+        cy += box_h;
+        if !self.text.is_empty() && !valid {
+            painter.text(
+                egui::Pos2::new(cx, cy + hint_h * 0.5),
+                egui::Align2::CENTER_CENTER,
+                "Start with a letter — letters, digits and single spaces only",
+                egui::FontId::proportional(11.5 * s),
+                egui::Color32::from_rgb(0xE0, 0x80, 0x80).gamma_multiply(0.9 * fade),
+            );
+        }
+
+        // Enter submits when valid; Esc cancels. Both are CONSUMED —
+        // this ui() runs before the global Esc/Enter chain in main.rs
+        // and neither may leak through (Esc would otherwise navigate
+        // back / close a running session).
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                cancel = true;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                submit = valid;
+                cancel = !valid; // Enter on an empty/invalid box = cancel
+            }
+        });
+        if resp.lost_focus() && valid && self.shown {
+            // The singleline TextEdit surrenders focus on Enter — that
+            // path submits too (consume_key above already ran first in
+            // the same frame, so this only catches IME-style commits).
+            submit = true;
+        }
+        if submit || cancel {
+            self.shown = false;
+            self.result = Some(if submit {
+                Some(self.text.trim().to_string())
+            } else {
+                None
+            });
+        }
+        None
+    }
+}

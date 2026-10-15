@@ -812,6 +812,30 @@ pub(crate) fn icon_power(painter: &egui::Painter, rect: Rect, alpha: f32) {
     painter.add(egui::Shape::line(pts, stroke));
 }
 
+/// Input-tunnel toggle (the emulator-control button): a classic
+/// pointer-cursor arrow, lit while clicks/keys forward into the
+/// captured emulator window.
+pub(crate) fn icon_pointer(painter: &egui::Painter, rect: Rect, on: bool, alpha: f32) {
+    let c = (if on { LIT } else { DIM }).gamma_multiply(alpha);
+    let k = rect.height() / 100.0;
+    // Cursor silhouette: tip at top-left, notched tail — the Win32
+    // arrow shape scaled to the 100px box.
+    let pts = [
+        cv(rect, 100.0, 34.0, 14.0),
+        cv(rect, 100.0, 34.0, 72.0),
+        cv(rect, 100.0, 44.0, 62.0),
+        cv(rect, 100.0, 52.0, 82.0),
+        cv(rect, 100.0, 60.0, 77.0),
+        cv(rect, 100.0, 52.0, 56.0),
+        cv(rect, 100.0, 66.0, 56.0),
+    ];
+    painter.add(Shape::convex_polygon(pts.to_vec(), c, Stroke::NONE));
+    painter.add(Shape::closed_line(
+        pts.to_vec(),
+        Stroke::new(3.0 * k, c),
+    ));
+}
+
 /// Equalizer: rounded frame with a divider, 4 vertical slider slots
 /// with chunky knobs. Lit while the EQ drawer is open.
 fn icon_eq(painter: &egui::Painter, rect: Rect, open: bool, alpha: f32) {

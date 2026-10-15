@@ -2,7 +2,7 @@
 name = "aes_rustified"
 version = "0.1.0"
 edition = "2021"
-description = "AES Rustified"
+description = "AES Lacrima [Rust]"
 
 # The shipped binary is AES-Rustified.exe — the package name stays a
 # normal crate identifier.
