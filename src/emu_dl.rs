@@ -22,6 +22,8 @@ const RPCS3_RELEASES_API: &str =
     "https://api.github.com/repos/RPCS3/rpcs3-binaries-win/releases?per_page=20";
 const SHADPS4_RELEASES_API: &str =
     "https://api.github.com/repos/shadps4-emu/shadPS4/releases?per_page=20";
+const DUCKSTATION_RELEASES_API: &str =
+    "https://api.github.com/repos/stenzek/duckstation/releases?per_page=100";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
@@ -32,6 +34,7 @@ const FLYCAST_VERSION_MARKER: &str = "flycast_version.txt";
 const XEMU_VERSION_MARKER: &str = "xemu_version.txt";
 const RPCS3_VERSION_MARKER: &str = "rpcs3_version.txt";
 const SHADPS4_VERSION_MARKER: &str = "shadps4_version.txt";
+const DUCKSTATION_VERSION_MARKER: &str = "duckstation_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -75,6 +78,12 @@ pub fn shadps4_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("PS4").join("shadPS4"))
 }
 
+/// `<data>/Emulators/PSX/DuckStation` — Lacrima's
+/// `EmulatorsDirectory/PSX/DuckStation`.
+pub fn duckstation_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("PSX").join("DuckStation"))
+}
+
 /// Find the installed launcher (`ResolveLauncherPath`):
 /// `xenia_canary.exe`, then `xenia.exe`, then any *xenia* exe.
 pub fn xenia_exe() -> Option<PathBuf> {
@@ -115,6 +124,11 @@ pub fn rpcs3_exe() -> Option<PathBuf> {
 /// Find the installed `shadPS4.exe` under the managed dir.
 pub fn shadps4_exe() -> Option<PathBuf> {
     resolve_exe(&shadps4_dir()?, &SHADPS4_SPEC).ok()
+}
+
+/// Find the installed DuckStation exe under the managed dir.
+pub fn duckstation_exe() -> Option<PathBuf> {
+    resolve_exe(&duckstation_dir()?, &DUCKSTATION_SPEC).ok()
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -301,6 +315,39 @@ const SHADPS4_SPEC: EmuSpec = EmuSpec {
 
 pub fn download_shadps4() -> Shared {
     download_emu(&SHADPS4_SPEC)
+}
+
+const DUCKSTATION_SPEC: EmuSpec = EmuSpec {
+    name: "DuckStation",
+    releases_api: DUCKSTATION_RELEASES_API,
+    version_marker: DUCKSTATION_VERSION_MARKER,
+    dir: duckstation_dir,
+    // Lacrima's asset pick: duckstation-windows-x64-release.zip —
+    // the symbols 7z and the sse2/x64 variants match a naive
+    // windows+x64 filter and sort BEFORE the real zip in the
+    // release's asset list, so exclude them explicitly.
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("duckstation-windows")
+            && n.contains("x64")
+            && !n.contains("symbols")
+            && !n.contains("sse2")
+            && !n.contains("arm64")
+    },
+    // ResolveLauncherPath — the LTCG build first, then the plain Qt
+    // exe and renames.
+    exe_names: &[
+        "duckstation-qt-x64-ReleaseLTCG.exe",
+        "duckstation-qt-x64-Release.exe",
+        "duckstation-qt.exe",
+        "duckstation.exe",
+    ],
+    exe_contains: "duckstation",
+    patches: false,
+};
+
+pub fn download_duckstation() -> Shared {
+    download_emu(&DUCKSTATION_SPEC)
 }
 
 fn download_emu(spec: &'static EmuSpec) -> Shared {

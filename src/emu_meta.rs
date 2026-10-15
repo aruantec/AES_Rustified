@@ -989,6 +989,339 @@ pub(crate) fn descriptor_refs(path: &Path) -> Vec<PathBuf> {
 }
 
 // ------------------------------------------------------------------
+// PlayStation / PlayStation 2 serial + title DB
+// (PsxIsoTitleIdHelper + embedded Database/{psx,ps2}.json —
+// NormalizeSerialKey lookup → game title)
+// ------------------------------------------------------------------
+const PS_SECTOR: u64 = 2048;
+const PS_PVD_OFF: u64 = 16 * PS_SECTOR;
+const PS_SERIAL_PREFIXES: &[&str] = &[
+    "SLUS", "SCUS", "SLES", "SCES", "SLPS", "SCPS", "SLPM", "SCPM", "SLKA", "SCKA", "SLAJ", "SCAJ",
+    "SLEH", "SCEH", "PAPX", "SCZS",
+];
+
+/// Lacrima's NormalizeSerialKey — spaces/underscores/dots become
+/// dashes, then uppercase. Display form for extracted serials.
+fn ps_serial_norm(s: &str) -> String {
+    s.trim()
+        .replace(' ', "-")
+        .replace('_', "-")
+        .replace('.', "-")
+        .to_uppercase()
+}
+
+/// Lookup key — alphanumeric-only squash, so "SLUS_005.94",
+/// "SLUS-00594" and "slus00594" all hit the same DB row (the
+/// strict normalized form misses the common `XXXX_NNN.NN` CNF style).
+fn ps_serial_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+fn ps_db(file: &'static str) -> &'static HashMap<String, String> {
+    static PSX: OnceLock<HashMap<String, String>> = OnceLock::new();
+    static PS2: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let slot = if file == "psx.json" { &PSX } else { &PS2 };
+    slot.get_or_init(|| {
+        let json = if file == "psx.json" {
+            include_str!("../assets/database/psx.json")
+        } else {
+            include_str!("../assets/database/ps2.json")
+        };
+        let mut map = HashMap::new();
+        for e in serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap_or_default() {
+            let (Some(serial), Some(title)) = (
+                e.get("serial").and_then(|s| s.as_str()),
+                e.get("title").and_then(|s| s.as_str()),
+            ) else {
+                continue;
+            };
+            // First wins on squash collisions (Lacrima's
+            // `!lookup.ContainsKey` behavior).
+            map.entry(ps_serial_key(serial))
+                .or_insert_with(|| title.trim().to_string());
+        }
+        map
+    })
+}
+
+/// The disc serial — Lacrima's GetTitleId dispatch on extension.
+pub(crate) fn ps_disc_serial(path: &Path) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+    match ext.as_str() {
+        // A cue owns its tracks — read the first data bin.
+        "cue" => cue_track_files(path)
+            .into_iter()
+            .find_map(|b| ps_iso_serial(&b)),
+        "m3u" => descriptor_refs(path)
+            .into_iter()
+            .find_map(|p| ps_disc_serial(&p)),
+        "pbp" => ps_pbp_serial(path),
+        _ => ps_iso_serial(path),
+    }
+}
+
+/// PBP's embedded PARAM.SFO carries TITLE_ID (GetTitleIdFromPbp).
+fn ps_pbp_serial(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 0x28];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"PBP\0" {
+        return None;
+    }
+    let sfo_off = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
+    f.seek(SeekFrom::Start(sfo_off)).ok()?;
+    // The SFO data table bound is unknown — read to EOF (PBPs are
+    // small relative to what follows anyway) and let the parser walk.
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    if bytes.len() < 20 || bytes[0..4] != [0x00, 0x50, 0x53, 0x46] {
+        return None;
+    }
+    let u32le = |o: usize| -> Option<usize> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+    };
+    let key_table = u32le(8)?;
+    let data_table = u32le(12)?;
+    let count = u32le(16)?.min(4096);
+    for i in 0..count {
+        let e = 20 + i * 16;
+        let Some(entry) = bytes.get(e..e + 16) else {
+            break;
+        };
+        let key_off = u16::from_le_bytes(entry[0..2].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
+        let data_off = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+        let key: String = bytes
+            .get(key_table + key_off..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
+        if key.eq_ignore_ascii_case("TITLE_ID") && data_len > 0 {
+            let raw = bytes.get(data_table + data_off..data_table + data_off + data_len)?;
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let v = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+            return (!v.is_empty()).then_some(v);
+        }
+    }
+    None
+}
+
+/// MODE1/2048 PVD → root dir → SYSTEM.CNF `BOOT=` serial, then
+/// PSX.EXE scan, then the 16-sector system area, then the filename
+/// (Lacrima's GetTitleIdFromIso fallback chain).
+fn ps_iso_serial(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let read_at = |f: &mut std::fs::File, off: u64, len: usize| -> Option<Vec<u8>> {
+        f.seek(SeekFrom::Start(off)).ok()?;
+        let mut b = vec![0u8; len];
+        let n = f.read(&mut b).ok()?;
+        (n > 0).then(|| {
+            b.truncate(n);
+            b
+        })
+    };
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len >= PS_PVD_OFF + PS_SECTOR {
+        if let Some(pvd) = read_at(&mut f, PS_PVD_OFF, PS_SECTOR as usize) {
+            if pvd.first() == Some(&1) {
+                // Root directory record sits at PVD+156 (34 bytes):
+                // extent LBA le32@+2, data size le32@+10.
+                let root_lba = le32(&pvd, 156 + 2).unwrap_or(0) as u64;
+                let root_size = le32(&pvd, 156 + 10).unwrap_or(0).min(64 * 1024 * 1024);
+                if root_lba != 0 && root_size != 0 {
+                    if let Some(dir) = read_at(&mut f, root_lba * PS_SECTOR, root_size as usize) {
+                        if let Some(cnf) = iso_read_named(&mut f, &dir, "SYSTEM.CNF", &read_at) {
+                            if let Some(s) = ps_parse_system_cnf(&cnf) {
+                                return Some(s);
+                            }
+                        }
+                        if let Some(exe) = iso_read_named(&mut f, &dir, "PSX.EXE", &read_at) {
+                            if let Some(s) = ps_scan_serial(&exe) {
+                                return Some(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The 32KB system area precedes the PVD — some images keep
+        // the serial there.
+        if let Some(area) = read_at(&mut f, 0, 16 * PS_SECTOR as usize) {
+            if let Some(s) = ps_scan_serial(&area) {
+                return Some(s);
+            }
+        }
+    }
+    ps_serial_from_name(path)
+}
+
+/// Walk an ISO9660 directory for `name` (single level — Lacrima
+/// only reads the root dir) and return the file's bytes.
+fn iso_read_named(
+    f: &mut std::fs::File,
+    dir: &[u8],
+    name: &str,
+    read_at: &dyn Fn(&mut std::fs::File, u64, usize) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    while pos < dir.len() {
+        let rec = dir[pos] as usize;
+        if rec == 0 {
+            // Directory records can't cross a sector boundary.
+            let pad = PS_SECTOR as usize - (pos % PS_SECTOR as usize);
+            pos += pad.max(1);
+            continue;
+        }
+        if pos + rec > dir.len() {
+            break;
+        }
+        let name_len = dir[pos + 32] as usize;
+        if name_len > 0 {
+            if let Some(raw) = dir.get(pos + 33..pos + 33 + name_len) {
+                let n = String::from_utf8_lossy(raw);
+                let n = n.split(';').next().unwrap_or("");
+                if n.eq_ignore_ascii_case(name) {
+                    let lba = le32(dir, pos + 2)? as u64;
+                    let size = le32(dir, pos + 10)?.min(64 * 1024 * 1024) as usize;
+                    if lba != 0 && size != 0 {
+                        return read_at(f, lba * PS_SECTOR, size);
+                    }
+                    return None;
+                }
+            }
+        }
+        pos += rec;
+    }
+    None
+}
+
+/// SYSTEM.CNF `BOOT = cdrom:\SLUS_005.94;1` → "SLUS-00594".
+fn ps_parse_system_cnf(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(eq) = line.find('=') else {
+            continue;
+        };
+        // PSX discs use BOOT, PS2 discs BOOT2 (cdrom0:/...).
+        let key = line[..eq].trim();
+        if !key.eq_ignore_ascii_case("BOOT") && !key.eq_ignore_ascii_case("BOOT2") {
+            continue;
+        }
+        let mut exe = line[eq + 1..].trim();
+        let lower = exe.to_lowercase();
+        for p in ["cdrom0:", "cdrom:"] {
+            if lower.starts_with(p) {
+                exe = exe[p.len()..].trim_start_matches(['/', '\\']);
+                break;
+            }
+        }
+        let base = exe
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(exe)
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if base.is_empty() {
+            continue;
+        }
+        let upper = base.to_uppercase();
+        if let Some(s) = ps_prefix_serial(&upper) {
+            return Some(s);
+        }
+        return Some(ps_serial_norm(&upper));
+    }
+    None
+}
+
+/// Find a SERIAL_PREFIXES token in `s` and collect ≤16 alnum/-_
+/// chars after it (≥9 total → "SLUS-00594").
+fn ps_prefix_serial(upper: &str) -> Option<String> {
+    for p in PS_SERIAL_PREFIXES {
+        let Some(idx) = upper.find(p) else {
+            continue;
+        };
+        let bytes = upper.as_bytes();
+        let mut end = idx + p.len();
+        while end < bytes.len() && end - idx < 16 {
+            let c = bytes[end] as char;
+            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+                break;
+            }
+            end += 1;
+        }
+        if end - idx >= 9 {
+            return Some(ps_serial_norm(&upper[idx..end]));
+        }
+    }
+    None
+}
+
+/// Scan raw bytes for a serial-prefixed token (PSX.EXE / system
+/// area fallback).
+fn ps_scan_serial(data: &[u8]) -> Option<String> {
+    for i in 0..data.len().saturating_sub(9) {
+        if !matches!(data[i], b'S' | b's') {
+            continue;
+        }
+        for p in PS_SERIAL_PREFIXES {
+            let pb = p.as_bytes();
+            if i + pb.len() > data.len() {
+                continue;
+            }
+            if !data[i..i + pb.len()].eq_ignore_ascii_case(pb) {
+                continue;
+            }
+            let mut end = i + pb.len();
+            while end < data.len() && end - i < 16 {
+                let c = data[end];
+                if !(c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+                    break;
+                }
+                end += 1;
+            }
+            if (9..=16).contains(&(end - i)) {
+                let s = String::from_utf8_lossy(&data[i..end]);
+                return Some(ps_serial_norm(&s));
+            }
+        }
+    }
+    None
+}
+
+/// Last resort: "SLUS-00594 - Game Name.iso" (TryExtractFromFileName).
+fn ps_serial_from_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?.to_uppercase();
+    ps_prefix_serial(&stem)
+}
+
+/// psx.json serial → title (Lacrima's ResolvePsTitle on PSX).
+fn psx_title(path: &Path) -> Option<String> {
+    let id = ps_disc_serial(path)?;
+    ps_db("psx.json").get(&ps_serial_key(&id)).cloned()
+}
+
+/// ps2.json serial → title — same ISO layout + serial family.
+fn ps2_title(path: &Path) -> Option<String> {
+    let id = ps_disc_serial(path)?;
+    ps_db("ps2.json").get(&ps_serial_key(&id)).cloned()
+}
+
+// ------------------------------------------------------------------
 // LibRetro thumbnails (LibRetroThumbnailCoverService)
 // ------------------------------------------------------------------
 const LIBRETRO_BASE: &str = "https://thumbnails.libretro.com/";
@@ -1947,6 +2280,8 @@ fn resolve_one(
         let t = match section_key {
             "X360" => x360_title(path),
             "DC" => dc_title(path),
+            "PSX" => psx_title(path),
+            "PS2" => ps2_title(path),
             "PS3" => ps3_title(path),
             "PS4" => ps4_title(path),
             _ => None,
@@ -2536,5 +2871,79 @@ mod tests {
         // Prefix chars that aren't all-alpha mustn't false-positive
         // the generic PS4 pattern on "123456789".
         assert!(ps4_title_id_token("123456789").is_none());
+    }
+
+    /// SYSTEM.CNF parsing — PSX `BOOT = cdrom:\...` and PS2
+    /// `BOOT2 = cdrom0:\...` forms both yield a normalized serial.
+    #[test]
+    fn system_cnf_serial_parse() {
+        // The serial keeps its on-disc punctuation — the DB lookup
+        // squashes separators, so SLUS_005.94 == SLUS-00594.
+        assert_eq!(
+            ps_parse_system_cnf(b"BOOT = cdrom:\\SLUS_005.94;1\r\n")
+                .map(|s| ps_serial_key(&s))
+                .as_deref(),
+            Some("SLUS00594")
+        );
+        assert_eq!(
+            ps_parse_system_cnf(b"BOOT2 = cdrom0:\\SCUS_971.13;1\n")
+                .map(|s| ps_serial_key(&s))
+                .as_deref(),
+            Some("SCUS97113")
+        );
+        assert!(ps_parse_system_cnf(b"VMODE = PAL\n").is_none());
+    }
+
+    /// A synthetic ISO9660 (PVD@16 + root dir + SYSTEM.CNF) resolves
+    /// a serial → the embedded psx/ps2 DB title — the whole chain.
+    #[test]
+    fn psx_iso_serial_resolves_db_title() {
+        fn dirrec(img: &mut [u8], off: usize, lba: u32, size: u32, name: &[u8]) -> usize {
+            let len = 33 + name.len() + usize::from(name.len() % 2 == 0);
+            img[off] = len as u8;
+            img[off + 2..off + 6].copy_from_slice(&lba.to_le_bytes());
+            img[off + 6..off + 10].copy_from_slice(&lba.to_be_bytes());
+            img[off + 10..off + 14].copy_from_slice(&size.to_le_bytes());
+            img[off + 14..off + 18].copy_from_slice(&size.to_be_bytes());
+            img[off + 32] = name.len() as u8;
+            img[off + 33..off + 33 + name.len()].copy_from_slice(name);
+            len
+        }
+        let cnf = b"BOOT = cdrom:\\SLUS_005.94;1";
+        let mut img = vec![0u8; 22 * 2048];
+        img[16 * 2048] = 1; // PVD type
+        let rec = 16 * 2048 + 156;
+        dirrec(&mut img, rec, 20, 2048, &[0]);
+        let dir = 20 * 2048;
+        let mut p = dir;
+        p += dirrec(&mut img, p, 20, 2048, &[0]);
+        p += dirrec(&mut img, p, 20, 2048, &[1]);
+        let _ = dirrec(&mut img, p, 21, cnf.len() as u32, b"SYSTEM.CNF;1");
+        img[21 * 2048..21 * 2048 + cnf.len()].copy_from_slice(cnf);
+
+        let dir_p = std::env::temp_dir().join(format!("aes_test_psx_{}", std::process::id()));
+        std::fs::create_dir_all(&dir_p).unwrap();
+        let iso = dir_p.join("game.iso");
+        std::fs::write(&iso, &img).unwrap();
+        assert_eq!(
+            ps_disc_serial(&iso).map(|s| ps_serial_key(&s)).as_deref(),
+            Some("SLUS00594")
+        );
+        assert_eq!(psx_title(&iso).as_deref(), Some("Metal Gear Solid (Disc 1)"));
+        let _ = std::fs::remove_dir_all(&dir_p);
+    }
+
+    /// Serial normalization hits the DB through its variants —
+    /// filenames like "SLUS_005.94 - Game.iso" must map too.
+    #[test]
+    fn ps_serial_normalization() {
+        assert_eq!(ps_serial_norm("slus_005.94"), "SLUS-005-94");
+        assert_eq!(ps_serial_key("slus_005.94"), "SLUS00594");
+        assert_eq!(
+            ps_serial_from_name(Path::new("SLUS-00594 - Metal Gear Solid.iso"))
+                .map(|s| ps_serial_key(&s))
+                .as_deref(),
+            Some("SLUS00594")
+        );
     }
 }

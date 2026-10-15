@@ -40,6 +40,8 @@ const PS3_SECTION: &str = "PS3";
 const RPCS3_HANDLER: &str = "rpcs3";
 const PS4_SECTION: &str = "PS4";
 const SHADPS4_HANDLER: &str = "shadps4";
+const PSX_SECTION: &str = "PSX";
+const DUCKSTATION_HANDLER: &str = "duckstation";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -107,6 +109,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             dialog_title: "Locate shadPS4.exe",
             installed_exe: emu_dl::shadps4_exe,
             download: emu_dl::download_shadps4,
+        },
+        PSX_SECTION => HandlerSpec {
+            section: PSX_SECTION,
+            handler: DUCKSTATION_HANDLER,
+            name: "DuckStation",
+            exe_hint: "Path to duckstation-qt-x64-ReleaseLTCG.exe",
+            dialog_title: "Locate DuckStation",
+            installed_exe: emu_dl::duckstation_exe,
+            download: emu_dl::download_duckstation,
         },
         _ => return None,
     })
@@ -702,7 +713,7 @@ impl EmuView {
 
     /// Resolved titles + fetched covers from the worker — applied to
     /// the card items as they stream in.
-    fn drain_meta(&mut self, cfg: &settings::Emulation) {
+    fn drain_meta(&mut self, cfg: &settings::Emulation, ctx: &egui::Context) {
         let mut i = 0;
         let mut covers_landed = false;
         while i < self.meta_rxs.len() {
@@ -744,6 +755,11 @@ impl EmuView {
         // A landed cover may be a section tile's new face.
         if covers_landed {
             self.refresh_section_covers(cfg);
+        }
+        // Resolvers still in flight — keep repainting so results
+        // land without waiting on input events.
+        if !self.meta_rxs.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -855,6 +871,7 @@ impl EmuView {
             XBOX_SECTION => Some(XEMU_HANDLER.to_string()),
             PS3_SECTION => Some(RPCS3_HANDLER.to_string()),
             PS4_SECTION => Some(SHADPS4_HANDLER.to_string()),
+            PSX_SECTION => Some(DUCKSTATION_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -880,6 +897,7 @@ impl EmuView {
                     XEMU_HANDLER => emu_dl::xemu_exe(),
                     RPCS3_HANDLER => emu_dl::rpcs3_exe(),
                     SHADPS4_HANDLER => emu_dl::shadps4_exe(),
+                    DUCKSTATION_HANDLER => emu_dl::duckstation_exe(),
                     _ => None,
                 }
             };
@@ -899,6 +917,7 @@ impl EmuView {
             Some(XEMU_HANDLER) => Some(xenia::Kind::Xemu),
             Some(RPCS3_HANDLER) => Some(xenia::Kind::Rpcs3),
             Some(SHADPS4_HANDLER) => Some(xenia::Kind::Shadps4),
+            Some(DUCKSTATION_HANDLER) => Some(xenia::Kind::DuckStation),
             _ => None,
         }) else {
             self.notice = Some("No emulator handler configured for this section".into());
@@ -910,6 +929,7 @@ impl EmuView {
             xenia::Kind::Xemu => "xemu",
             xenia::Kind::Rpcs3 => "RPCS3",
             xenia::Kind::Shadps4 => "shadPS4",
+            xenia::Kind::DuckStation => "DuckStation",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
@@ -1188,7 +1208,7 @@ pub fn view(
     }
 
     // Resolved titles + fetched covers land on the card items.
-    emu.drain_meta(cfg);
+    emu.drain_meta(cfg, ui.ctx());
 
     // The carousel stays mounted under the capture layer — cards keep
     // receiving input only once the layer is mostly faded out. While
@@ -3538,6 +3558,10 @@ pub fn settings_tab(
                         }
                         emu.dl = None;
                     } else {
+                        // Keep repainting while the download runs —
+                        // egui is reactive, so without this the bar
+                        // only moves on input events.
+                        ui.ctx().request_repaint();
                         let track = Rect::from_min_size(
                             Pos2::new(inner.min.x + m, py),
                             Vec2::new(inner.width() - m * 2.0, 6.0 * s),

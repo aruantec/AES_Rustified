@@ -132,6 +132,7 @@ pub enum Kind {
     Xemu,
     Rpcs3,
     Shadps4,
+    DuckStation,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -240,6 +241,20 @@ impl Session {
                 // CreateNoWindow.)
                 use std::os::windows::process::CommandExt;
                 cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            // DuckStation: `-batch -nofullscreen -nogui -- <rom>` —
+            // switches before `--`, the image path after so the
+            // filename can't parse as an option (DuckStationHandler's
+            // BuildStartInfo). portable.txt forces portable mode
+            // (settings.ini beside the exe) and PauseOnFocusLoss must
+            // be off — a hidden window never gets focus.
+            Kind::DuckStation => {
+                ensure_duckstation_setup(&work_dir);
+                cmd.arg("-batch")
+                    .arg("-nofullscreen")
+                    .arg("-nogui")
+                    .arg("--")
+                    .arg(game);
             }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
@@ -614,6 +629,41 @@ fn ensure_rpcs3_pause_fix(launcher_dir: &Path) {
     }
 }
 
+/// DuckStationHandler's EnsurePortableModeMarker +
+/// EnsurePauseOnFocusLossDisabled: `portable.txt` beside the exe
+/// keeps all state in the install dir, and pause-on-focus-loss must
+/// be off or the hidden window freezes the game.
+fn ensure_duckstation_setup(exe_dir: &Path) {
+    let _ = std::fs::write(exe_dir.join("portable.txt"), b"");
+    let ini = exe_dir.join("settings.ini");
+    let Ok(content) = std::fs::read_to_string(&ini) else {
+        return;
+    };
+    let mut out = String::with_capacity(content.len());
+    let mut dirty = false;
+    for line in content.lines() {
+        if line
+            .trim_start()
+            .to_lowercase()
+            .starts_with("pauseonfocusloss")
+            && line.contains('=')
+        {
+            if line.trim() != "PauseOnFocusLoss = false" {
+                out.push_str("PauseOnFocusLoss = false");
+                dirty = true;
+            } else {
+                out.push_str(line);
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if dirty {
+        let _ = std::fs::write(&ini, out);
+    }
+}
+
 /// Folder ROM → its EBOOT.BIN boot target
 /// (Ps3InstalledGameHelper.GetPreferredBootPath); files pass through.
 fn ps3_boot_path(game: &Path) -> PathBuf {
@@ -693,9 +743,12 @@ fn worker_main(
     let delay = match kind {
         Kind::Xemu => 1500,
         Kind::Rpcs3 => 2500,
+        // CaptureStartupDelayMs = 120 — DuckStation's early Qt
+        // windows settle fast.
+        Kind::DuckStation => 120,
         _ => 0,
     };
-    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4) {
+    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation) {
         25
     } else {
         100
@@ -755,9 +808,10 @@ fn worker_main(
     // whether its 16:9 capture geometry has been applied yet.
     let mut rpcs3_geom = false;
     let mut rpcs3_size = (0i32, 0i32);
-    // 25ms polls for RPCS3/shadPS4 keep the cloak gap sub-frame; other
-    // kinds sweep at 50ms (window flash isn't an issue once captured).
-    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4) {
+    // 25ms polls for RPCS3/shadPS4/DuckStation keep the cloak gap
+    // sub-frame; other kinds sweep at 50ms (window flash isn't an
+    // issue once captured).
+    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation) {
         25
     } else {
         50
@@ -839,6 +893,36 @@ fn worker_main(
                 });
                 prepare_window_for_capture(hwnd);
                 apply_aspect_ratio(hwnd, 16.0 / 9.0);
+            }
+            if kind == Kind::DuckStation {
+                // ResolveCaptureTargetAsync: the candidate must be
+                // ≥640×360 client AND the same hwnd across 6
+                // consecutive polls (stableAttemptsBeforeAssign) —
+                // the Qt UI settles before the game surface is
+                // stable.
+                let (w, h) = client_size(hwnd).unwrap_or((0, 0));
+                if w < 640 || h < 360 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                stable_count = if hwnd == stable_hwnd {
+                    stable_count + 1
+                } else {
+                    stable_hwnd = hwnd;
+                    1
+                };
+                if stable_count < 6 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                // CaptureWindowAspectRatio = 4:3 applied once.
+                hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                });
+                prepare_window_for_capture(hwnd);
+                apply_aspect_ratio(hwnd, 4.0 / 3.0);
             }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
@@ -939,8 +1023,9 @@ fn worker_main(
                 2500
             }
             // Lacrima's ForceCloseTrackedEmulatorProcess kills
-            // shadPS4 outright — no graceful window close.
-            Kind::Shadps4 => 0,
+            // shadPS4 and DuckStation outright — no graceful window
+            // close (DuckStation prompts to confirm on WM_CLOSE).
+            Kind::Shadps4 | Kind::DuckStation => 0,
             _ => {
                 unsafe {
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1410,6 +1495,67 @@ fn score_shadps4_child(hwnd: HWND, pid: u32, parent: HWND) -> i64 {
     w as i64 * h as i64
 }
 
+/// IsLikelyDuckStationRenderWindow — the game surface is a Qt
+/// top-level; the duckstation chrome (settings/input/cheats/…) and
+/// IME/tooltip windows are rejected. It can also render in the main
+/// window with an EMPTY title while a game loads.
+fn is_likely_duckstation_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let t = window_title(hwnd).trim().to_lowercase();
+    let class = class_name(hwnd).to_lowercase();
+    if t.contains("_q_titlebar")
+        || t.contains("msctfime ui")
+        || t.contains("default ime")
+        || class.contains("screenchangeobserver")
+        || class.contains("themechangeobserver")
+        || class.contains("ime")
+    {
+        return false;
+    }
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let mut looks_primary = hwnd == main;
+    if looks_primary && t.is_empty() && class.contains("qt") && !has_caption {
+        return true;
+    }
+    if !t.is_empty() {
+        let ui = t == "duckstation"
+            || [
+                "settings",
+                "audio",
+                "video",
+                "input",
+                "controller",
+                "memory card",
+                "cheat",
+                "achievement",
+                "tools",
+                "view",
+                "help",
+                "shader",
+                "about",
+            ]
+            .iter()
+            .any(|w| t.contains(w));
+        if ui {
+            looks_primary = true;
+        } else if t.chars().count() >= 2 {
+            return true;
+        }
+    }
+    if !class.is_empty() && class.contains("qt") {
+        if !looks_primary && !t.contains("duckstation") {
+            return true;
+        }
+        if !looks_primary && !has_caption {
+            return true;
+        }
+    }
+    !looks_primary && (!has_caption || !t.is_empty())
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
@@ -1418,6 +1564,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::Xemu => return is_likely_xemu_window(hwnd, main),
         Kind::Rpcs3 => return is_likely_rpcs3_window(hwnd, main),
         Kind::Shadps4 => return is_likely_shadps4_window(hwnd, main),
+        Kind::DuckStation => return is_likely_duckstation_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -1916,11 +2063,11 @@ fn sweep_hide(
         // HMENU at all — it's ImGui-rendered in-frame, handled by the
         // show_menubar config patch.)
         strip_menu(hwnd);
-        // RPCS3/shadPS4: cloak EVERY window — a DWM cloak hides
-        // instantly with no geometry/style change for Qt/SDL to race,
-        // so nothing flashes between spawn and capture. Other kinds
-        // park aux windows.
-        let cloak = matches!(kind, Kind::Rpcs3 | Kind::Shadps4);
+        // RPCS3/shadPS4/DuckStation: cloak EVERY window — a DWM cloak
+        // hides instantly with no geometry/style change for Qt/SDL to
+        // race, so nothing flashes between spawn and capture. Other
+        // kinds park aux windows.
+        let cloak = matches!(kind, Kind::Rpcs3 | Kind::Shadps4 | Kind::DuckStation);
         hidden.entry(hwnd.0 as usize).or_insert_with(|| {
             if cloak {
                 let s = snapshot_window(hwnd);

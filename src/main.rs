@@ -3234,8 +3234,9 @@ fn lacrima_window_frame(
             // the same visually but blocks hit-testing for every widget
             // underneath it, so paint order is used instead.
             let painter = ui.painter().clone().with_clip_rect(app_rect);
-            // Dark, mostly-opaque bar like Lacrima's MainTopBar
-            // (Background="Black" Opacity="0.8"), top corners rounded.
+            // Mostly-opaque charcoal bar at the back button's face
+            // tone (Lacrima's Black@0.8 bar, tinted to the corner
+            // button's perceived #12 so the two read as one surface).
             painter.rect_filled(
                 title_bar_rect,
                 CornerRadius {
@@ -3244,7 +3245,7 @@ fn lacrima_window_frame(
                     se: 0,
                     sw: 0,
                 },
-                Color32::from_black_alpha(204),
+                Color32::from_rgba_unmultiplied(0x12, 0x12, 0x12, 204),
             );
 
             logo.paint(&painter, title_bar_rect, elapsed, title, animate_title);
