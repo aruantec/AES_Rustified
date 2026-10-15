@@ -275,9 +275,7 @@ fn extract_default_xex(f: &mut std::fs::File) -> Option<Vec<u8>> {
             }
         }
         if e.is_dir && e.size > 0 && e.size <= MAX_DIR_BYTES {
-            if let Some(sub) =
-                read_sector_region(f, base_sector + e.sector as u64, e.size)
-            {
+            if let Some(sub) = read_sector_region(f, base_sector + e.sector as u64, e.size) {
                 if !sub.is_empty() {
                     stack.push((sub, 0));
                 }
@@ -342,10 +340,7 @@ fn title_id_from_path(path: &Path) -> Option<String> {
             let run = b[i..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
             // `\b[0-9A-Fa-f]{8}\b` — exactly 8 hex chars bounded by
             // non-word edges.
-            if run == 8
-                && (i == 0 || !word(b[i - 1]))
-                && (i + 8 == b.len() || !word(b[i + 8]))
-            {
+            if run == 8 && (i == 0 || !word(b[i - 1])) && (i + 8 == b.len() || !word(b[i + 8])) {
                 let id = seg[i..i + 8].to_uppercase();
                 if x360_titles().contains_key(&id) {
                     return Some(id);
@@ -388,7 +383,9 @@ fn x360_title(path: &Path) -> Option<String> {
 fn walkdir_find_xex(dir: &Path) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -462,15 +459,11 @@ fn cue_track_files(path: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for line in text.lines() {
         let l = line.trim();
-        if !l
-            .get(..5)
-            .is_some_and(|p| p.eq_ignore_ascii_case("FILE "))
-        {
+        if !l.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("FILE ")) {
             continue;
         }
         let rest = l[5..].trim();
-        let name = if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.split('"').next())
-        {
+        let name = if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) {
             inner
         } else {
             rest.split_whitespace().next().unwrap_or("")
@@ -519,8 +512,7 @@ fn gdi_track_files(path: &Path) -> Vec<PathBuf> {
             continue;
         }
         rest = rest.trim_start();
-        let file = if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.split('"').next())
-        {
+        let file = if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) {
             inner
         } else {
             rest.split_whitespace().next().unwrap_or("")
@@ -596,7 +588,9 @@ pub(crate) fn sfo_value(sfo: &Path, want: &str) -> Option<String> {
     let count = u32be(16)?;
     for i in 0..count {
         let e = 20 + i * 16;
-        let Some(entry) = bytes.get(e..e + 16) else { break };
+        let Some(entry) = bytes.get(e..e + 16) else {
+            break;
+        };
         let key_off = u16::from_le_bytes(entry[0..2].try_into().unwrap()) as usize;
         let data_len = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
         let data_off = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
@@ -652,7 +646,11 @@ fn ps3_title(path: &Path) -> Option<String> {
     } else {
         // A file ROM: walk up so .../PS3_GAME/USRDIR/EBOOT.BIN finds
         // its sibling PARAM.SFO (file's dir → 3 ancestors max).
-        path.ancestors().skip(1).take(3).map(|d| d.to_path_buf()).collect()
+        path.ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.to_path_buf())
+            .collect()
     };
     for root in roots {
         for sfo in ps3_sfo_candidates(&root) {
@@ -671,7 +669,11 @@ fn ps3_local_cover(path: &Path) -> Option<PathBuf> {
     let roots: Vec<PathBuf> = if path.is_dir() {
         vec![path.to_path_buf()]
     } else {
-        path.ancestors().skip(1).take(3).map(|d| d.to_path_buf()).collect()
+        path.ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.to_path_buf())
+            .collect()
     };
     for root in roots {
         for dir in [
@@ -733,8 +735,7 @@ fn ps3_title_id_in(s: &str) -> bool {
         return false;
     }
     (0..=b.len() - 9).any(|i| {
-        PRE.iter()
-            .any(|p| b[i..i + 4].eq_ignore_ascii_case(&p[..]))
+        PRE.iter().any(|p| b[i..i + 4].eq_ignore_ascii_case(&p[..]))
             && b[i + 4..i + 9].iter().all(|c| c.is_ascii_digit())
     })
 }
@@ -745,10 +746,16 @@ fn ps3_title_id_in(s: &str) -> bool {
 /// uppercased.
 pub(crate) fn ps3_title_id_token(s: &str) -> Option<String> {
     const PRE: &[&[u8; 4]] = &[
-        b"BLUS", b"BLES", b"BLJM", b"BLJS", b"NPUB", b"NPEB", b"NPJB", b"NPUJ", b"NPUA",
-        b"NPUX", b"BCUS", b"BCES", b"MRTC",
+        b"BLUS", b"BLES", b"BLJM", b"BLJS", b"NPUB", b"NPEB", b"NPJB", b"NPUJ", b"NPUA", b"NPUX",
+        b"BCUS", b"BCES", b"MRTC",
     ];
     let b = s.as_bytes();
+    // A token needs the full 9 bytes — without this the digit slice
+    // b[i+4..i+9] panics on a short name whose prefix matches
+    // ("BLES x" under a dir called "BLES").
+    if b.len() < 9 {
+        return None;
+    }
     let word = |i: usize| {
         (i == 0 || !b[i - 1].is_ascii_alphanumeric())
             && (i + 9 >= b.len() || !b[i + 9].is_ascii_alphanumeric())
@@ -770,7 +777,11 @@ pub(crate) fn ps3_ids(path: &Path) -> (Option<String>, Option<String>) {
     let roots: Vec<PathBuf> = if path.is_dir() {
         vec![path.to_path_buf()]
     } else {
-        path.ancestors().skip(1).take(3).map(|d| d.to_path_buf()).collect()
+        path.ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.to_path_buf())
+            .collect()
     };
     let mut tid = None;
     let mut ver = None;
@@ -789,6 +800,150 @@ pub(crate) fn ps3_ids(path: &Path) -> (Option<String>, Option<String>) {
             .ancestors()
             .filter_map(|a| a.file_name().and_then(|n| n.to_str()))
             .find_map(ps3_title_id_token);
+    }
+    (tid, ver)
+}
+
+// ======================================================================
+// PS4 — same SFO format as PS3 (param.sfo lives in sce_sys/), the
+// dump ships its own icon0.png, and title ids are `XXXX12345`.
+// ======================================================================
+
+/// Lacrima's `Ps4InstalledGameHelper` SFO candidates — `param.sfo`
+/// sits under `sce_sys/` in an installed dump.
+pub(crate) fn ps4_sfo_candidates(root: &Path) -> [PathBuf; 3] {
+    [
+        root.join("sce_sys").join("param.sfo"),
+        root.join("sce_sys").join("PARAM.SFO"),
+        root.join("param.sfo"),
+    ]
+}
+
+/// PS4 title — `sce_sys/param.sfo` `TITLE` (file rom: ancestors).
+fn ps4_title(path: &Path) -> Option<String> {
+    let roots: Vec<PathBuf> = if path.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        path.ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.to_path_buf())
+            .collect()
+    };
+    for root in roots {
+        for sfo in ps4_sfo_candidates(&root) {
+            if let Some(title) = sfo_value(&sfo, "TITLE") {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+/// GetPreferredIconPath — the installed dump's `sce_sys/icon0.png`
+/// (512×512 square cover; pic0/pic1 as larger fallbacks).
+fn ps4_local_cover(path: &Path) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = if path.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        path.ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.to_path_buf())
+            .collect()
+    };
+    for root in roots {
+        for dir in [root.clone(), root.join("sce_sys")] {
+            for name in [
+                "icon0.png",
+                "ICON0.PNG",
+                "pic0.png",
+                "PIC0.PNG",
+                "pic1.png",
+                "PIC1.PNG",
+            ] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ps4InstalledGameHelper.IsInstalledGameFolder — a dir that owns
+/// `sce_sys/param.sfo`, `eboot.bin` or `icon0.png`, or carries a
+/// CUSA-style title id in a path segment.
+pub fn ps4_is_installed_folder(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    if dir
+        .ancestors()
+        .filter_map(|a| a.file_name().and_then(|n| n.to_str()))
+        .any(|n| ps4_title_id_token(n).is_some())
+    {
+        return true;
+    }
+    dir.join("sce_sys").join("param.sfo").is_file()
+        || dir.join("sce_sys").join("PARAM.SFO").is_file()
+        || dir.join("eboot.bin").is_file()
+        || dir.join("icon0.png").is_file()
+        || dir.join("ICON0.PNG").is_file()
+}
+
+/// `\b[A-Z]{4}\d{5}\b` — CUSA/PCAS/PPSA-style PS4 title ids, a token
+/// anywhere in the text (shadPS4 dumps are named `CUSA12345 - Title`).
+pub(crate) fn ps4_title_id_token(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    // Same guard — a <9-byte name whose first 4 letters are all alpha
+    // ("Games", "Sony") would panic slicing b[4..9].
+    if b.len() < 9 {
+        return None;
+    }
+    let word = |i: usize| {
+        (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+            && (i + 9 >= b.len() || !b[i + 9].is_ascii_alphanumeric())
+    };
+    (0..=b.len().saturating_sub(9))
+        .find(|&i| {
+            word(i)
+                && b[i..i + 4].iter().all(|c| c.is_ascii_alphabetic())
+                && b[i + 4..i + 9].iter().all(|c| c.is_ascii_digit())
+        })
+        .map(|i| s[i..i + 9].to_uppercase())
+}
+
+/// TITLE_ID + APP_VER for a PS4 rom — `sce_sys/param.sfo` first,
+/// then a title-id token from the path segments.
+pub(crate) fn ps4_ids(path: &Path) -> (Option<String>, Option<String>) {
+    let roots: Vec<PathBuf> = if path.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        path.ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.to_path_buf())
+            .collect()
+    };
+    let mut tid = None;
+    let mut ver = None;
+    for root in &roots {
+        for sfo in ps4_sfo_candidates(root) {
+            if tid.is_none() {
+                tid = sfo_value(&sfo, "TITLE_ID");
+            }
+            if ver.is_none() {
+                ver = sfo_value(&sfo, "APP_VER");
+            }
+        }
+    }
+    if tid.is_none() {
+        tid = path
+            .ancestors()
+            .filter_map(|a| a.file_name().and_then(|n| n.to_str()))
+            .find_map(ps4_title_id_token);
     }
     (tid, ver)
 }
@@ -996,7 +1151,10 @@ fn title_variants(title: &str) -> Vec<String> {
 // serves the repo's Named_Boxarts listing; cached on disk 7 days so
 // a section's index costs two requests a week, not per run.
 // ------------------------------------------------------------------
-fn libretro_index(agent: &ureq::Agent, section_key: &str) -> Option<std::sync::Arc<HashSet<String>>> {
+fn libretro_index(
+    agent: &ureq::Agent,
+    section_key: &str,
+) -> Option<std::sync::Arc<HashSet<String>>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static IDX: OnceLock<Mutex<HashMap<String, Option<Arc<HashSet<String>>>>>> = OnceLock::new();
     let map = IDX.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1059,11 +1217,7 @@ fn fetch_libretro_index(agent: &ureq::Agent, section_key: &str) -> Option<Vec<St
     let folder = libretro_folder(section_key)?;
     let repo = folder.replace(' ', "_");
     let root = github_tree(agent, &repo, "master")?;
-    let sha = root
-        .iter()
-        .find(|(p, _)| p == "Named_Boxarts")?
-        .1
-        .clone();
+    let sha = root.iter().find(|(p, _)| p == "Named_Boxarts")?.1.clone();
     let sub = github_tree(agent, &repo, &sha)?;
     let names: Vec<String> = sub
         .into_iter()
@@ -1074,11 +1228,7 @@ fn fetch_libretro_index(agent: &ureq::Agent, section_key: &str) -> Option<Vec<St
 }
 
 /// `git/trees/<sha>` → (path, sha) pairs for its direct children.
-fn github_tree(
-    agent: &ureq::Agent,
-    repo: &str,
-    sha: &str,
-) -> Option<Vec<(String, String)>> {
+fn github_tree(agent: &ureq::Agent, repo: &str, sha: &str) -> Option<Vec<(String, String)>> {
     #[derive(Deserialize)]
     struct Entry {
         path: String,
@@ -1088,9 +1238,7 @@ fn github_tree(
     struct Tree {
         tree: Vec<Entry>,
     }
-    let url = format!(
-        "https://api.github.com/repos/libretro-thumbnails/{repo}/git/trees/{sha}"
-    );
+    let url = format!("https://api.github.com/repos/libretro-thumbnails/{repo}/git/trees/{sha}");
     let mut resp = agent
         .get(&url)
         .header("User-Agent", "AES_Rustified")
@@ -1172,7 +1320,12 @@ fn bing_image_urls(html: &str) -> Vec<String> {
         }
     };
     // "murl":"<url>" / "turl":"..." / "thumbnailUrl":"..."
-    for key in ["\"murl\":\"", "\"turl\":\"", "\"imgurl\":\"", "\"thumbnailUrl\":\""] {
+    for key in [
+        "\"murl\":\"",
+        "\"turl\":\"",
+        "\"imgurl\":\"",
+        "\"thumbnailUrl\":\"",
+    ] {
         let mut pos = 0;
         while let Some(i) = decoded[pos..].to_lowercase().find(&key.to_lowercase()) {
             let start = pos + i + key.len();
@@ -1221,11 +1374,7 @@ fn ddg_image_urls(agent: &ureq::Agent, q: &str, target: f32) -> Vec<String> {
         "https://duckduckgo.com/?q={}&iax=images&ia=images",
         escape(q)
     );
-    let Ok(mut resp) = agent
-        .get(&main)
-        .header("User-Agent", BING_UA)
-        .call()
-    else {
+    let Ok(mut resp) = agent.get(&main).header("User-Agent", BING_UA).call() else {
         return Vec::new();
     };
     let Ok(html) = resp.body_mut().read_to_string() else {
@@ -1371,17 +1520,31 @@ fn image_candidates(agent: &ureq::Agent, q: &str, target: f32, budget: Duration)
 fn cover_url_score(u: &str) -> i32 {
     let u = u.to_lowercase();
     if [
-        "mobygames", "thecoverproject", "coverproject", "launchbox",
-        "gamesdb", "gamefaqs", "giantbomb", "boxart", "box_art",
-        "packshot", "cover",
+        "mobygames",
+        "thecoverproject",
+        "coverproject",
+        "launchbox",
+        "gamesdb",
+        "gamefaqs",
+        "giantbomb",
+        "boxart",
+        "box_art",
+        "packshot",
+        "cover",
     ]
     .iter()
     .any(|k| u.contains(k))
     {
         2
     } else if [
-        "ebay", "walmartimages", "secondhand", "preowned", "pawn",
-        "auction", "cash-crusaders", "cash_converters",
+        "ebay",
+        "walmartimages",
+        "secondhand",
+        "preowned",
+        "pawn",
+        "auction",
+        "cash-crusaders",
+        "cash_converters",
     ]
     .iter()
     .any(|k| u.contains(k))
@@ -1483,11 +1646,7 @@ fn download_classify(
     url: &str,
     section_key: &str,
 ) -> Option<(Vec<u8>, CoverClass)> {
-    let mut r = agent
-        .get(url)
-        .header("User-Agent", BING_UA)
-        .call()
-        .ok()?;
+    let mut r = agent.get(url).header("User-Agent", BING_UA).call().ok()?;
     let bytes = r.body_mut().read_to_vec().ok()?;
     if bytes.len() < 2 * 1024 {
         return None;
@@ -1681,7 +1840,18 @@ fn trim_borders(img: &image::RgbaImage) -> (Option<image::RgbaImage>, Sides) {
     while ut + ub < cap_y && (ub < b || uni_row(h - 1 - ub)) {
         ub += 1;
     }
-    let sides = Sides { l, r, t, b, ul, ur, ut, ub, w, h };
+    let sides = Sides {
+        l,
+        r,
+        t,
+        b,
+        ul,
+        ur,
+        ut,
+        ub,
+        w,
+        h,
+    };
     let (cw, ch) = (w - l - r, h - t - b);
     if (l + r < 4 && t + b < 4) || cw < w / 3 || ch < h / 3 {
         return (None, sides);
@@ -1778,6 +1948,7 @@ fn resolve_one(
             "X360" => x360_title(path),
             "DC" => dc_title(path),
             "PS3" => ps3_title(path),
+            "PS4" => ps4_title(path),
             _ => None,
         };
         if let Some(t) = &t {
@@ -1798,10 +1969,15 @@ fn resolve_one(
     // correct and instant; it wins over the web lottery, which can
     // land case photos — the "good cover replaced by a photo" churn.
     let ps3_local = || -> Option<PathBuf> {
-        if section_key != "PS3" || !ok() {
+        if !ok() {
             return None;
         }
-        let icon = ps3_local_cover(path)?;
+        // PS4 dumps ship sce_sys/icon0.png; same treatment as PS3.
+        let icon = match section_key {
+            "PS3" => ps3_local_cover(path)?,
+            "PS4" => ps4_local_cover(path)?,
+            _ => return None,
+        };
         let dst = cover_path(path);
         if let Some(d) = dst.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -1840,7 +2016,11 @@ fn resolve_one(
             })
         })
     };
-    RomInfo { path: path.to_path_buf(), title, cover }
+    RomInfo {
+        path: path.to_path_buf(),
+        title,
+        cover,
+    }
 }
 
 /// Photo-of-an-object detection: a physical case photographed
@@ -1873,8 +2053,7 @@ fn has_inset_vertical_edges(img: &image::RgbaImage) -> bool {
         false
     };
     let margin = (w / 16).max(4);
-    (margin..w * 45 / 100).any(|x| edge_col(x))
-        && (w * 55 / 100..w - margin).any(|x| edge_col(x))
+    (margin..w * 45 / 100).any(|x| edge_col(x)) && (w * 55 / 100..w - margin).any(|x| edge_col(x))
 }
 
 /// A cached cover is only trusted while it classifies `Good` — a
@@ -2043,8 +2222,11 @@ pub fn save_meta(rom: &Path, doc: &RomMetaDoc) -> std::io::Result<()> {
 /// insets measured when the capture was `frame_width` px wide.
 pub fn locked_crop(rom: &Path) -> Option<(u32, u32, u32)> {
     let m = load_meta(rom)?;
-    (m.crop_fw > 0 && (m.crop_left > 0 || m.crop_right > 0))
-        .then_some((m.crop_left, m.crop_right, m.crop_fw))
+    (m.crop_fw > 0 && (m.crop_left > 0 || m.crop_right > 0)).then_some((
+        m.crop_left,
+        m.crop_right,
+        m.crop_fw,
+    ))
 }
 
 pub fn save_locked_crop(rom: &Path, left: u32, right: u32, frame_width: u32) {
@@ -2155,11 +2337,7 @@ pub fn fetch_image(url: &str) -> Option<Vec<u8>> {
         .http_status_as_error(true)
         .build()
         .into();
-    let mut r = agent
-        .get(url)
-        .header("User-Agent", BING_UA)
-        .call()
-        .ok()?;
+    let mut r = agent.get(url).header("User-Agent", BING_UA).call().ok()?;
     let bytes = r.body_mut().read_to_vec().ok()?;
     if bytes.len() < 512 || image::load_from_memory(&bytes).is_err() {
         return None;
@@ -2206,7 +2384,9 @@ pub fn youtube_search(query: &str) -> Vec<YtHit> {
     let mut pos = 0;
     while let Some(i) = html[pos..].find("\"videoId\":\"") {
         let vs = pos + i + "\"videoId\":\"".len();
-        let Some(ve) = html[vs..].find('"') else { break };
+        let Some(ve) = html[vs..].find('"') else {
+            break;
+        };
         let id = html[vs..vs + ve].to_string();
         // The title text follows shortly after the id.
         let window_end = (vs + ve + 4000).min(html.len());
@@ -2333,5 +2513,28 @@ mod tests {
         assert!(download_cover(&agent(), "http://127.0.0.1:1/x.png", &rom, &cancel).is_none());
         assert!(!cover_path(&rom).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The title-id token scanners slice b[i..i+9] — a short name
+    /// ("Games", "BLES") must return None, not panic. This was the
+    /// Scan-Folder crash: a 4-letter dir name panicked the worker,
+    /// which silently abandoned the scan with the notice stuck.
+    #[test]
+    fn title_id_tokens_safe_on_short_names() {
+        for t in ["Games", "Sony", "PS4", "BLES", "CUSA", "", "a", "CUSA1234"] {
+            assert!(ps4_title_id_token(t).is_none());
+            assert!(ps3_title_id_token(t).is_none());
+        }
+        assert_eq!(
+            ps4_title_id_token("CUSA12345 - Game"),
+            Some("CUSA12345".to_string())
+        );
+        assert_eq!(
+            ps3_title_id_token("Game BLES99998"),
+            Some("BLES99998".to_string())
+        );
+        // Prefix chars that aren't all-alpha mustn't false-positive
+        // the generic PS4 pattern on "123456789".
+        assert!(ps4_title_id_token("123456789").is_none());
     }
 }

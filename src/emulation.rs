@@ -17,8 +17,8 @@ use eframe::egui::{
 };
 
 use crate::{
-    album_row, carousel, emu_dl, emu_meta, library, paint, rom_editor, rpcs3_overlay,
-    search_pill, settings, transport, xenia, xenia_cfg, xenia_overlay, xenia_profile,
+    album_row, carousel, emu_dl, emu_meta, library, paint, rom_editor, rpcs3_overlay, search_pill,
+    settings, shadps4, shadps4_overlay, transport, xenia, xenia_cfg, xenia_overlay, xenia_profile,
 };
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -38,6 +38,8 @@ const XBOX_SECTION: &str = "XBOX";
 const XEMU_HANDLER: &str = "xemu";
 const PS3_SECTION: &str = "PS3";
 const RPCS3_HANDLER: &str = "rpcs3";
+const PS4_SECTION: &str = "PS4";
+const SHADPS4_HANDLER: &str = "shadps4";
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -97,6 +99,15 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             installed_exe: emu_dl::rpcs3_exe,
             download: emu_dl::download_rpcs3,
         },
+        PS4_SECTION => HandlerSpec {
+            section: PS4_SECTION,
+            handler: SHADPS4_HANDLER,
+            name: "shadPS4",
+            exe_hint: "Path to shadPS4.exe",
+            dialog_title: "Locate shadPS4.exe",
+            installed_exe: emu_dl::shadps4_exe,
+            download: emu_dl::download_shadps4,
+        },
         _ => return None,
     })
 }
@@ -110,7 +121,9 @@ fn section_patterns(key: &str) -> &'static [&'static str] {
         "NES" => &["nes", "fds", "unf", "unif"],
         "N64" => &["n64", "z64", "v64"],
         "DC" => &["cdi", "gdi", "chd", "cue", "iso"],
-        "GCN" => &["iso", "gcm", "ciso", "gcz", "rvz", "wia", "dol", "elf", "tgc"],
+        "GCN" => &[
+            "iso", "gcm", "ciso", "gcz", "rvz", "wia", "dol", "elf", "tgc",
+        ],
         "GBA" => &["gba"],
         "GENESIS" => &["gen", "md", "smd", "32x", "sg", "bin", "zip", "7z"],
         "3DS" => &["3ds", "3dsx", "cci", "cxi", "cia"],
@@ -202,7 +215,10 @@ const CONSOLES: &[(&str, &str, &str)] = &[
 const ART: &[(&str, &[u8])] = &[
     ("3DS", include_bytes!("../assets/consoles/3DS.png")),
     ("Arcade", include_bytes!("../assets/consoles/Arcade.png")),
-    ("Dreamcast", include_bytes!("../assets/consoles/Dreamcast.png")),
+    (
+        "Dreamcast",
+        include_bytes!("../assets/consoles/Dreamcast.png"),
+    ),
     ("FBN", include_bytes!("../assets/consoles/FBN.png")),
     ("GBA", include_bytes!("../assets/consoles/GBA.png")),
     ("GC", include_bytes!("../assets/consoles/GC.png")),
@@ -348,6 +364,10 @@ pub struct EmuView {
     pub cfg_ov: xenia_overlay::ConfigOverlay,
     /// RPCS3 per-game Patches overlay (Rpcs3PatchesOverlay).
     pub rpcs3_patches: rpcs3_overlay::Rpcs3PatchesOverlay,
+    /// shadPS4 per-game Patches overlay (ShadPs4PatchesOverlay).
+    pub shad_patches: shadps4_overlay::ShadPs4PatchesOverlay,
+    /// shadPS4 per-game Cheats overlay (ShadPs4CheatsOverlay).
+    pub shad_cheats: shadps4_overlay::ShadPs4CheatsOverlay,
     /// Xenia profile-creation prompt — opens when the X360 section is
     /// entered and no profile exists under the Xenia content dir.
     pub prof_prompt: xenia_overlay::ProfilePrompt,
@@ -511,6 +531,8 @@ impl EmuView {
             patches: xenia_overlay::PatchesOverlay::new(),
             cfg_ov: xenia_overlay::ConfigOverlay::new(),
             rpcs3_patches: rpcs3_overlay::Rpcs3PatchesOverlay::new(),
+            shad_patches: shadps4_overlay::ShadPs4PatchesOverlay::new(),
+            shad_cheats: shadps4_overlay::ShadPs4CheatsOverlay::new(),
             prof_prompt: xenia_overlay::ProfilePrompt::new(),
             prof_want: false,
             launch_rx: None,
@@ -594,8 +616,11 @@ impl EmuView {
             .enumerate()
             .map(|(i, k)| (k.as_str(), i))
             .collect();
-        self.sections
-            .sort_by_key(|s| rank.get(section_key(s).as_str()).copied().unwrap_or(usize::MAX));
+        self.sections.sort_by_key(|s| {
+            rank.get(section_key(s).as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         self.refresh_section_covers(cfg);
     }
 
@@ -609,11 +634,7 @@ impl EmuView {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect();
             cfg.games.insert(key.clone(), list);
-            if let Some(sec) = self
-                .sections
-                .iter_mut()
-                .find(|s| section_key(s) == key)
-            {
+            if let Some(sec) = self.sections.iter_mut().find(|s| section_key(s) == key) {
                 sec.tracks = self.items.clone();
             }
             self.settings_dirty = true;
@@ -628,7 +649,9 @@ impl EmuView {
             .active
             .and_then(|i| self.sections.get(i))
             .map(|s| section_key(s))?;
-        console_art(self.art_dir.as_deref(), &key).into_iter().next()
+        console_art(self.art_dir.as_deref(), &key)
+            .into_iter()
+            .next()
     }
 
     /// Load a section's persisted games into the card view and spawn
@@ -659,7 +682,9 @@ impl EmuView {
         self.cards.open_roms(
             &self.sections[i],
             &rom_cover,
-            console_art(self.art_dir.as_deref(), &key).into_iter().next(),
+            console_art(self.art_dir.as_deref(), &key)
+                .into_iter()
+                .next(),
         );
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.meta_rxs.push((
@@ -742,8 +767,10 @@ impl EmuView {
                 .map(|c| c.title.clone())
                 .unwrap_or_else(|| key.clone());
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.meta_rxs
-                .push((emu_meta::spawn_resolver(key, platform, added, cancel.clone()), cancel));
+            self.meta_rxs.push((
+                emu_meta::spawn_resolver(key, platform, added, cancel.clone()),
+                cancel,
+            ));
             self.sync_games(cfg);
         }
     }
@@ -795,7 +822,9 @@ impl EmuView {
             self.cards.open_roms(
                 &self.sections[i],
                 &rom_cover,
-                console_art(self.art_dir.as_deref(), &key).into_iter().next(),
+                console_art(self.art_dir.as_deref(), &key)
+                    .into_iter()
+                    .next(),
             );
         }
         let platform = self
@@ -825,6 +854,7 @@ impl EmuView {
             DC_SECTION => Some(FLYCAST_HANDLER.to_string()),
             XBOX_SECTION => Some(XEMU_HANDLER.to_string()),
             PS3_SECTION => Some(RPCS3_HANDLER.to_string()),
+            PS4_SECTION => Some(SHADPS4_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -840,9 +870,7 @@ impl EmuView {
         let key = format!("{handler}|{configured}");
         if key != self.setup_exe_key {
             self.setup_exe_key = key;
-            let valid = |p: &str| {
-                !p.trim().is_empty() && Path::new(p.trim()).exists()
-            };
+            let valid = |p: &str| !p.trim().is_empty() && Path::new(p.trim()).exists();
             self.setup_exe = if valid(&configured) {
                 Some(PathBuf::from(configured.trim()))
             } else {
@@ -851,6 +879,7 @@ impl EmuView {
                     FLYCAST_HANDLER => emu_dl::flycast_exe(),
                     XEMU_HANDLER => emu_dl::xemu_exe(),
                     RPCS3_HANDLER => emu_dl::rpcs3_exe(),
+                    SHADPS4_HANDLER => emu_dl::shadps4_exe(),
                     _ => None,
                 }
             };
@@ -869,6 +898,7 @@ impl EmuView {
             Some(FLYCAST_HANDLER) => Some(xenia::Kind::Flycast),
             Some(XEMU_HANDLER) => Some(xenia::Kind::Xemu),
             Some(RPCS3_HANDLER) => Some(xenia::Kind::Rpcs3),
+            Some(SHADPS4_HANDLER) => Some(xenia::Kind::Shadps4),
             _ => None,
         }) else {
             self.notice = Some("No emulator handler configured for this section".into());
@@ -879,12 +909,21 @@ impl EmuView {
             xenia::Kind::Flycast => "Flycast",
             xenia::Kind::Xemu => "xemu",
             xenia::Kind::Rpcs3 => "RPCS3",
+            xenia::Kind::Shadps4 => "shadPS4",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
                 "No {name} executable — set a path or press Download in Settings → Emulation"
             ));
             return;
+        };
+        // A qtlauncher selection upgrades to the sibling core exe —
+        // the launcher ignores `-g` (Lacrima's
+        // ResolveShadPs4ExecutablePath).
+        let exe = if kind == xenia::Kind::Shadps4 {
+            shadps4::resolve_exe_path(&exe)
+        } else {
+            exe
         };
         // Per-section capture pool depth (Lacrima's LowLatencyCapture
         // → FramePoolSize 1 vs 2).
@@ -993,6 +1032,8 @@ pub fn view(
         && !emu.patches.is_open()
         && !emu.cfg_ov.is_open()
         && !emu.rpcs3_patches.is_open()
+        && !emu.shad_patches.is_open()
+        && !emu.shad_cheats.is_open()
         && !emu.prof_prompt.is_open();
 
     // open_section flagged a missing Xenia profile — open the prompt
@@ -1041,12 +1082,14 @@ pub fn view(
         match rx.try_recv() {
             Ok(paths) => {
                 emu.scan_rx = None;
-                emu.notice = (paths.is_empty())
-                    .then(|| "No ROMs found in that folder".to_string());
+                emu.notice = (paths.is_empty()).then(|| "No ROMs found in that folder".to_string());
                 emu.add_games(cfg, paths);
             }
             Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
-            Err(mpsc::TryRecvError::Disconnected) => emu.scan_rx = None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                emu.scan_rx = None;
+                emu.notice = Some("Folder scan failed.".into());
+            }
         }
     }
 
@@ -1116,10 +1159,8 @@ pub fn view(
     if let Some(session) = &emu.session {
         use std::sync::atomic::Ordering::Relaxed;
         let r = session.render();
-        r.brightness
-            .store(emu.render.brightness.to_bits(), Relaxed);
-        r.saturation
-            .store(emu.render.saturation.to_bits(), Relaxed);
+        r.brightness.store(emu.render.brightness.to_bits(), Relaxed);
+        r.saturation.store(emu.render.saturation.to_bits(), Relaxed);
         let [tr, tg, tb] = emu.render.tint;
         r.tint
             .store((tr as u32) << 16 | (tg as u32) << 8 | tb as u32, Relaxed);
@@ -1296,11 +1337,7 @@ pub fn view(
     // click opens the session menu. The interact region also stops
     // clicks from reaching the cards underneath.
     if emu.session.is_some() && cap_a > 0.5 {
-        let cap = ui.interact(
-            pres_rect,
-            ui.id().with("emu-capture-layer"),
-            Sense::click(),
-        );
+        let cap = ui.interact(pres_rect, ui.id().with("emu-capture-layer"), Sense::click());
         if cap.double_clicked() && !emu.input_tun {
             emu.game_fs = !emu.game_fs;
         }
@@ -1347,7 +1384,10 @@ pub fn view(
             // Use Current Crop Size — persist the live resolved crop
             // into the ROM's .meta (SaveCurrentArcadePillarboxCrop).
             if ui.button("Use Current Crop Size").clicked() {
-                let (l, r) = (emu.pillar_cur.0.round() as u32, emu.pillar_cur.1.round() as u32);
+                let (l, r) = (
+                    emu.pillar_cur.0.round() as u32,
+                    emu.pillar_cur.1.round() as u32,
+                );
                 let fw = emu
                     .frame_tex
                     .as_ref()
@@ -1412,383 +1452,364 @@ pub fn view(
     let chrome_hidden = fs && cap_a > 0.5;
 
     if !chrome_hidden {
-    // Row 1 — the 140px control band (Background #E6000000 plus the
-    // top Separator that every Lacrima chrome band draws).
-    painter.rect_filled(band, 0.0, Color32::from_black_alpha((230.0 * alpha) as u8));
-    let line = Stroke::new(
-        s.max(1.0),
-        Color32::from_white_alpha((51.0 * alpha) as u8),
-    );
-    painter.hline(content.min.x..=content.max.x, band.min.y, line);
-    if list_t > 0.001 {
-        painter.hline(content.min.x..=content.max.x, menu_top, line);
-        painter.rect_filled(
-            menu_band,
-            CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: radius,
-                se: radius,
-            },
-            Color32::BLACK.gamma_multiply(alpha * list_t),
-        );
-    }
-
-    // Left: the section-list toggle (StackPanel Margin 50,0,0,0,
-    // 60px button — the bar-over-square glyph, lit while open).
-    let cy = band.center().y;
-    let btn = Rect::from_center_size(
-        Pos2::new(band.min.x + 50.0 * s + 30.0 * s, cy),
-        Vec2::splat(60.0 * s),
-    );
-    let r = if interactive {
-        ui.interact(btn, ui.id().with("emu-list-toggle"), Sense::click())
-    } else {
-        ui.interact(btn, ui.id().with("emu-list-toggle"), Sense::hover())
-    }
-    .on_hover_text(if emu.list_open {
-        "Hide Albums"
-    } else {
-        "Show Albums"
-    });
-    if r.clicked() {
-        emu.list_open = !emu.list_open;
-    }
-    if r.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    transport::icon_album_list(&painter, btn, emu.list_open, alpha);
-
-    // Right cluster packs from the edge — session-only buttons take
-    // the outer slots: [layout][setup][sliders][tun][power], shrinking
-    // to [layout][setup] while no capture runs (the capture-settings
-    // and input-tunnel toggles only exist while a game is captured).
-    let mut rx = band.max.x - 50.0 * s - 30.0 * s;
-    let mut slot = |cond: bool| -> f32 {
-        let x = rx;
-        if cond {
-            rx -= 110.0 * s;
-            x
-        } else {
-            f32::NAN
+        // Row 1 — the 140px control band (Background #E6000000 plus the
+        // top Separator that every Lacrima chrome band draws).
+        painter.rect_filled(band, 0.0, Color32::from_black_alpha((230.0 * alpha) as u8));
+        let line = Stroke::new(s.max(1.0), Color32::from_white_alpha((51.0 * alpha) as u8));
+        painter.hline(content.min.x..=content.max.x, band.min.y, line);
+        if list_t > 0.001 {
+            painter.hline(content.min.x..=content.max.x, menu_top, line);
+            painter.rect_filled(
+                menu_band,
+                CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: radius,
+                    se: radius,
+                },
+                Color32::BLACK.gamma_multiply(alpha * list_t),
+            );
         }
-    };
-    let pw_x = slot(emu.session.is_some());
-    let tun_x = slot(emu.session.is_some());
-    let sliders_x = slot(emu.session.is_some());
-    let setup_x = rx;
-    let layout_x = rx - 110.0 * s;
 
-    // Capture-settings toggle (Lacrima's ToggleRenderOptions) — the
-    // sliders glyph; only exists while a session captures.
-    if !sliders_x.is_nan() {
-        let rb = Rect::from_center_size(
-            Pos2::new(sliders_x, cy),
+        // Left: the section-list toggle (StackPanel Margin 50,0,0,0,
+        // 60px button — the bar-over-square glyph, lit while open).
+        let cy = band.center().y;
+        let btn = Rect::from_center_size(
+            Pos2::new(band.min.x + 50.0 * s + 30.0 * s, cy),
             Vec2::splat(60.0 * s),
         );
         let r = if interactive {
-            ui.interact(rb, ui.id().with("emu-render"), Sense::click())
+            ui.interact(btn, ui.id().with("emu-list-toggle"), Sense::click())
         } else {
-            ui.interact(rb, ui.id().with("emu-render"), Sense::hover())
+            ui.interact(btn, ui.id().with("emu-list-toggle"), Sense::hover())
         }
-        .on_hover_text("Capture Settings");
-        if r.clicked() {
-            emu.render_open = !emu.render_open;
-        }
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        transport::icon_sliders(&painter, rb, emu.render_open, alpha);
-    }
-
-    // Input-tunnel toggle — while lit, clicks/keys inside the frame
-    // reach the emulator's hidden window so its own dialogs are
-    // usable in the captured stream.
-    if !tun_x.is_nan() {
-        let tb = Rect::from_center_size(Pos2::new(tun_x, cy), Vec2::splat(60.0 * s));
-        let r = if interactive {
-            ui.interact(tb, ui.id().with("emu-tun"), Sense::click())
+        .on_hover_text(if emu.list_open {
+            "Hide Albums"
         } else {
-            ui.interact(tb, ui.id().with("emu-tun"), Sense::hover())
-        }
-        .on_hover_text(if emu.input_tun {
-            "Stop Controlling Emulator (Esc)"
-        } else {
-            "Control Emulator — clicks and keys reach the game"
+            "Show Albums"
         });
         if r.clicked() {
-            emu.input_tun = !emu.input_tun;
+            emu.list_open = !emu.list_open;
         }
         if r.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        transport::icon_pointer(&painter, tb, emu.input_tun, alpha);
-    }
+        transport::icon_album_list(&painter, btn, emu.list_open, alpha);
 
-    // Handler-setup launch (LaunchCurrentSectionHandlerSetup) —
-    // spawns the configured emulator with no game so the user can
-    // reach its own settings. Disabled while a session runs or a
-    // launch is in flight (Lacrima's CanLaunch… guard).
-    let setup_exe = emu.setup_exe(cfg);
-    let setup_ok =
-        setup_exe.is_some() && emu.session.is_none() && emu.launch_rx.is_none();
-    let sb = Rect::from_center_size(
-        Pos2::new(setup_x, cy),
-        Vec2::splat(60.0 * s),
-    );
-    let r = if interactive && setup_ok {
-        ui.interact(sb, ui.id().with("emu-setup"), Sense::click())
-    } else {
-        ui.interact(sb, ui.id().with("emu-setup"), Sense::hover())
-    }
-    .on_hover_text(if setup_ok {
-        "Open Emulator Settings".to_string()
-    } else {
-        "Open Emulator Settings — unavailable while a game runs".to_string()
-    });
-    if r.clicked() {
-        if let Some(exe) = &setup_exe {
-            if let Err(e) = xenia::launch_setup(&exe.to_string_lossy()) {
-                emu.notice = Some(e);
+        // Right cluster packs from the edge — session-only buttons take
+        // the outer slots: [layout][setup][sliders][tun][power], shrinking
+        // to [layout][setup] while no capture runs (the capture-settings
+        // and input-tunnel toggles only exist while a game is captured).
+        let mut rx = band.max.x - 50.0 * s - 30.0 * s;
+        let mut slot = |cond: bool| -> f32 {
+            let x = rx;
+            if cond {
+                rx -= 110.0 * s;
+                x
+            } else {
+                f32::NAN
             }
+        };
+        let pw_x = slot(emu.session.is_some());
+        let tun_x = slot(emu.session.is_some());
+        let sliders_x = slot(emu.session.is_some());
+        let setup_x = rx;
+        let layout_x = rx - 110.0 * s;
+
+        // Capture-settings toggle (Lacrima's ToggleRenderOptions) — the
+        // sliders glyph; only exists while a session captures.
+        if !sliders_x.is_nan() {
+            let rb = Rect::from_center_size(Pos2::new(sliders_x, cy), Vec2::splat(60.0 * s));
+            let r = if interactive {
+                ui.interact(rb, ui.id().with("emu-render"), Sense::click())
+            } else {
+                ui.interact(rb, ui.id().with("emu-render"), Sense::hover())
+            }
+            .on_hover_text("Capture Settings");
+            if r.clicked() {
+                emu.render_open = !emu.render_open;
+            }
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            transport::icon_sliders(&painter, rb, emu.render_open, alpha);
         }
-    }
-    if r.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    // The handler's own exe icon (ExtractIconEx → 48px) inside a
-    // rounded-rect button like Lacrima's setup tile — dimmed while
-    // unavailable, a gear glyph when extraction fails.
-    if let Some(p) = &setup_exe {
-        let key = p.to_string_lossy().into_owned();
-        if emu.handler_icon_key.as_deref() != Some(key.as_str()) {
-            emu.handler_icon_key = Some(key);
-            emu.handler_icon = crate::exe_icon::load(p).map(|img| {
-                ui.ctx()
-                    .load_texture("handler-icon", img, egui::TextureOptions::LINEAR)
+
+        // Input-tunnel toggle — while lit, clicks/keys inside the frame
+        // reach the emulator's hidden window so its own dialogs are
+        // usable in the captured stream.
+        if !tun_x.is_nan() {
+            let tb = Rect::from_center_size(Pos2::new(tun_x, cy), Vec2::splat(60.0 * s));
+            let r = if interactive {
+                ui.interact(tb, ui.id().with("emu-tun"), Sense::click())
+            } else {
+                ui.interact(tb, ui.id().with("emu-tun"), Sense::hover())
+            }
+            .on_hover_text(if emu.input_tun {
+                "Stop Controlling Emulator (Esc)"
+            } else {
+                "Control Emulator — clicks and keys reach the game"
             });
+            if r.clicked() {
+                emu.input_tun = !emu.input_tun;
+            }
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            transport::icon_pointer(&painter, tb, emu.input_tun, alpha);
         }
-    }
-    let icon_a = alpha * if setup_ok { 1.0 } else { 0.45 };
-    let bgr = sb.shrink(4.0 * s);
-    painter.rect_filled(
-        bgr,
-        CornerRadius::same((9.0 * s) as u8),
-        Color32::from_rgb(0x2D, 0x2D, 0x2D).gamma_multiply(icon_a),
-    );
-    painter.rect_stroke(
-        bgr,
-        CornerRadius::same((9.0 * s) as u8),
-        Stroke::new(
-            s.max(1.0),
-            Color32::from_white_alpha((40.0 * icon_a) as u8),
-        ),
-        StrokeKind::Inside,
-    );
-    // The icon fills most of the button — Lacrima's setup tile is
-    // icon-dominant, not a chip in a big button.
-    let ir = bgr.shrink(6.0 * s);
-    if let Some(tex) = &emu.handler_icon {
-        painter.image(
-            tex.id(),
-            ir,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE.gamma_multiply(icon_a),
+
+        // Handler-setup launch (LaunchCurrentSectionHandlerSetup) —
+        // spawns the configured emulator with no game so the user can
+        // reach its own settings. Disabled while a session runs or a
+        // launch is in flight (Lacrima's CanLaunch… guard).
+        let setup_exe = emu.setup_exe(cfg);
+        let setup_ok = setup_exe.is_some() && emu.session.is_none() && emu.launch_rx.is_none();
+        let sb = Rect::from_center_size(Pos2::new(setup_x, cy), Vec2::splat(60.0 * s));
+        let r = if interactive && setup_ok {
+            ui.interact(sb, ui.id().with("emu-setup"), Sense::click())
+        } else {
+            ui.interact(sb, ui.id().with("emu-setup"), Sense::hover())
+        }
+        .on_hover_text(if setup_ok {
+            "Open Emulator Settings".to_string()
+        } else {
+            "Open Emulator Settings — unavailable while a game runs".to_string()
+        });
+        if r.clicked() {
+            if let Some(exe) = &setup_exe {
+                if let Err(e) = xenia::launch_setup(&exe.to_string_lossy()) {
+                    emu.notice = Some(e);
+                }
+            }
+        }
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        // The handler's own exe icon (ExtractIconEx → 48px) inside a
+        // rounded-rect button like Lacrima's setup tile — dimmed while
+        // unavailable, a gear glyph when extraction fails.
+        if let Some(p) = &setup_exe {
+            let key = p.to_string_lossy().into_owned();
+            if emu.handler_icon_key.as_deref() != Some(key.as_str()) {
+                emu.handler_icon_key = Some(key);
+                emu.handler_icon = crate::exe_icon::load(p).map(|img| {
+                    ui.ctx()
+                        .load_texture("handler-icon", img, egui::TextureOptions::LINEAR)
+                });
+            }
+        }
+        let icon_a = alpha * if setup_ok { 1.0 } else { 0.45 };
+        let bgr = sb.shrink(4.0 * s);
+        painter.rect_filled(
+            bgr,
+            CornerRadius::same((9.0 * s) as u8),
+            Color32::from_rgb(0x2D, 0x2D, 0x2D).gamma_multiply(icon_a),
         );
-    } else {
-        // Fallback — a gear: hub circle + eight spokes, line-art style.
-        let c = Color32::from_gray(170).gamma_multiply(icon_a);
-        let stroke = Stroke::new(2.4 * s, c);
-        let ctr = ir.center();
-        let r_out = ir.height() * 0.42;
-        let r_in = ir.height() * 0.28;
-        painter.circle_stroke(ctr, ir.height() * 0.16, stroke);
-        for i in 0..8 {
-            let a = i as f32 * std::f32::consts::FRAC_PI_4;
-            painter.add(Shape::line_segment(
-                [
-                    ctr + Vec2::new(a.cos() * r_in, a.sin() * r_in),
-                    ctr + Vec2::new(a.cos() * r_out, a.sin() * r_out),
-                ],
-                stroke,
+        painter.rect_stroke(
+            bgr,
+            CornerRadius::same((9.0 * s) as u8),
+            Stroke::new(s.max(1.0), Color32::from_white_alpha((40.0 * icon_a) as u8)),
+            StrokeKind::Inside,
+        );
+        // The icon fills most of the button — Lacrima's setup tile is
+        // icon-dominant, not a chip in a big button.
+        let ir = bgr.shrink(6.0 * s);
+        if let Some(tex) = &emu.handler_icon {
+            painter.image(
+                tex.id(),
+                ir,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE.gamma_multiply(icon_a),
+            );
+        } else {
+            // Fallback — a gear: hub circle + eight spokes, line-art style.
+            let c = Color32::from_gray(170).gamma_multiply(icon_a);
+            let stroke = Stroke::new(2.4 * s, c);
+            let ctr = ir.center();
+            let r_out = ir.height() * 0.42;
+            let r_in = ir.height() * 0.28;
+            painter.circle_stroke(ctr, ir.height() * 0.16, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                painter.add(Shape::line_segment(
+                    [
+                        ctr + Vec2::new(a.cos() * r_in, a.sin() * r_in),
+                        ctr + Vec2::new(a.cos() * r_out, a.sin() * r_out),
+                    ],
+                    stroke,
+                ));
+            }
+        }
+
+        // Session controls — Lacrima's IsEmulatorRunning button set:
+        // left adds the viewport toggle (switch list ⇄ game), the center
+        // holds pause/play (process suspend/resume), and the right adds
+        // the Close-Emulator power button at the far end.
+        let mut toggle_viewport = false;
+        let mut toggle_pause = false;
+        let mut close_emu = false;
+        if let Some(session) = &emu.session {
+            // Viewport toggle — directly right of the albums toggle
+            // (same 110px button spacing the right cluster uses).
+            let vp = Rect::from_center_size(
+                Pos2::new(band.min.x + 190.0 * s, cy),
+                Vec2::splat(60.0 * s),
+            );
+            let r = if interactive {
+                ui.interact(vp, ui.id().with("emu-viewport"), Sense::click())
+            } else {
+                ui.interact(vp, ui.id().with("emu-viewport"), Sense::hover())
+            }
+            .on_hover_text(if emu.viewport_dismissed {
+                "Back to Game"
+            } else {
+                "Switch to List"
+            });
+            toggle_viewport = r.clicked();
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            transport::icon_viewport(&painter, vp, !emu.viewport_dismissed, alpha);
+
+            // Center pause/play — NtSuspendProcess/NtResumeProcess, the
+            // glyph is Lacrima's circled bars/triangle.
+            let pp = Rect::from_center_size(band.center(), Vec2::splat(80.0 * s));
+            let r = if interactive {
+                ui.interact(pp, ui.id().with("emu-pause"), Sense::click())
+            } else {
+                ui.interact(pp, ui.id().with("emu-pause"), Sense::hover())
+            }
+            .on_hover_text(if session.is_paused() {
+                "Resume Emulator"
+            } else {
+                "Pause Emulator"
+            });
+            toggle_pause = r.clicked();
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            transport::icon_play(&painter, pp, !session.is_paused(), alpha);
+
+            // Close Emulator — the power glyph at the right end of the
+            // band (CloseEmulatorCommand), next to the layout icon which
+            // slides one slot left to make room.
+            let pw = Rect::from_center_size(Pos2::new(pw_x, cy), Vec2::splat(60.0 * s));
+            let r = if interactive {
+                ui.interact(pw, ui.id().with("emu-close"), Sense::click())
+            } else {
+                ui.interact(pw, ui.id().with("emu-close"), Sense::hover())
+            }
+            .on_hover_text("Close Emulator");
+            close_emu = r.clicked();
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            transport::icon_power(&painter, pw, alpha);
+        }
+        if toggle_viewport {
+            emu.viewport_dismissed = !emu.viewport_dismissed;
+            if emu.viewport_dismissed {
+                emu.game_fs = false;
+                // The capture isn't on screen — nothing to tunnel into.
+                emu.input_tun = false;
+            }
+        }
+        if toggle_pause {
+            if let Some(session) = &emu.session {
+                session.set_paused(!session.is_paused());
+            }
+        }
+        if close_emu {
+            if let Some(session) = &emu.session {
+                session.stop();
+            }
+        }
+
+        // Right: the cover-layout cycle (Margin 0,0,50,0) — Lacrima binds
+        // the same global CoverLayoutMode the music band uses. While a
+        // session runs it makes room for the power button (Lacrima's
+        // right StackPanel order: layout … power … volume).
+        let right_x = layout_x;
+        let btn = Rect::from_center_size(Pos2::new(right_x, cy), Vec2::splat(60.0 * s));
+        let r = if interactive {
+            ui.interact(btn, ui.id().with("emu-layout"), Sense::click())
+        } else {
+            ui.interact(btn, ui.id().with("emu-layout"), Sense::hover())
+        }
+        .on_hover_text("Cover Layout");
+        if r.clicked() {
+            *cover_layout = (*cover_layout + 1) % 3;
+        }
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        transport::icon_layout(&painter, btn, *cover_layout, alpha);
+
+        // Row 2 — the section strip slides down out of view while the
+        // band holds (same trick as the music album row).
+        if list_t > 0.001 {
+            let slide = row_rect.translate(Vec2::new(
+                0.0,
+                (1.0 - list_t) * (content.max.y - row_rect.min.y),
             ));
-        }
-    }
-
-    // Session controls — Lacrima's IsEmulatorRunning button set:
-    // left adds the viewport toggle (switch list ⇄ game), the center
-    // holds pause/play (process suspend/resume), and the right adds
-    // the Close-Emulator power button at the far end.
-    let mut toggle_viewport = false;
-    let mut toggle_pause = false;
-    let mut close_emu = false;
-    if let Some(session) = &emu.session {
-        // Viewport toggle — directly right of the albums toggle
-        // (same 110px button spacing the right cluster uses).
-        let vp = Rect::from_center_size(
-            Pos2::new(band.min.x + 190.0 * s, cy),
-            Vec2::splat(60.0 * s),
-        );
-        let r = if interactive {
-            ui.interact(vp, ui.id().with("emu-viewport"), Sense::click())
-        } else {
-            ui.interact(vp, ui.id().with("emu-viewport"), Sense::hover())
-        }
-        .on_hover_text(if emu.viewport_dismissed {
-            "Back to Game"
-        } else {
-            "Switch to List"
-        });
-        toggle_viewport = r.clicked();
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        transport::icon_viewport(&painter, vp, !emu.viewport_dismissed, alpha);
-
-        // Center pause/play — NtSuspendProcess/NtResumeProcess, the
-        // glyph is Lacrima's circled bars/triangle.
-        let pp = Rect::from_center_size(band.center(), Vec2::splat(80.0 * s));
-        let r = if interactive {
-            ui.interact(pp, ui.id().with("emu-pause"), Sense::click())
-        } else {
-            ui.interact(pp, ui.id().with("emu-pause"), Sense::hover())
-        }
-        .on_hover_text(if session.is_paused() {
-            "Resume Emulator"
-        } else {
-            "Pause Emulator"
-        });
-        toggle_pause = r.clicked();
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        transport::icon_play(&painter, pp, !session.is_paused(), alpha);
-
-        // Close Emulator — the power glyph at the right end of the
-        // band (CloseEmulatorCommand), next to the layout icon which
-        // slides one slot left to make room.
-        let pw = Rect::from_center_size(
-            Pos2::new(pw_x, cy),
-            Vec2::splat(60.0 * s),
-        );
-        let r = if interactive {
-            ui.interact(pw, ui.id().with("emu-close"), Sense::click())
-        } else {
-            ui.interact(pw, ui.id().with("emu-close"), Sense::hover())
-        }
-        .on_hover_text("Close Emulator");
-        close_emu = r.clicked();
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        transport::icon_power(&painter, pw, alpha);
-    }
-    if toggle_viewport {
-        emu.viewport_dismissed = !emu.viewport_dismissed;
-        if emu.viewport_dismissed {
-            emu.game_fs = false;
-            // The capture isn't on screen — nothing to tunnel into.
-            emu.input_tun = false;
-        }
-    }
-    if toggle_pause {
-        if let Some(session) = &emu.session {
-            session.set_paused(!session.is_paused());
-        }
-    }
-    if close_emu {
-        if let Some(session) = &emu.session {
-            session.stop();
-        }
-    }
-
-    // Right: the cover-layout cycle (Margin 0,0,50,0) — Lacrima binds
-    // the same global CoverLayoutMode the music band uses. While a
-    // session runs it makes room for the power button (Lacrima's
-    // right StackPanel order: layout … power … volume).
-    let right_x = layout_x;
-    let btn = Rect::from_center_size(Pos2::new(right_x, cy), Vec2::splat(60.0 * s));
-    let r = if interactive {
-        ui.interact(btn, ui.id().with("emu-layout"), Sense::click())
-    } else {
-        ui.interact(btn, ui.id().with("emu-layout"), Sense::hover())
-    }
-    .on_hover_text("Cover Layout");
-    if r.clicked() {
-        *cover_layout = (*cover_layout + 1) % 3;
-    }
-    if r.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    transport::icon_layout(&painter, btn, *cover_layout, alpha);
-
-    // Row 2 — the section strip slides down out of view while the
-    // band holds (same trick as the music album row).
-    if list_t > 0.001 {
-        let slide = row_rect.translate(Vec2::new(
-            0.0,
-            (1.0 - list_t) * (content.max.y - row_rect.min.y),
-        ));
-        match emu.row.ui(
-            ui,
-            slide,
-            &mut emu.sections,
-            alpha * list_t,
-            interactive && list_t > 0.999,
-            s,
-            false,
-            false,
-        ) {
-            // Like the music album row: a single click only selects
-            // the tile — opening a section requires a double-click.
-            album_row::Action::Opened(i) => {
-                emu.active = Some(i);
-                // Load the section's persisted games into the card
-                // view on first activation — the key travels on the
-                // tile's `emu:` dir so reordering can't miskey it.
-                emu.open_section(i, cfg);
+            match emu.row.ui(
+                ui,
+                slide,
+                &mut emu.sections,
+                alpha * list_t,
+                interactive && list_t > 0.999,
+                s,
+                false,
+                false,
+            ) {
+                // Like the music album row: a single click only selects
+                // the tile — opening a section requires a double-click.
+                album_row::Action::Opened(i) => {
+                    emu.active = Some(i);
+                    // Load the section's persisted games into the card
+                    // view on first activation — the key travels on the
+                    // tile's `emu:` dir so reordering can't miskey it.
+                    emu.open_section(i, cfg);
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        // A landed section reorder persists (Lacrima's AlbumOrder) —
-        // the strip restores this order next launch. The loaded-
-        // section marker follows its key across the permutation so
-        // `active` can't end up pointing at the wrong console.
-        if emu.row.take_order_dirty() {
-            cfg.section_order = emu.sections.iter().map(section_key).collect();
-            if let Some(key) = emu.loaded_key.clone() {
-                emu.active = emu
-                    .sections
-                    .iter()
-                    .position(|s| section_key(s) == key);
+            // A landed section reorder persists (Lacrima's AlbumOrder) —
+            // the strip restores this order next launch. The loaded-
+            // section marker follows its key across the permutation so
+            // `active` can't end up pointing at the wrong console.
+            if emu.row.take_order_dirty() {
+                cfg.section_order = emu.sections.iter().map(section_key).collect();
+                if let Some(key) = emu.loaded_key.clone() {
+                    emu.active = emu.sections.iter().position(|s| section_key(s) == key);
+                }
+                emu.settings_dirty = true;
             }
-            emu.settings_dirty = true;
         }
-    }
 
-    // Item search pill docked top-right (RomSearch — same slot as the
-    // music view's item search). Lacrima hides the search box while
-    // the capture layer is up — it fades with the rest of the chrome.
-    if cap_a < 0.999 {
-        emu.search.ui(
-            ui,
-            content.max.x - 30.0 * s,
-            content.min.y + 26.0 * s,
-            "Search",
-            true,
-            false,
-            alpha * (1.0 - cap_a),
-            interactive && cap_a < 0.05,
-            s,
-        );
-    }
+        // Item search pill docked top-right (RomSearch — same slot as the
+        // music view's item search). Lacrima hides the search box while
+        // the capture layer is up — it fades with the rest of the chrome.
+        if cap_a < 0.999 {
+            emu.search.ui(
+                ui,
+                content.max.x - 30.0 * s,
+                content.min.y + 26.0 * s,
+                "Search",
+                true,
+                false,
+                alpha * (1.0 - cap_a),
+                interactive && cap_a < 0.05,
+                s,
+            );
+        }
 
-    // The capture render-options panel (Lacrima's
-    // RenderOptionsOverlay) — slides in from the right over the
-    // item area only; the icon band and section strip stay
-    // visible like the global settings overlay keeps its chrome.
-    let item_area = Rect::from_min_max(content.min, Pos2::new(content.max.x, band.min.y));
-    render_panel(ui, emu, item_area, alpha, interactive, s);
+        // The capture render-options panel (Lacrima's
+        // RenderOptionsOverlay) — slides in from the right over the
+        // item area only; the icon band and section strip stay
+        // visible like the global settings overlay keeps its chrome.
+        let item_area = Rect::from_min_max(content.min, Pos2::new(content.max.x, band.min.y));
+        render_panel(ui, emu, item_area, alpha, interactive, s);
     } // !chrome_hidden
 
     // The ROM metadata editor paints last — above the cards, the
@@ -1836,13 +1857,19 @@ pub fn view(
     if emu.rpcs3_patches.is_open() {
         emu.rpcs3_patches.ui(ui, content, s);
     }
+    if emu.shad_patches.is_open() {
+        emu.shad_patches.ui(ui, content, s);
+    }
+    if emu.shad_cheats.is_open() {
+        emu.shad_cheats.ui(ui, content, s);
+    }
     if emu.prof_prompt.is_open() {
         if let Some(Some(name)) = emu.prof_prompt.ui(ui, content, s) {
             emu.notice = Some(match xenia_storage(cfg) {
                 Some(root) => match xenia_profile::create(&root, &name) {
-                    Ok(_) => format!(
-                        "Xenia profile \"{name}\" created — it will sign in on launch."
-                    ),
+                    Ok(_) => {
+                        format!("Xenia profile \"{name}\" created — it will sign in on launch.")
+                    }
                     Err(e) => format!("Failed to create the Xenia profile: {e}"),
                 },
                 None => "Failed to create the Xenia profile — no storage root.".into(),
@@ -1872,9 +1899,7 @@ fn xenia_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let launcher = configured
-        .filter(|p| p.exists())
-        .or_else(emu_dl::xenia_exe);
+    let launcher = configured.filter(|p| p.exists()).or_else(emu_dl::xenia_exe);
     xenia_cfg::storage_root(launcher.as_deref().and_then(|p| p.parent()))
 }
 
@@ -1899,6 +1924,24 @@ fn rpcs3_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
         return managed;
     }
     configured.or(managed)
+}
+
+/// Resolve the shadPS4 emulator directory — the dir holding the exe
+/// (`user/` under it carries patches/cheats). Lacrima's
+/// ResolveShadPs4EmulatorDirectory semantics: the configured
+/// launcher's dir first (upgraded off qtlauncher via
+/// resolve_exe_path), else the managed install.
+fn shadps4_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
+    let configured = cfg
+        .emulators
+        .get(SHADPS4_HANDLER)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .map(|p| shadps4::resolve_exe_path(&p));
+    let exe = configured.or_else(emu_dl::shadps4_exe);
+    exe.and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
 /// Destination rect + UV for a captured frame in `rect`, blended by
@@ -1928,7 +1971,7 @@ fn frame_dest_uv(
     let fhf = fh as f32;
     let cw = (fwf - pl - pr).max(1.0);
     let eff = cw / fhf; // content aspect
-    // Pillar window in uv: [wl, wr] horizontally, full height.
+                        // Pillar window in uv: [wl, wr] horizontally, full height.
     let wl = (pl / fwf).clamp(0.0, 0.5);
     let wr = (1.0 - pr / fwf).clamp(0.5, 1.0);
     let ww = wr - wl;
@@ -1940,10 +1983,7 @@ fn frame_dest_uv(
         return (rect, uv);
     }
     let fit = (rect.width() / (fhf * eff)).min(rect.height() / fhf);
-    let fit_dest = Rect::from_center_size(
-        rect.center(),
-        Vec2::new(fhf * eff * fit, fhf * fit),
-    );
+    let fit_dest = Rect::from_center_size(rect.center(), Vec2::new(fhf * eff * fit, fhf * fit));
     let dest = lerp_rect(fit_dest, rect, crop_t);
     let d = dest.width() / dest.height();
     let uw = (d / eff).min(1.0) * ww;
@@ -1994,7 +2034,10 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
         if dest.width() <= 0.0 || dest.height() <= 0.0 {
             return None;
         }
-        let p = Pos2::new(p.x.clamp(dest.min.x, dest.max.x), p.y.clamp(dest.min.y, dest.max.y));
+        let p = Pos2::new(
+            p.x.clamp(dest.min.x, dest.max.x),
+            p.y.clamp(dest.min.y, dest.max.y),
+        );
         let tx = (p.x - dest.min.x) / dest.width();
         let ty = (p.y - dest.min.y) / dest.height();
         Some((
@@ -2028,12 +2071,9 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
                     let in_dest = dest.contains(*p);
                     if in_dest || *btns != 0 {
                         if let Some((x, y)) = map(*p) {
-                            *sent += session.post_at(
-                                WM_MOUSEMOVE,
-                                WPARAM(mk(*btns, i.modifiers)),
-                                x,
-                                y,
-                            ) as u32;
+                            *sent +=
+                                session.post_at(WM_MOUSEMOVE, WPARAM(mk(*btns, i.modifiers)), x, y)
+                                    as u32;
                         }
                     }
                 }
@@ -2090,7 +2130,7 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
                                 _ => delta.y * 3.0,
                             }
                             .clamp(i16::MIN as f32, i16::MAX as f32)
-                            as i16;
+                                as i16;
                             if d != 0 {
                                 let (sx, sy) = session.client_to_screen(x, y);
                                 *sent += session.post(
@@ -2219,20 +2259,20 @@ fn draw_session(
         } else {
             return;
         };
-        let (dest, uv) = frame_dest_uv(
-            rect,
-            fw,
-            fh,
-            emu.crop_t,
-            emu.render.stretch,
-            emu.pillar_cur,
-        );
+        let (dest, uv) =
+            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.pillar_cur);
         let seq = emu.frame_seq;
         let adjust = render_adjust(emu);
         let cb = emu
             .gpu_cap
             .as_ref()
-            .map(|gc| (gc.bgs[(seq % 3) as usize].clone(), gc.fence.clone(), gc.size))
+            .map(|gc| {
+                (
+                    gc.bgs[(seq % 3) as usize].clone(),
+                    gc.fence.clone(),
+                    gc.size,
+                )
+            })
             .and_then(|(bg, fence, size)| {
                 emu.cap_shader.as_mut().and_then(|cs| {
                     cs.callback_gpu(
@@ -2315,10 +2355,10 @@ fn draw_session(
     // The capture's CPU readback only earns its keep when something
     // actually needs pixels there — display on the mirror path, or
     // pillarbox detection.
-    session
-        .render()
-        .want_cpu
-        .store(emu.render.remove_pillars || emu.gpu_cap.is_none(), Ordering::Relaxed);
+    session.render().want_cpu.store(
+        emu.render.remove_pillars || emu.gpu_cap.is_none(),
+        Ordering::Relaxed,
+    );
 
     // Pull the newest captured frame — on the zero-copy path only the
     // ring seq matters (stats + shader FrameCount); on the CPU mirror
@@ -2350,8 +2390,7 @@ fn draw_session(
                         size: [w, h],
                         source_size: Vec2::new(w as f32, h as f32),
                         // Opaque frames — premult == unmult.
-                        pixels: bytemuck::cast_slice::<u8, egui::Color32>(&emu.frame_buf)
-                            .to_vec(),
+                        pixels: bytemuck::cast_slice::<u8, egui::Color32>(&emu.frame_buf).to_vec(),
                     };
                     match &mut emu.frame_tex {
                         Some(tex) if tex.size() == [w, h] => {
@@ -2376,41 +2415,41 @@ fn draw_session(
                     new_seq = Some(seq);
                 }
                 // Remove-side-pillars: a locked per-ROM crop wins
-            // outright (Lacrima's EnforceLockedArcadeCrop); otherwise
-            // measure the frame's black bars (PillarboxBarDetector,
-            // aggressive profile since AggressivePillarboxCrop ==
-            // RemoveArcadePillarboxBars there) + the arcade resolver,
-            // then the 6-stable-frame debounce before retargeting.
-            if emu.render.remove_pillars {
-                let det = if let Some((ll, lr, lfw)) = emu.pillar_lock {
-                    crate::pillarbox::scale_locked(ll, lr, lfw, w as u32)
-                } else {
-                    crate::pillarbox::resolve(
-                        w as u32,
-                        crate::pillarbox::detect(
-                            &emu.frame_buf,
-                            w,
-                            h,
-                            crate::pillarbox::Profile::Aggressive,
-                        ),
-                    )
-                };
-                let locked = emu.pillar_lock.is_some();
-                if det == emu.pillar_last {
-                    emu.pillar_stable = emu.pillar_stable.saturating_add(1).min(60);
-                } else {
-                    emu.pillar_last = det;
-                    emu.pillar_stable = 1;
-                }
-                // Locked crops enforce immediately — detection
-                // doesn't run on a locked resolver either.
-                if (locked || emu.pillar_stable >= 6) && det != emu.pillar_tgt {
-                    emu.pillar_tgt = det;
-                    emu.pillar_from = emu.pillar_cur;
-                    emu.pillar_prog = 0.0;
+                // outright (Lacrima's EnforceLockedArcadeCrop); otherwise
+                // measure the frame's black bars (PillarboxBarDetector,
+                // aggressive profile since AggressivePillarboxCrop ==
+                // RemoveArcadePillarboxBars there) + the arcade resolver,
+                // then the 6-stable-frame debounce before retargeting.
+                if emu.render.remove_pillars {
+                    let det = if let Some((ll, lr, lfw)) = emu.pillar_lock {
+                        crate::pillarbox::scale_locked(ll, lr, lfw, w as u32)
+                    } else {
+                        crate::pillarbox::resolve(
+                            w as u32,
+                            crate::pillarbox::detect(
+                                &emu.frame_buf,
+                                w,
+                                h,
+                                crate::pillarbox::Profile::Aggressive,
+                            ),
+                        )
+                    };
+                    let locked = emu.pillar_lock.is_some();
+                    if det == emu.pillar_last {
+                        emu.pillar_stable = emu.pillar_stable.saturating_add(1).min(60);
+                    } else {
+                        emu.pillar_last = det;
+                        emu.pillar_stable = 1;
+                    }
+                    // Locked crops enforce immediately — detection
+                    // doesn't run on a locked resolver either.
+                    if (locked || emu.pillar_stable >= 6) && det != emu.pillar_tgt {
+                        emu.pillar_tgt = det;
+                        emu.pillar_from = emu.pillar_cur;
+                        emu.pillar_prog = 0.0;
+                    }
                 }
             }
-        }
         }
         // Zero-copy path — the ring's signaled seq IS the frame
         // counter (and the fence value to wait on before sampling).
@@ -2451,9 +2490,8 @@ fn draw_session(
         // The pillar crop replaces the frame's aspect with the
         // measured content's — the fill decision uses the debounced
         // TARGET insets so it can't flip mid-tween (crop_t bounce).
-        let eff = ((fw as f32 - emu.pillar_tgt.0 as f32 - emu.pillar_tgt.1 as f32)
-            .max(1.0))
-            / fh as f32;
+        let eff =
+            ((fw as f32 - emu.pillar_tgt.0 as f32 - emu.pillar_tgt.1 as f32).max(1.0)) / fh as f32;
         // `want` uses the TARGET aspect, not the animating rect's —
         // otherwise it flips as the easing aspect sweeps through the
         // fill band mid-transition and crop_t reverses (the bounce).
@@ -2509,14 +2547,8 @@ fn draw_session(
     }
 
     if let Some((fw, fh)) = frame_dims {
-        let (dest, uv) = frame_dest_uv(
-            rect,
-            fw,
-            fh,
-            emu.crop_t,
-            emu.render.stretch,
-            emu.pillar_cur,
-        );
+        let (dest, uv) =
+            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.pillar_cur);
         // The tunnel maps screen → frame → client through this same
         // transform — refresh it wherever the draw moved to.
         emu.tun_map = Some((dest, uv));
@@ -2526,11 +2558,13 @@ fn draw_session(
         // mirror path: named shader via PaintCallback or plain blit.
         let seq = emu.frame_seq;
         let adjust = render_adjust(emu);
-        let cb = if let Some((bg, fence, size)) = emu
-            .gpu_cap
-            .as_ref()
-            .map(|gc| (gc.bgs[(seq % 3) as usize].clone(), gc.fence.clone(), gc.size))
-        {
+        let cb = if let Some((bg, fence, size)) = emu.gpu_cap.as_ref().map(|gc| {
+            (
+                gc.bgs[(seq % 3) as usize].clone(),
+                gc.fence.clone(),
+                gc.size,
+            )
+        }) {
             emu.cap_shader.as_mut().and_then(|cs| {
                 cs.callback_gpu(
                     &emu.render.shader,
@@ -2563,9 +2597,7 @@ fn draw_session(
                 // Must be the egui_wgpu::Callback wrapper — the
                 // renderer downcasts the Arc to that exact type; a
                 // bare PaintCallback shape is silently culled.
-                painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
-                    dest, cb,
-                ));
+                painter.add(eframe::egui_wgpu::Callback::new_paint_callback(dest, cb));
             }
             None => {
                 if let Some(tex) = &emu.frame_tex {
@@ -2644,13 +2676,7 @@ fn draw_session(
 /// panel at RenderOverlayOpacity. Content: capture fps + frametime,
 /// a status line, optional GPU renderer/vendor, and the 520x40
 /// frametime polyline with 16.7/33.3 ms guides.
-fn draw_stats_overlay(
-    painter: &egui::Painter,
-    rect: Rect,
-    emu: &mut EmuView,
-    alpha: f32,
-    s: f32,
-) {
+fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, alpha: f32, s: f32) {
     let op = (emu.render.overlay_opacity * alpha).clamp(0.0, 1.0);
     if op <= 0.01 {
         return;
@@ -2753,7 +2779,10 @@ fn draw_stats_overlay(
             .collect();
         painter.add(Shape::line(
             pts,
-            Stroke::new(1.5 * s, Color32::from_rgb(0, 0xFF, 0xFF).gamma_multiply(op * 0.7)),
+            Stroke::new(
+                1.5 * s,
+                Color32::from_rgb(0, 0xFF, 0xFF).gamma_multiply(op * 0.7),
+            ),
         ));
     }
 }
@@ -2777,10 +2806,12 @@ fn draw_items(
     let key = emu.loaded_key.clone().unwrap_or_default();
     // The Xenia item-menu entries only make sense for the X360
     // section wired to the xenia handler.
-    emu.cards.xenia_menu = key == XENIA_SECTION
-        && emu.active_handler(cfg).as_deref() == Some(XENIA_HANDLER);
-    emu.cards.rpcs3_menu = key == PS3_SECTION
-        && emu.active_handler(cfg).as_deref() == Some(RPCS3_HANDLER);
+    emu.cards.xenia_menu =
+        key == XENIA_SECTION && emu.active_handler(cfg).as_deref() == Some(XENIA_HANDLER);
+    emu.cards.rpcs3_menu =
+        key == PS3_SECTION && emu.active_handler(cfg).as_deref() == Some(RPCS3_HANDLER);
+    emu.cards.shadps4_menu =
+        key == PS4_SECTION && emu.active_handler(cfg).as_deref() == Some(SHADPS4_HANDLER);
     let mode = match cover_layout {
         1 => carousel::Mode::VerticalGrid,
         2 => carousel::Mode::HorizontalGrid,
@@ -2831,7 +2862,8 @@ fn draw_items(
                 Pos2::new(cx + a.cos() * r, cy + a.sin() * r)
             })
             .collect();
-        ui.painter().add(egui::Shape::line(pts, Stroke::new(2.2 * s, col)));
+        ui.painter()
+            .add(egui::Shape::line(pts, Stroke::new(2.2 * s, col)));
         ui.painter().text(
             Pos2::new(cx + r + 8.0 * s, cy),
             Align2::LEFT_CENTER,
@@ -2863,12 +2895,23 @@ fn draw_items(
         // Xenia per-game overlays — the storage root resolves the
         // same way a launch does (launcher dir ⇄ managed install).
         carousel::Action::Patches(p) => {
-            if key == PS3_SECTION
-                && emu.active_handler(cfg).as_deref() == Some(RPCS3_HANDLER)
-            {
-                emu.rpcs3_patches.open(&p, &rom_title(&p), rpcs3_storage(cfg));
+            let handler = emu.active_handler(cfg);
+            if key == PS3_SECTION && handler.as_deref() == Some(RPCS3_HANDLER) {
+                emu.rpcs3_patches
+                    .open(&p, &rom_title(&p), rpcs3_storage(cfg));
+            } else if key == PS4_SECTION && handler.as_deref() == Some(SHADPS4_HANDLER) {
+                emu.shad_patches
+                    .open(&p, &rom_title(&p), shadps4_storage(cfg));
             } else {
                 emu.patches.open(&p, &rom_title(&p), xenia_storage(cfg));
+            }
+        }
+        // PS4 + shadPS4: the ShadPs4CheatsOverlay (Lacrima's
+        // ShadPs4CheatsMenuItem).
+        carousel::Action::Cheats(p) => {
+            if key == PS4_SECTION && emu.active_handler(cfg).as_deref() == Some(SHADPS4_HANDLER) {
+                emu.shad_cheats
+                    .open(&p, &rom_title(&p), shadps4_storage(cfg));
             }
         }
         carousel::Action::CustomConfig(p) => {
@@ -2902,7 +2945,14 @@ fn draw_items(
                 let key2 = key.clone();
                 let (tx, rx) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = tx.send(scan_rom_folder(&dir, &key2));
+                    // A panic mid-walk (a weird filename anywhere in
+                    // the tree) must still deliver a result — a dead
+                    // sender leaves the UI spinning on "Scanning…".
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scan_rom_folder(&dir, &key2)
+                    }))
+                    .unwrap_or_default();
+                    let _ = tx.send(res);
                 });
                 emu.scan_rx = Some(rx);
                 emu.notice = Some("Scanning folder…".into());
@@ -2921,8 +2971,8 @@ fn draw_items(
 /// drains the result off the UI thread.
 fn scan_rom_folder(root: &Path, key: &str) -> Vec<PathBuf> {
     let pats = section_patterns(key);
-    // EmulationConsoleCatalog.SupportsFolderImport.
-    let folder_import = matches!(key, "PS3" | "PS4");
+    // EmulationConsoleCatalog.SupportsFolderImport — PS3/PS4 each get
+    // their own installed-folder check.
     let accept = |ext: &str| {
         // STEAM's AllFilePatterns — no extension gate at all.
         key == "STEAM"
@@ -2931,12 +2981,26 @@ fn scan_rom_folder(root: &Path, key: &str) -> Vec<PathBuf> {
     };
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    // Canonical dedup — a directory junction pointing back at an
+    // ancestor would loop the DFS forever.
+    let mut visited = HashSet::new();
     while let Some(dir) = stack.pop() {
-        if folder_import && emu_meta::ps3_is_installed_folder(&dir) {
+        let canon = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canon) {
+            continue;
+        }
+        let installed = match key {
+            "PS3" => emu_meta::ps3_is_installed_folder(&dir),
+            "PS4" => emu_meta::ps4_is_installed_folder(&dir),
+            _ => false,
+        };
+        if installed {
             out.push(dir);
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             // ShouldSkipFilesystemEntry — dot/hidden + macOS `._`.
             if e.file_name().to_string_lossy().starts_with('.') {
@@ -3190,10 +3254,7 @@ pub fn settings_tab(
         } else {
             0.0
         };
-        let card = Rect::from_min_size(
-            Pos2::new(x, y),
-            Vec2::new(right - x, head_h + body_h),
-        );
+        let card = Rect::from_min_size(Pos2::new(x, y), Vec2::new(right - x, head_h + body_h));
         painter.rect_filled(
             card,
             CornerRadius::same((8.0 * s) as u8),
@@ -3325,10 +3386,7 @@ pub fn settings_tab(
                 tui.add(
                     egui::TextEdit::singleline(entry)
                         .desired_width(box_rect.width())
-                        .hint_text(
-                            egui::RichText::new(spec.exe_hint)
-                                .font(font14.clone()),
-                        )
+                        .hint_text(egui::RichText::new(spec.exe_hint).font(font14.clone()))
                         .font(font14.clone()),
                 );
                 painter.rect_filled(
@@ -3576,9 +3634,9 @@ fn render_panel(
     // Same slide as the global settings overlay — 0.3s wall-clock
     // animate_bool + ease_out_cubic; the panel just slides out and
     // back over the content.
-    let slide = ui
-        .ctx()
-        .animate_bool_with_time(ui.id().with("render-panel-slide"), emu.render_open, 0.3);
+    let slide =
+        ui.ctx()
+            .animate_bool_with_time(ui.id().with("render-panel-slide"), emu.render_open, 0.3);
     let t = crate::ease_out_cubic(slide);
     if t <= 0.001 {
         return;
@@ -3588,23 +3646,13 @@ fn render_panel(
     // overlay (38% slab over the full content height).
     let ps = s.clamp(0.56, 0.82);
     let w = (area.width() * 0.30).clamp(230.0, area.width());
-    let panel = Rect::from_min_max(
-        Pos2::new(area.max.x - w * t, area.min.y),
-        area.max,
-    );
+    let panel = Rect::from_min_max(Pos2::new(area.max.x - w * t, area.min.y), area.max);
     let painter = ui.painter().clone();
-    painter.rect_filled(
-        panel,
-        0.0,
-        Color32::from_black_alpha((242.0 * alpha) as u8),
-    );
+    painter.rect_filled(panel, 0.0, Color32::from_black_alpha((242.0 * alpha) as u8));
     painter.vline(
         panel.min.x,
         panel.y_range(),
-        Stroke::new(
-            s.max(1.0),
-            Color32::from_white_alpha((51.0 * alpha) as u8),
-        ),
+        Stroke::new(s.max(1.0), Color32::from_white_alpha((51.0 * alpha) as u8)),
     );
     // Clicking the exposed content left of the panel closes it —
     // the panel itself swallows clicks (settings overlay pattern).
@@ -3659,8 +3707,7 @@ fn render_panel(
             Stroke::new(2.0 * ps, accent),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let (xr, resp) =
-                ui.allocate_exact_size(Vec2::splat(26.0 * ps), Sense::click());
+            let (xr, resp) = ui.allocate_exact_size(Vec2::splat(26.0 * ps), Sense::click());
             if resp.clicked() {
                 close = true;
             }
@@ -3678,20 +3725,10 @@ fn render_panel(
                 })
                 .gamma_multiply(alpha),
             );
-            ui.painter().line_segment(
-                [
-                    c + Vec2::new(-k, -k),
-                    c + Vec2::new(k, k),
-                ],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [
-                    c + Vec2::new(k, -k),
-                    c + Vec2::new(-k, k),
-                ],
-                stroke,
-            );
+            ui.painter()
+                .line_segment([c + Vec2::new(-k, -k), c + Vec2::new(k, k)], stroke);
+            ui.painter()
+                .line_segment([c + Vec2::new(k, -k), c + Vec2::new(-k, k)], stroke);
         });
     });
     if close {
@@ -3724,8 +3761,7 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             egui::ComboBox::from_id_salt("render-stretch")
                 .selected_text(
-                    ["Uniform", "Uniform to Fill", "Fill"]
-                        [emu.render.stretch.min(2) as usize],
+                    ["Uniform", "Uniform to Fill", "Fill"][emu.render.stretch.min(2) as usize],
                 )
                 .width(170.0 * ps)
                 .show_ui(ui, |ui| {
@@ -3766,10 +3802,20 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
     );
 
     render_toggle(pui, "Disable VSync", &mut emu.render.disable_vsync, ps);
-    render_toggle(pui, "Remove side pillars", &mut emu.render.remove_pillars, ps);
+    render_toggle(
+        pui,
+        "Remove side pillars",
+        &mut emu.render.remove_pillars,
+        ps,
+    );
     pui.add_space(6.0 * ps);
     render_toggle(pui, "Show Stats Overlay", &mut emu.render.stats_overlay, ps);
-    render_toggle(pui, "Show Frametime Graph", &mut emu.render.frametime_graph, ps);
+    render_toggle(
+        pui,
+        "Show Frametime Graph",
+        &mut emu.render.frametime_graph,
+        ps,
+    );
     render_toggle(pui, "Show GPU Info", &mut emu.render.gpu_info, ps);
     pui.add_space(6.0 * ps);
 
@@ -3812,11 +3858,7 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
                         ui.selectable_value(&mut emu.render.shader, String::new(), "None");
                         if let Some(cs) = &emu.cap_shader {
                             for n in cs.names() {
-                                ui.selectable_value(
-                                    &mut emu.render.shader,
-                                    n.clone(),
-                                    n.clone(),
-                                );
+                                ui.selectable_value(&mut emu.render.shader, n.clone(), n.clone());
                             }
                         }
                     });
@@ -3858,8 +3900,7 @@ fn render_slider(
                     .color(Color32::from_gray(160)),
             );
             let tw = (ui.available_width() - 8.0 * ps).max(40.0 * ps);
-            let (track, _) =
-                ui.allocate_exact_size(Vec2::new(tw, 12.0 * ps), Sense::hover());
+            let (track, _) = ui.allocate_exact_size(Vec2::new(tw, 12.0 * ps), Sense::hover());
             crate::pill_slider(
                 ui,
                 track,
@@ -3887,10 +3928,43 @@ fn render_toggle(ui: &mut egui::Ui, label: &str, on: &mut bool, ps: f32) {
                     .size(13.0 * ps)
                     .color(Color32::from_gray(150)),
             );
-            let (rect, _) =
-                ui.allocate_exact_size(Vec2::new(46.0 * ps, 24.0 * ps), Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(46.0 * ps, 24.0 * ps), Sense::hover());
             crate::toggle_switch(ui, rect, &format!("rt-{label}"), on, 1.0);
         });
     });
     ui.add_space(12.0 * ps);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scan Folder over a PS4 tree: the installed dump is added
+    /// whole (never descended into), loose .pkg files are found —
+    /// and a short alpha dir name ("Games") must not panic the
+    /// worker via the title-id token scanner.
+    #[test]
+    fn ps4_scan_collects_installed_folders() {
+        let base = std::env::temp_dir().join(format!("aes_scan_ps4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("Games");
+        let dump = root.join("CUSA12345 - Bloodborne");
+        std::fs::create_dir_all(dump.join("sce_sys")).unwrap();
+        std::fs::write(dump.join("sce_sys").join("param.sfo"), b"fake").unwrap();
+        // A pkg INSIDE the dump must never surface as its own rom.
+        std::fs::write(dump.join("patch.pkg"), b"x").unwrap();
+        std::fs::write(root.join("Loose.pkg"), b"x").unwrap();
+        let nested = root.join("Stuff").join("Inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.pkg"), b"x").unwrap();
+
+        // Scanning "Games" exercises the short-name panic path: the
+        // installed-folder check inspects each ancestor segment.
+        let found = scan_rom_folder(&root, "PS4");
+        assert!(found.contains(&dump));
+        assert!(found.contains(&root.join("Loose.pkg")));
+        assert!(found.contains(&nested.join("deep.pkg")));
+        assert!(!found.contains(&dump.join("patch.pkg")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

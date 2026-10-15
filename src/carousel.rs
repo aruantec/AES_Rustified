@@ -15,9 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use eframe::egui::epaint::Vertex;
-use eframe::egui::{
-    self, Align2, Color32, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, Vec2,
-};
+use eframe::egui::{self, Align2, Color32, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::album_row::AlbumRow;
 use crate::library::{Album, CoverSrc, TrackInfo};
@@ -122,10 +120,13 @@ pub enum Action {
     AddRoms,
     /// ROM mode: "Scan Folder" context menu — recursive scan.
     ScanFolder,
-    /// X360 ROM menu: "Patches" — the XeniaPatchesOverlay.
+    /// X360 ROM menu: "Patches" — the XeniaPatchesOverlay (PS3/PS4
+    /// sections reuse it for their RPCS3/shadPS4 patch overlays).
     Patches(PathBuf),
     /// X360 ROM menu: "Custom Config" — the XeniaCustomConfigOverlay.
     CustomConfig(PathBuf),
+    /// PS4 ROM menu: "Cheats" — the ShadPs4CheatsOverlay.
+    Cheats(PathBuf),
 }
 
 /// One carousel/grid item = one track of the loaded album.
@@ -276,6 +277,9 @@ pub struct Carousel {
     /// ROM mode + RPCS3 handler — shows the Lacrima "Patches" item
     /// entry (Rpcs3PatchesMenuItem).
     pub rpcs3_menu: bool,
+    /// ROM mode + shadPS4 handler — shows the "Patches" + "Cheats"
+    /// entries (ShadPs4PatchesMenuItem / ShadPs4CheatsMenuItem).
+    pub shadps4_menu: bool,
 }
 
 impl Carousel {
@@ -315,6 +319,7 @@ impl Carousel {
             rom_mode: false,
             xenia_menu: false,
             rpcs3_menu: false,
+            shadps4_menu: false,
         }
     }
 
@@ -419,7 +424,8 @@ impl Carousel {
             return false;
         }
         let section = self.album_title.clone();
-        self.items.push(Self::rom_item(path, cover, fallback, &section));
+        self.items
+            .push(Self::rom_item(path, cover, fallback, &section));
         true
     }
 
@@ -474,7 +480,11 @@ impl Carousel {
             fallback: None,
             title: id.unwrap_or_else(|| url.to_string()),
             artist: String::new(),
-            album: self.items.first().map(|i| i.album.clone()).unwrap_or_default(),
+            album: self
+                .items
+                .first()
+                .map(|i| i.album.clone())
+                .unwrap_or_default(),
         });
     }
 
@@ -542,10 +552,7 @@ impl Carousel {
     /// descending so earlier positions stay valid.
     pub fn remove_many(&mut self, paths: &[PathBuf]) {
         self.item_drag = None;
-        let mut idxs: Vec<usize> = paths
-            .iter()
-            .filter_map(|p| self.index_of(p))
-            .collect();
+        let mut idxs: Vec<usize> = paths.iter().filter_map(|p| self.index_of(p)).collect();
         idxs.sort_unstable();
         idxs.dedup();
         for &i in idxs.iter().rev() {
@@ -562,9 +569,7 @@ impl Carousel {
         }
         if !idxs.is_empty() {
             // Primary + anchor shift down by every removal before them.
-            let shift = |v: usize| {
-                v.saturating_sub(idxs.iter().filter(|&&i| i < v).count())
-            };
+            let shift = |v: usize| v.saturating_sub(idxs.iter().filter(|&&i| i < v).count());
             self.sel = shift(self.sel);
             self.sel_anchor = shift(self.sel_anchor);
             let max = self.items.len().saturating_sub(1) as f32;
@@ -674,10 +679,7 @@ impl Carousel {
             return None;
         }
         let title = self.items[0].album.clone();
-        Some((
-            self.items.iter().map(|i| i.path.clone()).collect(),
-            title,
-        ))
+        Some((self.items.iter().map(|i| i.path.clone()).collect(), title))
     }
 
     /// Tag metadata arrived from the worker — upgrade item labels
@@ -732,9 +734,7 @@ impl Carousel {
             .iter()
             .position(|&i| i == self.sel)
             .unwrap_or_else(|| {
-                self.current
-                    .round()
-                    .clamp(0.0, (visible.len() - 1) as f32) as usize
+                self.current.round().clamp(0.0, (visible.len() - 1) as f32) as usize
             });
         let cols = self
             .nav_geo
@@ -746,8 +746,7 @@ impl Carousel {
             Mode::Carousel => dx + dy,
             _ => dx + dy * cols as i32,
         };
-        let new_pos =
-            (pos as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
+        let new_pos = (pos as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
         if new_pos == pos {
             return;
         }
@@ -788,10 +787,7 @@ impl Carousel {
             Mode::Carousel => dx + dy,
             _ => dx + dy * cols as i32,
         };
-        let pr = indices
-            .iter()
-            .position(|&i| i == self.sel)
-            .unwrap_or(0);
+        let pr = indices.iter().position(|&i| i == self.sel).unwrap_or(0);
         // Primary item's landing slot → block start, same formula as
         // the drag-commit.
         let drop_target = (self.sel as i32 + delta).clamp(0, n as i32 - 1) as usize;
@@ -802,11 +798,8 @@ impl Carousel {
             pulled.push(self.items.remove(i));
         }
         pulled.reverse();
-        let insert = drop_target
-            .saturating_sub(pr)
-            .min(self.items.len());
-        let unchanged =
-            indices == (insert..insert + indices.len()).collect::<Vec<_>>();
+        let insert = drop_target.saturating_sub(pr).min(self.items.len());
+        let unchanged = indices == (insert..insert + indices.len()).collect::<Vec<_>>();
         for (j, it) in pulled.into_iter().enumerate() {
             self.items.insert(insert + j, it);
         }
@@ -826,11 +819,12 @@ impl Carousel {
         if visible.is_empty() {
             return;
         }
-        let pos = visible.iter().position(|&i| i == self.sel).unwrap_or_else(|| {
-            self.current
-                .round()
-                .clamp(0.0, (visible.len() - 1) as f32) as usize
-        });
+        let pos = visible
+            .iter()
+            .position(|&i| i == self.sel)
+            .unwrap_or_else(|| {
+                self.current.round().clamp(0.0, (visible.len() - 1) as f32) as usize
+            });
         let idx = visible[pos];
         self.sel = idx;
         self.sel_anchor = idx;
@@ -974,11 +968,7 @@ impl Carousel {
 
     /// Best texture for an item: its own embedded art, the album's
     /// top cover when that failed, else the shared placeholder.
-    fn item_tex(
-        row: &mut AlbumRow,
-        ctx: &egui::Context,
-        item: &Item,
-    ) -> egui::TextureHandle {
+    fn item_tex(row: &mut AlbumRow, ctx: &egui::Context, item: &Item) -> egui::TextureHandle {
         if let Some(t) = row.cover_tex(ctx, &item.cover) {
             return t;
         }
@@ -1062,7 +1052,11 @@ impl Carousel {
 
     /// Shared press bookkeeping: anchor + smoothed velocity.
     fn press_update(press: &mut Press, p: Pos2, dt: f32, px_per_unit: f32, axis_x: bool) {
-        let d = if axis_x { p.x - press.last.x } else { p.y - press.last.y };
+        let d = if axis_x {
+            p.x - press.last.x
+        } else {
+            p.y - press.last.y
+        };
         if dt > 1e-6 {
             let instant = -d / (px_per_unit * dt);
             // ~45ms exponential window keeps the release fling stable
@@ -1103,11 +1097,7 @@ impl Carousel {
     /// Block start for a drag: the primary's target slot minus its
     /// rank in the dragged set (Lacrima's blockToIndex clamp).
     fn block_start(d: &ItemDrag, count: usize) -> usize {
-        let pr = d
-            .indices
-            .iter()
-            .position(|&i| i == d.index)
-            .unwrap_or(0);
+        let pr = d.indices.iter().position(|&i| i == d.index).unwrap_or(0);
         d.drop_target
             .min(count.saturating_sub(1))
             .saturating_sub(pr)
@@ -1121,11 +1111,7 @@ impl Carousel {
         match &self.item_drag {
             Some(d) if d.indices.binary_search(&vi).is_err() => {
                 let n = self.items.len();
-                let disp = Self::display_slot(
-                    vi,
-                    &d.indices,
-                    Self::block_start(d, n),
-                ) as f32;
+                let disp = Self::display_slot(vi, &d.indices, Self::block_start(d, n)) as f32;
                 // During the drop glide neighbors are fully at their
                 // displaced slots — the asymptotic swap chase would
                 // otherwise snap its last few percent at permute.
@@ -1158,8 +1144,7 @@ impl Carousel {
             Mode::Carousel => {
                 let item = self.items.get(vi)?;
                 let tex = Self::item_tex(row, ctx, item);
-                let (tx, tz, rot, sc, _w, _h) =
-                    self.item_geo(vi as f32, &tex, cfg, s);
+                let (tx, tz, rot, sc, _w, _h) = self.item_geo(vi as f32, &tex, cfg, s);
                 let center = Pos2::new(
                     grid_area.center().x,
                     grid_area.center().y + cfg.vertical_offset * s,
@@ -1177,20 +1162,11 @@ impl Carousel {
     /// the contiguous slot `k - primary_rank` away from the primary's
     /// (Lacrima's _targetOffsetsRelPrimary). Uniform grid layout makes
     /// both scroll-independent; carousel-mode drags are singletons.
-    fn drag_item_offsets(
-        &self,
-        d: &ItemDrag,
-        k: usize,
-        geo: Option<&GridGeo>,
-    ) -> (Vec2, Vec2) {
+    fn drag_item_offsets(&self, d: &ItemDrag, k: usize, geo: Option<&GridGeo>) -> (Vec2, Vec2) {
         let Some(g) = geo else {
             return (Vec2::ZERO, Vec2::ZERO);
         };
-        let pr = d
-            .indices
-            .iter()
-            .position(|&i| i == d.index)
-            .unwrap_or(0);
+        let pr = d.indices.iter().position(|&i| i == d.index).unwrap_or(0);
         let Some(pc) = g.card_rect(d.index, 0.0).map(|r| r.center()) else {
             return (Vec2::ZERO, Vec2::ZERO);
         };
@@ -1210,18 +1186,8 @@ impl Carousel {
     /// block; carousel members fan out horizontally under the pointer
     /// (a pile — the honest equivalent of collapsed margins on a
     /// curved layout).
-    fn drag_member_offset(
-        &self,
-        d: &ItemDrag,
-        k: usize,
-        geo: Option<&GridGeo>,
-        s: f32,
-    ) -> Vec2 {
-        let pr = d
-            .indices
-            .iter()
-            .position(|&i| i == d.index)
-            .unwrap_or(0);
+    fn drag_member_offset(&self, d: &ItemDrag, k: usize, geo: Option<&GridGeo>, s: f32) -> Vec2 {
+        let pr = d.indices.iter().position(|&i| i == d.index).unwrap_or(0);
         match geo {
             Some(_) => {
                 let (home, glued) = self.drag_item_offsets(d, k, geo);
@@ -1280,23 +1246,18 @@ impl Carousel {
             if !indices.is_empty() {
                 // Pull the dragged items out (descending indices keep
                 // positions valid), preserving their relative order.
-                let mut pulled: Vec<Item> =
-                    Vec::with_capacity(indices.len());
+                let mut pulled: Vec<Item> = Vec::with_capacity(indices.len());
                 for &i in indices.iter().rev() {
                     pulled.push(self.items.remove(i));
                 }
                 pulled.reverse();
-                let pr = indices
-                    .iter()
-                    .position(|&i| i == d.index)
-                    .unwrap_or(0);
+                let pr = indices.iter().position(|&i| i == d.index).unwrap_or(0);
                 let insert = d
                     .drop_target
                     .min(n - 1)
                     .saturating_sub(pr)
                     .min(self.items.len());
-                let unchanged =
-                    indices == (insert..insert + indices.len()).collect::<Vec<_>>();
+                let unchanged = indices == (insert..insert + indices.len()).collect::<Vec<_>>();
                 for (j, it) in pulled.into_iter().enumerate() {
                     self.items.insert(insert + j, it);
                 }
@@ -1318,8 +1279,7 @@ impl Carousel {
             return;
         }
 
-        let (pointer, down) =
-            ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+        let (pointer, down) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
 
         if self.item_drag.is_none() {
             // Still-holding press -> lift. Any earlier movement already
@@ -1331,21 +1291,17 @@ impl Carousel {
             if pr.moved || pr.at.elapsed().as_millis() < REORDER_HOLD_MS {
                 return;
             }
-            let Some(vi) = pr.item.filter(|&vi| vi < n) else { return };
-            let Some(c) =
-                self.slot_center(vi, mode, geo, grid_area, row, ctx, cfg, s)
-            else {
+            let Some(vi) = pr.item.filter(|&vi| vi < n) else {
+                return;
+            };
+            let Some(c) = self.slot_center(vi, mode, geo, grid_area, row, ctx, cfg, s) else {
                 return;
             };
             let grab = pr.start - c;
             // Drag set: the selection when the held card is part of
             // it, else just the held card (Lacrima's _draggedIndices).
             let indices: Vec<usize> = if self.sel_set.contains(&vi) {
-                self.sel_set
-                    .iter()
-                    .copied()
-                    .filter(|&i| i < n)
-                    .collect()
+                self.sel_set.iter().copied().filter(|&i| i < n).collect()
             } else {
                 vec![vi]
             };
@@ -1393,21 +1349,15 @@ impl Carousel {
                 let c = self.item_drag.as_ref().unwrap().center;
                 starts.push(c + off);
                 targets.push(
-                    self.slot_center(
-                        bs + k,
-                        mode,
-                        geo,
-                        grid_area,
-                        row,
-                        ctx,
-                        cfg,
-                        s,
-                    )
-                    .unwrap_or(c + off),
+                    self.slot_center(bs + k, mode, geo, grid_area, row, ctx, cfg, s)
+                        .unwrap_or(c + off),
                 );
             }
-            self.item_drag.as_mut().unwrap().commit =
-                Some(ItemCommit { starts, targets, progress: 0.0 });
+            self.item_drag.as_mut().unwrap().commit = Some(ItemCommit {
+                starts,
+                targets,
+                progress: 0.0,
+            });
             ctx.request_repaint();
             return;
         }
@@ -1430,9 +1380,7 @@ impl Carousel {
         let mut best = 0usize;
         let mut best_d = f32::MAX;
         for vi in 0..n {
-            let Some(c) =
-                self.slot_center(vi, mode, geo, grid_area, row, ctx, cfg, s)
-            else {
+            let Some(c) = self.slot_center(vi, mode, geo, grid_area, row, ctx, cfg, s) else {
                 continue;
             };
             let dd = match mode {
@@ -1463,8 +1411,7 @@ impl Carousel {
                 let disp = Self::display_slot(vi, &d.indices, bs);
                 let want = if disp == vi { 0.0 } else { 1.0 };
                 let cur = d.swap.get(&vi).copied().unwrap_or(0.0);
-                let next =
-                    cur + (want - cur) * (1.0 - (-dt / ITEM_SWAP_TAU).exp());
+                let next = cur + (want - cur) * (1.0 - (-dt / ITEM_SWAP_TAU).exp());
                 if want == 0.0 && next < 0.01 {
                     d.swap.remove(&vi);
                 } else {
@@ -1494,10 +1441,8 @@ impl Carousel {
                     // at the edge speed instead of a laggy spring
                     // chase (which the settle would pin anyway).
                     let d_idx = f * DRAG_EDGE_CAR_SPEED * boost * dt;
-                    self.target = (self.target + d_idx)
-                        .clamp(0.0, (n - 1) as f32);
-                    self.current = (self.current + d_idx)
-                        .clamp(-0.5, (n - 1) as f32 + 0.5);
+                    self.target = (self.target + d_idx).clamp(0.0, (n - 1) as f32);
+                    self.current = (self.current + d_idx).clamp(-0.5, (n - 1) as f32 + 0.5);
                     self.velocity = 0.0;
                     self.wheel_settle_at = None;
                 }
@@ -1588,8 +1533,7 @@ impl Carousel {
         // signaling it can be moved. A still press on an item arms it
         // the same way (the hold-to-lift cue) and a live drag keeps
         // it up until the drop lands. Eases in fast, settles out.
-        let press_armed =
-            matches!(&self.press, Some(p) if !p.moved && p.item.is_some());
+        let press_armed = matches!(&self.press, Some(p) if !p.moved && p.item.is_some());
         let lift_target = if (reorder_armed && reorderable && !visible.is_empty())
             || (interactive && (press_armed || self.item_drag.is_some()))
         {
@@ -1598,8 +1542,7 @@ impl Carousel {
             0.0
         };
         let rate = dt / if lift_target > self.pop { 0.12 } else { 0.18 };
-        self.pop =
-            (self.pop + (lift_target - self.pop).clamp(-rate, rate)).clamp(0.0, 1.0);
+        self.pop = (self.pop + (lift_target - self.pop).clamp(-rate, rate)).clamp(0.0, 1.0);
         if !reorderable {
             self.item_drag = None;
             // Hidden items must never be deletable — prune the
@@ -1612,7 +1555,11 @@ impl Carousel {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                if self.rom_mode { "No items" } else { "No album loaded" },
+                if self.rom_mode {
+                    "No items"
+                } else {
+                    "No album loaded"
+                },
                 FontId::proportional(24.0 * s),
                 Color32::from_rgb(0x78, 0x78, 0x78).gamma_multiply(alpha * 0.53),
             );
@@ -1629,8 +1576,7 @@ impl Carousel {
             // filter hides every item (Lacrima's menu lives on the
             // cover view itself, not on items).
             if interactive && self.album_key.is_some() {
-                let resp =
-                    ui.interact(rect, ui.id().with("cover-view-empty"), Sense::click());
+                let resp = ui.interact(rect, ui.id().with("cover-view-empty"), Sense::click());
                 resp.context_menu(|ui| {
                     if self.rom_mode {
                         if ui.button("Add Roms").clicked() {
@@ -1650,15 +1596,17 @@ impl Carousel {
                             action = Action::AddPlaylist;
                             ui.close();
                         }
-                        if self.has_url_items()
-                            && ui.button("Export Playlist").clicked()
-                        {
+                        if self.has_url_items() && ui.button("Export Playlist").clicked() {
                             action = Action::Export;
                             ui.close();
                         }
                     }
                     if ui
-                        .button(if self.rom_mode { "Clear Section" } else { "Clear Album" })
+                        .button(if self.rom_mode {
+                            "Clear Section"
+                        } else {
+                            "Clear Album"
+                        })
                         .clicked()
                     {
                         action = Action::Clear;
@@ -1736,7 +1684,11 @@ impl Carousel {
             }
         }
         if let Some(g) = &geo {
-            self.step_grid(dt, g.max_scroll, self.press.is_some() && self.sb_drag.is_none());
+            self.step_grid(
+                dt,
+                g.max_scroll,
+                self.press.is_some() && self.sb_drag.is_none(),
+            );
         }
         let pointer = ctx.input(|i| i.pointer.latest_pos());
         // Grid scrollbar geometry — `None` in carousel mode or when the
@@ -1752,11 +1704,8 @@ impl Carousel {
         // Auto-fade like the album-row bar: hot, recently scrolled, or
         // still moving keeps it up; idle fades it out.
         let wants_sb = sb.is_some()
-            && (sb_hot
-                || Instant::now() < self.sb_visible_until
-                || self.grid_vel.abs() > 1.0);
-        self.sb_opacity +=
-            ((wants_sb as u8) as f32 - self.sb_opacity) * (dt * 10.0).min(1.0);
+            && (sb_hot || Instant::now() < self.sb_visible_until || self.grid_vel.abs() > 1.0);
+        self.sb_opacity += ((wants_sb as u8) as f32 - self.sb_opacity) * (dt * 10.0).min(1.0);
 
         // --- Input --------------------------------------------------
         // The pill slider's rect — computed here so wheel/press input
@@ -1814,14 +1763,17 @@ impl Carousel {
             }
         }
 
-        self.step(dt, self.press.is_some() && mode == Mode::Carousel, max_index);
+        self.step(
+            dt,
+            self.press.is_some() && mode == Mode::Carousel,
+            max_index,
+        );
 
         // Manual press tracking — raw input can't be stolen by widget
         // routing (same approach as the album row's scrollbar).
         if interactive && ctx.input(|i| i.pointer.primary_pressed()) {
             if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
-                let over_slider =
-                    slider_rect.map(|r| r.contains(p)).unwrap_or(false);
+                let over_slider = slider_rect.map(|r| r.contains(p)).unwrap_or(false);
                 if rect.contains(p) && !over_slider {
                     // Press inside the scrollbar's grab zone owns the
                     // drag — store the offset within the thumb (or the
@@ -1843,14 +1795,10 @@ impl Carousel {
                         // quads, so skip it otherwise.
                         let item = if reorderable {
                             match mode {
-                                Mode::Carousel => self.hit_carousel(
-                                    p, grid_area, &visible, row, &ctx, cfg, s,
-                                ),
-                                _ => self.hit_grid(
-                                    p,
-                                    &visible,
-                                    geo.as_ref().unwrap(),
-                                ),
+                                Mode::Carousel => {
+                                    self.hit_carousel(p, grid_area, &visible, row, &ctx, cfg, s)
+                                }
+                                _ => self.hit_grid(p, &visible, geo.as_ref().unwrap()),
                             }
                         } else {
                             None
@@ -1895,8 +1843,7 @@ impl Carousel {
                 self.grid_target = frac * g.max_scroll;
                 self.grid_current = self.grid_target;
                 self.grid_vel = 0.0;
-                self.sb_visible_until =
-                    Instant::now() + std::time::Duration::from_secs_f32(1.2);
+                self.sb_visible_until = Instant::now() + std::time::Duration::from_secs_f32(1.2);
                 ctx.request_repaint();
             }
         } else if self.press.is_some() && primary_down {
@@ -1916,8 +1863,8 @@ impl Carousel {
                         Mode::Carousel => {
                             Self::press_update(press, p, dt, DRAG_PX_PER_ITEM, true);
                             let dx = p.x - press.start.x;
-                            self.target = (press.anchor - dx / DRAG_PX_PER_ITEM)
-                                .clamp(0.0, max_index);
+                            self.target =
+                                (press.anchor - dx / DRAG_PX_PER_ITEM).clamp(0.0, max_index);
                         }
                         _ => {
                             Self::press_update(press, p, dt, 1.0, axis_x);
@@ -1926,8 +1873,8 @@ impl Carousel {
                             } else {
                                 p.y - press.start.y
                             };
-                            self.grid_target = (press.anchor - delta)
-                                .clamp(0.0, geo.as_ref().unwrap().max_scroll);
+                            self.grid_target =
+                                (press.anchor - delta).clamp(0.0, geo.as_ref().unwrap().max_scroll);
                         }
                     }
                 } else {
@@ -1990,8 +1937,7 @@ impl Carousel {
                         }
                         _ => self.hit_grid(p, &visible, geo.as_ref().unwrap()),
                     };
-                    self.menu_item =
-                        hit.map(|vi| self.items[visible[vi]].path.clone());
+                    self.menu_item = hit.map(|vi| self.items[visible[vi]].path.clone());
                 } else {
                     self.menu_item = None;
                 }
@@ -2034,18 +1980,23 @@ impl Carousel {
                         self.menu_item = None;
                         ui.close();
                     }
-                    // X360 + Xenia / PS3 + RPCS3 — Lacrima's per-game
-                    // Patches menu item (Xenia adds Custom Config).
-                    if self.rom_mode && (self.xenia_menu || self.rpcs3_menu)
+                    // X360 + Xenia / PS3 + RPCS3 / PS4 + shadPS4 —
+                    // Lacrima's per-game Patches menu item (Xenia adds
+                    // Custom Config, shadPS4 adds Cheats).
+                    if self.rom_mode
+                        && (self.xenia_menu || self.rpcs3_menu || self.shadps4_menu)
                         && ui.button("Patches").clicked()
                     {
                         action = Action::Patches(p.clone());
                         self.menu_item = None;
                         ui.close();
                     }
-                    if self.rom_mode && self.xenia_menu
-                        && ui.button("Custom Config").clicked()
-                    {
+                    if self.rom_mode && self.shadps4_menu && ui.button("Cheats").clicked() {
+                        action = Action::Cheats(p.clone());
+                        self.menu_item = None;
+                        ui.close();
+                    }
+                    if self.rom_mode && self.xenia_menu && ui.button("Custom Config").clicked() {
                         action = Action::CustomConfig(p.clone());
                         self.menu_item = None;
                         ui.close();
@@ -2073,15 +2024,17 @@ impl Carousel {
                     }
                 }
                 ui.separator();
-                if !self.rom_mode
-                    && self.has_url_items()
-                    && ui.button("Export Playlist").clicked()
+                if !self.rom_mode && self.has_url_items() && ui.button("Export Playlist").clicked()
                 {
                     action = Action::Export;
                     ui.close();
                 }
                 if ui
-                    .button(if self.rom_mode { "Clear Section" } else { "Clear Album" })
+                    .button(if self.rom_mode {
+                        "Clear Section"
+                    } else {
+                        "Clear Album"
+                    })
                     .clicked()
                 {
                     action = Action::Clear;
@@ -2101,15 +2054,9 @@ impl Carousel {
                 let skip = slider_rect.map(|r| r.contains(p)).unwrap_or(false);
                 if !skip {
                     let hit = match mode {
-                        Mode::Carousel => self.hit_carousel(
-                            p,
-                            grid_area,
-                            &visible,
-                            row,
-                            &ctx,
-                            cfg,
-                            s,
-                        ),
+                        Mode::Carousel => {
+                            self.hit_carousel(p, grid_area, &visible, row, &ctx, cfg, s)
+                        }
                         _ => self.hit_grid(p, &visible, geo.as_ref().unwrap()),
                     };
                     if let Some(vi) = hit {
@@ -2126,10 +2073,8 @@ impl Carousel {
                                 .iter()
                                 .position(|&i| i == self.sel_anchor)
                                 .unwrap_or(vi);
-                            let (a, b) =
-                                (anchor_vi.min(vi), anchor_vi.max(vi));
-                            self.sel_set =
-                                visible[a..=b].iter().copied().collect();
+                            let (a, b) = (anchor_vi.min(vi), anchor_vi.max(vi));
+                            self.sel_set = visible[a..=b].iter().copied().collect();
                         } else if mods.ctrl || mods.command {
                             if !self.sel_set.remove(&idx) {
                                 self.sel_set.insert(idx);
@@ -2252,11 +2197,7 @@ impl Carousel {
     /// core, brighter while hot (hovered/dragged).
     fn paint_scrollbar(painter: &egui::Painter, sb: &SbGeo, hot: bool, opacity: f32) {
         let r = sb.track.width().min(sb.track.height()) * 0.5;
-        painter.rect_filled(
-            sb.track,
-            r,
-            Color32::WHITE.gamma_multiply(0.10 * opacity),
-        );
+        painter.rect_filled(sb.track, r, Color32::WHITE.gamma_multiply(0.10 * opacity));
         let hot_mul = if hot { 1.0 } else { 0.75 };
         painter.rect_filled(
             sb.thumb.expand(1.5),
@@ -2298,7 +2239,17 @@ impl Carousel {
             Mode::Carousel => {
                 let r = rect.translate(Vec2::new(0.0, drift_y));
                 let v = view.translate(Vec2::new(0.0, drift_y));
-                self.paint_carousel(ui, r, visible, row, playing_vidx, loading_vidx, cfg, alpha, s);
+                self.paint_carousel(
+                    ui,
+                    r,
+                    visible,
+                    row,
+                    playing_vidx,
+                    loading_vidx,
+                    cfg,
+                    alpha,
+                    s,
+                );
                 self.overlay_stack(ui, r, v, visible, alpha, interactive, s);
             }
             _ => {
@@ -2360,15 +2311,7 @@ impl Carousel {
 
     /// Full local->screen transform: matrix T * RotY * Scale applied to
     /// (x, y, 0), then perspective projection about `center`.
-    fn project(
-        tx: f32,
-        tz: f32,
-        rot: f32,
-        sc: f32,
-        center: Pos2,
-        x: f32,
-        y: f32,
-    ) -> (Pos2, f32) {
+    fn project(tx: f32, tz: f32, rot: f32, sc: f32, center: Pos2, x: f32, y: f32) -> (Pos2, f32) {
         let xs = x * sc;
         let ys = y * sc;
         let cos = rot.cos();
@@ -2385,11 +2328,7 @@ impl Carousel {
     /// UseFullCoverSize the width slides to baseH*aspect (Lacrima's
     /// fullCoverSizeFactor treated as 0/1); off keeps the landscape
     /// frame and the cover is fill-cropped into it.
-    fn item_size(
-        tex: &egui::TextureHandle,
-        cfg: &settings::Carousel,
-        s: f32,
-    ) -> (f32, f32) {
+    fn item_size(tex: &egui::TextureHandle, cfg: &settings::Carousel, s: f32) -> (f32, f32) {
         let base_w = BASE_W * s * cfg.scale;
         let base_h = BASE_H * s * cfg.scale;
         let [tw, th] = tex.size();
@@ -2515,10 +2454,7 @@ impl Carousel {
         // edge, never let them stray over the bands (the top bar is a
         // front overlay, but the band edges aren't).
         let painter = ui.painter().clone().with_clip_rect(rect);
-        let center = Pos2::new(
-            rect.center().x,
-            rect.center().y + cfg.vertical_offset * s,
-        );
+        let center = Pos2::new(rect.center().x, rect.center().y + cfg.vertical_offset * s);
 
         // Draw farthest first so z-order follows the animation
         // continuously instead of snapping at the halfway point.
@@ -2618,9 +2554,8 @@ impl Carousel {
                 );
                 outline(
                     1.2 + 0.3 * pulse,
-                    Color32::WHITE.gamma_multiply(
-                        ((225.0 + 30.0 * pulse) / 255.0).min(1.0) * base_opacity,
-                    ),
+                    Color32::WHITE
+                        .gamma_multiply(((225.0 + 30.0 * pulse) / 255.0).min(1.0) * base_opacity),
                 );
                 // Stream still resolving/buffering — spin over the
                 // quad's center (Lacrima's busy overlay on the item).
@@ -2629,9 +2564,7 @@ impl Carousel {
                         corners.iter().map(|p| p.x).sum::<f32>() / 4.0,
                         corners.iter().map(|p| p.y).sum::<f32>() / 4.0,
                     );
-                    let rr = corners.iter().map(|p| p.distance(cc)).sum::<f32>()
-                        / 4.0
-                        * 0.22;
+                    let rr = corners.iter().map(|p| p.distance(cc)).sum::<f32>() / 4.0 * 0.22;
                     let phase = ctx.input(|i| i.time) as f32 * 7.5;
                     spinner(&painter, cc, rr, phase, base_opacity, s);
                 }
@@ -2644,20 +2577,14 @@ impl Carousel {
         // selection paints as a glued pile (non-primary members
         // underneath, the grabbed card last/on top).
         if let Some(d) = &self.item_drag {
-            let pr = d
-                .indices
-                .iter()
-                .position(|&i| i == d.index)
-                .unwrap_or(0);
+            let pr = d.indices.iter().position(|&i| i == d.index).unwrap_or(0);
             let e = d
                 .commit
                 .as_ref()
                 .map(|c| ease_out_cubic(c.progress.min(1.0)));
             let centers: Vec<Pos2> = (0..d.indices.len())
                 .map(|k| match (&d.commit, e) {
-                    (Some(c), Some(t)) => {
-                        lerp_pos(c.starts[k], c.targets[k], t)
-                    }
+                    (Some(c), Some(t)) => lerp_pos(c.starts[k], c.targets[k], t),
                     _ => d.center + self.drag_member_offset(d, k, None, s),
                 })
                 .collect();
@@ -2681,10 +2608,8 @@ impl Carousel {
                 // seamlessly with no second slide.
                 let (c, mtx, mtz, mrot, msc) = match e {
                     Some(t) => {
-                        let slot =
-                            Self::block_start(d, self.items.len()) + k;
-                        let (tx, tz, rot, ssc, _, _) =
-                            self.item_geo(slot as f32, &tex, cfg, s);
+                        let slot = Self::block_start(d, self.items.len()) + k;
+                        let (tx, tz, rot, ssc, _, _) = self.item_geo(slot as f32, &tex, cfg, s);
                         (
                             lerp_pos(centers[k], center, t),
                             tx * t,
@@ -2833,7 +2758,14 @@ impl Carousel {
             Vec2::new(520.0 * s, 28.0 * s),
         );
         if visible.len() > 1 && view.contains_rect(slider) {
-            self.pill_slider(ui, slider, (visible.len() - 1) as f32, alpha, interactive, s);
+            self.pill_slider(
+                ui,
+                slider,
+                (visible.len() - 1) as f32,
+                alpha,
+                interactive,
+                s,
+            );
         }
     }
 
@@ -2859,7 +2791,10 @@ impl Carousel {
         painter.rect_stroke(
             outer,
             r,
-            Stroke::new(1.5, Color32::from_rgb(0xCC, 0xCC, 0xCC).gamma_multiply(alpha)),
+            Stroke::new(
+                1.5,
+                Color32::from_rgb(0xCC, 0xCC, 0xCC).gamma_multiply(alpha),
+            ),
             egui::StrokeKind::Inside,
         );
         let inner = outer.shrink(0.75 + track_h * 0.125);
@@ -2986,8 +2921,7 @@ impl Carousel {
             };
             // Neighbors ease toward the slots the block vacated.
             if let Some(d) = &self.item_drag {
-                let disp =
-                    Self::display_slot(vi, &d.indices, Self::block_start(d, n_items));
+                let disp = Self::display_slot(vi, &d.indices, Self::block_start(d, n_items));
                 let t = d.swap.get(&vi).copied().unwrap_or(0.0);
                 if t > 0.001 && disp != vi {
                     if let Some(to) = geo.card_rect(disp, scroll) {
@@ -3043,24 +2977,15 @@ impl Carousel {
         // dragged selection paints as its glued block, non-primary
         // members underneath the grabbed card.
         if let Some(d) = &self.item_drag {
-            let pr = d
-                .indices
-                .iter()
-                .position(|&i| i == d.index)
-                .unwrap_or(0);
+            let pr = d.indices.iter().position(|&i| i == d.index).unwrap_or(0);
             let e = d
                 .commit
                 .as_ref()
                 .map(|c| ease_out_cubic(c.progress.min(1.0)));
             let centers: Vec<Pos2> = (0..d.indices.len())
                 .map(|k| match (&d.commit, e) {
-                    (Some(c), Some(t)) => {
-                        lerp_pos(c.starts[k], c.targets[k], t)
-                    }
-                    _ => {
-                        d.center
-                            + self.drag_member_offset(d, k, Some(geo), s)
-                    }
+                    (Some(c), Some(t)) => lerp_pos(c.starts[k], c.targets[k], t),
+                    _ => d.center + self.drag_member_offset(d, k, Some(geo), s),
                 })
                 .collect();
             let lift = d.lift * (1.0 - e.unwrap_or(0.0));
@@ -3073,10 +2998,8 @@ impl Carousel {
             {
                 let item = &self.items[d.indices[k]];
                 let tex = Self::item_tex(row, &ctx, item);
-                let card = Rect::from_center_size(
-                    centers[k],
-                    Vec2::new(geo.card_w, geo.card_h) * sc,
-                );
+                let card =
+                    Rect::from_center_size(centers[k], Vec2::new(geo.card_w, geo.card_h) * sc);
                 if lift > 0.01 {
                     float_paint.rect_filled(
                         card.translate(Vec2::new(0.0, 12.0 * s)),
@@ -3085,8 +3008,17 @@ impl Carousel {
                     );
                 }
                 Self::paint_card(
-                    &float_paint, &ctx, card, item, &tex, false, false, pulse,
-                    false, alpha, s,
+                    &float_paint,
+                    &ctx,
+                    card,
+                    item,
+                    &tex,
+                    false,
+                    false,
+                    pulse,
+                    false,
+                    alpha,
+                    s,
                 );
             }
         }
@@ -3129,14 +3061,8 @@ impl Carousel {
         let v0 = (1.0 - hr) * 0.5;
         let mut mesh = Mesh::with_texture(tex.id());
         let col = Color32::from_white_alpha((alpha * 255.0) as u8);
-        for (px, uvx) in [
-            (cover.min.x, u0),
-            (cover.max.x, u0 + wr),
-        ] {
-            for (py, uvy) in [
-                (cover.min.y, v0),
-                (cover.max.y, v0 + hr),
-            ] {
+        for (px, uvx) in [(cover.min.x, u0), (cover.max.x, u0 + wr)] {
+            for (py, uvy) in [(cover.min.y, v0), (cover.max.y, v0 + hr)] {
                 mesh.vertices.push(Vertex {
                     pos: Pos2::new(px, py),
                     uv: Pos2::new(uvx, uvy),
@@ -3290,8 +3216,7 @@ impl GridGeo {
         let avail_h = (rect.height() - GRID_TOP * s - GRID_BOTTOM * s - SB_ZONE * s).max(120.0);
         let card_h = (cfg.card_size * CARD_RATIO * s).min(avail_h);
         let card_w = card_h / CARD_RATIO;
-        let rows = (((avail_h + spacing) / (card_h + spacing)) as usize)
-            .clamp(1, count.max(1));
+        let rows = (((avail_h + spacing) / (card_h + spacing)) as usize).clamp(1, count.max(1));
         let content_h = rows as f32 * card_h + (rows.saturating_sub(1)) as f32 * spacing;
         let pad_top = GRID_TOP * s + (avail_h - content_h).max(0.0) * 0.5;
         let columns = count.max(1).div_ceil(rows);
@@ -3335,19 +3260,17 @@ impl GridGeo {
                 false,
             )
         };
-        let view = if horizontal { rect.width() } else { rect.height() };
+        let view = if horizontal {
+            rect.width()
+        } else {
+            rect.height()
+        };
         let frac = (scroll / self.max_scroll).clamp(0.0, 1.0);
         let view_frac = (view / (view + self.max_scroll)).min(1.0);
         let (thumb_len, travel) = if horizontal {
-            (
-                (track.width() * view_frac).max(24.0 * s),
-                track.width(),
-            )
+            ((track.width() * view_frac).max(24.0 * s), track.width())
         } else {
-            (
-                (track.height() * view_frac).max(24.0 * s),
-                track.height(),
-            )
+            ((track.height() * view_frac).max(24.0 * s), track.height())
         };
         let thumb_len = thumb_len.min(travel);
         let thumb = if horizontal {
@@ -3435,10 +3358,7 @@ fn spinner(painter: &egui::Painter, c: Pos2, r: f32, phase: f32, alpha: f32, s: 
                 Pos2::new(c.x + r * 0.45 * dx, c.y + r * 0.45 * dy),
                 Pos2::new(c.x + r * dx, c.y + r * dy),
             ],
-            Stroke::new(
-                w,
-                Color32::WHITE.gamma_multiply((0.12 + 0.88 * k) * alpha),
-            ),
+            Stroke::new(w, Color32::WHITE.gamma_multiply((0.12 + 0.88 * k) * alpha)),
         );
     }
 }

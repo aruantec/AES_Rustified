@@ -20,6 +20,8 @@ const XEMU_RELEASES_API: &str =
 // to rpcs3-binaries-win instead (Lacrima's BinaryReleasesApiEndpoint).
 const RPCS3_RELEASES_API: &str =
     "https://api.github.com/repos/RPCS3/rpcs3-binaries-win/releases?per_page=20";
+const SHADPS4_RELEASES_API: &str =
+    "https://api.github.com/repos/shadps4-emu/shadPS4/releases?per_page=20";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
 const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
@@ -29,6 +31,7 @@ const XENIA_VERSION_MARKER: &str = "xenia_version.txt";
 const FLYCAST_VERSION_MARKER: &str = "flycast_version.txt";
 const XEMU_VERSION_MARKER: &str = "xemu_version.txt";
 const RPCS3_VERSION_MARKER: &str = "rpcs3_version.txt";
+const SHADPS4_VERSION_MARKER: &str = "shadps4_version.txt";
 
 /// Shared download state the settings card polls each frame.
 #[derive(Default)]
@@ -65,6 +68,11 @@ pub fn xemu_dir() -> Option<PathBuf> {
 /// `EmulatorsDirectory/PS3/RPCS3`.
 pub fn rpcs3_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("PS3").join("RPCS3"))
+}
+
+/// `<data>/Emulators/PS4/shadPS4` — same layout for the PS4 handler.
+pub fn shadps4_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("PS4").join("shadPS4"))
 }
 
 /// Find the installed launcher (`ResolveLauncherPath`):
@@ -104,8 +112,15 @@ pub fn rpcs3_exe() -> Option<PathBuf> {
     resolve_exe(&rpcs3_dir()?, &RPCS3_SPEC).ok()
 }
 
+/// Find the installed `shadPS4.exe` under the managed dir.
+pub fn shadps4_exe() -> Option<PathBuf> {
+    resolve_exe(&shadps4_dir()?, &SHADPS4_SPEC).ok()
+}
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -118,7 +133,9 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Depth-first search for a directory named `name`.
 fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(root) else { return None };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return None;
+    };
     let mut nested = Vec::new();
     for e in rd.flatten() {
         let p = e.path();
@@ -266,6 +283,26 @@ pub fn download_rpcs3() -> Shared {
     download_emu(&RPCS3_SPEC)
 }
 
+const SHADPS4_SPEC: EmuSpec = EmuSpec {
+    name: "shadPS4",
+    releases_api: SHADPS4_RELEASES_API,
+    version_marker: SHADPS4_VERSION_MARKER,
+    dir: shadps4_dir,
+    // Lacrima's SelectAssetForPlatform: the windows Qt zip first
+    // (older releases), the win64-sdl zip on current ones.
+    asset_ok: |n| {
+        let n = n.to_lowercase();
+        n.contains("win") && n.ends_with(".zip")
+    },
+    exe_names: &["shadPS4.exe", "shadps4.exe", "shadPS4QtLauncher.exe"],
+    exe_contains: "shad",
+    patches: false,
+};
+
+pub fn download_shadps4() -> Shared {
+    download_emu(&SHADPS4_SPEC)
+}
+
 fn download_emu(spec: &'static EmuSpec) -> Shared {
     let dl: Shared = Arc::new(Mutex::new(DlProgress {
         stage: format!("Starting {} download…", spec.name),
@@ -338,12 +375,13 @@ fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
         .unwrap_or_default();
     let is_archive = |n: &str| n.ends_with(".zip") || n.ends_with(".7z");
     let pick = |pred: &dyn Fn(&str) -> bool| assets.iter().find(|(n, _)| pred(n)).cloned();
-    let (asset_name, asset_url) = pick(&|n: &str| {
-        (spec.asset_ok)(n) && is_archive(&n.to_lowercase())
-    })
-    .or_else(|| pick(&|n: &str| n.to_lowercase().contains("win") && is_archive(&n.to_lowercase())))
-    .or_else(|| pick(&|n: &str| is_archive(&n.to_lowercase())))
-    .ok_or_else(|| format!("No compatible {} asset found", spec.name))?;
+    let (asset_name, asset_url) =
+        pick(&|n: &str| (spec.asset_ok)(n) && is_archive(&n.to_lowercase()))
+            .or_else(|| {
+                pick(&|n: &str| n.to_lowercase().contains("win") && is_archive(&n.to_lowercase()))
+            })
+            .or_else(|| pick(&|n: &str| is_archive(&n.to_lowercase())))
+            .ok_or_else(|| format!("No compatible {} asset found", spec.name))?;
 
     // Download the zip.
     let stage = format!("Downloading {asset_name} ({tag})…");
@@ -391,11 +429,9 @@ fn resolve_exe(dir: &Path, spec: &EmuSpec) -> Result<PathBuf, String> {
     }
     all.into_iter()
         .find(|p| {
-            p.file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| {
-                    f.to_lowercase().contains(spec.exe_contains) && f.ends_with(".exe")
-                })
+            p.file_name().and_then(|f| f.to_str()).is_some_and(|f| {
+                f.to_lowercase().contains(spec.exe_contains) && f.ends_with(".exe")
+            })
         })
         .ok_or_else(|| format!("{} exe not found after install", spec.name))
 }
@@ -425,7 +461,14 @@ fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), Stri
         f.write_all(&buf[..n])
             .map_err(|e| format!("{stage} failed: {e}"))?;
         got += n as u64;
-        set(dl, stage, total.map(|t| got as f32 / t as f32).unwrap_or(0.0).clamp(0.0, 1.0));
+        set(
+            dl,
+            stage,
+            total
+                .map(|t| got as f32 / t as f32)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+        );
     }
     Ok(())
 }
@@ -487,7 +530,12 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 /// If the archive ships a single root folder, descend into it.
 fn normalize_root(extracted: &Path) -> PathBuf {
     let dirs: Vec<PathBuf> = std::fs::read_dir(extracted)
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
         .unwrap_or_default();
     let has_files = std::fs::read_dir(extracted)
         .map(|rd| rd.flatten().any(|e| e.path().is_file()))

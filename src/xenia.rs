@@ -23,19 +23,19 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
-};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, TerminateProcess,
-    WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MapVirtualKeyW, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -131,6 +131,7 @@ pub enum Kind {
     Flycast,
     Xemu,
     Rpcs3,
+    Shadps4,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -182,6 +183,10 @@ impl Session {
             .parent()
             .map(|d| d.to_path_buf())
             .unwrap_or_default();
+        // shadPS4's stdout goes to a launch transcript the worker
+        // scans for [Core.Linker] before resolving the render window
+        // (WaitForCoreLinkerOutputAsync).
+        let mut transcript: Option<PathBuf> = None;
         let mut cmd = Command::new(exe);
         match kind {
             // RPCS3: --no-gui skips the launcher/game-list shell so
@@ -191,6 +196,50 @@ impl Session {
             Kind::Rpcs3 => {
                 ensure_rpcs3_pause_fix(&work_dir);
                 cmd.arg("--no-gui").arg(ps3_boot_path(game));
+            }
+            // shadPS4: `-g <game> -f false` — the launcher would ignore
+            // the game path (ResolveShadPs4ExecutablePath upgrades a
+            // qtlauncher selection to the sibling core exe). The user
+            // dir is forced portable (`<exe dir>/user` gets SHADPS4_
+            // USER_DIR + APPDATA/LOCALAPPDATA/XDG_*) so patches and
+            // cheats land in a known place, and stdout/stderr go to a
+            // transcript the worker scans for [Core.Linker] — Lacrima's
+            // WaitForCoreLinkerOutput gate before capture resolution.
+            Kind::Shadps4 => {
+                let user = crate::shadps4::user_dir(&work_dir);
+                let _ = std::fs::create_dir_all(&user);
+                crate::shadps4::ensure_background_input(&work_dir);
+                cmd.env("SHADPS4_USER_DIR", &user)
+                    .env("APPDATA", &user)
+                    .env("LOCALAPPDATA", &user)
+                    .env("XDG_CONFIG_HOME", &user)
+                    .env("XDG_DATA_HOME", &user);
+                cmd.arg("-g")
+                    .arg(crate::shadps4::resolve_game_path(game))
+                    .arg("-f")
+                    .arg("false");
+                let log_dir = user.join("log");
+                let _ = std::fs::create_dir_all(&log_dir);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tp = log_dir.join(format!("shadps4_launch_{nanos:x}.log"));
+                if let Ok(out) = std::fs::File::create(&tp) {
+                    if let Ok(err) = out.try_clone() {
+                        cmd.stdout(std::process::Stdio::from(out))
+                            .stderr(std::process::Stdio::from(err));
+                        transcript = Some(tp);
+                    }
+                }
+                // shadPS4's exe is console-subsystem — spawned from a
+                // GUI process Windows allocates it a console window
+                // (the "command window"). CREATE_NO_WINDOW suppresses
+                // the allocation; the transcript above keeps the log.
+                // (Lacrima achieves the same via `cmd /d /c` +
+                // CreateNoWindow.)
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
             }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
@@ -254,14 +303,23 @@ impl Session {
                     // degrade to a failed session — never take the
                     // whole app down with the emulator.
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        worker_main(pid, status, frames, gpu, stop, render, hwnd, low_latency, kind)
+                        worker_main(
+                            pid,
+                            status,
+                            frames,
+                            gpu,
+                            stop,
+                            render,
+                            hwnd,
+                            low_latency,
+                            kind,
+                            transcript,
+                        )
                     }))
                     .is_err()
                     {
-                        status2
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .status = Status::Failed("capture worker crashed".into());
+                        status2.lock().unwrap_or_else(|p| p.into_inner()).status =
+                            Status::Failed("capture worker crashed".into());
                     }
                 })
                 .expect("spawn xenia worker")
@@ -420,8 +478,7 @@ impl Session {
     /// True once the emulator process is gone (UI can drop the
     /// session — Drop reaps the child and detaches the worker).
     pub fn finished(&mut self) -> bool {
-        matches!(self.status(), Status::Exited)
-            || matches!(self.child.try_wait(), Ok(Some(_)))
+        matches!(self.status(), Status::Exited) || matches!(self.child.try_wait(), Ok(Some(_)))
     }
 }
 
@@ -591,6 +648,7 @@ fn worker_main(
     hwnd_out: Arc<std::sync::atomic::AtomicUsize>,
     low_latency: bool,
     kind: Kind,
+    transcript: Option<PathBuf>,
 ) {
     let set_status = |s: Status| {
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
@@ -637,7 +695,11 @@ fn worker_main(
         Kind::Rpcs3 => 2500,
         _ => 0,
     };
-    let poll = if kind == Kind::Rpcs3 { 25 } else { 100 };
+    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4) {
+        25
+    } else {
+        100
+    };
     let mut waited = 0u64;
     while waited < delay {
         sweep_hide(pid, HWND::default(), &mut hidden, kind);
@@ -647,6 +709,45 @@ fn worker_main(
         std::thread::sleep(Duration::from_millis(poll));
         waited += poll;
     }
+    // WaitForCoreLinkerOutputAsync — shadPS4's stdout transcript
+    // emits `[Core.Linker]` once the game's modules are linked; the
+    // SDL render window before that is a loader surface, not the
+    // game. Up to 45s, sweeping every 50ms so the early window stays
+    // cloaked the whole wait.
+    if kind == Kind::Shadps4 {
+        if let Some(tp) = &transcript {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            let mut pos = 0u64;
+            let mut hit = false;
+            while Instant::now() < deadline && !hit {
+                if stop.load(Ordering::Relaxed) || !alive(proc) {
+                    break;
+                }
+                sweep_hide(pid, HWND::default(), &mut hidden, kind);
+                if let Ok(meta) = std::fs::metadata(tp) {
+                    if meta.len() < pos {
+                        pos = 0;
+                    }
+                    if meta.len() > pos {
+                        use std::io::{Read, Seek};
+                        if let Ok(mut f) = std::fs::File::open(tp) {
+                            let _ = f.seek(std::io::SeekFrom::Start(pos));
+                            let mut buf = Vec::new();
+                            let _ = f.read_to_end(&mut buf);
+                            pos += buf.len() as u64;
+                            let text = String::from_utf8_lossy(&buf);
+                            hit = text
+                                .lines()
+                                .any(|l| l.to_lowercase().contains("core.linker"));
+                        }
+                    }
+                }
+                if !hit {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
     let mut hwnd = HWND::default();
     let mut stable_hwnd = HWND::default();
     let mut stable_count = 0u32;
@@ -654,9 +755,13 @@ fn worker_main(
     // whether its 16:9 capture geometry has been applied yet.
     let mut rpcs3_geom = false;
     let mut rpcs3_size = (0i32, 0i32);
-    // 25ms polls for RPCS3 keep the cloak gap sub-frame; other kinds
-    // sweep at 50ms (window flash isn't an issue once captured).
-    let poll = if kind == Kind::Rpcs3 { 25 } else { 50 };
+    // 25ms polls for RPCS3/shadPS4 keep the cloak gap sub-frame; other
+    // kinds sweep at 50ms (window flash isn't an issue once captured).
+    let poll = if matches!(kind, Kind::Rpcs3 | Kind::Shadps4) {
+        25
+    } else {
+        50
+    };
     for _ in 0..240 {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -696,13 +801,11 @@ fn worker_main(
                     // Originals on record (cloak-snapshotted if the
                     // sweep already saw it), then strip decorations +
                     // apply the 16:9 size once — ApplyCaptureGeometryOnce.
-                    hidden
-                        .entry(hwnd.0 as usize)
-                        .or_insert_with(|| {
-                            let s = snapshot_window(hwnd);
-                            set_cloaked(hwnd, true);
-                            s
-                        });
+                    hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                        let s = snapshot_window(hwnd);
+                        set_cloaked(hwnd, true);
+                        s
+                    });
                     prepare_window_for_capture(hwnd);
                     apply_aspect_ratio(hwnd, 16.0 / 9.0);
                     rpcs3_geom = true;
@@ -723,6 +826,18 @@ fn worker_main(
                     std::thread::sleep(Duration::from_millis(poll));
                     continue;
                 }
+                apply_aspect_ratio(hwnd, 16.0 / 9.0);
+            }
+            if kind == Kind::Shadps4 {
+                // CaptureWindowAspectRatio = 16:9 applied once on
+                // resolve — no stability gate (Lacrima resizes the
+                // target as soon as it's found).
+                hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                });
+                prepare_window_for_capture(hwnd);
                 apply_aspect_ratio(hwnd, 16.0 / 9.0);
             }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
@@ -782,12 +897,7 @@ fn worker_main(
         // The capture target isn't swept — strip its menu too so a
         // late-attached menu bar can't leak into the captured frame.
         strip_menu(hwnd);
-        if let Some(err) = frames
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .err
-            .clone()
-        {
+        if let Some(err) = frames.lock().unwrap_or_else(|p| p.into_inner()).err.clone() {
             capture_err = Some(err);
             break;
         }
@@ -820,17 +930,23 @@ fn worker_main(
     //    (Lacrima's force-kill-first list — pcsx2/dolphin/duckstation/
     //    shadps4 — maps to the same branch when those kinds land.)
     if alive(proc) {
-        let grace = if kind == Kind::Rpcs3 {
-            send_ctrl_s(hwnd);
-            // With --no-gui a landed Ctrl+S stops the game and exits
-            // within ~a second; if it didn't land, don't sit in the
-            // full 5s wait — cut to TerminateProcess sooner.
-            2500
-        } else {
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        let grace = match kind {
+            Kind::Rpcs3 => {
+                send_ctrl_s(hwnd);
+                // With --no-gui a landed Ctrl+S stops the game and
+                // exits within ~a second; if it didn't land, don't
+                // sit in the full 5s wait — cut to TerminateProcess.
+                2500
             }
-            2500
+            // Lacrima's ForceCloseTrackedEmulatorProcess kills
+            // shadPS4 outright — no graceful window close.
+            Kind::Shadps4 => 0,
+            _ => {
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                2500
+            }
         };
         let deadline = Instant::now() + Duration::from_millis(grace);
         while Instant::now() < deadline && alive(proc) {
@@ -893,10 +1009,7 @@ fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
         out: Vec::new(),
     };
     unsafe {
-        let _ = EnumWindows(
-            Some(enum_top),
-            LPARAM(&mut ctx as *mut EnumCtx as isize),
-        );
+        let _ = EnumWindows(Some(enum_top), LPARAM(&mut ctx as *mut EnumCtx as isize));
     }
     ctx.out
 }
@@ -904,6 +1017,9 @@ fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
 struct ChildCtx {
     pid: u32,
     kind: Kind,
+    /// shadPS4's FindBestRenderChildWindow only scores DIRECT
+    /// children of the resolved top-level.
+    parent: HWND,
     best: HWND,
     best_score: i64,
 }
@@ -912,6 +1028,7 @@ unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut ChildCtx);
     let score = match ctx.kind {
         Kind::Rpcs3 => score_rpcs3_child(hwnd, ctx.pid),
+        Kind::Shadps4 => score_shadps4_child(hwnd, ctx.pid, ctx.parent),
         _ => score_render_child(hwnd, ctx.pid),
     };
     if score > ctx.best_score {
@@ -1159,10 +1276,7 @@ fn is_likely_rpcs3_window(hwnd: HWND, main: HWND) -> bool {
         return true;
     }
     // gs_frame: a separate QWindow titled after the game.
-    if !looks_primary
-        && !t.is_empty()
-        && (class.contains("qt") || class.contains("qwindow"))
-    {
+    if !looks_primary && !t.is_empty() && (class.contains("qt") || class.contains("qwindow")) {
         return true;
     }
     !looks_primary && w >= 960 && h >= 540 && !t.is_empty()
@@ -1209,6 +1323,93 @@ fn score_rpcs3_child(hwnd: HWND, pid: u32) -> i64 {
     score
 }
 
+/// IsLikelyShadPs4RenderWindow — the game surface is a top-level SDL
+/// window; the launcher/settings chrome and child surfaces are
+/// filtered out, then a direct render-class child of the top-level
+/// can win over it (FindBestRenderChildWindow).
+fn is_likely_shadps4_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let title = window_title(hwnd);
+    let t = title.trim().to_lowercase();
+    let class = class_name(hwnd).to_lowercase();
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
+    // WGC on child HWNDs produces edge corruption — reject them.
+    if (style & WS_CHILD.0 as i64) != 0 {
+        return false;
+    }
+    let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+    if !parent.is_invalid() {
+        return false;
+    }
+    let has_caption = (style & WS_CAPTION.0 as i64) == WS_CAPTION.0 as i64;
+    let mut looks_primary = hwnd == main;
+    for bad in [
+        "qtlauncher",
+        "settings",
+        "controller",
+        "about",
+        "compatibility",
+        "version manager",
+        "game install",
+        "launcher",
+    ] {
+        if t.contains(bad) {
+            return false;
+        }
+    }
+    if class.contains("ime") || class.contains("tooltip") || class.contains("observer") {
+        return false;
+    }
+    if class.contains("sdl") || class.contains("vulkan") || class.contains("render") {
+        return true;
+    }
+    if t.starts_with("fps:") || t.contains("vulkan") || t.contains("opengl") {
+        return true;
+    }
+    if !t.is_empty() {
+        if t.contains("shadps4") || t.contains("qt") {
+            looks_primary = true;
+        } else if (hwnd == main || !looks_primary) && t.chars().count() >= 2 {
+            return true;
+        }
+    }
+    if class.contains("qt") && looks_primary {
+        return false;
+    }
+    !looks_primary && (!has_caption || !t.is_empty())
+}
+
+/// ScoreRenderChildWindow — a direct render-class child of the
+/// resolved top-level (SDL/Vulkan surface) wins the capture.
+fn score_shadps4_child(hwnd: HWND, pid: u32, parent: HWND) -> i64 {
+    if hwnd.is_invalid() {
+        return i64::MIN;
+    }
+    if !parent.is_invalid() && unsafe { GetParent(hwnd) }.unwrap_or_default() != parent {
+        return i64::MIN;
+    }
+    let mut wpid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+    }
+    if wpid != pid {
+        return i64::MIN;
+    }
+    let Some((w, h)) = client_size(hwnd) else {
+        return i64::MIN;
+    };
+    if w < 320 || h < 180 {
+        return i64::MIN;
+    }
+    let class = class_name(hwnd).to_lowercase();
+    if !(class.contains("sdl") || class.contains("vulkan") || class.contains("render")) {
+        return i64::MIN;
+    }
+    w as i64 * h as i64
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
@@ -1216,6 +1417,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::Flycast => return is_likely_flycast_window(hwnd, main),
         Kind::Xemu => return is_likely_xemu_window(hwnd, main),
         Kind::Rpcs3 => return is_likely_rpcs3_window(hwnd, main),
+        Kind::Shadps4 => return is_likely_shadps4_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -1232,8 +1434,16 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
     if !title.trim().is_empty() {
         let t = title.to_lowercase();
         for bad in [
-            "console", "debug", "log", "settings", "controller", "tools", "about", "help",
-            "warning", "error",
+            "console",
+            "debug",
+            "log",
+            "settings",
+            "controller",
+            "tools",
+            "about",
+            "help",
+            "warning",
+            "error",
         ] {
             if t.contains(bad) {
                 return false;
@@ -1328,10 +1538,46 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
     // lives under a top-level) and RPCS3 (gs_frame can be a Qt child
     // of the main window); Flycast/xemu render in the top-level
     // window itself — a child could only be chrome, so skip.
+    // shadPS4 resolves differently: the top-level wins first, then a
+    // DIRECT render-class child of that window overrides it
+    // (FindBestRenderChildWindow — GetParent(child) == top).
+    if kind == Kind::Shadps4 {
+        let top = tops
+            .iter()
+            .copied()
+            .map(|h| (h, score_top_level(h, pid, main, kind)))
+            .filter(|(_, s)| *s > i64::MIN)
+            .max_by_key(|(_, s)| *s)
+            .map(|(h, _)| h)
+            .unwrap_or_default();
+        if !top.is_invalid() {
+            let mut ctx = ChildCtx {
+                pid,
+                kind,
+                parent: top,
+                best: HWND::default(),
+                best_score: i64::MIN,
+            };
+            unsafe {
+                let _ = EnumChildWindows(
+                    Some(top),
+                    Some(enum_child),
+                    LPARAM(&mut ctx as *mut ChildCtx as isize),
+                );
+            }
+            if ctx.best_score > i64::MIN && !ctx.best.is_invalid() {
+                return ctx.best;
+            }
+            return top;
+        }
+        return HWND::default();
+    }
+
     if matches!(kind, Kind::Xenia | Kind::Rpcs3) {
         let mut ctx = ChildCtx {
             pid,
             kind,
+            parent: HWND::default(),
             best: HWND::default(),
             best_score: i64::MIN,
         };
@@ -1393,7 +1639,10 @@ unsafe extern "system" fn enum_button(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !class_name(hwnd).eq_ignore_ascii_case("button") {
         return BOOL(1);
     }
-    if !window_title(hwnd).trim().eq_ignore_ascii_case(ctx.text.trim_start_matches('&')) {
+    if !window_title(hwnd)
+        .trim()
+        .eq_ignore_ascii_case(ctx.text.trim_start_matches('&'))
+    {
         return BOOL(1);
     }
     SendMessageW(hwnd, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -1462,12 +1711,8 @@ fn prepare_window_for_capture(hwnd: HWND) -> SavedWindow {
             Some(m.0 as isize)
         }
     };
-    let remove = (WS_CAPTION
-        | WS_SYSMENU
-        | WS_THICKFRAME
-        | WS_MINIMIZEBOX
-        | WS_MAXIMIZEBOX)
-        .0 as i64;
+    let remove =
+        (WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX).0 as i64;
     let new_style = style & !remove;
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
@@ -1495,7 +1740,11 @@ fn prepare_window_for_capture(hwnd: HWND) -> SavedWindow {
                     0,
                     w,
                     h,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOOWNERZORDER,
+                    SWP_NOMOVE
+                        | SWP_NOZORDER
+                        | SWP_NOACTIVATE
+                        | SWP_FRAMECHANGED
+                        | SWP_NOOWNERZORDER,
                 );
             }
         }
@@ -1580,8 +1829,8 @@ fn hide_window(hwnd: HWND) {
         // WS_EX_APPWINDOW removal keeps it out even with a 0-alpha
         // layered window.
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i64;
-        let new_ex = (ex | WS_EX_LAYERED.0 as i64 | WS_EX_TOOLWINDOW.0 as i64)
-            & !(WS_EX_APPWINDOW.0 as i64);
+        let new_ex =
+            (ex | WS_EX_LAYERED.0 as i64 | WS_EX_TOOLWINDOW.0 as i64) & !(WS_EX_APPWINDOW.0 as i64);
         if new_ex != ex {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
             let _ = SetWindowPos(
@@ -1615,9 +1864,12 @@ fn restore_window(hwnd: HWND, saved: &SavedWindow) {
         SetWindowLongPtrW(hwnd, GWL_STYLE, saved.style as isize);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, saved.exstyle as isize);
         if let Some(menu) = saved.menu {
-            let _ = SetMenu(hwnd, Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
-                menu as *mut core::ffi::c_void,
-            )));
+            let _ = SetMenu(
+                hwnd,
+                Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                    menu as *mut core::ffi::c_void,
+                )),
+            );
             let _ = DrawMenuBar(hwnd);
         }
         let w = (saved.rect.right - saved.rect.left).max(0);
@@ -1664,23 +1916,22 @@ fn sweep_hide(
         // HMENU at all — it's ImGui-rendered in-frame, handled by the
         // show_menubar config patch.)
         strip_menu(hwnd);
-        // RPCS3: cloak EVERY window — a DWM cloak hides instantly with
-        // no geometry/style change for Qt to race, so nothing flashes
-        // between spawn and capture. Other kinds park aux windows.
-        let cloak = kind == Kind::Rpcs3;
-        hidden
-            .entry(hwnd.0 as usize)
-            .or_insert_with(|| {
-                if cloak {
-                    let s = snapshot_window(hwnd);
-                    set_cloaked(hwnd, true);
-                    s
-                } else {
-                    let saved = prepare_window_for_capture(hwnd);
-                    hide_window(hwnd);
-                    saved
-                }
-            });
+        // RPCS3/shadPS4: cloak EVERY window — a DWM cloak hides
+        // instantly with no geometry/style change for Qt/SDL to race,
+        // so nothing flashes between spawn and capture. Other kinds
+        // park aux windows.
+        let cloak = matches!(kind, Kind::Rpcs3 | Kind::Shadps4);
+        hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+            if cloak {
+                let s = snapshot_window(hwnd);
+                set_cloaked(hwnd, true);
+                s
+            } else {
+                let saved = prepare_window_for_capture(hwnd);
+                hide_window(hwnd);
+                saved
+            }
+        });
     }
 }
 
@@ -1698,7 +1949,11 @@ fn send_ctrl_s(hwnd: HWND) {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(vk),
-                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
                 ..Default::default()
             },
         },
@@ -1861,8 +2116,8 @@ pub fn key_vk(key: egui::Key) -> Option<u16> {
         K::End => 0x23,
         K::PageUp => 0x21,
         K::PageDown => 0x22,
-        K::Colon | K::Semicolon => 0xBA,     // OEM_1 (;:)
-        K::Plus | K::Equals => 0xBB,       // OEM_PLUS (=+)
+        K::Colon | K::Semicolon => 0xBA, // OEM_1 (;:)
+        K::Plus | K::Equals => 0xBB,     // OEM_PLUS (=+)
         K::Comma => 0xBC,
         K::Minus => 0xBD,
         K::Period => 0xBE,
@@ -1884,10 +2139,7 @@ pub fn key_vk(key: egui::Key) -> Option<u16> {
 /// lParams keep anyone who does honest.
 pub fn key_lparam(vk: u16, pressed: bool, repeat: bool) -> LPARAM {
     let sc = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) };
-    let ext = matches!(
-        vk,
-        0x21..=0x28 | 0x2D | 0x2E
-    ) as isize;
+    let ext = matches!(vk, 0x21..=0x28 | 0x2D | 0x2E) as isize;
     let mut l = 1isize | ((sc as isize) << 16) | (ext << 24);
     if pressed && repeat {
         l |= 1 << 30;

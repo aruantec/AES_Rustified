@@ -4,29 +4,28 @@ mod album_row;
 mod apl;
 mod audio;
 mod cap_shader;
-mod pillarbox;
 mod carousel;
 mod edge_border;
 mod emu_dl;
 mod emu_meta;
-mod exe_icon;
 mod emulation;
 mod equalizer;
+mod exe_icon;
 mod icons;
 mod library;
 mod logo;
 mod meta_cache;
 mod paint;
 mod particles;
+mod pillarbox;
 mod rom_editor;
 mod rpcs3_overlay;
 mod rpcs3_patch;
-mod xenia_cfg;
-mod xenia_overlay;
-mod xenia_profile;
+mod search_pill;
 mod settings;
 mod shadertoy;
-mod search_pill;
+mod shadps4;
+mod shadps4_overlay;
 mod spectrum_bar;
 mod tag_editor;
 mod transport;
@@ -35,17 +34,20 @@ mod waveform_bar;
 mod wgc;
 mod widgets;
 mod xenia;
+mod xenia_cfg;
+mod xenia_overlay;
+mod xenia_profile;
 // dead_code: a few query helpers (full -J metadata, extractor
 // profiles beyond Default) are the surface for future video-stream
 // selection — Lacrima's OnlineStreamSelector shape.
 #[allow(dead_code)]
 mod ytdlp;
 
-use eframe::egui_wgpu;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Layout, PointerButton, Pos2,
     Rect, ResizeDirection, Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2, ViewportCommand,
 };
+use eframe::egui_wgpu;
 
 const CORNER_RADIUS: u8 = 10;
 /// MainTopBar's declared height (virtual px, rendered at 1/ScaleFactor).
@@ -66,8 +68,6 @@ fn album_row_rect(content: Rect, s: f32) -> Rect {
         Pos2::new(content.max.x, content.max.y - margin),
     )
 }
-
-
 
 /// Merge the persisted virtual albums into the list (deduped by dir).
 /// Created and .apl-imported albums are the same record — neither is a
@@ -107,8 +107,6 @@ fn normalize_scanned_album(lib: &settings::Library, a: &mut library::Album) {
             .retain(|t| !ex.iter().any(|s| s == t.to_string_lossy().as_ref()));
     }
 }
-
-
 
 /// Smoothstep ease-in-out: slow start and end, no hard velocity changes.
 fn ease(t: f32) -> f32 {
@@ -151,7 +149,11 @@ impl Nav {
             Nav::Settled(cur) => (v == *cur) as u8 as f32,
             Nav::Fading { from, to, t } => {
                 if *t < 0.5 {
-                    if v == *from { 1.0 - ease(t * 2.0) } else { 0.0 }
+                    if v == *from {
+                        1.0 - ease(t * 2.0)
+                    } else {
+                        0.0
+                    }
                 } else if v == *to {
                     ease((t - 0.5) * 2.0)
                 } else {
@@ -176,10 +178,18 @@ impl Nav {
         let from = match self {
             Nav::Settled(cur) => *cur,
             Nav::Fading { from, to, t } => {
-                if *t > 0.5 { *to } else { *from }
+                if *t > 0.5 {
+                    *to
+                } else {
+                    *from
+                }
             }
         };
-        *self = Nav::Fading { from, to: v, t: 0.0 };
+        *self = Nav::Fading {
+            from,
+            to: v,
+            t: 0.0,
+        };
     }
 
     fn advance(&mut self, dt: f32) {
@@ -433,24 +443,20 @@ struct AesRustApp {
     /// yt-dlp stream resolution for a pending URL-item play —
     /// Lacrima's ResolveMediaSourceAsync -> PlayFile hop. Carries the
     /// item path so stale results (user clicked away meanwhile) drop.
-    resolve_rx:
-        Option<std::sync::mpsc::Receiver<(std::path::PathBuf, Result<String, String>)>>,
+    resolve_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, Result<String, String>)>>,
     /// Expanded playlist member urls arriving from the page scrape.
     playlist_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     /// Online metadata for freshly added url items (pairs with path).
-    url_info_rx:
-        Option<std::sync::mpsc::Receiver<Vec<(std::path::PathBuf, library::TrackInfo)>>>,
+    url_info_rx: Option<std::sync::mpsc::Receiver<Vec<(std::path::PathBuf, library::TrackInfo)>>>,
     /// Now-playing cover decoded on a worker — url items fetch over
     /// http, so the decode can't happen on the UI thread.
-    playing_cover_rx: Option<
-        std::sync::mpsc::Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>,
-    >,
+    playing_cover_rx:
+        Option<std::sync::mpsc::Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>>,
     /// Opened album's top cover decoded on a worker — pairs with the
     /// album dir so a stale result (user opened another album) drops.
     /// Web covers fetch over the network; decoding them on the UI
     /// thread froze the whole view for seconds.
-    album_cover_rx:
-        Option<std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>>,
+    album_cover_rx: Option<std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>>,
     /// Path currently loaded in the player — drives the playing-item
     /// glow and the top-left track info overlay.
     playing_track: Option<std::path::PathBuf>,
@@ -559,10 +565,8 @@ impl AesRustApp {
                         name.to_owned(),
                         std::sync::Arc::new(egui::FontData::from_owned(data)),
                     );
-                    defs.families.insert(
-                        egui::FontFamily::Name(family.into()),
-                        vec![name.to_owned()],
-                    );
+                    defs.families
+                        .insert(egui::FontFamily::Name(family.into()), vec![name.to_owned()]);
                 })
                 .is_ok()
         };
@@ -620,18 +624,11 @@ impl AesRustApp {
             .iter()
             .filter(|d| !lib.excluded_albums.contains(*d))
             .map(|d| {
-                if let Some(ia) =
-                    lib.virtual_albums.iter().find(|ia| ia.dir == *d)
-                {
+                if let Some(ia) = lib.virtual_albums.iter().find(|ia| ia.dir == *d) {
                     // Virtual album — real record (its position in the
                     // manifest restores interleaved ordering exactly).
-                    let urls =
-                        lib.url_items.get(&ia.dir).cloned().unwrap_or_default();
-                    let mut a = library::Album::virtual_album(
-                        &ia.dir,
-                        ia.title.clone(),
-                        &urls,
-                    );
+                    let urls = lib.url_items.get(&ia.dir).cloned().unwrap_or_default();
+                    let mut a = library::Album::virtual_album(&ia.dir, ia.title.clone(), &urls);
                     normalize_scanned_album(lib, &mut a);
                     a
                 } else {
@@ -768,8 +765,7 @@ impl AesRustApp {
 impl eframe::App for AesRustApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         {
-            static FRAME: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
+            static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 || n == 30 || n == 120 {
                 boot_mark(&format!("frame {n} built"));
@@ -780,10 +776,11 @@ impl eframe::App for AesRustApp {
         if !self.centered {
             if let Some(wa) = work_area_rect(ui.ctx()) {
                 let size = ui.max_rect().size();
-                ui.ctx().send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
-                    wa.min.x + (wa.width() - size.x) / 2.0,
-                    wa.min.y + (wa.height() - size.y) / 2.0,
-                )));
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
+                        wa.min.x + (wa.width() - size.x) / 2.0,
+                        wa.min.y + (wa.height() - size.y) / 2.0,
+                    )));
                 self.centered = true;
             }
         }
@@ -791,9 +788,7 @@ impl eframe::App for AesRustApp {
         // The shader paints first so everything else (frame stroke, menu)
         // lands on top of it. Painted every frame, so always repaint.
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
-        let is_fullscreen = ui
-            .ctx()
-            .input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let is_fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
         // Mirror the current window size into settings (un-maximized only,
         // so the restored size is the normal one).
         if !maximized && !is_fullscreen {
@@ -913,12 +908,7 @@ impl eframe::App for AesRustApp {
                     Ok(mut a) => {
                         let dir = a.dir.to_string_lossy().into_owned();
                         self.scan_seen.insert(dir.clone());
-                        if self
-                            .settings
-                            .library
-                            .excluded_albums
-                            .contains(&dir)
-                        {
+                        if self.settings.library.excluded_albums.contains(&dir) {
                             continue;
                         }
                         normalize_scanned_album(&self.settings.library, &mut a);
@@ -927,9 +917,7 @@ impl eframe::App for AesRustApp {
                         // ahead of un-arrived front ones (arrival order
                         // can't know final positions mid-scan). The
                         // real order applies once, when the walk ends.
-                        if let Some(pos) =
-                            self.albums.iter().position(|x| x.dir == a.dir)
-                        {
+                        if let Some(pos) = self.albums.iter().position(|x| x.dir == a.dir) {
                             self.albums[pos] = a;
                         } else {
                             self.albums.push(a);
@@ -952,8 +940,7 @@ impl eframe::App for AesRustApp {
                 let imported = self.settings.library.virtual_albums.clone();
                 self.albums.retain(|a| {
                     let dir = a.dir.to_string_lossy();
-                    self.scan_seen.contains(dir.as_ref())
-                        || imported.iter().any(|ia| ia.dir == dir)
+                    self.scan_seen.contains(dir.as_ref()) || imported.iter().any(|ia| ia.dir == dir)
                 });
                 merge_virtual_albums(&mut self.albums, &self.settings.library);
                 // Scan-complete ordering: saved drag rank first, then
@@ -1012,8 +999,7 @@ impl eframe::App for AesRustApp {
                             .as_ref()
                             .map(|p| p.duration().as_secs_f64())
                             .unwrap_or(0.0);
-                        self.trailing_silence_s =
-                            trailing_silence_seconds(&self.waveform, dur);
+                        self.trailing_silence_s = trailing_silence_seconds(&self.waveform, dur);
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1108,9 +1094,7 @@ impl eframe::App for AesRustApp {
                         if player.is_none() {
                             *player = audio::AudioPlayer::new().ok();
                             if let Some(p) = player {
-                                for (i, &db) in
-                                    settings.equalizer.bands.iter().enumerate()
-                                {
+                                for (i, &db) in settings.equalizer.bands.iter().enumerate() {
                                     p.set_band_gain(i, db);
                                 }
                                 p.apply_audio(&settings.audio);
@@ -1130,22 +1114,16 @@ impl eframe::App for AesRustApp {
                         if let Some(c) = waveform_cancel.take() {
                             c.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        let cancel = std::sync::Arc::new(
-                            std::sync::atomic::AtomicBool::new(false),
-                        );
-                        *waveform_rx = Some(audio::waveform::spawn_stream(
-                            stream,
-                            key,
-                            cancel.clone(),
-                        ));
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        *waveform_rx =
+                            Some(audio::waveform::spawn_stream(stream, key, cancel.clone()));
                         *waveform_cancel = Some(cancel);
                     } else {
                         *waveform_loading = false;
                     }
                     *resolve_rx = None;
                 }
-                Ok((_, Err(_)))
-                | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Ok((_, Err(_))) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     *waveform_loading = false;
                     *resolve_rx = None;
                 }
@@ -1166,13 +1144,10 @@ impl eframe::App for AesRustApp {
                     }
                     if !added.is_empty() {
                         persist_url_items(carousel, albums, settings);
-                        let title = carousel
-                            .display_for(std::path::Path::new(&added[0]))
-                            .2;
+                        let title = carousel.display_for(std::path::Path::new(&added[0])).2;
                         let paths: Vec<std::path::PathBuf> =
                             added.iter().map(std::path::PathBuf::from).collect();
-                        *url_info_rx =
-                            Some(library::spawn_url_info(paths, title));
+                        *url_info_rx = Some(library::spawn_url_info(paths, title));
                         ui.ctx().request_repaint();
                     }
                     *playlist_rx = None;
@@ -1215,10 +1190,7 @@ impl eframe::App for AesRustApp {
             // them into the loaded album tile's web fan so the tile
             // tracks item updates live.
             if let Some(key) = carousel.album_key().map(|k| k.to_string()) {
-                if let Some(a) = albums
-                    .iter_mut()
-                    .find(|a| a.dir.to_string_lossy() == key)
-                {
+                if let Some(a) = albums.iter_mut().find(|a| a.dir.to_string_lossy() == key) {
                     let covers = carousel.url_covers();
                     let n = covers.len();
                     a.sync_url_covers(covers, n);
@@ -1233,12 +1205,9 @@ impl eframe::App for AesRustApp {
             match rx.try_recv() {
                 Ok((dir, img)) => {
                     if carousel.album_key() == Some(dir.as_str()) {
-                        *spectrum_colors = img
-                            .as_ref()
-                            .map(|i| spectrum_bar::dominant_colors(i, 3));
-                        if let (Some(toy), Some(img)) =
-                            (shadertoy.as_mut(), img.as_ref())
-                        {
+                        *spectrum_colors =
+                            img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
+                        if let (Some(toy), Some(img)) = (shadertoy.as_mut(), img.as_ref()) {
                             toy.set_cover_image(img);
                             if let Some(c) = spectrum_colors.as_deref() {
                                 toy.set_palette(c);
@@ -1260,8 +1229,7 @@ impl eframe::App for AesRustApp {
             if let Ok((path, img)) = rx.try_recv() {
                 if playing_track.as_ref() == Some(&path) {
                     if let Some(img) = img {
-                        *spectrum_colors =
-                            Some(spectrum_bar::dominant_colors(&img, 3));
+                        *spectrum_colors = Some(spectrum_bar::dominant_colors(&img, 3));
                         if let Some(toy) = shadertoy.as_mut() {
                             toy.set_cover_image(&img);
                             if let Some(c) = spectrum_colors.as_deref() {
@@ -1281,8 +1249,7 @@ impl eframe::App for AesRustApp {
         // Pump the spectrum tap once per frame (Lacrima's analyzer also
         // runs regardless of the visible view). Bars settling after a
         // pause need frames to decay.
-        if spectrum.update(player.as_mut(), dt, &settings.spectrum)
-            && nav.alpha(View::Music) > 0.0
+        if spectrum.update(player.as_mut(), dt, &settings.spectrum) && nav.alpha(View::Music) > 0.0
         {
             ui.ctx().request_repaint();
         }
@@ -1303,7 +1270,9 @@ impl eframe::App for AesRustApp {
             let (mx, my) = pos
                 .map(|p| (p.x * ppp, h_px - p.y * ppp))
                 .unwrap_or((0.0, 0.0));
-            let (cx, cy) = org.map(|p| (p.x * ppp, h_px - p.y * ppp)).unwrap_or((mx, my));
+            let (cx, cy) = org
+                .map(|p| (p.x * ppp, h_px - p.y * ppp))
+                .unwrap_or((mx, my));
             toy.set_mouse([mx, my, if down { cx } else { -cx }, cy]);
             // u_disc occluder — the player widget's disc in GL coords
             // (ShaderDiscOccluderSync); inactive when the widget is hidden
@@ -1317,15 +1286,18 @@ impl eframe::App for AesRustApp {
                 None
             };
             if let Some(d) = d {
-                toy.set_disc(d.center.x * ppp, h_px - d.center.y * ppp, d.ring_radius * ppp, true);
+                toy.set_disc(
+                    d.center.x * ppp,
+                    h_px - d.center.y * ppp,
+                    d.ring_radius * ppp,
+                    true,
+                );
             } else {
                 toy.set_disc(0.0, 0.0, 0.0, false);
             }
         }
         // Track tag metadata landed — upgrade the cover items' labels.
-        let infos = track_info_rx
-            .as_ref()
-            .and_then(|rx| rx.try_recv().ok());
+        let infos = track_info_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(infos) = infos {
             carousel.set_info(infos);
             *track_info_rx = None;
@@ -1338,11 +1310,9 @@ impl eframe::App for AesRustApp {
         // While the settings overlay is open (or sliding) nothing
         // behind it accepts input — including the carousel's raw
         // pointer paths that bypass egui's widget hit routing.
-        let overlay_slide = ui.ctx().animate_bool_with_time(
-            egui::Id::new("settings-overlay"),
-            *settings_open,
-            0.3,
-        );
+        let overlay_slide =
+            ui.ctx()
+                .animate_bool_with_time(egui::Id::new("settings-overlay"), *settings_open, 0.3);
         let view_interactive = interactive
             && overlay_slide < 0.001
             && !tag_editor.is_open()
@@ -1444,20 +1414,10 @@ impl eframe::App for AesRustApp {
                     let a = nav.alpha(View::Main);
                     if a > 0.0 {
                         ui.set_opacity(a);
-                        if let Some(i) = main_menu(
-                            ui,
-                            icons,
-                            menu_scales,
-                            view_interactive,
-                            *settings_open,
-                            s,
-                        ) {
-                            menu_activate(
-                                i,
-                                menu_entries(icons).len(),
-                                settings_open,
-                                nav,
-                            );
+                        if let Some(i) =
+                            main_menu(ui, icons, menu_scales, view_interactive, *settings_open, s)
+                        {
+                            menu_activate(i, menu_entries(icons).len(), settings_open, nav);
                         }
                         let cout = clock.ui(
                             ui,
@@ -1528,15 +1488,13 @@ impl eframe::App for AesRustApp {
                                     // while its stream url resolves or
                                     // the decoder preroll fills —
                                     // cleared the moment playback runs.
-                                    let stream_loading = playing_track
-                                        .as_ref()
-                                        .is_some_and(|t| library::is_url(t))
-                                        && (resolve_rx.is_some()
-                                            || player.as_ref().is_some_and(|p| {
-                                                p.buffering()
-                                                    && p.state()
-                                                        == audio::PlayerState::Playing
-                                            }));
+                                    let stream_loading =
+                                        playing_track.as_ref().is_some_and(|t| library::is_url(t))
+                                            && (resolve_rx.is_some()
+                                                || player.as_ref().is_some_and(|p| {
+                                                    p.buffering()
+                                                        && p.state() == audio::PlayerState::Playing
+                                                }));
                                     // Shift held = reorder armed —
                                     // the owning list lifts its
                                     // selection to signal the arrows
@@ -1626,8 +1584,7 @@ impl eframe::App for AesRustApp {
                         .iter()
                         .map(|a| a.dir.to_string_lossy().into_owned())
                         .collect();
-                    settings.library.cached_albums =
-                        settings.library.album_order.clone();
+                    settings.library.cached_albums = settings.library.album_order.clone();
                     settings::save(settings);
                 }
                 // A landed item reorder: the new URL order persists
@@ -1665,9 +1622,9 @@ impl eframe::App for AesRustApp {
                     && !emu.prof_prompt.is_open()
                     && !emu.render_open
                     && !ui.ctx().text_edit_focused()
-                    && ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                    })
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 {
                     if emu.session.is_some() {
                         emu.viewport_dismissed = false;
@@ -1715,9 +1672,10 @@ impl eframe::App for AesRustApp {
                     {
                         emu.cards.select_all(&emu.search.text);
                     }
-                    if ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
-                    }) {
+                    if ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                    {
                         let paths = emu.cards.selected_paths();
                         if !paths.is_empty() {
                             emu.pending_delete = Some(paths);
@@ -1745,16 +1703,15 @@ impl eframe::App for AesRustApp {
                 if view_interactive
                     && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
-                    && ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
-                    })
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
                 {
                     match *sel_owner {
                         SelOwner::Albums => {
                             let dirs = album_row.selected_dirs(albums);
                             if !dirs.is_empty() {
-                                row_action =
-                                    album_row::Action::DeleteAlbum(dirs);
+                                row_action = album_row::Action::DeleteAlbum(dirs);
                             }
                         }
                         SelOwner::Cards => {
@@ -1770,9 +1727,9 @@ impl eframe::App for AesRustApp {
                 if view_interactive
                     && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
-                    && ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)
-                    })
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
                 {
                     match *sel_owner {
                         SelOwner::Albums => album_row.select_all(albums),
@@ -1820,12 +1777,8 @@ impl eframe::App for AesRustApp {
                     // same owner routing either way.
                     if mdx != 0 || mdy != 0 {
                         match *sel_owner {
-                            SelOwner::Albums => {
-                                album_row.move_selection(albums, mdx + mdy)
-                            }
-                            SelOwner::Cards => {
-                                carousel.move_selection(&search.text, mdx, mdy)
-                            }
+                            SelOwner::Albums => album_row.move_selection(albums, mdx + mdy),
+                            SelOwner::Cards => carousel.move_selection(&search.text, mdx, mdy),
                             SelOwner::None => {
                                 if carousel.has_items() {
                                     carousel.move_selection(&search.text, mdx, mdy)
@@ -1837,9 +1790,7 @@ impl eframe::App for AesRustApp {
                     } else if dx != 0 || dy != 0 {
                         match *sel_owner {
                             SelOwner::Albums => album_row.arrow(albums, dx + dy),
-                            SelOwner::Cards => {
-                                carousel.arrow(&search.text, dx, dy)
-                            }
+                            SelOwner::Cards => carousel.arrow(&search.text, dx, dy),
                             SelOwner::None => {
                                 if carousel.has_items() {
                                     carousel.arrow(&search.text, dx, dy)
@@ -1857,9 +1808,9 @@ impl eframe::App for AesRustApp {
                 if view_interactive
                     && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
-                    && ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
-                    })
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
                 {
                     let next = match *sel_owner {
                         SelOwner::Albums | SelOwner::None => SelOwner::Cards,
@@ -1881,9 +1832,9 @@ impl eframe::App for AesRustApp {
                 if view_interactive
                     && nav.target() != View::Emulation
                     && !ui.ctx().text_edit_focused()
-                    && ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                    })
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 {
                     match *sel_owner {
                         SelOwner::Albums => {
@@ -1904,9 +1855,9 @@ impl eframe::App for AesRustApp {
                 // strip, the top-right item search for the cards.
                 // The Emulation view's item pill takes it there too.
                 if view_interactive
-                    && ui.ctx().input_mut(|i| {
-                        i.consume_key(egui::Modifiers::CTRL, egui::Key::F)
-                    })
+                    && ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F))
                 {
                     match nav.target() {
                         View::Music => match *sel_owner {
@@ -1970,10 +1921,7 @@ impl eframe::App for AesRustApp {
                             // TerminateProcess fallback).
                             emu.stop_session();
                         } else if !ui.ctx().text_edit_focused() {
-                            if ui
-                                .ctx()
-                                .input(|i| i.viewport().fullscreen.unwrap_or(false))
-                            {
+                            if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                                 fs_exit.begin(ui.ctx());
                             } else {
                                 esc_back = true;
@@ -1997,10 +1945,7 @@ impl eframe::App for AesRustApp {
                         .ctx()
                         .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F12))
                 {
-                    if ui
-                        .ctx()
-                        .input(|i| i.viewport().fullscreen.unwrap_or(false))
-                    {
+                    if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                         fs_exit.begin(ui.ctx());
                     } else {
                         ui.ctx()
@@ -2037,10 +1982,7 @@ impl eframe::App for AesRustApp {
                 // order — the binding follows `menu_entries`, so a
                 // new entry automatically takes the next number.
                 // Only on the Main view where the menu lives.
-                if view_interactive
-                    && !ui.ctx().text_edit_focused()
-                    && nav.target() == View::Main
-                {
+                if view_interactive && !ui.ctx().text_edit_focused() && nav.target() == View::Main {
                     let menu_n = menu_entries(icons).len();
                     for n in 1..=menu_n.min(9) {
                         let key = match n {
@@ -2090,7 +2032,10 @@ impl eframe::App for AesRustApp {
                     let (mut pressed, mut released) = (false, false);
                     let (other_key, focused) = ui.ctx().input(|i| {
                         for ev in &i.events {
-                            if let egui::Event::Key { key, pressed: p, .. } = ev {
+                            if let egui::Event::Key {
+                                key, pressed: p, ..
+                            } = ev
+                            {
                                 match (key, p) {
                                     (egui::Key::AltLeft | egui::Key::AltRight, true) => {
                                         pressed = true
@@ -2102,10 +2047,7 @@ impl eframe::App for AesRustApp {
                                 }
                             }
                         }
-                        (
-                            i.keys_down.iter().any(|k| !is_mod(*k)),
-                            i.focused,
-                        )
+                        (i.keys_down.iter().any(|k| !is_mod(*k)), i.focused)
                     });
                     if pressed {
                         *alt_down = true;
@@ -2122,8 +2064,7 @@ impl eframe::App for AesRustApp {
                             && !ui.ctx().text_edit_focused()
                             && nav.target() == View::Music
                         {
-                            transport.cover_layout =
-                                (transport.cover_layout + 1) % 3;
+                            transport.cover_layout = (transport.cover_layout + 1) % 3;
                         }
                         *alt_down = false;
                         *alt_clean = false;
@@ -2139,8 +2080,7 @@ impl eframe::App for AesRustApp {
                             settings::save(settings);
                             album_row.reset();
                             scan_seen.clear();
-                            *album_rx =
-                                Some(library::spawn_scan(&settings.library.music_roots));
+                            *album_rx = Some(library::spawn_scan(&settings.library.music_roots));
                         }
                     }
                     album_row::Action::Rescan => {
@@ -2160,9 +2100,7 @@ impl eframe::App for AesRustApp {
                         // and clear the cover view if it was loaded.
                         for dir in dirs {
                             if let Some(i) =
-                                albums.iter().position(|a| {
-                                    a.dir.to_string_lossy() == dir
-                                })
+                                albums.iter().position(|a| a.dir.to_string_lossy() == dir)
                             {
                                 if carousel.album_key() == Some(dir.as_str()) {
                                     if let Some(cur) = playing_track.as_ref() {
@@ -2209,15 +2147,10 @@ impl eframe::App for AesRustApp {
                         // cover-view export; labels come from the
                         // loaded carousel when this album is open,
                         // persisted urls otherwise.
-                        if let Some(i) =
-                            albums.iter().position(|a| {
-                                a.dir.to_string_lossy() == dir
-                            })
+                        if let Some(i) = albums.iter().position(|a| a.dir.to_string_lossy() == dir)
                         {
                             let title = albums[i].title.clone();
-                            let items = if carousel.album_key()
-                                == Some(dir.as_str())
-                            {
+                            let items = if carousel.album_key() == Some(dir.as_str()) {
                                 carousel.export_items()
                             } else {
                                 settings
@@ -2235,8 +2168,7 @@ impl eframe::App for AesRustApp {
                             };
                             if !items.is_empty() {
                                 let file_name = {
-                                    let n =
-                                        apl::sanitize_file_name(&title);
+                                    let n = apl::sanitize_file_name(&title);
                                     if n.is_empty() {
                                         "playlist".to_string()
                                     } else {
@@ -2245,21 +2177,12 @@ impl eframe::App for AesRustApp {
                                 };
                                 if let Some(file) = rfd::FileDialog::new()
                                     .set_title("Export Online Playlist")
-                                    .set_file_name(format!(
-                                        "{file_name}.apl"
-                                    ))
-                                    .add_filter(
-                                        "AES Online Playlist",
-                                        &["apl"],
-                                    )
+                                    .set_file_name(format!("{file_name}.apl"))
+                                    .add_filter("AES Online Playlist", &["apl"])
                                     .save_file()
                                 {
-                                    if let Err(e) =
-                                        apl::write(&file, &title, items)
-                                    {
-                                        eprintln!(
-                                            "apl export failed: {e}"
-                                        );
+                                    if let Err(e) = apl::write(&file, &title, items) {
+                                        eprintln!("apl export failed: {e}");
                                     }
                                 }
                             }
@@ -2291,61 +2214,45 @@ impl eframe::App for AesRustApp {
                                 for it in &doc.items {
                                     let u = it.url.trim();
                                     if u.is_empty()
-                                        || !(u.starts_with("http://")
-                                            || u.starts_with("https://"))
+                                        || !(u.starts_with("http://") || u.starts_with("https://"))
                                     {
                                         continue;
                                     }
                                     let id = ytdlp::extract_video_id(u);
                                     let dup = urls.iter().any(|e| {
-                                        e == u
-                                            || (id.is_some()
-                                                && ytdlp::extract_video_id(e) == id)
+                                        e == u || (id.is_some() && ytdlp::extract_video_id(e) == id)
                                     });
                                     if !dup {
                                         urls.push(u.to_string());
                                     }
                                 }
                                 if !urls.is_empty() {
-                                    let dir = format!(
-                                        "{}{}",
-                                        library::VIRTUAL_SCHEME,
-                                        title
-                                    );
+                                    let dir = format!("{}{}", library::VIRTUAL_SCHEME, title);
                                     albums.push(library::Album::virtual_album(
                                         &dir,
                                         title.clone(),
                                         &urls,
                                     ));
                                     let lib = &mut settings.library;
-                                    lib.virtual_albums.push(
-                                        settings::VirtualAlbum {
-                                            dir: dir.clone(),
-                                            title,
-                                        },
-                                    );
-                                    lib.url_items
-                                        .insert(dir, urls.clone());
+                                    lib.virtual_albums.push(settings::VirtualAlbum {
+                                        dir: dir.clone(),
+                                        title,
+                                    });
+                                    lib.url_items.insert(dir, urls.clone());
                                     settings::save(settings);
                                     // Open it (the album tile's web
                                     // covers load on their own worker
                                     // threads — no synchronous fetch).
                                     if let Some(album) = albums.last() {
-                                        let album_title =
-                                            album.title.clone();
-                                        let (tracks, t) =
-                                            carousel.open(album, &urls);
+                                        let album_title = album.title.clone();
+                                        let (tracks, t) = carousel.open(album, &urls);
                                         // The .apl carries display
                                         // labels — seed them now;
                                         // workers still re-resolve
                                         // fresh metadata + thumbnails.
                                         for u in &urls {
-                                            let Some(it) = doc
-                                                .items
-                                                .iter()
-                                                .find(|i| {
-                                                    i.url.trim() == u
-                                                })
+                                            let Some(it) =
+                                                doc.items.iter().find(|i| i.url.trim() == u)
                                             else {
                                                 continue;
                                             };
@@ -2353,18 +2260,9 @@ impl eframe::App for AesRustApp {
                                                 .title
                                                 .as_deref()
                                                 .map(str::trim)
-                                                .filter(|s| {
-                                                    !s.is_empty()
-                                                });
-                                            let artist = it
-                                                .artist
-                                                .clone()
-                                                .unwrap_or_default();
-                                            if title.is_none()
-                                                && artist
-                                                    .trim()
-                                                    .is_empty()
-                                            {
+                                                .filter(|s| !s.is_empty());
+                                            let artist = it.artist.clone().unwrap_or_default();
+                                            if title.is_none() && artist.trim().is_empty() {
                                                 continue;
                                             }
                                             // Persist into the
@@ -2375,43 +2273,27 @@ impl eframe::App for AesRustApp {
                                             meta_cache::save(
                                                 u,
                                                 &meta_cache::CachedMeta {
-                                                    title: title
-                                                        .unwrap_or(u)
-                                                        .to_string(),
-                                                    artist: artist
-                                                        .clone(),
+                                                    title: title.unwrap_or(u).to_string(),
+                                                    artist: artist.clone(),
                                                     thumb: None,
                                                     ..Default::default()
                                                 },
                                             );
                                             carousel.apply_info(
-                                                std::path::Path::new(
-                                                    u.as_str(),
-                                                ),
+                                                std::path::Path::new(u.as_str()),
                                                 &library::TrackInfo {
-                                                    title: title
-                                                        .unwrap_or(u)
-                                                        .to_string(),
+                                                    title: title.unwrap_or(u).to_string(),
                                                     artist,
                                                     album: it
                                                         .album
                                                         .clone()
-                                                        .unwrap_or_else(
-                                                            || {
-                                                                album_title
-                                                                    .clone()
-                                                            },
-                                                        ),
+                                                        .unwrap_or_else(|| album_title.clone()),
                                                     number: None,
                                                     cover_url: None,
                                                 },
                                             );
                                         }
-                                        *url_info_rx = Some(
-                                            library::spawn_url_info(
-                                                tracks, t,
-                                            ),
-                                        );
+                                        *url_info_rx = Some(library::spawn_url_info(tracks, t));
                                     }
                                     ui.ctx().request_repaint();
                                 }
@@ -2438,11 +2320,7 @@ impl eframe::App for AesRustApp {
                                 .map(|d| d.as_nanos())
                                 .unwrap_or(0)
                         );
-                        albums.push(library::Album::virtual_album(
-                            &dir,
-                            title.clone(),
-                            &[],
-                        ));
+                        albums.push(library::Album::virtual_album(&dir, title.clone(), &[]));
                         let lib = &mut settings.library;
                         lib.virtual_albums.push(settings::VirtualAlbum {
                             dir: dir.clone(),
@@ -2459,18 +2337,14 @@ impl eframe::App for AesRustApp {
                         // stable. Virtual albums' records update too.
                         let title = title.trim().to_string();
                         if !title.is_empty() {
-                            if let Some(a) = albums
-                                .iter_mut()
-                                .find(|a| a.dir.to_string_lossy() == dir)
+                            if let Some(a) =
+                                albums.iter_mut().find(|a| a.dir.to_string_lossy() == dir)
                             {
                                 a.title = title.clone();
                             }
                             let lib = &mut settings.library;
                             lib.album_titles.insert(dir.clone(), title.clone());
-                            if let Some(ia) = lib
-                                .virtual_albums
-                                .iter_mut()
-                                .find(|ia| ia.dir == dir)
+                            if let Some(ia) = lib.virtual_albums.iter_mut().find(|ia| ia.dir == dir)
                             {
                                 ia.title = title.clone();
                             }
@@ -2493,16 +2367,12 @@ impl eframe::App for AesRustApp {
                             // (seconds), which used to freeze the whole
                             // view (and stall track-end advance).
                             if let Some(src) = album.covers.last().cloned() {
-                                let dir =
-                                    album.dir.to_string_lossy().into_owned();
+                                let dir = album.dir.to_string_lossy().into_owned();
                                 let (tx, rx) = std::sync::mpsc::channel();
                                 std::thread::Builder::new()
                                     .name("aes-album-cover".into())
                                     .spawn(move || {
-                                        let _ = tx.send((
-                                            dir,
-                                            library::decode_cover(&src),
-                                        ));
+                                        let _ = tx.send((dir, library::decode_cover(&src)));
                                     })
                                     .ok();
                                 *album_cover_rx = Some(rx);
@@ -2519,8 +2389,7 @@ impl eframe::App for AesRustApp {
                                 .cloned()
                                 .unwrap_or_default();
                             let (tracks, title) = carousel.open(album, &urls);
-                            *url_info_rx =
-                                Some(library::spawn_url_info(tracks, title));
+                            *url_info_rx = Some(library::spawn_url_info(tracks, title));
                         }
                     }
                     album_row::Action::Selected(_) | album_row::Action::None => {}
@@ -2545,8 +2414,8 @@ impl eframe::App for AesRustApp {
                             let in_tail = p.position().as_secs_f64()
                                 >= p.duration().as_secs_f64() - *trailing_silence_s;
                             if in_tail {
-                                let t0 = silence_entered
-                                    .get_or_insert_with(std::time::Instant::now);
+                                let t0 =
+                                    silence_entered.get_or_insert_with(std::time::Instant::now);
                                 if t0.elapsed().as_millis() as u64
                                     >= settings.audio.silence_advance_delay_ms as u64
                                 {
@@ -2626,8 +2495,7 @@ impl eframe::App for AesRustApp {
                             std::thread::Builder::new()
                                 .name("aes-cover-fetch".into())
                                 .spawn(move || {
-                                    let _ =
-                                        tx.send((t, library::decode_cover(&src)));
+                                    let _ = tx.send((t, library::decode_cover(&src)));
                                 })
                                 .ok();
                             *playing_cover_rx = Some(rx);
@@ -2646,8 +2514,7 @@ impl eframe::App for AesRustApp {
                         *waveform_loading = true;
                         *waveform_rx = None;
                     } else {
-                        let img =
-                            library::decode_cover(&library::CoverSrc::Tag(track.clone()));
+                        let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
                         *spectrum_colors =
                             img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
                         if let (Some(toy), Some(img)) = (shadertoy.as_mut(), img.as_ref()) {
@@ -2670,9 +2537,7 @@ impl eframe::App for AesRustApp {
                             // A lazily created player starts at unity —
                             // apply the persisted EQ curve.
                             if let Some(p) = player {
-                                for (i, &db) in
-                                    settings.equalizer.bands.iter().enumerate()
-                                {
+                                for (i, &db) in settings.equalizer.bands.iter().enumerate() {
                                     p.set_band_gain(i, db);
                                 }
                                 p.apply_audio(&settings.audio);
@@ -2690,10 +2555,8 @@ impl eframe::App for AesRustApp {
                         *trailing_silence_s = 0.0;
                         *silence_entered = None;
                         *waveform_loading = true;
-                        let cancel =
-                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        *waveform_rx =
-                            Some(audio::waveform::spawn(track, cancel.clone()));
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        *waveform_rx = Some(audio::waveform::spawn(track, cancel.clone()));
                         *waveform_cancel = Some(cancel);
                     }
                 }
@@ -2738,9 +2601,7 @@ impl eframe::App for AesRustApp {
                     // otherwise re-add them on the next scan (Lacrima
                     // serializes the reduced Children list; we carry
                     // the removal in Settings.Library.ExcludedTracks).
-                    if let Some(key) =
-                        carousel.album_key().map(|k| k.to_string())
-                    {
+                    if let Some(key) = carousel.album_key().map(|k| k.to_string()) {
                         let removed: Vec<String> = paths
                             .iter()
                             .filter(|p| !library::is_url(p))
@@ -2758,9 +2619,7 @@ impl eframe::App for AesRustApp {
                         // The tile's count badge = tracks + url items —
                         // drop removed file items from `tracks` too (url
                         // items update via sync_url_covers in persist).
-                        if let Some(a) = albums
-                            .iter_mut()
-                            .find(|a| a.dir.to_string_lossy() == key)
+                        if let Some(a) = albums.iter_mut().find(|a| a.dir.to_string_lossy() == key)
                         {
                             a.tracks.retain(|t| !paths.contains(t));
                         }
@@ -2792,9 +2651,7 @@ impl eframe::App for AesRustApp {
                     // excluded_tracks keeps them out of the next scan.
                     let file_paths = carousel.file_items();
                     carousel.clear_items();
-                    if let Some(key) =
-                        carousel.album_key().map(|k| k.to_string())
-                    {
+                    if let Some(key) = carousel.album_key().map(|k| k.to_string()) {
                         if !file_paths.is_empty() {
                             settings
                                 .library
@@ -2804,17 +2661,13 @@ impl eframe::App for AesRustApp {
                                 .extend(
                                     file_paths
                                         .iter()
-                                        .map(|p| {
-                                            p.to_string_lossy().into_owned()
-                                        })
+                                        .map(|p| p.to_string_lossy().into_owned())
                                         .collect::<Vec<_>>(),
                                 );
                             settings::save(settings);
                         }
                         // Count badge: every child left the view.
-                        if let Some(a) = albums
-                            .iter_mut()
-                            .find(|a| a.dir.to_string_lossy() == key)
+                        if let Some(a) = albums.iter_mut().find(|a| a.dir.to_string_lossy() == key)
                         {
                             a.tracks.clear();
                         }
@@ -2869,24 +2722,17 @@ impl eframe::App for AesRustApp {
                         if let Some(src) = library::CoverSrc::web_for(&url) {
                             album_row.invalidate_cover(&src);
                         }
-                        if let Some(t) =
-                            crate::meta_cache::load(&url).and_then(|m| m.thumb)
-                        {
-                            album_row
-                                .invalidate_cover(&library::CoverSrc::Web(vec![t]));
+                        if let Some(t) = crate::meta_cache::load(&url).and_then(|m| m.thumb) {
+                            album_row.invalidate_cover(&library::CoverSrc::Web(vec![t]));
                         }
-                        if let Some((tracks, title)) = carousel.info_refresh_args()
-                        {
+                        if let Some((tracks, title)) = carousel.info_refresh_args() {
                             *url_info_rx = Some(library::spawn_url_info(tracks, title));
                         }
                         // Re-read the now-playing art off the UI thread —
                         // without an override this is a remote fetch.
                         if playing_track.as_deref() == Some(saved.as_path()) {
-                            let src = library::CoverSrc::File(
-                                crate::meta_cache::cover_path(&url),
-                            );
-                            let src = if crate::meta_cache::cover_path(&url).exists()
-                            {
+                            let src = library::CoverSrc::File(crate::meta_cache::cover_path(&url));
+                            let src = if crate::meta_cache::cover_path(&url).exists() {
                                 Some(src)
                             } else {
                                 library::CoverSrc::web_for(&url)
@@ -2897,8 +2743,7 @@ impl eframe::App for AesRustApp {
                                 std::thread::Builder::new()
                                     .name("aes-cover-fetch".into())
                                     .spawn(move || {
-                                        let _ =
-                                            tx.send((t, library::decode_cover(&src)));
+                                        let _ = tx.send((t, library::decode_cover(&src)));
                                     })
                                     .ok();
                                 *playing_cover_rx = Some(rx);
@@ -2907,13 +2752,12 @@ impl eframe::App for AesRustApp {
                     } else {
                         album_row.invalidate_cover(&library::CoverSrc::Tag(saved.clone()));
                         if let Some((tracks, title)) = carousel.info_refresh_args() {
-                            *track_info_rx =
-                                Some(library::spawn_track_info(tracks, title));
+                            *track_info_rx = Some(library::spawn_track_info(tracks, title));
                         }
                         if playing_track.as_deref() == Some(saved.as_path()) {
-                            if let Some(img) = library::decode_cover(
-                                &library::CoverSrc::Tag(saved.clone()),
-                            ) {
+                            if let Some(img) =
+                                library::decode_cover(&library::CoverSrc::Tag(saved.clone()))
+                            {
                                 *playing_cover = Some(ui.ctx().load_texture(
                                     "playing-cover",
                                     img,
@@ -2984,9 +2828,7 @@ impl eframe::App for AesRustApp {
                             url_prompt::Kind::Url => {
                                 if carousel.add_url(&url) {
                                     persist_url_items(carousel, albums, settings);
-                                    let title = carousel
-                                        .display_for(std::path::Path::new(&url))
-                                        .2;
+                                    let title = carousel.display_for(std::path::Path::new(&url)).2;
                                     *url_info_rx = Some(library::spawn_url_info(
                                         vec![std::path::PathBuf::from(url)],
                                         title,
@@ -3003,8 +2845,7 @@ impl eframe::App for AesRustApp {
                                 std::thread::Builder::new()
                                     .name("aes-playlist-expand".into())
                                     .spawn(move || {
-                                        let _ =
-                                            tx.send(ytdlp::playlist_video_urls(&url));
+                                        let _ = tx.send(ytdlp::playlist_video_urls(&url));
                                     })
                                     .ok();
                                 *playlist_rx = Some(rx);
@@ -3133,9 +2974,8 @@ impl eframe::App for AesRustApp {
                 // leave waits for the fade to finish.
                 if fs_exit.open || fs_exit.vis > 0.001 {
                     let dt = ui.ctx().input(|i| i.stable_dt);
-                    fs_exit.vis = (fs_exit.vis
-                        + dt / if fs_exit.open { 0.18 } else { -0.14 })
-                    .clamp(0.0, 1.0);
+                    fs_exit.vis = (fs_exit.vis + dt / if fs_exit.open { 0.18 } else { -0.14 })
+                        .clamp(0.0, 1.0);
                     match confirm_overlay(
                         ui,
                         content,
@@ -3177,8 +3017,7 @@ impl eframe::App for AesRustApp {
                             } else {
                                 format!("Delete {} items?", p.len())
                             },
-                            "Removed from the album — the files stay on disk."
-                                .to_string(),
+                            "Removed from the album — the files stay on disk.".to_string(),
                         ),
                         Some(PendingDelete::Albums(d)) => (
                             if d.len() == 1 {
@@ -3186,8 +3025,7 @@ impl eframe::App for AesRustApp {
                             } else {
                                 format!("Delete {} albums?", d.len())
                             },
-                            "Removed from the library — the files stay on disk."
-                                .to_string(),
+                            "Removed from the library — the files stay on disk.".to_string(),
                         ),
                         Some(PendingDelete::Roms(p)) => (
                             if p.len() == 1 {
@@ -3195,8 +3033,7 @@ impl eframe::App for AesRustApp {
                             } else {
                                 format!("Remove {} items?", p.len())
                             },
-                            "Removed from the section — the files stay on disk."
-                                .to_string(),
+                            "Removed from the section — the files stay on disk.".to_string(),
                         ),
                         None => ("Delete?".to_string(), String::new()),
                     };
@@ -3240,8 +3077,7 @@ impl eframe::App for AesRustApp {
             self.settings_open = !self.settings_open;
         }
         {
-            static FRAME2: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
+            static FRAME2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = FRAME2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 {
                 boot_mark(&format!("frame {n} ui() done"));
@@ -3266,14 +3102,22 @@ fn widget_menu(
     s: f32,
 ) {
     if ui
-        .button(if clock.visible { "Hide Clock" } else { "Show Clock" })
+        .button(if clock.visible {
+            "Hide Clock"
+        } else {
+            "Show Clock"
+        })
         .clicked()
     {
         clock.visible = !clock.visible;
         ui.close();
     }
     if ui
-        .button(if player.visible { "Hide Player" } else { "Show Player" })
+        .button(if player.visible {
+            "Hide Player"
+        } else {
+            "Show Player"
+        })
         .clicked()
     {
         player.visible = !player.visible;
@@ -3331,12 +3175,8 @@ fn lacrima_window_frame(
         .show(ui, |ui| {
             let app_rect = ui.max_rect();
 
-            let resize_dir = resize_direction(
-                &ctx,
-                app_rect,
-                maximized || is_fullscreen,
-                resize_exclude,
-            );
+            let resize_dir =
+                resize_direction(&ctx, app_rect, maximized || is_fullscreen, resize_exclude);
             if let Some(dir) = resize_dir {
                 ctx.set_cursor_icon(cursor_icon_for(dir));
                 if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
@@ -3416,8 +3256,7 @@ fn lacrima_window_frame(
                     ),
                     Vec2::new(35.0 * scale, 30.0 * scale),
                 );
-                let back_resp =
-                    ui.interact(btn, ui.id().with("back"), Sense::click());
+                let back_resp = ui.interact(btn, ui.id().with("back"), Sense::click());
                 if back_resp.hovered() {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
                     painter.rect_filled(
@@ -3488,11 +3327,8 @@ fn lacrima_window_frame(
                     }
                     // Rotate the gear 90° while the overlay slides in (same
                     // 0.3s easeOutCubic), back to 0° as it closes.
-                    let rot = ctx.animate_bool_with_time(
-                        ui.id().with("gear-rot"),
-                        settings_active,
-                        0.3,
-                    );
+                    let rot =
+                        ctx.animate_bool_with_time(ui.id().with("gear-rot"), settings_active, 0.3);
                     let angle = ease_out_cubic(rot) * std::f32::consts::FRAC_PI_2;
                     egui::Image::new(egui::load::SizedTexture::new(
                         settings_icon,
@@ -3571,8 +3407,7 @@ const MENU_LABEL_OVERLAP: f32 = 15.0;
 const MENU_LABEL_FONT: f32 = 24.0;
 const MENU_BUTTON_HEIGHT: f32 = 120.0;
 const MENU_ICON_SIZE: f32 = 70.0;
-const MENU_ITEM_HEIGHT: f32 =
-    MENU_LABEL_HEIGHT - MENU_LABEL_OVERLAP + MENU_BUTTON_HEIGHT;
+const MENU_ITEM_HEIGHT: f32 = MENU_LABEL_HEIGHT - MENU_LABEL_OVERLAP + MENU_BUTTON_HEIGHT;
 const MENU_DOCK_OVERLAP: f32 = 10.0;
 
 // Dock magnification: hovered icon grows toward this scale, influence on
@@ -3589,9 +3424,7 @@ const MENU_LABEL_GAP: f32 = 17.0;
 /// 1..=N in this order — a new entry here automatically picks up
 /// the next number. The last entry is always Settings (toggles
 /// the overlay instead of navigating).
-fn menu_entries(
-    icons: &icons::MenuIcons,
-) -> [(&'static str, &egui::TextureHandle); 4] {
+fn menu_entries(icons: &icons::MenuIcons) -> [(&'static str, &egui::TextureHandle); 4] {
     [
         ("Emulation", &icons.emulation),
         ("Re/Decompilation", &icons.recomp),
@@ -3705,21 +3538,16 @@ fn main_menu(
         // grows symmetrically toward both edges.
         let icon_center_y = item_rect.max.y - MENU_BUTTON_HEIGHT / 2.0 * s;
         let size = icon_size * *scale * (1.0 - MENU_PRESS_SHRINK * press);
-        let icon_rect = Rect::from_center_size(
-            Pos2::new(center_x, icon_center_y),
-            Vec2::splat(size),
-        );
+        let icon_rect =
+            Rect::from_center_size(Pos2::new(center_x, icon_center_y), Vec2::splat(size));
         let tint = Color32::WHITE;
         if i == 3 {
             // The dock gear spins 90° while the overlay opens, like the
             // top-bar gear; pivot is the texture center.
-            egui::Image::new(egui::load::SizedTexture::new(
-                icon.id(),
-                icon_rect.size(),
-            ))
-            .rotate(gear_angle, Vec2::splat(0.5))
-            .tint(tint)
-            .paint_at(ui, icon_rect);
+            egui::Image::new(egui::load::SizedTexture::new(icon.id(), icon_rect.size()))
+                .rotate(gear_angle, Vec2::splat(0.5))
+                .tint(tint)
+                .paint_at(ui, icon_rect);
         } else {
             painter.image(
                 icon.id(),
@@ -3916,10 +3744,7 @@ fn music_view(
             Color32::BLACK.gamma_multiply(alpha),
         );
     }
-    let line = Stroke::new(
-        s.max(1.0),
-        Color32::from_white_alpha((51.0 * alpha) as u8),
-    );
+    let line = Stroke::new(s.max(1.0), Color32::from_white_alpha((51.0 * alpha) as u8));
     for y in [band.min.y, wave_row.min.y, menu_top] {
         if y <= content.max.y {
             painter.hline(content.min.x..=content.max.x, y, line);
@@ -3932,10 +3757,7 @@ fn music_view(
     let mut step = transport.ui(ui, band, player, alpha, interactive, accent, s);
     // Keyboard media buttons map onto the transport buttons (only
     // while our window is focused — VK_MEDIA_* are global-visible).
-    if ui
-        .ctx()
-        .input(|i| i.viewport().focused.unwrap_or(false))
-    {
+    if ui.ctx().input(|i| i.viewport().focused.unwrap_or(false)) {
         media_key_events(|k| match k {
             MediaKey::PlayPause => {
                 if let Some(p) = player {
@@ -4016,11 +3838,9 @@ fn music_view(
     );
     // Now-playing track info, top-left (MusicView's Metadata
     // StackPanel, Margin 25,20 — fades in with HasCurrentMediaLoaded).
-    let meta_t = ui.ctx().animate_bool_with_time(
-        ui.id().with("trackinfo"),
-        playing_track.is_some(),
-        0.6,
-    );
+    let meta_t =
+        ui.ctx()
+            .animate_bool_with_time(ui.id().with("trackinfo"), playing_track.is_some(), 0.6);
     if meta_t > 0.001 {
         if let Some(tp) = playing_track {
             let (title, artist, album) = carousel.display_for(tp);
@@ -4080,10 +3900,8 @@ fn music_view(
             &manual
         };
         let spec_h = (spec_cfg.height * s).min(upper.height());
-        let spec_rect = Rect::from_min_max(
-            Pos2::new(content.min.x, upper.max.y - spec_h),
-            upper.max,
-        );
+        let spec_rect =
+            Rect::from_min_max(Pos2::new(content.min.x, upper.max.y - spec_h), upper.max);
         spectrum.paint(&painter, spec_rect, spec_cfg, colors, alpha);
     }
     let (position, duration) = player
@@ -4173,7 +3991,8 @@ fn music_view(
         | carousel::Action::ScanFolder
         | carousel::Action::ClearCache
         | carousel::Action::Patches(_)
-        | carousel::Action::CustomConfig(_) => None,
+        | carousel::Action::CustomConfig(_)
+        | carousel::Action::Cheats(_) => None,
         carousel::Action::None => None,
     };
     // Transport prev/next resolve against the loaded album's items
@@ -4235,10 +4054,7 @@ fn persist_url_items(
         return;
     };
     let urls = carousel.url_items();
-    if let Some(a) = albums
-        .iter_mut()
-        .find(|a| a.dir.to_string_lossy() == key)
-    {
+    if let Some(a) = albums.iter_mut().find(|a| a.dir.to_string_lossy() == key) {
         // Rebuilds the tile's web fan layers too — mirroring the
         // loaded items' covers (resolved thumbs where they landed),
         // so adds/removes/order changes propagate to the tile.
@@ -4310,10 +4126,7 @@ fn settings_overlay(
     scale: f32,
 ) {
     let w = (content.width() * 0.38).clamp(240.0, content.width());
-    let panel = Rect::from_min_max(
-        Pos2::new(content.max.x - w * t, content.min.y),
-        content.max,
-    );
+    let panel = Rect::from_min_max(Pos2::new(content.max.x - w * t, content.min.y), content.max);
     let painter = ui.painter().clone();
 
     // Clicking the exposed content left of the panel closes it; the panel
@@ -4435,9 +4248,7 @@ fn settings_overlay(
         CornerRadius::same((10.0 * scale).round() as u8),
         Stroke::new(
             1.0,
-            Color32::from_white_alpha(
-                ((if hot { 110.0 } else { 70.0 }) * t) as u8,
-            ),
+            Color32::from_white_alpha(((if hot { 110.0 } else { 70.0 }) * t) as u8),
         ),
         StrokeKind::Inside,
     );
@@ -4518,7 +4329,17 @@ fn ui_tab_effects(
     let scale_track =
         Rect::from_min_size(Pos2::new(x, y + 6.0 * s), Vec2::new(260.0 * s, 16.0 * s));
     let mut factor = settings.ui.scale_factor;
-    if pill_slider(ui, scale_track, "ui-scale", &mut factor, 1.0, 3.0, 0.01, t, None) {
+    if pill_slider(
+        ui,
+        scale_track,
+        "ui-scale",
+        &mut factor,
+        1.0,
+        3.0,
+        0.01,
+        t,
+        None,
+    ) {
         settings.ui.scale_factor = factor;
     }
     painter.text(
@@ -4557,7 +4378,13 @@ fn ui_tab_effects(
         );
         toggle_switch(ui, sw, salt, on, t);
     };
-    label_row(ui, y, "Show Lacrima", &mut settings.effects.show_lacrima, "lacrima-toggle");
+    label_row(
+        ui,
+        y,
+        "Show Lacrima",
+        &mut settings.effects.show_lacrima,
+        "lacrima-toggle",
+    );
     y += 40.0 * s;
     label_row(
         ui,
@@ -4589,7 +4416,11 @@ fn ui_tab_effects(
     painter.text(
         Pos2::new(track.max.x + 8.0 * s, track.center().y),
         Align2::LEFT_CENTER,
-        format!("{} / {}", settings.effects.lacrima_count, particles::MAX_COUNT),
+        format!(
+            "{} / {}",
+            settings.effects.lacrima_count,
+            particles::MAX_COUNT
+        ),
         label.clone(),
         Color32::from_gray(225).gamma_multiply(t),
     );
@@ -4655,11 +4486,7 @@ fn ui_tab_effects(
         .width(250.0 * s)
         .show_ui(&mut cui, |ui| {
             for name in toy_names {
-                ui.selectable_value(
-                    &mut settings.effects.shadertoy,
-                    name.clone(),
-                    name.as_str(),
-                );
+                ui.selectable_value(&mut settings.effects.shadertoy, name.clone(), name.as_str());
             }
         });
 }
@@ -4668,13 +4495,7 @@ fn ui_tab_effects(
 /// spacing sliders, show + cover-colors toggles, and the five gradient
 /// color swatches — then the "ReplayGain / Normalization" and
 /// "Playback Options" sections (SettingsOverlay.axaml's Audio tab).
-fn ui_tab_audio(
-    ui: &mut egui::Ui,
-    panel: Rect,
-    t: f32,
-    settings: &mut settings::Settings,
-    s: f32,
-) {
+fn ui_tab_audio(ui: &mut egui::Ui, panel: Rect, t: f32, settings: &mut settings::Settings, s: f32) {
     // The tab grew past the panel height — it scrolls like Lacrima's
     // ScrollViewer. Content is painted into a body rect clipped below
     // the tab strip and above the footer; the clip also makes scrolled-
@@ -4720,13 +4541,13 @@ fn ui_tab_audio(
     // Slider rows (Lacrima's 3-row grid): label, 300px PillProgressSlider,
     // value readout.
     let slider_row = |ui: &mut egui::Ui,
-                          y: f32,
-                          name: &str,
-                          value: &mut f32,
-                          min: f32,
-                          max: f32,
-                          step: f32,
-                          decimals: usize| {
+                      y: f32,
+                      name: &str,
+                      value: &mut f32,
+                      min: f32,
+                      max: f32,
+                      step: f32,
+                      decimals: usize| {
         painter.text(
             Pos2::new(x, y),
             Align2::LEFT_CENTER,
@@ -4738,7 +4559,17 @@ fn ui_tab_audio(
             Pos2::new(x + 130.0 * s, y - 8.0 * s),
             Vec2::new(300.0 * s, 16.0 * s),
         );
-        pill_slider(ui, track, &format!("spec-{name}"), value, min, max, step, t, None);
+        pill_slider(
+            ui,
+            track,
+            &format!("spec-{name}"),
+            value,
+            min,
+            max,
+            step,
+            t,
+            None,
+        );
         let text = match decimals {
             0 => format!("{value:.0}"),
             _ => {
@@ -4754,11 +4585,38 @@ fn ui_tab_audio(
             Color32::from_gray(225).gamma_multiply(t),
         );
     };
-    slider_row(&mut cui, y, "Height", &mut spec.height, 50.0, 1000.0, 1.0, 0);
+    slider_row(
+        &mut cui,
+        y,
+        "Height",
+        &mut spec.height,
+        50.0,
+        1000.0,
+        1.0,
+        0,
+    );
     y += 44.0 * s;
-    slider_row(&mut cui, y, "Bar Width", &mut spec.bar_width, 1.0, 100.0, 1.0, 2);
+    slider_row(
+        &mut cui,
+        y,
+        "Bar Width",
+        &mut spec.bar_width,
+        1.0,
+        100.0,
+        1.0,
+        2,
+    );
     y += 44.0 * s;
-    slider_row(&mut cui, y, "Bar Spacing", &mut spec.bar_spacing, 0.0, 100.0, 1.0, 2);
+    slider_row(
+        &mut cui,
+        y,
+        "Bar Spacing",
+        &mut spec.bar_spacing,
+        0.0,
+        100.0,
+        1.0,
+        2,
+    );
     y += 44.0 * s;
 
     // Toggle rows, same styling as the Effects tab.
@@ -4782,7 +4640,13 @@ fn ui_tab_audio(
     };
     toggle_row(&mut cui, y, "Show Spectrum", &mut spec.show, "spec-show");
     y += 40.0 * s;
-    toggle_row(&mut cui, y, "Use Cover Colors", &mut spec.cover_colors, "spec-cover");
+    toggle_row(
+        &mut cui,
+        y,
+        "Use Cover Colors",
+        &mut spec.cover_colors,
+        "spec-cover",
+    );
     y += 48.0 * s;
 
     // Gradient swatches: 80x40 ColorPicker equivalents in a wrap row.
@@ -4903,7 +4767,11 @@ fn ui_tab_audio(
     painter.text(
         Pos2::new(sw.max.x + 8.0 * s, y),
         Align2::LEFT_CENTER,
-        if audio.replay_gain_enabled { "On" } else { "Off" },
+        if audio.replay_gain_enabled {
+            "On"
+        } else {
+            "Off"
+        },
         FontId::proportional(14.0 * s),
         Color32::from_gray(180).gamma_multiply(t),
     );
@@ -5147,10 +5015,7 @@ fn ui_tab_audio(
     painter.rect_stroke(
         box_rect,
         CornerRadius::same(4),
-        Stroke::new(
-            1.0,
-            Color32::from_gray(150).gamma_multiply(t),
-        ),
+        Stroke::new(1.0, Color32::from_gray(150).gamma_multiply(t)),
         StrokeKind::Outside,
     );
     if r.changed() {
@@ -5218,7 +5083,11 @@ fn trailing_silence_seconds(waveform: &[f32], duration: f64) -> f64 {
     }
     let tail = waveform.iter().rev().take_while(|&&v| v < 0.055).count();
     let secs = tail as f64 / waveform.len() as f64 * duration;
-    if secs >= 1.0 { secs } else { 0.0 }
+    if secs >= 1.0 {
+        secs
+    } else {
+        0.0
+    }
 }
 
 /// "0.##" readout — trims trailing zeros like Lacrima's StringFormat.
@@ -5304,7 +5173,17 @@ fn ui_tab_carousel(
             Pos2::new(x + 170.0 * s, y - 8.0 * s),
             Vec2::new(260.0 * s, 16.0 * s),
         );
-        pill_slider(ui, track, &format!("car-{name}"), value, min, max, step, t, None);
+        pill_slider(
+            ui,
+            track,
+            &format!("car-{name}"),
+            value,
+            min,
+            max,
+            step,
+            t,
+            None,
+        );
         painter.text(
             Pos2::new(track.max.x + 10.0 * s, y),
             Align2::LEFT_CENTER,
@@ -5316,7 +5195,16 @@ fn ui_tab_carousel(
 
     if car.layout_mode == 0 {
         let readout = format!("{:.2}", car.spacing);
-        slider_row(ui, y, "Item Spacing", &mut car.spacing, 0.2, 3.0, 0.01, readout);
+        slider_row(
+            ui,
+            y,
+            "Item Spacing",
+            &mut car.spacing,
+            0.2,
+            3.0,
+            0.01,
+            readout,
+        );
         y += 44.0 * s;
         let readout = format!("{:.2}X", car.scale);
         slider_row(ui, y, "Item Scale", &mut car.scale, 0.5, 2.0, 0.01, readout);
@@ -5489,13 +5377,7 @@ fn radio_button(
 
 /// Small Avalonia-style ToggleSwitch: a pill track with a sliding knob,
 /// cyan accent when on.
-fn toggle_switch(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    salt: &str,
-    on: &mut bool,
-    fade: f32,
-) {
+fn toggle_switch(ui: &mut egui::Ui, rect: Rect, salt: &str, on: &mut bool, fade: f32) {
     let resp = ui.interact(rect, ui.id().with(salt), Sense::click());
     if resp.clicked() {
         *on = !*on;
@@ -5512,8 +5394,7 @@ fn toggle_switch(
     painter.rect_filled(
         rect,
         radius,
-        Color32::from_rgb(lerp(60, 0x12), lerp(60, 0xC0), lerp(60, 0xF0))
-            .gamma_multiply(fade),
+        Color32::from_rgb(lerp(60, 0x12), lerp(60, 0xC0), lerp(60, 0xF0)).gamma_multiply(fade),
     );
     painter.rect_stroke(
         rect,
@@ -5584,16 +5465,13 @@ fn check_box(
             if *checked {
                 accent.gamma_multiply(fade)
             } else {
-                Color32::from_gray(if resp.hovered() { 190 } else { 150 })
-                    .gamma_multiply(fade)
+                Color32::from_gray(if resp.hovered() { 190 } else { 150 }).gamma_multiply(fade)
             },
         ),
         StrokeKind::Inside,
     );
     if *checked {
-        let p = |fx: f32, fy: f32| {
-            Pos2::new(brect.min.x + bs * fx, brect.min.y + bs * fy)
-        };
+        let p = |fx: f32, fy: f32| Pos2::new(brect.min.x + bs * fx, brect.min.y + bs * fy);
         painter.add(Shape::line(
             vec![p(0.22, 0.55), p(0.44, 0.74), p(0.80, 0.28)],
             Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(fade)),
@@ -5732,8 +5610,7 @@ fn pill_slider(
         radius,
         Stroke::new(
             if resp.has_focus() { 2.0 } else { 1.0 },
-            Color32::from_gray(if resp.has_focus() { 235 } else { 160 })
-                .gamma_multiply(fade),
+            Color32::from_gray(if resp.has_focus() { 235 } else { 160 }).gamma_multiply(fade),
         ),
         StrokeKind::Inside,
     );
@@ -5765,10 +5642,10 @@ fn media_key_events(mut f: impl FnMut(MediaKey)) {
         fn GetAsyncKeyState(v_key: i32) -> i16;
     }
     const MAP: [(i32, MediaKey); 4] = [
-        (0xB0, MediaKey::Next),     // VK_MEDIA_NEXT_TRACK
-        (0xB1, MediaKey::Prev),     // VK_MEDIA_PREV_TRACK
-        (0xB2, MediaKey::Stop),     // VK_MEDIA_STOP
-        (0xB3, MediaKey::PlayPause),// VK_MEDIA_PLAY_PAUSE
+        (0xB0, MediaKey::Next),      // VK_MEDIA_NEXT_TRACK
+        (0xB1, MediaKey::Prev),      // VK_MEDIA_PREV_TRACK
+        (0xB2, MediaKey::Stop),      // VK_MEDIA_STOP
+        (0xB3, MediaKey::PlayPause), // VK_MEDIA_PLAY_PAUSE
     ];
     unsafe {
         for (vk, k) in MAP {
@@ -5902,10 +5779,7 @@ fn confirm_overlay(
             painter.rect_stroke(
                 b.expand((4.0 * hot) * s),
                 CornerRadius::same((11.0 * s).round() as u8),
-                Stroke::new(
-                    1.5 * s,
-                    Color32::from_white_alpha((80.0 * hot * vis) as u8),
-                ),
+                Stroke::new(1.5 * s, Color32::from_white_alpha((80.0 * hot * vis) as u8)),
                 StrokeKind::Inside,
             );
         }
@@ -5956,7 +5830,10 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton, scale: f32) -> egui::Respo
         // 17x2.5 bar, 10px above the button's bottom edge.
         TitleButton::Minimize => {
             painter.line_segment(
-                [c + egui::vec2(-8.5 * s, 5.0 * s), c + egui::vec2(8.5 * s, 5.0 * s)],
+                [
+                    c + egui::vec2(-8.5 * s, 5.0 * s),
+                    c + egui::vec2(8.5 * s, 5.0 * s),
+                ],
                 Stroke::new(2.5 * s, color),
             );
         }
@@ -5979,11 +5856,17 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton, scale: f32) -> egui::Respo
         }
         TitleButton::Close => {
             painter.line_segment(
-                [c + egui::vec2(-7.0 * s, -7.0 * s), c + egui::vec2(7.0 * s, 7.0 * s)],
+                [
+                    c + egui::vec2(-7.0 * s, -7.0 * s),
+                    c + egui::vec2(7.0 * s, 7.0 * s),
+                ],
                 glyph,
             );
             painter.line_segment(
-                [c + egui::vec2(7.0 * s, -7.0 * s), c + egui::vec2(-7.0 * s, 7.0 * s)],
+                [
+                    c + egui::vec2(7.0 * s, -7.0 * s),
+                    c + egui::vec2(-7.0 * s, 7.0 * s),
+                ],
                 glyph,
             );
         }
@@ -6049,13 +5932,7 @@ fn flat_button(
 /// text, current/update versions, the Install/Update/Uninstall/
 /// Check-for-Updates row and the busy progress bar all run through
 /// [`ytdlp::YtDlp`], matching YtDlpManager's SettingsOverlay binding.
-fn ui_tab_libraries(
-    ui: &mut egui::Ui,
-    panel: Rect,
-    t: f32,
-    ytdlp: &mut ytdlp::YtDlp,
-    s: f32,
-) {
+fn ui_tab_libraries(ui: &mut egui::Ui, panel: Rect, t: f32, ytdlp: &mut ytdlp::YtDlp, s: f32) {
     ytdlp.ensure_queried();
     let painter = ui.painter().clone();
     let x = panel.min.x + 30.0 * s;
@@ -6106,7 +5983,10 @@ fn ui_tab_libraries(
         small.clone(),
         darkgray.gamma_multiply(t),
     );
-    let version = ytdlp.version.clone().unwrap_or_else(|| "Not Found".to_string());
+    let version = ytdlp
+        .version
+        .clone()
+        .unwrap_or_else(|| "Not Found".to_string());
     let vrect = painter.text(
         Pos2::new(x, y + 20.0 * s),
         Align2::LEFT_TOP,
