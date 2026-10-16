@@ -3106,10 +3106,21 @@ fn switch_tid_in(text: &str) -> Option<String> {
 fn switch_clean_title(name: &str, tid: Option<&str>) -> Option<String> {
     let mut s = name.to_string();
     if let Some(tid) = tid {
-        // Case-insensitive removal of [tid] then the bare id.
+        // Case-insensitive removal of [tid] then the bare id. Search
+        // s's own bytes — positions taken from s.to_uppercase() are in
+        // the WRONG coordinate space when a char's uppercase changes
+        // byte length (ſ→S, ß→SS), and replace_range then panics on a
+        // non-boundary index. The needle is ASCII so a byte-wise
+        // case-insensitive scan only matches on ASCII runs — always
+        // char boundaries.
         for needle in [format!("[{tid}]"), tid.to_string()] {
-            while let Some(pos) = s.to_uppercase().find(&needle.to_uppercase()) {
-                s.replace_range(pos..pos + needle.len(), "");
+            let nb = needle.as_bytes();
+            while let Some(pos) = s
+                .as_bytes()
+                .windows(nb.len())
+                .position(|w| w.eq_ignore_ascii_case(nb))
+            {
+                s.replace_range(pos..pos + nb.len(), "");
             }
         }
     }
@@ -5663,6 +5674,24 @@ mod tests {
             switch_clean_title("Animal_Crossing.New_Horizons", None).as_deref(),
             Some("Animal Crossing New Horizons")
         );
+    }
+
+    /// Regression: the tid-removal scan must index the ORIGINAL
+    /// string, not its to_uppercase() — chars whose uppercase changes
+    /// byte length (ſ→S, ß→SS) shift every later position, and
+    /// replace_range on that wrong index panics on a non-char boundary
+    /// (the crash on a "®"-carrying filename).
+    #[test]
+    fn switch_clean_title_unicode_casefold() {
+        // ſ is 2 bytes but its uppercase "S" is 1 — the uppercased
+        // match position lands inside ® (bytes 2..4) in the original.
+        let out = switch_clean_title("®ſ [0100ABCD1234ABCD] Game", Some("0100ABCD1234ABCD"));
+        assert!(out.is_some());
+        assert!(out.unwrap().contains("Game"));
+        // ß→SS grows instead — wrong space in the other direction.
+        let out = switch_clean_title("Fuß [0100111122223333] Ball", Some("0100111122223333"));
+        assert!(out.is_some());
+        assert!(out.unwrap().contains("Ball"));
     }
 
     #[test]

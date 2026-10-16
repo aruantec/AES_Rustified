@@ -401,6 +401,8 @@ pub struct Emulation {
     pub selected_gba_core: String,
     /// Same for the PSP section — `Emulators/PSP/Libretro`.
     pub selected_psp_core: String,
+    /// Same for the Saturn section — `Emulators/SATURN/Libretro`.
+    pub selected_saturn_core: String,
     /// Per-section capture/render options (Lacrima's RenderOptions
     /// overlay, "Rendering" tab) — keyed by section key.
     pub render: std::collections::BTreeMap<String, RenderOpts>,
@@ -489,6 +491,7 @@ impl Default for Emulation {
             selected_snes_core: String::new(),
             selected_gba_core: String::new(),
             selected_psp_core: String::new(),
+            selected_saturn_core: String::new(),
             render: Default::default(),
         }
     }
@@ -588,6 +591,14 @@ pub fn load() -> Settings {
         .ok()
         .and_then(|v| v.get("Ui")?.get("ScaleFactor").cloned())
         .is_some();
+    // The shared RetroArch frontend moved Emulators/3DS/RetroArch →
+    // Emulators/RetroArch — repoint a saved path still aimed at the
+    // migrated tree so the settings card shows the live install.
+    if let Some(cfg) = settings.emulation.emulators.get_mut("retroarch") {
+        if let Some(moved) = crate::emu_dl::retroarch_migrate_configured_path(cfg) {
+            *cfg = moved;
+        }
+    }
     settings
 }
 

@@ -59,6 +59,7 @@ const GENESIS_SECTION: &str = "GENESIS";
 const SNES_SECTION: &str = "SNES";
 const GBA_SECTION: &str = "GBA";
 const PSP_SECTION: &str = "PSP";
+const SATURN_SECTION: &str = "SATURN";
 const RETROARCH_HANDLER: &str = "retroarch";
 
 /// The persisted selected-core field for a RetroArch-backed section —
@@ -76,6 +77,7 @@ fn selected_core<'a>(
         libretro::Section::Snes => &mut cfg.selected_snes_core,
         libretro::Section::Gba => &mut cfg.selected_gba_core,
         libretro::Section::Psp => &mut cfg.selected_psp_core,
+        libretro::Section::Saturn => &mut cfg.selected_saturn_core,
     }
 }
 
@@ -89,6 +91,7 @@ fn selected_core_id<'a>(cfg: &'a settings::Emulation, section: libretro::Section
         libretro::Section::Snes => cfg.selected_snes_core.as_str(),
         libretro::Section::Gba => cfg.selected_gba_core.as_str(),
         libretro::Section::Psp => cfg.selected_psp_core.as_str(),
+        libretro::Section::Saturn => cfg.selected_saturn_core.as_str(),
     }
 }
 
@@ -216,6 +219,7 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
         SNES_SECTION => retroarch_spec(SNES_SECTION),
         GBA_SECTION => retroarch_spec(GBA_SECTION),
         PSP_SECTION => retroarch_spec(PSP_SECTION),
+        SATURN_SECTION => retroarch_spec(SATURN_SECTION),
         _ => return None,
     })
 }
@@ -1056,7 +1060,8 @@ impl EmuView {
             | GENESIS_SECTION
             | SNES_SECTION
             | GBA_SECTION
-            | PSP_SECTION => Some(RETROARCH_HANDLER.to_string()),
+            | PSP_SECTION
+            | SATURN_SECTION => Some(RETROARCH_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -1152,7 +1157,20 @@ impl EmuView {
             match libretro::resolve_core(section, selected_core_id(cfg, section))
                 .map(|c| c.core_path)
             {
-                Some(core) => Some(core),
+                Some(core) => {
+                    // Lacrima's TryGetSaturnBiosValidationError — the
+                    // saturn handler refuses to launch without BIOS in
+                    // the frontend system dir (the core would spawn and
+                    // instantly die on "content load failed" otherwise).
+                    if section == libretro::Section::Saturn {
+                        if let Some(e) = xenia::saturn_bios_error(&exe, &core) {
+                            self.notice = Some(e);
+                            xenia::session_log("launch aborted: Saturn BIOS missing");
+                            return;
+                        }
+                    }
+                    Some(core)
+                }
                 None => {
                     self.notice = Some(format!(
                         "No {} core installed — press Download all cores in Settings → Emulation",

@@ -388,7 +388,9 @@ impl Session {
                     "No 3DS core installed — press Download all cores in Settings → Emulation"
                         .to_string()
                 })?;
-                if let Some(cfg_path) = retroarch_append_config(retroarch_core.as_deref()) {
+                if let Some(cfg_path) =
+                    retroarch_append_config(&exe_path, retroarch_core.as_deref())
+                {
                     cmd.arg("--appendconfig").arg(cfg_path);
                 }
                 if let Some(log_path) = retroarch_log_path(retroarch_core.as_deref()) {
@@ -1050,12 +1052,15 @@ fn retroarch_root(core: Option<&Path>) -> Option<PathBuf> {
 /// hotkey grabs are disabled. RA runs plain windowed (the parked
 /// window is the capture surface); video_threaded is off so the
 /// core's retro_run stays on the main thread — azahar's threaded
-/// video path faulted inside amdvlk under capture. The 3DS
-/// system/save/state dirs point at the managed Libretro tree so core
-/// data survives regardless of which retroarch.exe the handler
-/// resolves to. Written under the AES data dir (always writable — a
-/// user-installed RetroArch may sit in Program Files).
-fn retroarch_append_config(core: Option<&Path>) -> Option<PathBuf> {
+/// video path faulted inside amdvlk under capture. The system dir
+/// follows the resolved frontend (`<launcher>/system` — Lacrima's
+/// GetRetroArchSystemDirectories shape: BIOS/firmware is shared
+/// across every section's cores); save/state dirs stay under the
+/// section's Libretro tree so core data survives regardless of which
+/// retroarch.exe the handler resolves to. Written under the AES data
+/// dir (always writable — a user-installed RetroArch may sit in
+/// Program Files).
+fn retroarch_append_config(exe: &Path, core: Option<&Path>) -> Option<PathBuf> {
     let root = retroarch_root(core)?;
     let libretro = root.join("Libretro");
     let path = root.join("retroarch-aes.cfg");
@@ -1066,7 +1071,10 @@ fn retroarch_append_config(core: Option<&Path>) -> Option<PathBuf> {
         "video_threaded = \"false\"".to_string(),
         format!(
             "system_directory = \"{}\"",
-            libretro.join("system").display()
+            exe.parent()
+                .unwrap_or(&libretro)
+                .join("system")
+                .display()
         ),
         format!(
             "savefile_directory = \"{}\"",
@@ -1082,7 +1090,56 @@ fn retroarch_append_config(core: Option<&Path>) -> Option<PathBuf> {
         std::fs::create_dir_all(&root).ok()?;
         std::fs::write(&path, body).ok()?;
     }
+    // RA ignores a *_directory override that doesn't exist
+    // ("savefile_directory is not a directory, ignoring") — the dirs
+    // must exist BEFORE spawn or saves silently fall back to the
+    // frontend's own dirs.
+    let _ = std::fs::create_dir_all(exe.parent().unwrap_or(&root).join("system"));
+    let _ = std::fs::create_dir_all(libretro.join("saves"));
+    let _ = std::fs::create_dir_all(libretro.join("states"));
     Some(path)
+}
+
+/// RetroArchHandler.SaturnBiosFileNames — the Saturn IPL dumps
+/// Beetle/Yabause-family cores load from the frontend system dir.
+const SATURN_BIOS_FILES: [&str; 3] = ["saturn_bios.bin", "sega_101.bin", "mpr-17933.bin"];
+
+/// RequiresSaturnBios — Lacrima gates on the core filename matching
+/// saturn/yabause/yabasanshiro/beetle (empty selection counts).
+fn saturn_core_needs_bios(core: &Path) -> bool {
+    let name = core
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.is_empty()
+        || name.contains("saturn")
+        || name.contains("yabause")
+        || name.contains("yabasanshiro")
+        || name.contains("beetle")
+}
+
+/// TryGetSaturnBiosValidationError — the pre-launch firmware gate for
+/// the Saturn handler. The effective system dir is the one our
+/// appendconfig writes: `<frontend>/system` (the shared
+/// `Emulators/RetroArch/system` for managed installs). Returns the
+/// actionable multi-line message when no region's dump is there.
+pub fn saturn_bios_error(exe: &Path, core: &Path) -> Option<String> {
+    if !saturn_core_needs_bios(core) {
+        return None;
+    }
+    let sys = exe.parent()?.join("system");
+    if SATURN_BIOS_FILES.iter().any(|f| sys.join(f).is_file()) {
+        return None;
+    }
+    Some(format!(
+        "Sega Saturn BIOS files are missing.\n\n\
+         Copy legally obtained BIOS dumps into this RetroArch system folder:\n\
+         {}\n\n\
+         Required files (at least one region):\n\
+           - saturn_bios.bin\n  - sega_101.bin\n  - mpr-17933.bin\n\n\
+         US: saturn_bios.bin | Japan: sega_101.bin | Europe: mpr-17933.bin",
+        sys.display()
+    ))
 }
 
 /// The `--verbose --log-file` target — retroarch-launch.log under
@@ -1652,16 +1709,7 @@ fn worker_main(
                 let reason = transcript
                     .as_ref()
                     .and_then(|p| std::fs::read_to_string(p).ok())
-                    .and_then(|s| {
-                        s.lines()
-                            .filter(|l| {
-                                let l = l.to_lowercase();
-                                l.contains("[error]") || l.contains("fatal")
-                            })
-                            .last()
-                            .map(|l| l.trim().to_string())
-                    })
-                    .filter(|s| !s.is_empty())
+                    .and_then(|s| retroarch_error_notice(&s))
                     .unwrap_or_else(|| "RetroArch exited before creating its window".into());
                 Status::Failed(reason)
             } else {
@@ -3694,7 +3742,7 @@ pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
         // directory overrides a game launch uses so core settings the
         // user changes land consistently.
         Some(Kind::RetroArch) => {
-            if let Some(cfg) = retroarch_append_config(None) {
+            if let Some(cfg) = retroarch_append_config(Path::new(exe), None) {
                 cmd.arg("--appendconfig").arg(cfg);
             }
         }
@@ -3804,6 +3852,96 @@ pub fn sync_mods(session: &Session, m: &egui::Modifiers, cur: &mut u8) {
     *cur = want;
 }
 
+/// Lacrima's `RetroArchHandler.IsRetroArchErrorLine` — the lines that
+/// count as errors when the process dies before creating a window.
+fn retroarch_is_error_line(line: &str) -> bool {
+    let l = line.trim().to_lowercase();
+    if l.is_empty() {
+        return false;
+    }
+    if l.contains("[error]")
+        || l.contains("libretro error")
+        || l.contains("required files are missing")
+        || l.contains("failed to load")
+        || l.contains("cannot initialize")
+        || l.contains("missing the bios")
+    {
+        return true;
+    }
+    l.contains("not found")
+        && (l.contains("_bios") || l.contains("sega_101") || l.contains("mpr-17933"))
+}
+
+/// `TryParseRetroArchSystemDirectoryFromLog` — the core's
+/// GET_SYSTEM_DIRECTORY env reply names the dir the user has to drop
+/// firmware into.
+fn retroarch_system_dir_from_log<'a>(lines: &[&'a str]) -> Option<String> {
+    const MARKER: &str = "GET_SYSTEM_DIRECTORY:";
+    lines.iter().find_map(|line| {
+        line.to_lowercase()
+            .find(&MARKER.to_lowercase())
+            .and_then(|i| {
+                let p = line[i + MARKER.len()..].trim().trim_matches('"');
+                (!p.is_empty()).then(|| p.to_string())
+            })
+    })
+}
+
+/// `TryExtractRetroArchErrorDetails` + `EnhanceRetroArchErrorDetails` —
+/// summary is the last error line, details the whole error block;
+/// missing-firmware failures are rewritten into the actionable message
+/// (the real Beetle Saturn failure is `Cannot open BIOS file
+/// mpr-17933.bin` — the last [ERROR] tail just says content load
+/// failed, which is useless as a notice).
+fn retroarch_error_notice(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let errors: Vec<String> = lines
+        .iter()
+        .filter(|l| retroarch_is_error_line(l))
+        .map(|l| l.trim().to_string())
+        .collect();
+    if errors.is_empty() {
+        return None;
+    }
+    let mut details = errors.join("\n");
+    let mut summary = errors.last().unwrap().clone();
+    let low = details.to_lowercase();
+    let saturn = low.contains("saturn_bios")
+        || low.contains("sega_101")
+        || low.contains("mpr-17933")
+        || low.contains("saturn");
+    let bios_missing = low.contains("missing the bios")
+        || low.contains("cannot open bios file")
+        || (low.contains("not found") && saturn);
+    if bios_missing {
+        summary = if saturn {
+            "Sega Saturn BIOS files are missing.".to_string()
+        } else {
+            "Required BIOS/firmware files are missing.".to_string()
+        };
+        details.push_str("\n\nCopy legally obtained BIOS dumps into:");
+        if let Some(dir) = retroarch_system_dir_from_log(&lines) {
+            details.push_str(&format!("\n{dir}"));
+        }
+        if saturn {
+            details.push_str(
+                "\nRequired files (at least one region): saturn_bios.bin, sega_101.bin, mpr-17933.bin",
+            );
+        }
+    } else if summary
+        .to_lowercase()
+        .contains("post-processing shader not found")
+        || low.contains("default_pre_post_process.glsl")
+    {
+        summary = "Dolphin core is missing required shader resources.".to_string();
+        details.push_str(
+            "\nEnsure RetroArch has the Dolphin system files under \
+             system\\dolphin-emu\\Sys\\Shaders\\default_pre_post_process.glsl.",
+        );
+    }
+    Some(format!("{summary}\n{details}"))
+}
+
 #[cfg(test)]
 mod tests {
     /// Regression: a recreated render window must trigger re-attach —
@@ -3829,6 +3967,59 @@ mod tests {
         assert!(super::status_finished(&super::Status::Failed("x".into())));
         assert!(!super::status_finished(&super::Status::Resolving));
         assert!(!super::status_finished(&super::Status::Capturing));
+    }
+
+    /// The Beetle Saturn no-BIOS boot ends with the generic
+    /// `[ERROR] [Content] Laden des Inhalts fehlgeschlagen` tail — the
+    /// actionable line is the `libretro ERROR` BIOS complaint above it.
+    /// The notice must surface the missing-BIOS message + the section
+    /// system dir, not just the content-load tail.
+    #[test]
+    fn retroarch_error_notice_surfaces_bios_error() {
+        let log = concat!(
+            "[INFO] [Environ] GET_SYSTEM_DIRECTORY: \
+             \"C:\\\\Emu\\\\SATURN\\\\Libretro\\\\system\".\n",
+            "[libretro ERROR] Cannot open BIOS file \
+             \"C:\\\\Emu\\\\SATURN\\\\Libretro\\\\system\\\\mpr-17933.bin\".\n",
+            "[ERROR] [Content] Laden des Inhalts fehlgeschlagen.\n"
+        );
+        let note = super::retroarch_error_notice(log).expect("error lines present");
+        assert!(note.contains("BIOS"), "{note}");
+        assert!(note.contains("mpr-17933"), "{note}");
+        assert!(note.contains("Libretro\\\\system"), "{note}");
+    }
+
+    /// A generic failure with no enhancement keeps the last [ERROR]
+    /// line as the summary and returns all error lines.
+    #[test]
+    fn retroarch_error_notice_generic_last_error() {
+        let log = "[INFO] starting\n[ERROR] [Foo] bar broke\n[INFO] done\n";
+        let note = super::retroarch_error_notice(log).expect("error line");
+        assert!(note.contains("bar broke"), "{note}");
+        assert!(super::retroarch_error_notice("[INFO] all good\n").is_none());
+    }
+
+    /// TryGetSaturnBiosValidationError — Beetle Saturn is gated on
+    /// saturn_bios.bin/sega_101.bin/mpr-17933.bin in <exe>/system;
+    /// non-Saturn-family cores (ymir) skip the check entirely.
+    #[test]
+    fn saturn_bios_gate() {
+        let dir = std::env::temp_dir().join(format!("aes_test_bios_{}", std::process::id()));
+        let sys = dir.join("system");
+        std::fs::create_dir_all(&sys).unwrap();
+        let exe = dir.join("retroarch.exe");
+        let beetle = dir.join("mednafen_saturn_libretro.dll");
+        let ymir = dir.join("ymir_libretro.dll");
+        // Missing → actionable message naming the system dir.
+        let e = super::saturn_bios_error(&exe, &beetle).expect("gated");
+        assert!(e.contains("BIOS"), "{e}");
+        assert!(e.contains("system"), "{e}");
+        // Non-saturn-family core → no gate.
+        assert!(super::saturn_bios_error(&exe, &ymir).is_none());
+        // Any region file releases the gate.
+        std::fs::write(sys.join("mpr-17933.bin"), b"x").unwrap();
+        assert!(super::saturn_bios_error(&exe, &beetle).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Repro driver for the live RetroArch capture path — run with

@@ -183,13 +183,62 @@ pub fn eden_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("SWITCH").join("Eden"))
 }
 
-/// `<data>/Emulators/3DS/RetroArch` — the shared RetroArch frontend
-/// install (RetroArchEmulatorUpdateService's per-section emulator
-/// dir shape). Every RetroArch-backed section (3DS, N64) resolves
-/// this same frontend; only the Libretro core sets are
-/// section-specific — `Emulators/<SECTION>/Libretro`.
+/// `<data>/Emulators/RetroArch` — the shared RetroArch frontend
+/// install (RetroArchEmulatorUpdateService installs to
+/// `Emulators/Retroarch` — a common dir, not a console section).
+/// Every RetroArch-backed section resolves this same frontend; only
+/// the Libretro core sets are section-specific —
+/// `Emulators/<SECTION>/Libretro`. The frontend used to live under
+/// `Emulators/3DS/` — existing installs are migrated in place.
 pub fn retroarch_dir() -> Option<PathBuf> {
-    crate::settings::data_root().map(|d| d.join("Emulators").join("3DS").join("RetroArch"))
+    let dir = crate::settings::data_root()?.join("Emulators").join("RetroArch");
+    if !dir.exists() {
+        let legacy = dir.parent()?.join("3DS").join("RetroArch");
+        if legacy.is_dir() {
+            let _ = std::fs::rename(&legacy, &dir);
+        }
+    }
+    Some(dir)
+}
+
+/// Case-insensitive `strip_prefix` — Windows paths compare
+/// case-insensitively on disk, so a configured path that differs in
+/// casing from `data_root()` still counts as inside the legacy tree.
+fn strip_prefix_ci(p: &Path, base: &Path) -> Option<PathBuf> {
+    let mut pc = p.components();
+    for bc in base.components() {
+        let ok = pc
+            .next()
+            .is_some_and(|c| {
+                c.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&bc.as_os_str().to_string_lossy())
+            });
+        if !ok {
+            return None;
+        }
+    }
+    Some(pc.as_path().to_path_buf())
+}
+
+/// Configured-path half of the 3DS→common move: a saved `retroarch`
+/// emulator path under the legacy `Emulators/3DS/RetroArch` tree is
+/// repointed at the moved install. Without this the settings card
+/// keeps showing (and resolution keeps trying first) a path into a
+/// directory the folder migration emptied.
+/// Returns the remapped path, or None when `configured` doesn't live
+/// under the legacy dir.
+pub fn retroarch_migrate_configured_path(configured: &str) -> Option<String> {
+    let root = crate::settings::data_root()?;
+    let legacy = root.join("Emulators").join("3DS").join("RetroArch");
+    let rest = strip_prefix_ci(Path::new(configured.trim()), &legacy)?;
+    Some(
+        root.join("Emulators")
+            .join("RetroArch")
+            .join(rest)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Find `retroarch.exe` / `retroarch` under the managed install.
@@ -1175,6 +1224,30 @@ mod tests {
         "#;
         assert_eq!(best_stable_version(html).as_deref(), Some("1.22.2"));
         assert_eq!(best_stable_version("<a href=\"/stable/x\">"), None);
+    }
+
+    /// Legacy→common frontend migration: a configured path under
+    /// `Emulators/3DS/RetroArch` remaps to `Emulators/RetroArch`
+    /// (case-insensitive prefix, Windows semantics); anything outside
+    /// the legacy tree is left alone.
+    #[test]
+    fn retroarch_configured_path_migration() {
+        let root = crate::settings::data_root().expect("data root");
+        let legacy = root.join("Emulators").join("3DS").join("RetroArch");
+        let old = legacy.join("retroarch.exe").to_string_lossy().into_owned();
+        let moved = retroarch_migrate_configured_path(&old).expect("remaps");
+        let expect = root
+            .join("Emulators")
+            .join("RetroArch")
+            .join("retroarch.exe")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(moved, expect);
+        // Casing differences in the saved path still migrate.
+        let odd = old.replace("3DS", "3ds");
+        assert_eq!(retroarch_migrate_configured_path(&odd).as_deref(), Some(expect.as_str()));
+        // Unrelated configured paths are untouched.
+        assert!(retroarch_migrate_configured_path("D:\\Tools\\retroarch.exe").is_none());
     }
 
     /// SelectAssetForPlatform — Cemu ships windows/macos/linux per

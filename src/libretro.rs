@@ -29,6 +29,7 @@ pub enum Section {
     Snes,
     Gba,
     Psp,
+    Saturn,
 }
 
 impl Section {
@@ -44,6 +45,7 @@ impl Section {
             "SNES" => Some(Self::Snes),
             "GBA" => Some(Self::Gba),
             "PSP" => Some(Self::Psp),
+            "SATURN" => Some(Self::Saturn),
             _ => None,
         }
     }
@@ -63,6 +65,7 @@ impl Section {
             Self::Snes => "SNES",
             Self::Gba => "GBA",
             Self::Psp => "PSP",
+            Self::Saturn => "SATURN",
         }
     }
 
@@ -75,6 +78,7 @@ impl Section {
             Self::Snes => "snes_cores.json",
             Self::Gba => "gba_cores.json",
             Self::Psp => "psp_cores.json",
+            Self::Saturn => "saturn_cores.json",
         }
     }
 
@@ -87,6 +91,7 @@ impl Section {
             Self::Snes => "SNES",
             Self::Gba => "GBA",
             Self::Psp => "PSP",
+            Self::Saturn => "Saturn",
         }
     }
 
@@ -101,6 +106,7 @@ impl Section {
             Self::Snes => is_snes_info(fields),
             Self::Gba => is_gba_info(fields),
             Self::Psp => is_psp_info(fields),
+            Self::Saturn => is_saturn_info(fields),
         }
     }
 }
@@ -660,6 +666,36 @@ fn is_psp_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
     has_psp_extension && meta
 }
 
+/// Saturn cores — "Saturn" metadata plus a disc-image extension
+/// (cue/chd/ccd/iso/mds/toc/m3u). Beetle Saturn, Yabause,
+/// Yabasanshiro and Kronos all advertise "Sega Saturn"; nothing else
+/// in the catalog carries a "saturn" token, so the substring trap is
+/// the extensions, not the name.
+fn is_saturn_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_disc_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "cue" | "chd" | "ccd" | "iso" | "mds" | "toc" | "m3u"
+        )
+    });
+    let meta = [system, database, display].iter().any(|v| {
+        v.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == "saturn")
+    });
+    has_disc_extension && meta
+}
+
 fn extract_core_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
     std::fs::create_dir_all(destination)
         .map_err(|e| format!("Cannot create core directory: {e}"))?;
@@ -798,7 +834,7 @@ fn set_progress(progress: &CoreDownload, stage: &str, fraction: f32) {
 mod tests {
     use super::{
         is_3ds_info, is_gba_info, is_genesis_info, is_n64_info, is_nes_info,
-        is_psp_info, is_snes_info, parse_info_fields, select_core, CoreInfo,
+        is_psp_info, is_saturn_info, is_snes_info, parse_info_fields, select_core, CoreInfo,
     };
 
     #[test]
@@ -1141,11 +1177,62 @@ mod tests {
     }
 
     #[test]
+    fn saturn_info_filter_accepts_beetle_yabause_rejects_sega_others() {
+        // Real Beetle Saturn / YabaSanshiro metadata.
+        let beetle = parse_info_fields(
+            r#"
+                corename = "Beetle Saturn"
+                display_name = "Sega - Saturn (Beetle Saturn)"
+                systemname = "Sega Saturn"
+                database = "Sega - Saturn"
+                supported_extensions = "cue|ccd|chd|toc|m3u"
+            "#,
+        );
+        assert!(is_saturn_info(&beetle));
+        let yaba = parse_info_fields(
+            r#"
+                corename = "YabaSanshiro"
+                display_name = "Sega - Saturn (YabaSanshiro)"
+                supported_extensions = "cue|chd|iso|mds|ccd"
+            "#,
+        );
+        assert!(is_saturn_info(&yaba));
+        // Other Sega cores share the brand and the disc-image
+        // extension space — only the saturn token gates them out.
+        let genplusgx = parse_info_fields(
+            r#"
+                corename = "Genesis Plus GX"
+                display_name = "Sega - MS/GG/MD/CD (Genesis Plus GX)"
+                systemname = "Sega 8/16-bit (Various)"
+                supported_extensions = "mdx|md|smd|gen|bin|cue|iso|sms|68k|sg|m3u"
+            "#,
+        );
+        assert!(!is_saturn_info(&genplusgx));
+        let flycast = parse_info_fields(
+            r#"
+                corename = "Flycast"
+                systemname = "Sega Dreamcast"
+                supported_extensions = "cdi|gdi|chd|cue|m3u"
+            "#,
+        );
+        assert!(!is_saturn_info(&flycast));
+        // "Saturn" metadata without a disc extension is no use.
+        let no_ext = parse_info_fields(
+            r#"
+                corename = "Saturn Test"
+                systemname = "Sega Saturn"
+                supported_extensions = "sav|srm"
+            "#,
+        );
+        assert!(!is_saturn_info(&no_ext));
+    }
+
+    #[test]
     fn section_key_roundtrips_from_card_key() {
         // The settings cards and download jobs key sections by the
         // same string — a mapping slip shows the wrong card's
         // progress or refreshes the wrong catalog.
-        for key in ["3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP"] {
+        for key in ["3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP", "SATURN"] {
             let section = super::Section::from_key(key).unwrap();
             assert_eq!(section.key(), key);
         }
