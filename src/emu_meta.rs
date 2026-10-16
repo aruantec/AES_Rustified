@@ -1072,8 +1072,13 @@ fn hash_title_db(file: &'static str) -> &'static HashTitleDb {
     static PSP: OnceLock<HashTitleDb> = OnceLock::new();
     static PSP_REDUMP: OnceLock<HashTitleDb> = OnceLock::new();
     static FBN: OnceLock<HashTitleDb> = OnceLock::new();
+    static ARCADE: OnceLock<HashTitleDb> = OnceLock::new();
     let (slot, json) = match file {
         "fbn.json" => (&FBN, include_str!("../assets/database/fbn.json")),
+        "arcade.json" => (
+            &ARCADE,
+            include_str!("../assets/database/arcade.json"),
+        ),
         "nes.json" => (&NES, include_str!("../assets/database/nes.json")),
         "snes.json" => (&SNES, include_str!("../assets/database/snes.json")),
         "gba.json" => (&GBA, include_str!("../assets/database/gba.json")),
@@ -1844,6 +1849,15 @@ fn psp_hash_title(path: &Path) -> Option<String> {
 
 fn fbn_title(path: &Path) -> Option<String> {
     hash_db_resolve_file(path, &["fbn.json"])
+}
+
+// ------------------------------------------------------------------
+// ARCADE: MAME consolidated-romsets dat — same archive-hash scheme
+// as FBN (the dat's rom() hashes the set zip itself).
+// ------------------------------------------------------------------
+
+fn arcade_title(path: &Path) -> Option<String> {
+    hash_db_resolve_file(path, &["arcade.json"])
 }
 
 /// PSP title — Lacrima's `TryResolvePspTitle`: the PARAM.SFO TITLE
@@ -4321,6 +4335,8 @@ fn resolve_one(
                 "PSP" => psp_title(path),
                 // FBNeo dat hash of the romset archive (fbn.json).
                 "FBN" => fbn_title(path),
+                // MAME consolidated-romsets dat (arcade.json).
+                "ARCADE" => arcade_title(path),
                 "PS3" => ps3_title(path),
                 "PS4" => ps4_title(path),
                 _ => None,
@@ -5086,6 +5102,14 @@ mod tests {
         assert_eq!(
             f.crc.get("AC6E93EA").map(String::as_str),
             Some("Metal Slug - Super Vehicle-001")
+        );
+        // The MAME consolidated-romsets dat (arcade.json) — same
+        // archive-hash scheme.
+        let a = hash_title_db("arcade.json");
+        assert!(a.md5.len() > 25000, "arcade.json should be ~30k rows");
+        assert_eq!(
+            a.crc.get("8F401426").map(String::as_str),
+            Some("10-Yard Fight (World, set 1)")
         );
     }
 

@@ -61,6 +61,7 @@ const GBA_SECTION: &str = "GBA";
 const PSP_SECTION: &str = "PSP";
 const SATURN_SECTION: &str = "SATURN";
 const FBN_SECTION: &str = "FBN";
+const ARCADE_SECTION: &str = "ARCADE";
 const RETROARCH_HANDLER: &str = "retroarch";
 
 /// The persisted selected-core field for a RetroArch-backed section —
@@ -80,6 +81,7 @@ fn selected_core<'a>(
         libretro::Section::Psp => &mut cfg.selected_psp_core,
         libretro::Section::Saturn => &mut cfg.selected_saturn_core,
         libretro::Section::FbNeo => &mut cfg.selected_fbn_core,
+        libretro::Section::Arcade => &mut cfg.selected_arcade_core,
     }
 }
 
@@ -95,6 +97,7 @@ fn selected_core_id<'a>(cfg: &'a settings::Emulation, section: libretro::Section
         libretro::Section::Psp => cfg.selected_psp_core.as_str(),
         libretro::Section::Saturn => cfg.selected_saturn_core.as_str(),
         libretro::Section::FbNeo => cfg.selected_fbn_core.as_str(),
+        libretro::Section::Arcade => cfg.selected_arcade_core.as_str(),
     }
 }
 
@@ -224,6 +227,7 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
         PSP_SECTION => retroarch_spec(PSP_SECTION),
         SATURN_SECTION => retroarch_spec(SATURN_SECTION),
         FBN_SECTION => retroarch_spec(FBN_SECTION),
+        ARCADE_SECTION => retroarch_spec(ARCADE_SECTION),
         _ => return None,
     })
 }
@@ -289,8 +293,6 @@ fn section_patterns(key: &str) -> &'static [&'static str] {
         "FBN" => &["zip", "7z", "dat"],
         "SATURN" => &["cue", "chd", "iso", "bin", "img", "zip", "7z"],
         "PSP" => &["iso", "cso", "pbp", "chd"],
-        // Steam's AllFilePatterns — the empty set accepts anything.
-        "STEAM" => &[],
         _ => &[],
     }
 }
@@ -349,7 +351,6 @@ const CONSOLES: &[(&str, &str, &str)] = &[
     ("PSX", "PlayStation", "PSX"),
     ("SNES", "Super Nintendo", "SNES"),
     ("SATURN", "Sega Saturn", "Saturn"),
-    ("STEAM", "Steam", "Steam"),
     ("SWITCH", "Nintendo Switch", "Switch"),
     ("WII", "Nintendo Wii", "Wii"),
     ("WIIU", "Nintendo Wii U", "WiiU"),
@@ -381,7 +382,6 @@ const ART: &[(&str, &[u8])] = &[
     ("PSX", include_bytes!("../assets/consoles/PSX.png")),
     ("SNES", include_bytes!("../assets/consoles/SNES.png")),
     ("Saturn", include_bytes!("../assets/consoles/Saturn.png")),
-    ("Steam", include_bytes!("../assets/consoles/Steam.png")),
     ("Switch", include_bytes!("../assets/consoles/Switch.png")),
     ("Wii", include_bytes!("../assets/consoles/Wii.png")),
     ("WiiU", include_bytes!("../assets/consoles/WiiU.png")),
@@ -1066,7 +1066,8 @@ impl EmuView {
             | GBA_SECTION
             | PSP_SECTION
             | SATURN_SECTION
-            | FBN_SECTION => Some(RETROARCH_HANDLER.to_string()),
+            | FBN_SECTION
+            | ARCADE_SECTION => Some(RETROARCH_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -3383,10 +3384,7 @@ fn scan_rom_folder(root: &Path, key: &str) -> Vec<PathBuf> {
     // EmulationConsoleCatalog.SupportsFolderImport — PS3/PS4 each get
     // their own installed-folder check.
     let accept = |ext: &str| {
-        // STEAM's AllFilePatterns — no extension gate at all.
-        key == "STEAM"
-            || pats.iter().any(|p| p.eq_ignore_ascii_case(ext))
-            || ARCHIVE_EXTS.contains(&ext)
+        pats.iter().any(|p| p.eq_ignore_ascii_case(ext)) || ARCHIVE_EXTS.contains(&ext)
     };
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -3653,12 +3651,19 @@ pub fn settings_tab(
         let open = emu.expanded.contains(key);
         let head_h = 88.0 * s;
         // Sections with a wired handler host the handler row — a bit
-        // taller than the empty-state cards.
+        // taller than the empty-state cards. RetroArch cards get one
+        // more row (the core selector pushes the buttons + status
+        // slot down ~32px), so their body grows to match.
         let body_h = if open {
-            if handler_spec(key).is_some() {
-                196.0 * s
-            } else {
-                74.0 * s
+            match handler_spec(key) {
+                Some(spec)
+                    if spec.handler == RETROARCH_HANDLER
+                        && libretro::Section::from_key(key).is_some() =>
+                {
+                    228.0 * s
+                }
+                Some(_) => 196.0 * s,
+                None => 74.0 * s,
             }
         } else {
             0.0
@@ -3764,14 +3769,18 @@ pub fn settings_tab(
                 let core_section = libretro::Section::from_key(key);
                 let core_select = spec.handler == RETROARCH_HANDLER && core_section.is_some();
                 let font14 = FontId::proportional(14.0 * s);
+                let name_font = FontId::proportional(18.0 * s);
                 painter.text(
                     Pos2::new(inner.min.x + m, ry + 2.0 * s),
                     Align2::LEFT_TOP,
                     spec.name,
-                    FontId::proportional(18.0 * s),
+                    name_font.clone(),
                     whitesmoke.gamma_multiply(t),
                 );
-                // Installed/version hint next to the name.
+                // Installed/version hint next to the name — offset by
+                // the name's real width (a fixed 64px underlaps
+                // "RetroArch" at 18pt) and clipped to the card so a
+                // long path can't run off the right edge.
                 {
                     let stale = emu.installed_hint.get(spec.handler).map_or(true, |(t, _)| {
                         t.elapsed() > std::time::Duration::from_millis(1500)
@@ -3782,8 +3791,17 @@ pub fn settings_tab(
                             .insert(spec.handler.to_string(), (std::time::Instant::now(), exe));
                     }
                     if let Some(Some(exe)) = emu.installed_hint.get(spec.handler).map(|(_, p)| p) {
-                        painter.text(
-                            Pos2::new(inner.min.x + m + 64.0 * s, ry + 7.0 * s),
+                        let name_w = painter
+                            .layout_no_wrap(spec.name.to_owned(), name_font.clone(), whitesmoke)
+                            .rect
+                            .width();
+                        let hint_x = inner.min.x + m + name_w + 10.0 * s;
+                        let hint_clip = Rect::from_min_max(
+                            Pos2::new(hint_x, inner.min.y),
+                            Pos2::new(inner.max.x - m, ry + 30.0 * s),
+                        );
+                        painter.with_clip_rect(hint_clip).text(
+                            Pos2::new(hint_x, ry + 7.0 * s),
                             Align2::LEFT_TOP,
                             exe.parent()
                                 .map(|p| p.display().to_string())
@@ -4223,10 +4241,18 @@ pub fn settings_tab(
                     );
                     status_line = Some(stage);
                 }
+                // Status + hint share the card's inner width — clip
+                // both so a long download summary can't spill past
+                // the right edge and over the next card.
+                let foot_clip = Rect::from_min_max(
+                    Pos2::new(inner.min.x + m, inner.min.y),
+                    Pos2::new(inner.max.x - m, inner.max.y),
+                );
+                let foot_painter = painter.with_clip_rect(foot_clip);
                 if let Some(msg) = status_line {
                     // Fixed slot above the hint — ~14px of clear
                     // margin between the status and the hint text.
-                    painter.text(
+                    foot_painter.text(
                         Pos2::new(inner.min.x + m, inner.max.y - 36.0 * s),
                         Align2::LEFT_BOTTOM,
                         msg,
@@ -4235,7 +4261,7 @@ pub fn settings_tab(
                     );
                 }
                 // Launch hint — where games come from.
-                painter.text(
+                foot_painter.text(
                     Pos2::new(inner.min.x + 12.0 * s, inner.max.y - 10.0 * s),
                     Align2::LEFT_BOTTOM,
                     "Add games in the Emulation view (right-click → Add Roms), then double-click a card to play.",

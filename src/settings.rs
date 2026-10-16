@@ -405,6 +405,8 @@ pub struct Emulation {
     pub selected_saturn_core: String,
     /// Same for the Final Burn Neo section — `Emulators/FBN/Libretro`.
     pub selected_fbn_core: String,
+    /// Same for the Arcade section — `Emulators/ARCADE/Libretro`.
+    pub selected_arcade_core: String,
     /// Per-section capture/render options (Lacrima's RenderOptions
     /// overlay, "Rendering" tab) — keyed by section key.
     pub render: std::collections::BTreeMap<String, RenderOpts>,
@@ -495,6 +497,7 @@ impl Default for Emulation {
             selected_psp_core: String::new(),
             selected_saturn_core: String::new(),
             selected_fbn_core: String::new(),
+            selected_arcade_core: String::new(),
             render: Default::default(),
         }
     }

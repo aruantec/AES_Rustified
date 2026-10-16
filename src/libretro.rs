@@ -31,12 +31,13 @@ pub enum Section {
     Psp,
     Saturn,
     FbNeo,
+    Arcade,
 }
 
 impl Section {
     /// Section key ("3DS", "N64", "NES", "GENESIS", "SNES", "GBA",
-    /// "PSP", "SATURN", "FBN") → core section. `None` for sections
-    /// with no RetroArch handler.
+    /// "PSP", "SATURN", "FBN", "ARCADE") → core section. `None` for
+    /// sections with no RetroArch handler.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "3DS" => Some(Self::ThreeDs),
@@ -48,6 +49,7 @@ impl Section {
             "PSP" => Some(Self::Psp),
             "SATURN" => Some(Self::Saturn),
             "FBN" => Some(Self::FbNeo),
+            "ARCADE" => Some(Self::Arcade),
             _ => None,
         }
     }
@@ -69,6 +71,7 @@ impl Section {
             Self::Psp => "PSP",
             Self::Saturn => "SATURN",
             Self::FbNeo => "FBN",
+            Self::Arcade => "ARCADE",
         }
     }
 
@@ -83,6 +86,7 @@ impl Section {
             Self::Psp => "psp_cores.json",
             Self::Saturn => "saturn_cores.json",
             Self::FbNeo => "fbn_cores.json",
+            Self::Arcade => "arcade_cores.json",
         }
     }
 
@@ -97,6 +101,7 @@ impl Section {
             Self::Psp => "PSP",
             Self::Saturn => "Saturn",
             Self::FbNeo => "Final Burn Neo",
+            Self::Arcade => "Arcade",
         }
     }
 
@@ -113,6 +118,7 @@ impl Section {
             Self::Psp => is_psp_info(fields),
             Self::Saturn => is_saturn_info(fields),
             Self::FbNeo => is_fbneo_info(fields),
+            Self::Arcade => is_mame_info(fields),
         }
     }
 }
@@ -744,6 +750,35 @@ fn is_fbneo_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
     has_archive_extension && meta
 }
 
+/// MAME cores for the ARCADE section — a "mame" metadata token
+/// (covers mame, mame2000…2016, hbmame, mamearcade, mamemess) plus an
+/// extension the section's roms arrive as (zip/7z romsets or chd
+/// dumps). FBNeo-family cores stay in the FBN section — their
+/// metadata carries no "mame" token.
+fn is_mame_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let corename = fields.get("corename").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_romset_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "zip" | "7z" | "chd" | "dat" | "cmd"
+        )
+    });
+    let meta = [system, database, display, corename]
+        .iter()
+        .any(|v| v.to_ascii_lowercase().contains("mame"));
+    has_romset_extension && meta
+}
+
 fn extract_core_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
     std::fs::create_dir_all(destination)
         .map_err(|e| format!("Cannot create core directory: {e}"))?;
@@ -881,8 +916,9 @@ fn set_progress(progress: &CoreDownload, stage: &str, fraction: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_3ds_info, is_fbneo_info, is_gba_info, is_genesis_info, is_n64_info, is_nes_info,
-        is_psp_info, is_saturn_info, is_snes_info, parse_info_fields, select_core, CoreInfo,
+        is_3ds_info, is_fbneo_info, is_gba_info, is_genesis_info, is_mame_info, is_n64_info,
+        is_nes_info, is_psp_info, is_saturn_info, is_snes_info, parse_info_fields, select_core,
+        CoreInfo,
     };
 
     #[test]
@@ -1320,13 +1356,57 @@ mod tests {
         assert!(!is_fbneo_info(&no_ext));
     }
 
+    /// ARCADE = mame-family only — the fbneo/fbalpha arcade cores
+    /// belong to the FBN section and must not leak in.
+    #[test]
+    fn mame_info_filter_accepts_mame_rejects_fbneo() {
+        // Real mame_libretro.info shape.
+        let mame = parse_info_fields(
+            r#"
+                corename = "MAME"
+                display_name = "Arcade (MAME)"
+                systemname = "Arcade (various)"
+                database = "MAME"
+                supported_extensions = "cmd|zip|7z"
+            "#,
+        );
+        assert!(is_mame_info(&mame));
+        let hbmame = parse_info_fields(
+            r#"
+                corename = "HBMAME"
+                display_name = "Arcade (HBMAME)"
+                supported_extensions = "zip|7z"
+            "#,
+        );
+        assert!(is_mame_info(&hbmame));
+        let fbneo = parse_info_fields(
+            r#"
+                corename = "FinalBurn Neo"
+                display_name = "Arcade (FinalBurn Neo)"
+                systemname = "Arcade (various)"
+                database = "FBNeo - Arcade Games"
+                supported_extensions = "zip|7z|cue|ccd"
+            "#,
+        );
+        assert!(!is_mame_info(&fbneo));
+        // MAME metadata without a romset extension is no use.
+        let no_ext = parse_info_fields(
+            r#"
+                corename = "MAME"
+                display_name = "Arcade (MAME)"
+                supported_extensions = "sav"
+            "#,
+        );
+        assert!(!is_mame_info(&no_ext));
+    }
+
     #[test]
     fn section_key_roundtrips_from_card_key() {
         // The settings cards and download jobs key sections by the
         // same string — a mapping slip shows the wrong card's
         // progress or refreshes the wrong catalog.
         for key in [
-            "3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP", "SATURN", "FBN",
+            "3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP", "SATURN", "FBN", "ARCADE",
         ] {
             let section = super::Section::from_key(key).unwrap();
             assert_eq!(section.key(), key);
