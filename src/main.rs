@@ -377,6 +377,19 @@ fn work_area_rect(ctx: &egui::Context) -> Option<Rect> {
         .map(|m| Rect::from_min_size(Pos2::ZERO, m))
 }
 
+/// Toggle borderless fullscreen. `Fullscreen` alone leaves the
+/// undecorated-window drop shadow enabled — winit's WM_NCCALCSIZE then
+/// still pushes the client area down 1px (`rgrc[0].top += 1`), leaving a
+/// thin transparent strip across the top of the screen. egui-winit only
+/// re-evaluates the shadow (egui issue #8399) on `Decorations` commands,
+/// so one rides along as a companion — sent AFTER Fullscreen so it sees
+/// the new state (`window.fullscreen()` flips synchronously). The window
+/// is already borderless, so `Decorations(false)` itself changes nothing.
+fn set_fullscreen(ctx: &egui::Context, on: bool) {
+    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(on));
+    ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+}
+
 struct AesRustApp {
     icons: icons::MenuIcons,
     menu_scales: [f32; 4],
@@ -1999,8 +2012,7 @@ impl eframe::App for AesRustApp {
                     if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                         fs_exit.begin(ui.ctx());
                     } else {
-                        ui.ctx()
-                            .send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                        set_fullscreen(ui.ctx(), true);
                     }
                 }
                 // Ctrl+arrows — Up/Down nudge the volume, Left/Right
@@ -3102,8 +3114,7 @@ impl eframe::App for AesRustApp {
                     ui.ctx().request_repaint();
                     if fs_exit.pending_exit && fs_exit.vis <= 0.001 {
                         fs_exit.pending_exit = false;
-                        ui.ctx()
-                            .send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                        set_fullscreen(ui.ctx(), false);
                     }
                 }
                 // Delete confirmation — same dialog, payload parked in
@@ -3465,7 +3476,7 @@ fn lacrima_window_frame(
                         if is_fullscreen {
                             *fs_exit_req = true;
                         } else {
-                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                            set_fullscreen(&ctx, true);
                         }
                     }
                     // Settings gear, left of the window buttons like
