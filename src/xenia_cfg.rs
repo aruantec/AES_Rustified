@@ -471,6 +471,19 @@ pub fn prepare_for_launch(root: &Path, tid: Option<&str>) {
     ensure_template(root);
     let doc = tid.map(|t| load_overrides(root, t)).unwrap_or_default();
     apply_overrides(root, &doc);
+    // Linux: xenia's "any" APU picks the raw ALSA driver, which opens
+    // the card directly — bypassing PipeWire's sink routing AND the
+    // hardware-mixer volume PipeWire manages (inaudible at low sink
+    // volume). SDL goes through the session sound server instead.
+    #[cfg(not(windows))]
+    {
+        let active = active_path(root);
+        if let Ok(text) = std::fs::read_to_string(&active) {
+            let mut t = TomlDoc::parse(&text);
+            t.set("APU", "apu", "\"sdl\"");
+            let _ = std::fs::write(&active, t.text());
+        }
+    }
 }
 
 pub fn apply_overrides(root: &Path, doc: &OverridesDoc) {

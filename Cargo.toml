@@ -53,6 +53,28 @@ encoding_rs = "0.8"
 # POSIX kill()/SIGSTOP/SIGCONT for session stop+pause on unix.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Nested Wayland compositor for emulator capture — the emulator runs
+# as a client of an in-app compositor and we get each committed frame
+# as a dmabuf/shm buffer directly (no compositor round-trip, no portal
+# permission dialog). GBM+EGL gives the headless GLES context used to
+# read client buffers; XWayland covers X11-only emulators.
+smithay = { version = "0.7.0", default-features = false, features = [
+    "wayland_frontend",
+    "backend_egl",
+    "backend_gbm",
+    "renderer_gl",
+    "renderer_pixman",
+    "desktop",
+    "xwayland",
+    "use_system_lib",
+] }
+calloop = "0.14"
+# wl_drm global for XWayland glamor (device discovery + prime buffers).
+# Generated bindings need wayland-server in scope; the scanner proc
+# macro reads protocols/wayland-drm.xml at compile time.
+wayland-server = "0.31"
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
 
 # Native Windows Graphics Capture for emulator frame capture (the
 # WgcBridge-equivalent path — WinRT WGC + D3D11 staging readback) plus

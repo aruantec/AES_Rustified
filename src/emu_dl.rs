@@ -18,8 +18,12 @@ const XEMU_RELEASES_API: &str =
     "https://api.github.com/repos/xemu-project/xemu/releases?per_page=20";
 // RPCS3 doesn't publish on its main repo — the CI ships every build
 // to rpcs3-binaries-win instead (Lacrima's BinaryReleasesApiEndpoint).
+// Linux builds land in the parallel rpcs3-binaries-linux repo as
+// rpcs3-v<ver>-<sha>_linux64.AppImage.
 const RPCS3_RELEASES_API: &str =
     "https://api.github.com/repos/RPCS3/rpcs3-binaries-win/releases?per_page=20";
+const RPCS3_RELEASES_API_LINUX: &str =
+    "https://api.github.com/repos/RPCS3/rpcs3-binaries-linux/releases?per_page=20";
 const SHADPS4_RELEASES_API: &str =
     "https://api.github.com/repos/shadps4-emu/shadPS4/releases?per_page=20";
 const DUCKSTATION_RELEASES_API: &str =
@@ -114,26 +118,11 @@ pub fn dolphin_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("GCN").join("Dolphin"))
 }
 
-/// Find the installed launcher (`ResolveLauncherPath`):
-/// `xenia_canary.exe`, then `xenia.exe`, then any *xenia* exe.
+/// Find the installed launcher (`ResolveLauncherPath`): the Windows
+/// exes first, then the shared resolver covers the Linux AppImage
+/// (`xenia_canary_linux.AppImage` matches `exe_contains: "xenia"`).
 pub fn xenia_exe() -> Option<PathBuf> {
-    let dir = xenia_dir()?;
-    let mut all = Vec::new();
-    walk(&dir, &mut all);
-    for want in ["xenia_canary.exe", "xenia.exe"] {
-        if let Some(p) = all.iter().find(|p| {
-            p.file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| f.eq_ignore_ascii_case(want))
-        }) {
-            return Some(p.clone());
-        }
-    }
-    all.into_iter().find(|p| {
-        p.file_name()
-            .and_then(|f| f.to_str())
-            .is_some_and(|f| f.to_lowercase().contains("xenia") && f.ends_with(".exe"))
-    })
+    resolve_exe(&xenia_dir()?, &XENIA_SPEC).ok()
 }
 
 /// Find the installed `flycast.exe` under the managed dir.
@@ -265,12 +254,32 @@ pub fn retroarch_exe() -> Option<PathBuf> {
             return Some(p.clone());
         }
     }
-    all.into_iter().find(|p| {
-        p.file_name()
-            .and_then(|f| f.to_str())
-            .is_some_and(|f| f.to_lowercase().contains("retroarch") && !f.ends_with(".dmg"))
-            && p.is_file()
-    })
+    // Loose match like resolve_exe's fallback — exe-shaped names
+    // only (retroarch_version.txt would otherwise win and spawn fails
+    // with ENOEXEC), newest first.
+    let exe = all
+        .into_iter()
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|f| f.to_str()).is_some_and(|f| {
+                    let low = f.to_lowercase();
+                    low.contains("retroarch")
+                        && (low.ends_with(".exe")
+                            || (cfg!(unix)
+                                && (low.ends_with(".appimage") || !low.contains('.'))))
+                        && arch_ok(&low)
+                })
+        })
+        .max_by_key(|p| {
+            p.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })?;
+    // A user-placed binary may have lost its exec bit (downloads and
+    // zip extraction don't preserve it) — resolution must yield a
+    // runnable file.
+    mark_exec(&exe);
+    Some(exe)
 }
 
 /// Find the installed `Cemu.exe` under the managed dir.
@@ -377,6 +386,35 @@ pub fn download_patches(root: PathBuf) -> Shared {
 
 /// Handler-agnostic download spec — which release feed, which asset
 /// marks the platform build, which exe names the install is complete.
+/// False when an asset name carries a CPU-arch marker the host can't
+/// run — release listings mix arm64/aarch64/armhf/riscv builds into the
+/// same list as x86_64 ones and a bare `contains("linux")` picks
+/// whichever sorts first (the armhf DuckStation AppImage got selected
+/// on x86_64 exactly this way). Marker-less names pass — several
+/// emulators ship a single unmarked Linux build.
+fn arch_ok(n: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        ![
+            "aarch64", "arm64", "armhf", "armv7", "armv6", "armv5", "arm32", "-arm.",
+            "riscv", "ppc64", "mips", "loongarch",
+        ]
+        .iter()
+        .any(|m| n.contains(m))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        !["x86_64", "amd64", "x64", "win64", "i386", "i686"]
+            .iter()
+            .any(|m| n.contains(m))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = n;
+        true
+    }
+}
+
 struct EmuSpec {
     name: &'static str,
     releases_api: &'static str,
@@ -406,9 +444,13 @@ const XENIA_SPEC: EmuSpec = EmuSpec {
     dir: xenia_dir,
     asset_ok: |n| {
         let n = n.to_lowercase();
-        // Xenia ships no official Linux build — nothing matches, and
-        // the generic "no compatible asset" error is the honest answer.
-        cfg!(windows) && n.contains("windows") && n.contains("canary")
+        // Canary ships `xenia_canary_windows.7z` and an experimental
+        // `xenia_canary_linux.AppImage`.
+        if cfg!(windows) {
+            n.contains("windows") && n.contains("canary") && arch_ok(&n)
+        } else {
+            n.contains("canary") && n.ends_with(".appimage") && arch_ok(&n)
+        }
     },
     exe_names: &["xenia_canary.exe", "xenia.exe", "xenia_canary", "xenia"],
     exe_contains: "xenia",
@@ -424,9 +466,9 @@ const FLYCAST_SPEC: EmuSpec = EmuSpec {
     asset_ok: |n| {
         let n = n.to_lowercase();
         if cfg!(windows) {
-            n.contains("win64") || n.contains("windows")
+            (n.contains("win64") || n.contains("windows")) && arch_ok(&n)
         } else {
-            n.contains("linux") || n.contains("appimage")
+            (n.contains("linux") || n.contains("appimage")) && arch_ok(&n)
         }
     },
     exe_names: &["flycast.exe", "flycast"],
@@ -442,7 +484,8 @@ const XEMU_SPEC: EmuSpec = EmuSpec {
     dir: xemu_dir,
     // Lacrima's SelectAssetForPlatform: xemu-win-x86_64-release.zip
     // first, then any win+x86_64 zip that isn't debug symbols.
-    // On Linux xemu ships an ubuntu tarball.
+    // On Linux current releases ship xemu-<ver>-<arch>.AppImage (no
+    // "linux"/"ubuntu" marker); older releases had ubuntu-* tarballs.
     asset_ok: |n| {
         let n = n.to_lowercase();
         if cfg!(windows) {
@@ -450,9 +493,10 @@ const XEMU_SPEC: EmuSpec = EmuSpec {
                 && !n.contains("dbg")
                 && !n.contains("pdb")
         } else {
-            (n.contains("linux") || n.contains("ubuntu"))
+            (n.ends_with(".appimage") || n.contains("linux") || n.contains("ubuntu"))
                 && !n.contains("dbg")
                 && !n.contains("source")
+                && arch_ok(&n)
         }
     },
     exe_names: &["xemu.exe", "xemu"],
@@ -471,7 +515,11 @@ pub fn download_flycast() -> Shared {
 
 const RPCS3_SPEC: EmuSpec = EmuSpec {
     name: "RPCS3",
-    releases_api: RPCS3_RELEASES_API,
+    releases_api: if cfg!(windows) {
+        RPCS3_RELEASES_API
+    } else {
+        RPCS3_RELEASES_API_LINUX
+    },
     version_marker: RPCS3_VERSION_MARKER,
     dir: rpcs3_dir,
     // Lacrima's SelectAssetForPlatform: a windows archive minus the
@@ -480,9 +528,9 @@ const RPCS3_SPEC: EmuSpec = EmuSpec {
     asset_ok: |n| {
         let n = n.to_lowercase();
         if cfg!(windows) {
-            n.contains("win") && !n.contains("symbols")
+            n.contains("win") && !n.contains("symbols") && arch_ok(&n)
         } else {
-            n.contains("linux") && n.ends_with(".appimage")
+            n.contains("linux") && n.ends_with(".appimage") && arch_ok(&n)
         }
     },
     exe_names: &["rpcs3.exe", "rpcs3"],
@@ -510,9 +558,9 @@ const SHADPS4_SPEC: EmuSpec = EmuSpec {
     asset_ok: |n| {
         let n = n.to_lowercase();
         if cfg!(windows) {
-            n.contains("win") && n.ends_with(".zip")
+            n.contains("win") && n.ends_with(".zip") && arch_ok(&n)
         } else {
-            n.contains("linux") && !n.contains("source")
+            n.contains("linux") && !n.contains("source") && arch_ok(&n)
         }
     },
     exe_names: &[
@@ -549,10 +597,13 @@ const DUCKSTATION_SPEC: EmuSpec = EmuSpec {
                 && !n.contains("sse2")
                 && !n.contains("arm64")
         } else {
-            // DuckStation-x64.AppImage / linux release archives.
+            // DuckStation-x64.AppImage / linux release archives —
+            // arch_ok rejects the armhf/arm64 AppImages, `sse2` the
+            // legacy-instruction-set x64 build.
             (n.contains("appimage") || n.contains("linux"))
-                && !n.contains("arm64")
                 && !n.contains("source")
+                && !n.contains("sse2")
+                && arch_ok(&n)
         }
     },
     // ResolveLauncherPath — the LTCG build first, then the plain Qt
@@ -587,7 +638,7 @@ const PCSX2_SPEC: EmuSpec = EmuSpec {
         if cfg!(windows) {
             n.contains("windows") && n.contains("qt") && !n.contains("symbols") && n.ends_with(".7z")
         } else {
-            n.contains("linux") && n.contains("x64") && !n.contains("symbols")
+            n.contains("linux") && n.contains("x64") && !n.contains("symbols") && arch_ok(&n)
         }
     },
     exe_names: &[
@@ -648,11 +699,88 @@ pub fn download_dolphin() -> Shared {
     }));
     let shared = dl.clone();
     std::thread::spawn(move || {
+        #[cfg(windows)]
         let res = work_dolphin(&shared, &DOLPHIN_SPEC);
+        #[cfg(not(windows))]
+        let res = work_dolphin_linux(&shared, &DOLPHIN_SPEC);
         let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
         p.done = Some(res);
     });
     dl
+}
+
+/// Linux: Dolphin ships no official Linux binaries — the supported
+/// distribution is the Flathub flatpak. Install it (user scope, no
+/// sudo) when missing, then drop a `dolphin` wrapper script into the
+/// managed dir — `resolve_exe` treats it like any other emu exe and
+/// the launch args pass straight through `flatpak run`.
+#[cfg(not(windows))]
+fn work_dolphin_linux(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
+    use std::process::Command;
+
+    const APP: &str = "org.DolphinEmu.dolphin-emu";
+
+    let Some(emu_dir) = (spec.dir)() else {
+        return Err("Could not resolve the emulators directory".into());
+    };
+    std::fs::create_dir_all(&emu_dir).map_err(|e| format!("Emu dir not writable: {e}"))?;
+
+    let flatpak_ok = Command::new("flatpak")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !flatpak_ok {
+        return Err(
+            "Dolphin ships no Linux binaries — the official package is the Flathub \
+             flatpak (org.DolphinEmu.dolphin-emu) and flatpak isn't installed here. \
+             Install flatpak, or browse to an existing Dolphin binary."
+                .into(),
+        );
+    }
+
+    let info = Command::new("flatpak")
+        .args(["info", APP])
+        .output()
+        .map_err(|e| format!("flatpak info failed: {e}"))?;
+    if !info.status.success() {
+        set(dl, "Installing Dolphin (Flathub)…", 0.0);
+        let out = Command::new("flatpak")
+            .args(["install", "-y", "--user", "flathub", APP])
+            .output()
+            .map_err(|e| format!("flatpak install failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "flatpak install failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    // Marker: the Version line from `flatpak info`, else "flatpak".
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    let tag = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Version:").map(str::trim))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("flatpak")
+        .to_string();
+
+    // --filesystem=host: the flatpak's default permissions only cover
+    // a few xdg-run paths — the game ROM and our portable `-u User`
+    // dir would be invisible inside the sandbox without it.
+    let wrapper = emu_dir.join("dolphin");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec flatpak run --filesystem=host {APP} \"$@\"\n"),
+    )
+    .map_err(|e| format!("Wrapper write failed: {e}"))?;
+    mark_exec(&wrapper);
+    let _ = std::fs::write(emu_dir.join(spec.version_marker), &tag);
+
+    set(dl, "Done", 1.0);
+    let exe = resolve_exe(&emu_dir, spec)?;
+    mark_exec(&exe);
+    Ok(exe.to_string_lossy().into_owned())
 }
 
 const CEMU_SPEC: EmuSpec = EmuSpec {
@@ -668,7 +796,7 @@ const CEMU_SPEC: EmuSpec = EmuSpec {
         if cfg!(windows) {
             n.contains("windows") && n.ends_with(".zip")
         } else {
-            n.contains("linux") && n.contains("x86_64")
+            n.contains("linux") && n.contains("x86_64") && arch_ok(&n)
         }
     },
     // CemuHandler's CemuExecutableNames.
@@ -699,7 +827,7 @@ const EDEN_SPEC: EmuSpec = EmuSpec {
             n.contains("windows") && (n.contains("amd64") || n.contains("x64")) && n.ends_with(".zip")
         } else {
             // Eden-Linux-v<ver>-amd64-<toolchain>.AppImage.
-            n.contains("linux") && n.contains("amd64") && !n.contains("zsync")
+            n.contains("linux") && n.contains("amd64") && !n.contains("zsync") && arch_ok(&n)
         }
     },
     // ResolveLauncherPath — eden-cli.exe first, then the Qt gui.
@@ -845,6 +973,7 @@ fn work_retroarch(dl: &Shared) -> Result<String, String> {
 /// feed entries → post HTML → the dl.dolphin-emu.org windows asset.
 /// "Dolphin XXXX[a]" posts are beta-track releases, "Dolphin Git
 /// XXXX-N" are dev builds — try the release posts first.
+#[cfg(windows)]
 fn work_dolphin(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
     let Some(emu_dir) = (spec.dir)() else {
         return Err("Could not resolve the emulators directory".into());
@@ -945,6 +1074,7 @@ fn get_text(url: &str) -> Result<String, String> {
 /// First `dl.dolphin-emu.org` href in an EmuCR post that matches the
 /// spec's windows-asset predicate (dolphin-<ver>-x64.7z — the .apk and
 /// arm/macos links fail the predicate).
+#[cfg(any(windows, test))]
 fn emucr_dolphin_asset(html: &str, spec: &EmuSpec) -> Option<(String, String)> {
     let mut rest = html;
     while let Some(at) = rest.find("href=\"") {
@@ -1118,14 +1248,24 @@ fn resolve_exe(dir: &Path, spec: &EmuSpec) -> Result<PathBuf, String> {
             return Ok(p.clone());
         }
     }
+    // Prefer the newest match — updated installs leave versioned
+    // binaries (rpcs3-vX.AppImage, DuckStation-x64-SSE2.AppImage)
+    // alongside the fresh download, and an arbitrary pick can land
+    // on the stale one.
     all.into_iter()
-        .find(|p| {
+        .filter(|p| {
             p.file_name().and_then(|f| f.to_str()).is_some_and(|f| {
                 let low = f.to_lowercase();
                 low.contains(spec.exe_contains)
                     && (low.ends_with(".exe")
                         || (cfg!(unix) && (low.ends_with(".appimage") || !low.contains('.'))))
+                    && arch_ok(&low)
             })
+        })
+        .max_by_key(|p| {
+            p.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         })
         .ok_or_else(|| format!("{} exe not found after install", spec.name))
 }
@@ -1137,8 +1277,10 @@ fn resolve_exe(dir: &Path, spec: &EmuSpec) -> Result<PathBuf, String> {
 fn mark_exec(p: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(mut perm) = p.metadata().map(|m| m.permissions()) {
-        perm.set_mode(perm.mode() | 0o111);
-        let _ = std::fs::set_permissions(p, perm);
+        if perm.mode() & 0o111 != 0o111 {
+            perm.set_mode(perm.mode() | 0o111);
+            let _ = std::fs::set_permissions(p, perm);
+        }
     }
 }
 
@@ -1420,6 +1562,50 @@ mod tests {
             assert!(ok("Cemu-2.6-linux-x86_64.AppImage"));
             assert!(!ok("cemu-2.6-windows-x64.zip"));
             assert!(!ok("cemu-2.6-macos-15-arm64.dmg"));
+        }
+    }
+
+    /// arch_ok is the load-bearing guard — release listings mix
+    /// foreign-arch builds into the same list and the picker used to
+    /// grab the armhf DuckStation AppImage on x86_64. Every spec's
+    /// predicate routes through it, so a marker that slips past one
+    /// platform check still dies here.
+    #[test]
+    fn arch_ok_rejects_foreign_arches() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            for bad in [
+                "DuckStation-armhf.AppImage",
+                "DuckStation-aarch64.AppImage",
+                "duckstation-linux-arm64.zip",
+                "flycast-arm64.AppImage",
+                "rpcs3-v1.0-linux_aarch64.AppImage",
+                "xemu-ubuntu-armv7.tar.gz",
+                "thing-riscv64.AppImage",
+            ] {
+                assert!(!arch_ok(bad), "{bad} should be rejected");
+            }
+            for good in [
+                "DuckStation-x64.AppImage",
+                "Cemu-2.6-linux-x86_64.AppImage",
+                "rpcs3-v1.0-linux.AppImage",
+                "Eden-Linux-v0.1-amd64-gcc.AppImage",
+                "xemu-0.8.66-ubuntu-24.04.tar.gz",
+            ] {
+                assert!(arch_ok(good), "{good} should pass");
+            }
+            // The DuckStation predicate specifically — this is the
+            // exact bug the user hit.
+            assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-armhf.AppImage"));
+            assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-arm64.AppImage"));
+            assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-x64-SSE2.AppImage"));
+            assert!((DUCKSTATION_SPEC.asset_ok)("DuckStation-x64.AppImage"));
+            // xemu dropped the "ubuntu"/"linux" marker from asset
+            // names — the Linux build is now xemu-<ver>-x86_64.AppImage.
+            assert!((XEMU_SPEC.asset_ok)("xemu-0.8.137-x86_64.AppImage"));
+            assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-aarch64.AppImage"));
+            assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-dbg-x86_64.AppImage"));
+            assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-windows-x86_64.zip"));
         }
     }
 }

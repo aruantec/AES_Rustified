@@ -324,6 +324,7 @@ fn install_cores(section: Section, progress: &CoreDownload) -> Result<String, St
             info_path,
             ..metadata
         });
+        ensure_system_bundle(&id, progress);
     }
 
     if installed.is_empty() {
@@ -353,6 +354,39 @@ fn install_cores(section: Section, progress: &CoreDownload) -> Result<String, St
             failures.join("; ")
         ))
     }
+}
+
+/// Cores that ship redistributable system-dir assets outside their
+/// core zip — id → buildbot `assets/system/<stem>.zip`. PPSSPP needs
+/// its fonts/atlases/shaders under `system/PPSSPP` or it boots with
+/// the "Core system files missing" warning.
+const SYSTEM_BUNDLES: &[(&str, &str)] = &[("ppsspp_libretro", "PPSSPP")];
+
+/// Fetch a core's redistributable system bundle into the frontend's
+/// system dir — the same dir the launch appendconfig points
+/// `system_directory` at. Best-effort: the core still runs when this
+/// fails (RA's warning banner), so nothing here hard-fails.
+fn ensure_system_bundle(id: &str, progress: &CoreDownload) {
+    let Some(&(_, stem)) = SYSTEM_BUNDLES.iter().find(|(k, _)| *k == id) else {
+        return;
+    };
+    let Some(system) = crate::emu_dl::retroarch_dir().map(|d| d.join("system")) else {
+        return;
+    };
+    if system.join(stem).is_dir() {
+        return;
+    }
+    let temp = system.join("Emu_Update");
+    if std::fs::create_dir_all(&temp).is_err() {
+        return;
+    }
+    let archive = temp.join(format!("{stem}.zip"));
+    let url = format!("https://buildbot.libretro.com/assets/system/{stem}.zip");
+    set_progress(progress, &format!("Downloading {stem} system files…"), 0.98);
+    if download_file(progress, &url, &archive, 0.98, 1.0).is_ok() {
+        let _ = extract_core_zip(&archive, &system);
+    }
+    let _ = std::fs::remove_dir_all(&temp);
 }
 
 fn read_core_infos(

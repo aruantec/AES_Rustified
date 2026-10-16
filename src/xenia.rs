@@ -65,6 +65,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use eframe::egui;
 
 use crate::wgc;
+#[cfg(not(windows))]
+use crate::wlcomp;
+#[cfg(not(windows))]
+use crate::xenia_cfg;
 
 /// Launch/session diagnostics — one timestamped line per event to
 /// `<data_root>/session.log` (truncated at 256KB). The failure modes
@@ -217,6 +221,13 @@ pub struct Session {
     paused: Arc<AtomicBool>,
     /// Live render adjustments the WGC swizzle reads each frame.
     render: Arc<wgc::RenderShared>,
+    /// The nested Wayland compositor hosting the emulator — `Some`
+    /// while the session renders into our private socket, `None`
+    /// when the launch fell back to an external desktop window.
+    /// Dropping it closes the socket; `stop()` already killed the
+    /// process group, so drop order vs. `child` doesn't matter.
+    #[cfg(not(windows))]
+    compositor: Option<wlcomp::WlComp>,
     /// The captured render window — written by the worker once the
     /// capture target resolves; the Aspect-Ratio context menu resizes
     /// it (Lacrima's EmulatorTargetHwnd).
@@ -270,6 +281,16 @@ impl Session {
         // (WaitForCoreLinkerOutputAsync).
         let mut transcript: Option<PathBuf> = None;
         let mut cmd = Command::new(&exe_path);
+        // Bundled-lib shim dir: `<exe>/lib` is searched first when it
+        // exists — covers distro gaps like libGLU (Cemu) without
+        // needing system packages.
+        #[cfg(not(windows))]
+        {
+            let lib = work_dir.join("lib");
+            if lib.is_dir() {
+                cmd.env("LD_LIBRARY_PATH", &lib);
+            }
+        }
         match kind {
             // RPCS3: --no-gui skips the launcher/game-list shell so
             // the gs_frame render window is the only surface (Lacrima's
@@ -373,6 +394,11 @@ impl Session {
             Kind::Cemu => {
                 ensure_cemu_setup(&work_dir);
                 transcript = Some(work_dir.clone());
+                // -f launches the game fullscreen — hides the wx
+                // menubar in the compositor (Windows stays windowed:
+                // its window is cloaked anyway).
+                #[cfg(not(windows))]
+                cmd.arg("-f");
                 cmd.arg("-g").arg(game);
             }
             // Eden (EdenHandler.BuildStartInfo): the cli frontend
@@ -387,6 +413,15 @@ impl Session {
             // the console-subsystem exe from flashing a cmd window.
             Kind::Eden => {
                 ensure_eden_setup();
+                #[cfg(not(windows))]
+                {
+                    // Isolate Qt config into the managed XDG dir so
+                    // Eden writes qt-config.ini/window_state.ini there
+                    // — never beside the app or under ~/.config.
+                    let xdg = eden_xdg_dir();
+                    let _ = std::fs::create_dir_all(&xdg);
+                    cmd.env("XDG_CONFIG_HOME", &xdg);
+                }
                 let stem = exe_path
                     .file_stem()
                     .and_then(|f| f.to_str())
@@ -414,6 +449,13 @@ impl Session {
                         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
                     }
                 }
+                #[cfg(not(windows))]
+                {
+                    // Qt hides menu/status chrome only in fullscreen —
+                    // the ini key lags (Eden rewrites it on exit), so
+                    // the flag is authoritative.
+                    cmd.arg("-f");
+                }
                 cmd.arg("-g").arg(game);
             }
             // RetroArch (RetroArchHandler.BuildRetroArchStartInfo):
@@ -426,6 +468,13 @@ impl Session {
                     "No 3DS core installed — press Download all cores in Settings → Emulation"
                         .to_string()
                 })?;
+                // Linux: RA ignores the compositor-driven fullscreen
+                // configure (commits a windowed-size surface) —
+                // request fullscreen client-side so it fills the
+                // nested output. Windows stays windowed (WGC captures
+                // the hidden window).
+                #[cfg(not(windows))]
+                cmd.arg("--fullscreen");
                 if let Some(cfg_path) =
                     retroarch_append_config(&exe_path, retroarch_core.as_deref())
                 {
@@ -469,6 +518,26 @@ impl Session {
             {
                 cmd.arg("-dvd_path").arg(game);
             }
+            // Xenia on Linux: --fullscreen hides the ImGui menu bar
+            // (the nested compositor is a real display it can
+            // fullscreen onto — Windows stays windowed since the window
+            // is cloaked anyway), and --storage_root aims the whole
+            // storage (config, content, profiles) at our managed dir —
+            // without it the AppImage is non-portable and reads
+            // ~/.local/share/Xenia, so our config overrides and profile
+            // writes would never reach it.
+            Kind::Xenia => {
+                #[cfg(not(windows))]
+                {
+                    cmd.arg("--fullscreen");
+                    if let Some(root) =
+                        xenia_cfg::storage_root(exe_path.parent())
+                    {
+                        cmd.arg(format!("--storage_root={}", root.display()));
+                    }
+                }
+                cmd.arg(game);
+            }
             _ => {
                 cmd.arg(game);
             }
@@ -477,6 +546,14 @@ impl Session {
             cmd.arg(format!("--logged_profile_slot_0_xuid={xuid:016X}"));
         }
         if kind == Kind::Xemu {
+            // Linux: -full-screen makes xemu fullscreen onto the nested
+            // compositor's output — its display fills the captured
+            // frame instead of staying a windowed layout with the
+            // canvas inset under the menubar (it ignored our
+            // compositor-initiated fullscreen configure). Windows
+            // stays windowed — WGC captures the hidden window.
+            #[cfg(not(windows))]
+            cmd.arg("-full-screen");
             // The captured window is hidden and unfocused — xemu must
             // capture controller input in the background or the game
             // gets no pad input at all (Lacrima's
@@ -491,6 +568,73 @@ impl Session {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        // Linux: bring up the nested compositor and aim the emulator
+        // at its private socket. `WAYLAND_DISPLAY` resolves against
+        // XDG_RUNTIME_DIR, which the app already inherits. `DISPLAY`
+        // is stripped so X11-capable builds still pick Wayland —
+        // XWayland clients come later. On failure we fall back to the
+        // old external-window mode and leave the env untouched.
+        #[cfg(not(windows))]
+        let frames = Arc::new(Mutex::new(wgc::FrameSlot::default()));
+        #[cfg(not(windows))]
+        let compositor = match wlcomp::WlComp::start(
+            (1920, 1080),
+            frames.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            Ok(c) => {
+                session_log(&format!("wlcomp socket {:?}", c.socket_name()));
+                // XWayland comes up async — wait briefly for its
+                // display number so X11-only emulators can use it.
+                // Xenia's Linux build has no wayland Vulkan surface at
+                // all (xcb-only), so it goes straight to XWayland and
+                // must NOT see WAYLAND_DISPLAY (its GTK would pick
+                // wayland while its presenter needs X11).
+                let x11 = c.wait_display(std::time::Duration::from_secs(4));
+                match (kind, x11) {
+                    (Kind::Xenia, Some(d)) => {
+                        session_log(&format!("x11 display :{d} for {kind:?}"));
+                        cmd.env("DISPLAY", format!(":{d}"));
+                        cmd.env_remove("WAYLAND_DISPLAY");
+                        // Force GTK's x11 backend — with WAYLAND_DISPLAY
+                        // unset, libwayland still defaults to the host's
+                        // wayland-0 if x11 fails, which would put the
+                        // window on the user's desktop.
+                        cmd.env("GDK_BACKEND", "x11");
+                    }
+                    (_, Some(d)) => {
+                        cmd.env("WAYLAND_DISPLAY", c.socket_name());
+                        cmd.env("DISPLAY", format!(":{d}"));
+                    }
+                    (_, None) => {
+                        cmd.env("WAYLAND_DISPLAY", c.socket_name());
+                        cmd.env_remove("DISPLAY");
+                    }
+                }
+                Some(c)
+            }
+            Err(e) => {
+                session_log(&format!("wlcomp start failed ({e}) — external window"));
+                None
+            }
+        };
+        // On Linux, route emulator stdout/stderr to a transcript —
+        // without it, "Failed to initialize GTK+" and friends are
+        // invisible. Skip kinds that already own a transcript
+        // (shadPS4, RetroArch) and null-io RetroArch.
+        #[cfg(not(windows))]
+        if transcript.is_none() && kind != Kind::RetroArch {
+            let log_path = crate::settings::data_root()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("emu-launch.log");
+            if let Ok(f) = std::fs::File::create(&log_path) {
+                if let Ok(err) = f.try_clone() {
+                    cmd.stdout(std::process::Stdio::from(f))
+                        .stderr(std::process::Stdio::from(err));
+                }
+            }
         }
         let child = cmd
             .current_dir(work_dir)
@@ -509,6 +653,7 @@ impl Session {
         let status = Arc::new(Mutex::new(Shared {
             status: Status::Resolving,
         }));
+        #[cfg(windows)]
         let frames = Arc::new(Mutex::new(wgc::FrameSlot::default()));
         let gpu = Arc::new(wgc::GpuState::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -570,6 +715,8 @@ impl Session {
             stop,
             paused,
             render,
+            #[cfg(not(windows))]
+            compositor,
             #[cfg(windows)]
             hwnd,
             #[cfg(windows)]
@@ -577,6 +724,23 @@ impl Session {
             #[cfg(windows)]
             _job: job,
         })
+    }
+
+    /// `true` when the emulator is hosted inside the nested
+    /// compositor (frames land in `frames()`), `false` when it fell
+    /// back to its own desktop window.
+    #[cfg(not(windows))]
+    pub fn embedded(&self) -> bool {
+        self.compositor.is_some()
+    }
+
+    /// Forward a UI-originated input event into the nested seat —
+    /// no-op when the session runs in an external window.
+    #[cfg(not(windows))]
+    pub fn send_input(&self, ev: wlcomp::WlInput) {
+        if let Some(c) = &self.compositor {
+            c.send_input(ev);
+        }
     }
 
     /// Live render adjustments — write the atomics and the capture
@@ -1004,6 +1168,37 @@ fn ensure_dolphin_setup(exe_dir: &Path) -> PathBuf {
 /// the dir is all the "setup" a launch needs.
 fn ensure_cemu_setup(exe_dir: &Path) {
     let _ = std::fs::create_dir_all(exe_dir.join("portable"));
+    #[cfg(not(windows))]
+    {
+        // Cemu's "Getting started" wizard only runs while settings.xml
+        // is missing — an undismissable blocker under the compositor.
+        // Seed the portable copy from the user's real config (game
+        // paths + tuned settings carry over), or a minimal valid file.
+        let settings = exe_dir.join("portable").join("settings.xml");
+        if !settings.exists() {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".config")
+                .join("Cemu")
+                .join("settings.xml");
+            let mlc = exe_dir.join("portable").join("mlc01");
+            let body = std::fs::read_to_string(&home).unwrap_or_else(|_| {
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<content>\n</content>\n"
+                )
+            });
+            let body = if body.contains("<mlc_path></mlc_path>") {
+                body.replace(
+                    "<mlc_path></mlc_path>",
+                    &format!("<mlc_path>{}</mlc_path>", mlc.display()),
+                )
+            } else {
+                body
+            };
+            let _ = std::fs::write(&settings, body);
+        }
+    }
 }
 
 /// CemuHandler's ResolveCemuLogFilePath candidates for a spawn at
@@ -1066,12 +1261,29 @@ fn eden_gui_sibling(exe: &str) -> PathBuf {
 }
 
 /// EdenHandler.ResolveEdenConfigPath — `%APPDATA%/eden/config`.
+/// Off Windows: a managed XDG_CONFIG_HOME under the data root; the
+/// child's qt-config.ini lands at `<dir>/qt-config.ini` and the env
+/// var keeps Eden (Qt) from touching `~/.config/eden` or dropping
+/// files relative to the CWD.
+#[cfg(windows)]
 fn eden_config_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_default()
         .join("eden")
         .join("config")
+}
+
+#[cfg(not(windows))]
+fn eden_config_dir() -> PathBuf {
+    eden_xdg_dir().join("eden")
+}
+
+#[cfg(not(windows))]
+fn eden_xdg_dir() -> PathBuf {
+    crate::settings::data_root()
+        .map(|d| d.join("Eden").join("xdg"))
+        .unwrap_or_else(|| PathBuf::from(".eden-xdg"))
 }
 
 fn eden_config_path() -> PathBuf {
@@ -1089,13 +1301,40 @@ fn ensure_eden_setup() {
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
+    // Off Windows the file lives in a managed XDG dir — seed it from
+    // the user's real `~/.config/eden/qt-config.ini` (if any) so their
+    // tuned settings carry over before we apply launch overrides.
+    #[cfg(not(windows))]
+    if !path.exists() {
+        let home_cfg = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".config")
+            .join("eden")
+            .join("qt-config.ini");
+        if home_cfg.exists() {
+            let _ = std::fs::copy(&home_cfg, &path);
+        }
+    }
+    // Fullscreen only off-Windows: the XWM snaps fullscreen windows to
+    // the capture output and Qt hides menu/status chrome there, while
+    // on Windows the window is cloaked and must stay windowed.
+    #[cfg(windows)]
+    let fs = "false";
+    #[cfg(not(windows))]
+    let fs = "true";
     let mut desired: Vec<(&str, &str)> = vec![
         ("fullscreen\\default", "false"),
-        ("fullscreen", "false"),
+        ("fullscreen", fs),
         ("showStatusBar\\default", "false"),
         ("showStatusBar", "false"),
         ("pause_on_focus_loss\\default", "false"),
         ("pause_on_focus_loss", "false"),
+        ("firstStart\\default", "false"),
+        ("firstStart", "false"),
+        // The update prompt can't be dismissed over the input tunnel.
+        ("check_for_updates\\default", "false"),
+        ("check_for_updates", "false"),
     ];
     let Ok(existing) = std::fs::read_to_string(&path) else {
         let body: String = desired.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
@@ -1156,8 +1395,9 @@ fn retroarch_root(core: Option<&Path>) -> Option<PathBuf> {
 
 /// RetroArchHandler's focus-override appendconfig — a hidden window
 /// never has focus, so pause_nonactive stays off and game-focus
-/// hotkey grabs are disabled. RA runs plain windowed (the parked
-/// window is the capture surface); video_threaded is off so the
+/// hotkey grabs are disabled. On Windows RA runs plain windowed (the
+/// parked window is the capture surface); on Linux it fullscreens
+/// onto the nested compositor's output. video_threaded is off so the
 /// core's retro_run stays on the main thread — azahar's threaded
 /// video path faulted inside amdvlk under capture. The system dir
 /// follows the resolved frontend (`<launcher>/system` — Lacrima's
@@ -1171,10 +1411,16 @@ fn retroarch_append_config(exe: &Path, core: Option<&Path>) -> Option<PathBuf> {
     let root = retroarch_root(core)?;
     let libretro = root.join("Libretro");
     let path = root.join("retroarch-aes.cfg");
-    let lines = [
+    let mut lines = vec![
         "pause_nonactive = \"false\"".to_string(),
         "input_auto_game_focus = \"0\"".to_string(),
-        "video_fullscreen = \"false\"".to_string(),
+        // Windowed on Windows (the parked window is the capture
+        // surface); fullscreen on Linux so RA's toplevel fills the
+        // nested compositor's output.
+        format!(
+            "video_fullscreen = \"{}\"",
+            if cfg!(windows) { "false" } else { "true" }
+        ),
         "video_threaded = \"false\"".to_string(),
         format!(
             "system_directory = \"{}\"",
@@ -1192,6 +1438,13 @@ fn retroarch_append_config(exe: &Path, core: Option<&Path>) -> Option<PathBuf> {
             libretro.join("states").display()
         ),
     ];
+    // PPSSPP's bundled GLEW can't init under RA's glcore driver (core
+    // profile) — `gl` gives it the compatibility context its G3D
+    // backend needs. PSP-section launches only, Linux only (Windows
+    // keeps glcore — D3D/GPU capture doesn't hit the GLEW path).
+    if !cfg!(windows) && root.file_name().is_some_and(|n| n == "PSP") {
+        lines.push("video_driver = \"gl\"".to_string());
+    }
     let body = lines.join("\n") + "\n";
     if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
         std::fs::create_dir_all(&root).ok()?;

@@ -587,7 +587,6 @@ pub struct EmuView {
     render_dirty: bool,
     /// Extracted handler-exe icon for the setup button — keyed by
     /// the resolved exe path so a handler switch reloads it.
-    #[cfg(windows)]
     handler_icon_key: Option<String>,
     handler_icon: Option<egui::TextureHandle>,
     /// Resolved handler exe for the setup button — cached on the
@@ -650,11 +649,10 @@ pub struct EmuView {
     /// The live frame mapping the tunnel needs — `(dest, uv)` —
     /// refreshed every frame the session draw path computes them.
     tun_map: Option<(Rect, Rect)>,
-    /// Held mouse-button mask (MK_* bits) + tracked modifier state so
-    /// tunneled wParams carry correct key flags.
-    #[cfg(windows)]
+    /// Held mouse-button mask (MK_* bits on Windows, BTN_* bits off
+    /// it) + tracked modifier state so tunneled events carry correct
+    /// key flags.
     tun_buttons: u8,
-    #[cfg(windows)]
     tun_mods: u8,
     /// Diagnostics — forwarded-event count + last post result, shown
     /// in the stats overlay so tunnel issues are visible instead of
@@ -742,7 +740,6 @@ impl EmuView {
             render_open: false,
             render: settings::RenderOpts::default(),
             render_dirty: false,
-            #[cfg(windows)]
             handler_icon_key: None,
             handler_icon: None,
             setup_exe_key: String::new(),
@@ -770,9 +767,7 @@ impl EmuView {
             aspect_applied: false,
             input_tun: false,
             tun_map: None,
-            #[cfg(windows)]
             tun_buttons: 0,
-            #[cfg(windows)]
             tun_mods: 0,
             tun_sent: 0,
             tun_dbg: None,
@@ -1871,9 +1866,15 @@ pub fn view(
 
         // Input-tunnel toggle — while lit, clicks/keys inside the frame
         // reach the emulator's hidden window so its own dialogs are
-        // usable in the captured stream. (Windows-only: off Windows
-        // the emulator owns its own window.)
-        if cfg!(windows) && !tun_x.is_nan() {
+        // usable in the captured stream. On Linux the same applies when
+        // the session runs embedded in the nested compositor — an
+        // external-window fallback owns its input itself.
+        let tun_ok = if cfg!(windows) {
+            true
+        } else {
+            emu.session.as_ref().is_some_and(|s| s.embedded())
+        };
+        if tun_ok && !tun_x.is_nan() {
             let tb = Rect::from_center_size(Pos2::new(tun_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
                 ui.interact(tb, ui.id().with("emu-tun"), Sense::click())
@@ -1925,7 +1926,6 @@ pub fn view(
         // The handler's own exe icon (ExtractIconEx → 48px) inside a
         // rounded-rect button like Lacrima's setup tile — dimmed while
         // unavailable, a gear glyph when extraction fails.
-        #[cfg(windows)]
         if let Some(p) = &setup_exe {
             let key = p.to_string_lossy().into_owned();
             if emu.handler_icon_key.as_deref() != Some(key.as_str()) {
@@ -2566,11 +2566,271 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
     });
 }
 
-/// Off Windows there is no hidden emulator window to post into —
-/// the emulator runs in its own window and owns its input.
+/// Linux input path — the emulator lives inside the nested compositor
+/// (`Session::embedded`), so egui events translate to evdev codes and
+/// ride the compositor's wl_seat straight to the client's surface.
+/// Same toggle/geometry as the Windows PostMessage tunnel; the big
+/// differences are evdev codes instead of VKs, axis values instead of
+/// WM_MOUSEWHEEL deltas, and modifiers — egui reports them only via
+/// ModifiersChanged, so their key events are synthesized on edges
+/// (smithay's xkb updates and forwards wl_keyboard.modifiers itself).
 #[cfg(not(windows))]
-fn tunnel_input(_ui: &egui::Ui, emu: &mut EmuView, _active: bool) {
-    emu.input_tun = false;
+fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
+    use crate::wlcomp::WlInput;
+    if !emu.input_tun || !active {
+        return;
+    }
+    let Some((dest, uv)) = emu.tun_map else {
+        emu.input_tun = false;
+        return;
+    };
+    let Some(session) = &emu.session else {
+        emu.input_tun = false;
+        return;
+    };
+    if !session.embedded() || !matches!(session.status(), xenia::Status::Capturing) {
+        return;
+    }
+    // Surface-local coords equal captured pixels at buffer scale 1 —
+    // the frame texture size is the client coordinate space.
+    let Some((cw, ch)) = emu
+        .frame_tex
+        .as_ref()
+        .map(|t| (t.size()[0] as f64, t.size()[1] as f64))
+    else {
+        emu.tun_dbg = Some("no frame yet".into());
+        return;
+    };
+    emu.tun_dbg = None;
+    let map = |p: Pos2| -> Option<(f64, f64)> {
+        if dest.width() <= 0.0 || dest.height() <= 0.0 {
+            return None;
+        }
+        let p = Pos2::new(
+            p.x.clamp(dest.min.x, dest.max.x),
+            p.y.clamp(dest.min.y, dest.max.y),
+        );
+        let tx = (p.x - dest.min.x) / dest.width();
+        let ty = (p.y - dest.min.y) / dest.height();
+        Some((
+            (uv.min.x + tx * uv.width()) as f64 * cw,
+            (uv.min.y + ty * uv.height()) as f64 * ch,
+        ))
+    };
+    let btns = &mut emu.tun_buttons;
+    let mods = &mut emu.tun_mods;
+    let sent = &mut emu.tun_sent;
+    // Synthesized modifier keys — ModifiersChanged only carries the
+    // *new* state, so edges are detected against our shadow bitmask.
+    // Bit layout mirrors the Windows tunnel (bit0 shift, bit1 ctrl,
+    // bit2 alt, bit3 super).
+    let send_mod = |session: &xenia::Session, mods: &mut u8, bit: u8, down: bool, code: u32| {
+        let held = *mods & bit != 0;
+        if down != held {
+            if down {
+                *mods |= bit;
+            } else {
+                *mods &= !bit;
+            }
+            session.send_input(WlInput::Key {
+                code,
+                pressed: down,
+            });
+        }
+    };
+    ui.input(|i| {
+        for ev in &i.events {
+            match ev {
+                egui::Event::PointerMoved(p) => {
+                    if dest.contains(*p) || *btns != 0 {
+                        if let Some((x, y)) = map(*p) {
+                            session.send_input(WlInput::PointerMotion { x, y });
+                            *sent += 1;
+                        }
+                    }
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } => {
+                    // RMB keeps the app's session menu — LMB/MMB/
+                    // side-buttons forward as BTN_LEFT/MIDDLE/etc.
+                    let (code, bit) = match button {
+                        egui::PointerButton::Primary => (0x110, 0x01u8), // BTN_LEFT
+                        egui::PointerButton::Middle => (0x112, 0x02u8), // BTN_MIDDLE
+                        egui::PointerButton::Extra1 => (0x114, 0x04u8), // BTN_SIDE
+                        egui::PointerButton::Extra2 => (0x115, 0x08u8), // BTN_EXTRA
+                        _ => continue,
+                    };
+                    let held = *btns & bit != 0;
+                    if *pressed {
+                        *btns |= bit;
+                    } else {
+                        *btns &= !bit;
+                    }
+                    if (*pressed && dest.contains(*pos)) || (!*pressed && held) {
+                        if map(*pos).is_some() {
+                            session.send_input(WlInput::PointerButton {
+                                button: code,
+                                pressed: *pressed,
+                            });
+                            *sent += 1;
+                        }
+                    }
+                }
+                egui::Event::MouseWheel { delta, .. } => {
+                    if let Some(p) = i.pointer.latest_pos() {
+                        if dest.contains(p) {
+                            session.send_input(WlInput::PointerAxis {
+                                horizontal: delta.x as f64 * 15.0,
+                                vertical: delta.y as f64 * 15.0,
+                            });
+                            *sent += 1;
+                        }
+                    }
+                }
+                egui::Event::Key {
+                    key, pressed, ..
+                } => {
+                    // Esc is the app's release key — never forwarded.
+                    if *key == egui::Key::Escape {
+                        continue;
+                    }
+                    if let Some(code) = key_evdev(*key) {
+                        session.send_input(WlInput::Key {
+                            code,
+                            pressed: *pressed,
+                        });
+                        *sent += 1;
+                    }
+                }
+                egui::Event::ModifiersChanged(m) => {
+                    send_mod(session, mods, 0x01, m.shift, 42); // KEY_LEFTSHIFT
+                    send_mod(session, mods, 0x02, m.ctrl, 29); // KEY_LEFTCTRL
+                    send_mod(session, mods, 0x04, m.alt, 56); // KEY_LEFTALT
+                    send_mod(session, mods, 0x08, m.mac_cmd || m.command, 125); // KEY_LEFTMETA
+                }
+                // Text lands through the keycodes — wl_keyboard has no
+                // char event; the client's xkb composes it.
+                _ => {}
+            }
+        }
+    });
+    // Same shortcut suppression as the Windows tunnel — while the
+    // emulator owns input, Backspace/F12/Ctrl+F/arrows must not fire
+    // app shortcuts underneath. Esc stays — it releases the tunnel.
+    ui.ctx().input_mut(|i| {
+        i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
+        i.consume_key(egui::Modifiers::NONE, egui::Key::F12);
+        i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+        for k in [
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+        ] {
+            i.consume_key(egui::Modifiers::CTRL, k);
+            i.consume_key(egui::Modifiers::NONE, k);
+        }
+    });
+}
+
+/// egui Key → evdev keycode (linux/input-event-codes.h). Named char
+/// keys map to the physical key that produces them unshifted —
+/// clients re-derive the shifted char through their own xkb state.
+#[cfg(not(windows))]
+fn key_evdev(key: egui::Key) -> Option<u32> {
+    Some(match key {
+        egui::Key::Escape => 1,
+        egui::Key::Num1 | egui::Key::Exclamationmark => 2,
+        egui::Key::Num2 => 3,
+        egui::Key::Num3 => 4,
+        egui::Key::Num4 => 5,
+        egui::Key::Num5 => 6,
+        egui::Key::Num6 => 7,
+        egui::Key::Num7 => 8,
+        egui::Key::Num8 => 9,
+        egui::Key::Num9 => 10,
+        egui::Key::Num0 => 11,
+        egui::Key::Minus => 12,
+        egui::Key::Equals | egui::Key::Plus => 13,
+        egui::Key::Backspace => 14,
+        egui::Key::Tab => 15,
+        egui::Key::Q => 16,
+        egui::Key::W => 17,
+        egui::Key::E => 18,
+        egui::Key::R => 19,
+        egui::Key::T => 20,
+        egui::Key::Y => 21,
+        egui::Key::U => 22,
+        egui::Key::I => 23,
+        egui::Key::O => 24,
+        egui::Key::P => 25,
+        egui::Key::OpenBracket | egui::Key::OpenCurlyBracket => 26,
+        egui::Key::CloseBracket | egui::Key::CloseCurlyBracket => 27,
+        egui::Key::Enter => 28,
+        egui::Key::A => 30,
+        egui::Key::S => 31,
+        egui::Key::D => 32,
+        egui::Key::F => 33,
+        egui::Key::G => 34,
+        egui::Key::H => 35,
+        egui::Key::J => 36,
+        egui::Key::K => 37,
+        egui::Key::L => 38,
+        egui::Key::Semicolon | egui::Key::Colon => 39,
+        egui::Key::Quote => 40,
+        egui::Key::Backtick => 41,
+        egui::Key::Backslash | egui::Key::Pipe => 43,
+        egui::Key::Z => 44,
+        egui::Key::X => 45,
+        egui::Key::C => 46,
+        egui::Key::V => 47,
+        egui::Key::B => 48,
+        egui::Key::N => 49,
+        egui::Key::M => 50,
+        egui::Key::Comma => 51,
+        egui::Key::Period => 52,
+        egui::Key::Slash | egui::Key::Questionmark => 53,
+        egui::Key::Space => 57,
+        egui::Key::F1 => 59,
+        egui::Key::F2 => 60,
+        egui::Key::F3 => 61,
+        egui::Key::F4 => 62,
+        egui::Key::F5 => 63,
+        egui::Key::F6 => 64,
+        egui::Key::F7 => 65,
+        egui::Key::F8 => 66,
+        egui::Key::F9 => 67,
+        egui::Key::F10 => 68,
+        egui::Key::F11 => 87,
+        egui::Key::F12 => 88,
+        egui::Key::F13 => 183,
+        egui::Key::F14 => 184,
+        egui::Key::F15 => 185,
+        egui::Key::F16 => 186,
+        egui::Key::F17 => 187,
+        egui::Key::F18 => 188,
+        egui::Key::F19 => 189,
+        egui::Key::F20 => 190,
+        egui::Key::F21 => 191,
+        egui::Key::F22 => 192,
+        egui::Key::F23 => 193,
+        egui::Key::F24 => 194,
+        egui::Key::Home => 102,
+        egui::Key::ArrowUp => 103,
+        egui::Key::PageUp => 104,
+        egui::Key::ArrowLeft => 105,
+        egui::Key::ArrowRight => 106,
+        egui::Key::End => 107,
+        egui::Key::ArrowDown => 108,
+        egui::Key::PageDown => 109,
+        egui::Key::Insert => 110,
+        egui::Key::Delete => 111,
+        _ => return None,
+    })
 }
 
 /// Live render adjustments for the zero-copy path — the GPU-side
@@ -3063,6 +3323,9 @@ fn draw_session(
         xenia::Status::Capturing => {
             if cfg!(windows) {
                 (emu.frame_seq == 0).then(|| format!("Waiting for frames — {game_name}"))
+            } else if session.embedded() {
+                (emu.frame_tex.is_none())
+                    .then(|| format!("Waiting for frames — {game_name}"))
             } else {
                 Some(format!("{game_name} is running in its own window"))
             }

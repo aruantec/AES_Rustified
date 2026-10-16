@@ -36,6 +36,8 @@ mod url_prompt;
 mod waveform_bar;
 mod wgc;
 mod widgets;
+#[cfg(not(windows))]
+mod wlcomp;
 mod xenia;
 mod xenia_cfg;
 mod xenia_overlay;
@@ -4429,6 +4431,13 @@ fn settings_overlay(
 ) {
     let w = (content.width() * 0.38).clamp(240.0, content.width());
     let panel = Rect::from_min_max(Pos2::new(content.max.x - w * t, content.min.y), content.max);
+    // Tab bodies and the footer lay out against a fixed-width rect that
+    // translates with the slide: `panel.max.x` stays pinned to the window
+    // edge while `panel.min.x` moves, so content anchored to it would
+    // squash horizontally instead of sliding out rigidly (the way the UI
+    // tab's fixed-size controls do).
+    let body_panel =
+        Rect::from_min_max(panel.min, Pos2::new(panel.min.x + w, panel.max.y));
     let painter = ui.painter().clone();
 
     // Clicking the exposed content left of the panel closes it; the panel
@@ -4503,18 +4512,18 @@ fn settings_overlay(
 
     // Body content per tab.
     if *tab == 0 {
-        ui_tab_effects(ui, panel, t, settings, toy_names, scale);
+        ui_tab_effects(ui, body_panel, t, settings, toy_names, scale);
     } else if *tab == 1 {
-        emulation::settings_tab(ui, panel, t, emu, &mut settings.emulation, scale);
+        emulation::settings_tab(ui, body_panel, t, emu, &mut settings.emulation, scale);
     } else if *tab == 3 {
-        ui_tab_audio(ui, panel, t, settings, scale);
+        ui_tab_audio(ui, body_panel, t, settings, scale);
     } else if *tab == 4 {
-        ui_tab_carousel(ui, panel, t, settings, transport, scale);
+        ui_tab_carousel(ui, body_panel, t, settings, transport, scale);
     } else if *tab == 5 {
-        ui_tab_libraries(ui, panel, t, ytdlp, scale);
+        ui_tab_libraries(ui, body_panel, t, ytdlp, scale);
     } else {
         painter.text(
-            panel.center(),
+            body_panel.center(),
             Align2::CENTER_CENTER,
             format!("{} settings", SETTINGS_TABS[*tab]),
             FontId::proportional(30.0 * scale),
@@ -4527,7 +4536,7 @@ fn settings_overlay(
     painter.line_segment(
         [
             Pos2::new(panel.min.x + 15.0 * scale, panel.max.y - 70.0 * scale),
-            Pos2::new(panel.max.x - 12.0 * scale, panel.max.y - 70.0 * scale),
+            Pos2::new(body_panel.max.x - 12.0 * scale, panel.max.y - 70.0 * scale),
         ],
         Stroke::new(1.0, Color32::from_gray(45).gamma_multiply(t)),
     );
@@ -4577,14 +4586,14 @@ fn settings_overlay(
     }
 
     painter.text(
-        Pos2::new(panel.max.x - 24.0 * scale, panel.max.y - 46.0 * scale),
+        Pos2::new(body_panel.max.x - 24.0 * scale, panel.max.y - 46.0 * scale),
         Align2::RIGHT_CENTER,
         "CURRENT VERSION",
         FontId::proportional(12.0 * scale),
         Color32::from_gray(110).gamma_multiply(t),
     );
     painter.text(
-        Pos2::new(panel.max.x - 24.0 * scale, panel.max.y - 26.0 * scale),
+        Pos2::new(body_panel.max.x - 24.0 * scale, panel.max.y - 26.0 * scale),
         Align2::RIGHT_CENTER,
         env!("CARGO_PKG_VERSION"),
         FontId::proportional(16.0 * scale),
