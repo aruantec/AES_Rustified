@@ -45,6 +45,9 @@ sha2 = "0.10"
 zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.24.0"
 flate2 = "1.1.10"
+md-5 = "0.10"
+sha1 = "0.10"
+crc32fast = "1"
 
 # Native Windows Graphics Capture for emulator frame capture (the
 # WgcBridge-equivalent path — WinRT WGC + D3D11 staging readback) plus

@@ -155,6 +155,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "cpal",
+ "crc32fast",
  "dirs",
  "eframe",
  "egui_extras",
@@ -162,6 +163,7 @@ dependencies = [
  "flate2",
  "image",
  "lofty",
+ "md-5",
  "naga",
  "resvg",
  "rfd",
@@ -171,6 +173,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "sha1",
  "sha2 0.10.9",
  "symphonia",
  "ureq",
@@ -2347,6 +2350,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3813,6 +3826,17 @@ dependencies = [
  "ppmd-rust",
  "sha2 0.11.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

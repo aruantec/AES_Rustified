@@ -55,6 +55,7 @@ const EDEN_HANDLER: &str = "eden";
 const THREE_DS_SECTION: &str = "3DS";
 const N64_SECTION: &str = "N64";
 const NES_SECTION: &str = "NES";
+const GENESIS_SECTION: &str = "GENESIS";
 const RETROARCH_HANDLER: &str = "retroarch";
 
 /// The persisted selected-core field for a RetroArch-backed section —
@@ -68,6 +69,7 @@ fn selected_core<'a>(
         libretro::Section::ThreeDs => &mut cfg.selected_3ds_core,
         libretro::Section::N64 => &mut cfg.selected_n64_core,
         libretro::Section::Nes => &mut cfg.selected_nes_core,
+        libretro::Section::Genesis => &mut cfg.selected_genesis_core,
     }
 }
 
@@ -77,6 +79,7 @@ fn selected_core_id<'a>(cfg: &'a settings::Emulation, section: libretro::Section
         libretro::Section::ThreeDs => cfg.selected_3ds_core.as_str(),
         libretro::Section::N64 => cfg.selected_n64_core.as_str(),
         libretro::Section::Nes => cfg.selected_nes_core.as_str(),
+        libretro::Section::Genesis => cfg.selected_genesis_core.as_str(),
     }
 }
 
@@ -195,10 +198,11 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             download: emu_dl::download_eden,
         },
         THREE_DS_SECTION => retroarch_spec(THREE_DS_SECTION),
-        // N64 + NES share the RetroArch handler + frontend install —
-        // only the Libretro core set is section-specific.
+        // N64, NES + Genesis share the RetroArch handler + frontend
+        // install — only the Libretro core set is section-specific.
         N64_SECTION => retroarch_spec(N64_SECTION),
         NES_SECTION => retroarch_spec(NES_SECTION),
+        GENESIS_SECTION => retroarch_spec(GENESIS_SECTION),
         _ => return None,
     })
 }
@@ -1017,7 +1021,7 @@ impl EmuView {
             GCN_SECTION | WII_SECTION => Some(DOLPHIN_HANDLER.to_string()),
             WIIU_SECTION => Some(CEMU_HANDLER.to_string()),
             SWITCH_SECTION => Some(EDEN_HANDLER.to_string()),
-            THREE_DS_SECTION | N64_SECTION | NES_SECTION => {
+            THREE_DS_SECTION | N64_SECTION | NES_SECTION | GENESIS_SECTION => {
                 Some(RETROARCH_HANDLER.to_string())
             }
             _ => None,

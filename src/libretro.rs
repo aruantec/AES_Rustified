@@ -25,16 +25,18 @@ pub enum Section {
     ThreeDs,
     N64,
     Nes,
+    Genesis,
 }
 
 impl Section {
-    /// Section key ("3DS", "N64", "NES") → core section. `None` for
-    /// sections with no RetroArch handler.
+    /// Section key ("3DS", "N64", "NES", "GENESIS") → core section.
+    /// `None` for sections with no RetroArch handler.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "3DS" => Some(Self::ThreeDs),
             "N64" => Some(Self::N64),
             "NES" => Some(Self::Nes),
+            "GENESIS" => Some(Self::Genesis),
             _ => None,
         }
     }
@@ -44,6 +46,7 @@ impl Section {
             Self::ThreeDs => "3DS",
             Self::N64 => "N64",
             Self::Nes => "NES",
+            Self::Genesis => "GENESIS",
         }
     }
 
@@ -52,6 +55,7 @@ impl Section {
             Self::ThreeDs => "3ds_cores.json",
             Self::N64 => "n64_cores.json",
             Self::Nes => "nes_cores.json",
+            Self::Genesis => "genesis_cores.json",
         }
     }
 
@@ -60,6 +64,7 @@ impl Section {
             Self::ThreeDs => "3DS",
             Self::N64 => "N64",
             Self::Nes => "NES",
+            Self::Genesis => "Genesis",
         }
     }
 
@@ -70,6 +75,7 @@ impl Section {
             Self::ThreeDs => is_3ds_info(fields),
             Self::N64 => is_n64_info(fields),
             Self::Nes => is_nes_info(fields),
+            Self::Genesis => is_genesis_info(fields),
         }
     }
 }
@@ -502,6 +508,43 @@ fn is_nes_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
     has_nes_extension && nes_meta
 }
 
+/// Sega Genesis/Mega Drive counterpart — genplusgx, picodrive,
+/// blastem. Meta must name a 16-bit Sega system (the token set
+/// covers "Sega - MS/GG/MD/CD" and "Mega Drive" spellings) and the
+/// extension list must carry a Genesis container — Saturn/Game Gear
+/// cores stay out on both axes.
+fn is_genesis_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_gen_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "md" | "gen" | "smd" | "32x" | "68k" | "sg"
+        )
+    });
+    let meta = [system, database, display].iter().any(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("genesis")
+            || lower.contains("mega drive")
+            || lower.contains("megadrive")
+            || lower.contains("mega cd")
+            || lower.contains("sega cd")
+            || lower.contains("32x")
+            || lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| t == "md")
+    });
+    has_gen_extension && meta
+}
+
 fn extract_core_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
     std::fs::create_dir_all(destination)
         .map_err(|e| format!("Cannot create core directory: {e}"))?;
@@ -639,7 +682,8 @@ fn set_progress(progress: &CoreDownload, stage: &str, fraction: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_3ds_info, is_n64_info, is_nes_info, parse_info_fields, select_core, CoreInfo,
+        is_3ds_info, is_genesis_info, is_n64_info, is_nes_info, parse_info_fields,
+        select_core, CoreInfo,
     };
 
     #[test]
@@ -787,5 +831,52 @@ mod tests {
             "#,
         );
         assert!(!is_nes_info(&azahar));
+    }
+
+    #[test]
+    fn genesis_info_filter_accepts_genplusgx_and_picodrive() {
+        let genplusgx = parse_info_fields(
+            r#"
+                corename = "Genesis Plus GX"
+                display_name = "Sega - MS/GG/MD/CD (Genesis Plus GX)"
+                systemname = "Sega 8/16-bit (Various)"
+                supported_extensions = "mdx|md|smd|gen|bin|cue|iso|sms|68k|sg|chd|m3u"
+            "#,
+        );
+        assert!(is_genesis_info(&genplusgx));
+        let picodrive = parse_info_fields(
+            r#"
+                corename = "PicoDrive"
+                display_name = "Sega - Mega Drive/Sega CD/32X (PicoDrive)"
+                systemname = "Sega Mega Drive"
+                supported_extensions = "bin|gen|smd|md|32x|cue|iso|chd|sms"
+            "#,
+        );
+        assert!(is_genesis_info(&picodrive));
+    }
+
+    #[test]
+    fn genesis_info_filter_rejects_saturn_and_sms() {
+        let saturn = parse_info_fields(
+            r#"
+                corename = "Beetle Saturn"
+                display_name = "Sega - Saturn (Beetle Saturn)"
+                systemname = "Sega Saturn"
+                database = "Sega - Saturn"
+                supported_extensions = "cue|ccd|chd|iso|img|mds|toc"
+            "#,
+        );
+        assert!(!is_genesis_info(&saturn));
+        // Master System only — no Genesis metadata, no Genesis
+        // cartridge extension.
+        let sms = parse_info_fields(
+            r#"
+                corename = "SMS Plus GX"
+                display_name = "Sega - MS/GG (SMS Plus GX)"
+                systemname = "Sega Master System"
+                supported_extensions = "sms|gg|sg|col|rom|bin"
+            "#,
+        );
+        assert!(!is_genesis_info(&sms));
     }
 }

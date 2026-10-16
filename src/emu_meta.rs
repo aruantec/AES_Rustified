@@ -1047,6 +1047,401 @@ fn ps_db(file: &'static str) -> &'static HashMap<String, String> {
     })
 }
 
+// ------------------------------------------------------------------
+// NES: No-Intro hash database (Lacrima's EmulationHashTitleResolver)
+// ------------------------------------------------------------------
+
+/// Lacrima's `FullHashThreshold` — cartridge files only.
+const CART_HASH_LIMIT: u64 = 200 * 1024 * 1024;
+
+/// A No-Intro hash→title database (`EmulationHashTitleDatabase`) —
+/// nes.json / genesis.json share the same {title, md5, sha1, crc}
+/// row shape.
+#[derive(Default)]
+struct HashTitleDb {
+    md5: HashMap<String, String>,
+    sha1: HashMap<String, String>,
+    crc: HashMap<String, String>,
+}
+
+fn hash_title_db(file: &'static str) -> &'static HashTitleDb {
+    static NES: OnceLock<HashTitleDb> = OnceLock::new();
+    static GENESIS: OnceLock<HashTitleDb> = OnceLock::new();
+    let (slot, json) = match file {
+        "nes.json" => (&NES, include_str!("../assets/database/nes.json")),
+        _ => (
+            &GENESIS,
+            include_str!("../assets/database/genesis.json"),
+        ),
+    };
+    slot.get_or_init(|| {
+        let mut db = HashTitleDb::default();
+        for e in serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap_or_default() {
+            let Some(title) = e
+                .get("title")
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            else {
+                continue;
+            };
+            // Lacrima's NormalizeHash/NormalizeCrc — hashes lowercase
+            // without dashes, CRC uppercase without the 0x prefix.
+            if let Some(h) = e.get("md5").and_then(|s| s.as_str()).map(norm_hash) {
+                db.md5.entry(h).or_insert_with(|| title.to_string());
+            }
+            if let Some(h) = e.get("sha1").and_then(|s| s.as_str()).map(norm_hash) {
+                db.sha1.entry(h).or_insert_with(|| title.to_string());
+            }
+            if let Some(c) = e.get("crc").and_then(|s| s.as_str()).map(norm_crc) {
+                db.crc.entry(c).or_insert_with(|| title.to_string());
+            }
+        }
+        db
+    })
+}
+
+fn norm_hash(v: &str) -> String {
+    v.trim().replace('-', "").to_lowercase()
+}
+
+fn norm_crc(v: &str) -> String {
+    v.trim()
+        .strip_prefix("0x")
+        .or_else(|| v.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| v.trim())
+        .to_uppercase()
+}
+
+/// md5 → sha1 → crc, in that order (Lacrima's TryResolveHashes).
+fn hash_db_resolve(file: &'static str, bytes: &[u8]) -> Option<String> {
+    use md5::Digest as _;
+    let db = hash_title_db(file);
+    let md5 = format!("{:x}", md5::Md5::digest(bytes));
+    if let Some(t) = db.md5.get(&md5) {
+        return Some(t.clone());
+    }
+    let sha1 = format!("{:x}", sha1::Sha1::digest(bytes));
+    if let Some(t) = db.sha1.get(&sha1) {
+        return Some(t.clone());
+    }
+    let crc = format!("{:08X}", crc32fast::hash(bytes));
+    db.crc.get(&crc).cloned()
+}
+
+/// Lacrima's `TryNormalizeNesRomForHash` — iNES files also hash their
+/// payload minus the 16-byte header and optional 512-byte trainer,
+/// catching dumps whose header bytes differ from the DAT's.
+fn nes_normalized_body(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() <= 16 || bytes[0..4] != [b'N', b'E', b'S', 0x1A] {
+        return None;
+    }
+    let trainer = if bytes[6] & 0x04 != 0 { 512 } else { 0 };
+    bytes.get(16 + trainer..)
+}
+
+/// Lacrima's `ExtractNesTitle` — the iNES 2.0 "Name" tag in the
+/// extension area after PRG+CHR (+trainer).
+fn nes_ines_title(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 16 || bytes[0..4] != [b'N', b'E', b'S', 0x1A] {
+        return None;
+    }
+    // NES 2.0 marker: byte 7 bits 2-3 == 0b10.
+    if bytes[7] & 0x0C != 0x08 {
+        return None;
+    }
+    let prg = bytes[4] as usize * 0x4000;
+    let chr = bytes[5] as usize * 0x2000;
+    let trainer = if bytes[6] & 0x04 != 0 { 512 } else { 0 };
+    let ext_off = 16 + trainer + prg + chr;
+    if bytes.len() <= ext_off + 8 {
+        return None;
+    }
+    let end = bytes.len().min(ext_off + 64 * 1024);
+    let area = &bytes[ext_off..end];
+    let mut i = 0;
+    while i + 8 <= area.len() {
+        if area[i..i + 4] == *b"Name" {
+            let len = u32::from_le_bytes(area[i + 4..i + 8].try_into().ok()?) as usize;
+            if len == 0 || i + 8 + len > area.len() {
+                return None;
+            }
+            let title = clean_ascii_text(
+                String::from_utf8_lossy(&area[i + 8..i + 8 + len])
+                    .trim_end_matches('\0'),
+            );
+            return if valid_rom_title(&title) {
+                Some(title)
+            } else {
+                None
+            };
+        }
+        if area[i] == 0 && (i == 0 || area[i - 1] == 0) {
+            break;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Lacrima's `CleanAsciiText` — printable ASCII + whitespace,
+/// collapse runs of space/tab.
+fn clean_ascii_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_ws = false;
+    for c in raw.chars() {
+        if c == '\t' || c == '\n' || c == '\r' || (c as u32) >= 32 && (c as u32) <= 126 {
+            out.push(c);
+        } else {
+            out.push(' ');
+        }
+    }
+    let mut clean = String::with_capacity(out.len());
+    for c in out.chars() {
+        match c {
+            ' ' | '\t' if pending_ws => {}
+            ' ' | '\t' => {
+                pending_ws = true;
+                clean.push(' ');
+            }
+            '\r' => {}
+            _ => {
+                pending_ws = false;
+                clean.push(c);
+            }
+        }
+    }
+    clean.trim().to_string()
+}
+
+/// Lacrima's `IsValidTitle` — ≥3 chars, ≥2 alnum, ≥30% alnum.
+fn valid_rom_title(text: &str) -> bool {
+    let text = text.trim();
+    if text.len() < 3 {
+        return false;
+    }
+    let alnum = text.chars().filter(|c| c.is_alphanumeric()).count();
+    alnum >= 2 && alnum as f64 / text.len() as f64 >= 0.3
+}
+
+/// NES title — hash the file (then the headerless iNES body) against
+/// nes.json, else the iNES 2.0 name tag, else the caller's stem.
+fn nes_title(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() as u64 <= CART_HASH_LIMIT {
+        if let Some(t) = hash_db_resolve("nes.json", &bytes) {
+            return Some(t);
+        }
+        if let Some(body) = nes_normalized_body(&bytes) {
+            if let Some(t) = hash_db_resolve("nes.json", body) {
+                return Some(t);
+            }
+        }
+    }
+    nes_ines_title(&bytes)
+}
+
+// ------------------------------------------------------------------
+// Genesis: No-Intro hash DB over the NORMALIZED dump (Lacrima's
+// TryApplyGenesisCartridgeInspection) → header title
+// (ExtractGenesisTitleFromBytes).
+// ------------------------------------------------------------------
+
+/// Genesis extension list for archive-member selection — the same
+/// cartridge set the section scans, minus the containers.
+const GENESIS_CART_EXTS: &[&str] = &["gen", "md", "smd", "32x", "sg", "bin"];
+
+/// The ROM bytes to inspect: the file itself, or the first
+/// cartridge member inside a zip/7z (member name returned for the
+/// SMD filename hint Lacrima uses).
+fn genesis_rom_bytes(path: &Path) -> Option<(Vec<u8>, Option<String>)> {
+    use std::io::Read as _;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "zip" => {
+            let f = std::fs::File::open(path).ok()?;
+            let mut z = zip::ZipArchive::new(f).ok()?;
+            for i in 0..z.len() {
+                let mut e = z.by_index(i).ok()?;
+                if e.is_dir() || e.size() > CART_HASH_LIMIT {
+                    continue;
+                }
+                let Ok(entry_name) = e.name() else {
+                    continue;
+                };
+                let name = entry_name
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let eext = name
+                    .rsplit_once('.')
+                    .map(|(_, x)| x.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !GENESIS_CART_EXTS.contains(&eext.as_str()) {
+                    continue;
+                }
+                let mut buf = Vec::with_capacity(e.size() as usize);
+                if e.read_to_end(&mut buf).is_err() {
+                    return None;
+                }
+                return Some((buf, Some(name)));
+            }
+            None
+        }
+        "7z" => {
+            let f = std::fs::File::open(path).ok()?;
+            let mut r =
+                sevenz_rust2::ArchiveReader::new(f, sevenz_rust2::Password::empty()).ok()?;
+            let name = r
+                .archive()
+                .files
+                .iter()
+                .find(|e| {
+                    e.has_stream()
+                        && !e.is_directory()
+                        && e.size <= CART_HASH_LIMIT
+                        && e.name()
+                            .rsplit_once('.')
+                            .map(|(_, x)| {
+                                GENESIS_CART_EXTS
+                                    .contains(&x.to_ascii_lowercase().as_str())
+                            })
+                            .unwrap_or(false)
+                })
+                .map(|e| e.name().to_string())?;
+            let buf = r.read_file(&name).ok()?;
+            Some((buf, Some(name)))
+        }
+        _ => {
+            if std::fs::metadata(path).ok()?.len() > CART_HASH_LIMIT {
+                return None;
+            }
+            Some((std::fs::read(path).ok()?, None))
+        }
+    }
+}
+
+fn genesis_has_tag(buf: &[u8], offset: usize, tag: &[u8; 4]) -> bool {
+    offset + 4 <= buf.len() && buf[offset..offset + 4] == *tag
+}
+
+/// SMD block deinterleave: even bytes live in the first half of each
+/// 16KB block, odd bytes in the second (DeinterleaveGenesisPayload).
+fn genesis_deinterleave(interleaved: &[u8]) -> Vec<u8> {
+    if interleaved.is_empty() || interleaved.len() % 16384 != 0 {
+        return interleaved.to_vec();
+    }
+    let mut out = vec![0u8; interleaved.len()];
+    for block in 0..interleaved.len() / 16384 {
+        let start = block * 16384;
+        for i in 0..8192 {
+            out[start + i * 2] = interleaved[start + i];
+            out[start + i * 2 + 1] = interleaved[start + 8192 + i];
+        }
+    }
+    out
+}
+
+/// Lacrima's `TryBuildGenesisLookupRom` — produce the canonical dump
+/// bytes the No-Intro hashes are computed over: strip a 512-byte SMD
+/// copier header, try raw SEGA tag, deinterleave, then the ESAG
+/// byte-pair swap.
+fn genesis_lookup_rom(data: &[u8], entry_name: Option<&str>) -> Option<Vec<u8>> {
+    let mut payload: &[u8] = data;
+    let smd = entry_name
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".smd"))
+        || (data.len() > 512 && (data.len() - 512) % 16384 == 0);
+    if smd {
+        if data.len() <= 512 {
+            return None;
+        }
+        payload = &data[512..];
+    }
+    if payload.len() < 0x200 {
+        return None;
+    }
+    if genesis_has_tag(payload, 0x100, b"SEGA") {
+        return Some(payload.to_vec());
+    }
+    if payload.len() % 16384 != 0 {
+        return None;
+    }
+    let de = genesis_deinterleave(payload);
+    if genesis_has_tag(&de, 0x100, b"SEGA") {
+        return Some(de);
+    }
+    if !genesis_has_tag(&de, 0x100, b"ESAG") {
+        return None;
+    }
+    let mut swapped = de;
+    for pair in swapped.chunks_exact_mut(2) {
+        pair.swap(0, 1);
+    }
+    genesis_has_tag(&swapped, 0x100, b"SEGA").then_some(swapped)
+}
+
+/// A Genesis ASCII header field — printable-ASCII run, trimmed
+/// (Lacrima's ReadGenesisAsciiField).
+fn genesis_ascii_field(buf: &[u8], offset: usize, len: usize) -> String {
+    if offset >= buf.len() {
+        return String::new();
+    }
+    let max = buf.len().min(offset + len);
+    let mut end = offset;
+    while end < max && (32..=126).contains(&buf[end]) {
+        end += 1;
+    }
+    String::from_utf8_lossy(&buf[offset..end]).trim_end().to_string()
+}
+
+/// ExtractGenesisTitleFromBytes — international name at 0x150 wins;
+/// the domestic name at 0x120 tries the short form before '/' first.
+fn genesis_header_title(normalized: &[u8]) -> Option<String> {
+    if normalized.len() < 0x180 {
+        return None;
+    }
+    let international = genesis_ascii_field(normalized, 0x150, 48);
+    if !international.trim().is_empty() {
+        let cleaned = clean_ascii_text(&international);
+        if valid_rom_title(&cleaned) {
+            return Some(cleaned);
+        }
+    }
+    let domestic = genesis_ascii_field(normalized, 0x120, 48);
+    if !domestic.trim().is_empty() {
+        if let Some(slash) = domestic.find('/') {
+            let short = clean_ascii_text(&domestic[..slash]);
+            if valid_rom_title(&short) {
+                return Some(short);
+            }
+        }
+        let cleaned = clean_ascii_text(&domestic);
+        if valid_rom_title(&cleaned) {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+/// Genesis title — normalize the dump (SMD/deinterleave/pair-swap),
+/// hash it against genesis.json; else the SEGA header name field;
+/// a non-normalizable file still gets the raw-hash shot like
+/// Lacrima's fallback ApplyCartridgeHashes.
+fn genesis_title(path: &Path) -> Option<String> {
+    let (bytes, inner_name) = genesis_rom_bytes(path)?;
+    if let Some(norm) = genesis_lookup_rom(&bytes, inner_name.as_deref()) {
+        if let Some(t) = hash_db_resolve("genesis.json", &norm) {
+            return Some(t);
+        }
+        return genesis_header_title(&norm);
+    }
+    hash_db_resolve("genesis.json", &bytes)
+}
+
 /// The disc serial — Lacrima's GetTitleId dispatch on extension.
 pub(crate) fn ps_disc_serial(path: &Path) -> Option<String> {
     let ext = path
@@ -3480,6 +3875,11 @@ fn resolve_one(
                 "WIIU" => wiiu_title(path),
                 "SWITCH" => switch_title(path),
                 "3DS" => three_ds_title(path),
+                // No-Intro hash DB (nes.json) → iNES 2.0 name tag.
+                "NES" => nes_title(path),
+                // No-Intro hash DB over the normalized dump → SEGA
+                // header name field.
+                "GENESIS" => genesis_title(path),
                 "PS3" => ps3_title(path),
                 "PS4" => ps4_title(path),
                 _ => None,
@@ -4103,6 +4503,124 @@ mod tests {
         // Prefix chars that aren't all-alpha mustn't false-positive
         // the generic PS4 pattern on "123456789".
         assert!(ps4_title_id_token("123456789").is_none());
+    }
+
+    /// The embedded No-Intro NES database parses and keys land in
+    /// the normalized forms the resolver produces.
+    #[test]
+    fn nes_db_loads_and_normalizes() {
+        let db = hash_title_db("nes.json");
+        assert!(db.md5.len() > 1000, "nes.json should be thousands of rows");
+        // First entry in nes.json: "!Clik! (World) (Proto 1)".
+        assert_eq!(
+            db.crc.get("865709AB").map(String::as_str),
+            Some("!Clik! (World) (Proto 1)")
+        );
+        assert_eq!(norm_crc(" 0x865709ab "), "865709AB");
+        assert_eq!(norm_hash("  AA-BB-CC "), "aabbcc");
+        // genesis.json loads too — first row "007 Shitou - The
+        // Duel (Japan) (En)".
+        let gdb = hash_title_db("genesis.json");
+        assert_eq!(
+            gdb.crc.get("AEB4B262").map(String::as_str),
+            Some("007 Shitou - The Duel (Japan) (En)")
+        );
+    }
+
+    /// iNES normalization strips the 16-byte header and the
+    /// trainer when flag6 bit2 is set — the alt-hash candidate.
+    #[test]
+    fn nes_normalized_body_strips_header_and_trainer() {
+        let mut rom = b"NES\x1A".to_vec();
+        rom.extend([1u8, 1, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // trainer flag set
+        rom.extend([0xAA; 512]); // trainer
+        rom.extend([0xBB; 0x4000]); // prg
+        rom.extend([0xCC; 0x2000]); // chr
+        assert_eq!(nes_normalized_body(&rom).map(|b| b.len()), Some(512 + 0x4000 + 0x2000 - 512));
+        // Body starts right after header+trainer — all AA trainer
+        // bytes must be excluded.
+        let body = nes_normalized_body(&rom).unwrap();
+        assert_eq!(&body[..16], &[0xBB; 16]);
+        assert!(nes_normalized_body(b"not a rom").is_none());
+    }
+
+    /// iNES 2.0 "Name" tag extraction + the validity gate that
+    /// rejects garbage extension data.
+    #[test]
+    fn nes_ines2_name_tag_title() {
+        let mut rom = b"NES\x1A".to_vec();
+        rom.extend([1, 1, 0, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]); // NES 2.0
+        rom.extend([0u8; 0x4000 + 0x2000]); // prg + chr
+        rom.extend(b"Name");
+        rom.extend(11u32.to_le_bytes());
+        rom.extend(b"StarCursor\0");
+        assert_eq!(nes_ines_title(&rom).as_deref(), Some("StarCursor"));
+        // Same payload without the 2.0 marker → no tag read.
+        rom[7] = 0;
+        assert!(nes_ines_title(&rom).is_none());
+        // Garbage tag content fails the alnum-ratio check.
+        rom[7] = 0x08;
+        let tail = rom.len() - 4 - 11;
+        for i in 0..11 {
+            rom[tail + i] = 0x01;
+        }
+        assert!(nes_ines_title(&rom).is_none());
+    }
+
+    /// Genesis lookup normalization: plain SEGA-tag dumps pass
+    /// through, SMD containers get the 512B strip + deinterleave,
+    /// ESAG dumps get the pair swap.
+    #[test]
+    fn genesis_lookup_rom_normalizes_variants() {
+        // Plain .gen — SEGA tag at 0x100.
+        let mut rom = vec![0u8; 0x400];
+        rom[0x100..0x104].copy_from_slice(b"SEGA");
+        assert_eq!(
+            genesis_lookup_rom(&rom, Some("game.gen")).map(|v| v.len()),
+            Some(0x400)
+        );
+
+        // Real SMD layout: 512B copier header + one interleaved 16KB
+        // block — even output bytes come from the block's first
+        // half, odd bytes from the second.
+        let mut file = vec![0u8; 512 + 16384];
+        let p = 512; // payload base
+        file[p + 128] = b'S'; // → out[0x100]
+        file[p + 8192 + 128] = b'E'; // → out[0x101]
+        file[p + 129] = b'G'; // → out[0x102]
+        file[p + 8192 + 129] = b'A'; // → out[0x103]
+        let norm = genesis_lookup_rom(&file, Some("game.smd")).unwrap();
+        assert_eq!(&norm[0x100..0x104], b"SEGA");
+
+        // Interleaved AND byte-swapped: ESAG after deinterleave →
+        // the pair swap recovers SEGA.
+        file[p + 128] = b'E';
+        file[p + 8192 + 128] = b'S';
+        file[p + 129] = b'A';
+        file[p + 8192 + 129] = b'G';
+        let norm = genesis_lookup_rom(&file, Some("game2.smd")).unwrap();
+        assert_eq!(&norm[0x100..0x104], b"SEGA");
+
+        // Garbage never normalizes.
+        assert!(genesis_lookup_rom(&vec![0x55; 8192], Some("x.bin")).is_none());
+    }
+
+    /// Header title fields: international name at 0x150 wins over
+    /// the domestic field at 0x120; the domestic '/' short form is
+    /// tried first.
+    #[test]
+    fn genesis_header_title_fields() {
+        let mut rom = vec![b' '; 0x200];
+        rom[0x100..0x104].copy_from_slice(b"SEGA");
+        rom[0x120..0x12B].copy_from_slice(b"DOMESTIC NA");
+        rom[0x150..0x15F].copy_from_slice(b"SONIC THE HEDGE");
+        assert_eq!(
+            genesis_header_title(&rom).as_deref(),
+            Some("SONIC THE HEDGE")
+        );
+        // No international field → domestic wins.
+        rom[0x150..0x180].fill(b' ');
+        assert_eq!(genesis_header_title(&rom).as_deref(), Some("DOMESTIC NA"));
     }
 
     /// SYSTEM.CNF parsing — PSX `BOOT = cdrom:\...` and PS2
