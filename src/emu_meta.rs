@@ -1071,7 +1071,9 @@ fn hash_title_db(file: &'static str) -> &'static HashTitleDb {
     static GBA: OnceLock<HashTitleDb> = OnceLock::new();
     static PSP: OnceLock<HashTitleDb> = OnceLock::new();
     static PSP_REDUMP: OnceLock<HashTitleDb> = OnceLock::new();
+    static FBN: OnceLock<HashTitleDb> = OnceLock::new();
     let (slot, json) = match file {
+        "fbn.json" => (&FBN, include_str!("../assets/database/fbn.json")),
         "nes.json" => (&NES, include_str!("../assets/database/nes.json")),
         "snes.json" => (&SNES, include_str!("../assets/database/snes.json")),
         "gba.json" => (&GBA, include_str!("../assets/database/gba.json")),
@@ -1794,10 +1796,9 @@ fn psp_sfo_read(path: &Path) -> Option<(Option<String>, Option<String>)> {
     }
 }
 
-/// Stream-hash a (potentially multi-GB) PSP image and look it up in
-/// the redump db first, then the No-Intro db — Lacrima's
-/// TryResolvePspTitle fallback order.
-fn psp_hash_title(path: &Path) -> Option<String> {
+/// Stream-hash a (potentially multi-GB) image and try each db in
+/// order — Lacrima's TryResolvePspTitle fallback pattern.
+fn hash_db_resolve_file(path: &Path, dbs: &[&'static str]) -> Option<String> {
     use md5::Digest as _;
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
@@ -1818,7 +1819,7 @@ fn psp_hash_title(path: &Path) -> Option<String> {
         format!("{:x}", sha1.finalize()),
         format!("{:08X}", crc.finalize()),
     );
-    for file in ["psp_redump.json", "psp.json"] {
+    for file in dbs {
         let db = hash_title_db(file);
         if let Some(t) = db
             .md5
@@ -1830,6 +1831,19 @@ fn psp_hash_title(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn psp_hash_title(path: &Path) -> Option<String> {
+    hash_db_resolve_file(path, &["psp_redump.json", "psp.json"])
+}
+
+// ------------------------------------------------------------------
+// FBN: the dat hashes the romset archive itself (zip), so a whole-
+// file hash resolves the title; else the caller's stem.
+// ------------------------------------------------------------------
+
+fn fbn_title(path: &Path) -> Option<String> {
+    hash_db_resolve_file(path, &["fbn.json"])
 }
 
 /// PSP title — Lacrima's `TryResolvePspTitle`: the PARAM.SFO TITLE
@@ -4305,6 +4319,8 @@ fn resolve_one(
                 // PARAM.SFO TITLE (PBP/ISO9660/CSO) → redump →
                 // No-Intro hash DBs (psp_redump.json / psp.json).
                 "PSP" => psp_title(path),
+                // FBNeo dat hash of the romset archive (fbn.json).
+                "FBN" => fbn_title(path),
                 "PS3" => ps3_title(path),
                 "PS4" => ps4_title(path),
                 _ => None,
@@ -5063,6 +5079,13 @@ mod tests {
         assert_eq!(
             g.crc.get("F0815EE7").map(String::as_str),
             Some("Pokemon - Ruby Version (USA, Europe)")
+        );
+        // The generated FBNeo dat db — archive hashes of romset zips.
+        let f = hash_title_db("fbn.json");
+        assert!(f.md5.len() > 7000, "fbn.json should be ~7700 rows");
+        assert_eq!(
+            f.crc.get("AC6E93EA").map(String::as_str),
+            Some("Metal Slug - Super Vehicle-001")
         );
     }
 

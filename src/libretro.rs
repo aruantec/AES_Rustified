@@ -30,12 +30,13 @@ pub enum Section {
     Gba,
     Psp,
     Saturn,
+    FbNeo,
 }
 
 impl Section {
     /// Section key ("3DS", "N64", "NES", "GENESIS", "SNES", "GBA",
-    /// "PSP") → core section. `None` for sections with no RetroArch
-    /// handler.
+    /// "PSP", "SATURN", "FBN") → core section. `None` for sections
+    /// with no RetroArch handler.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "3DS" => Some(Self::ThreeDs),
@@ -46,6 +47,7 @@ impl Section {
             "GBA" => Some(Self::Gba),
             "PSP" => Some(Self::Psp),
             "SATURN" => Some(Self::Saturn),
+            "FBN" => Some(Self::FbNeo),
             _ => None,
         }
     }
@@ -66,6 +68,7 @@ impl Section {
             Self::Gba => "GBA",
             Self::Psp => "PSP",
             Self::Saturn => "SATURN",
+            Self::FbNeo => "FBN",
         }
     }
 
@@ -79,6 +82,7 @@ impl Section {
             Self::Gba => "gba_cores.json",
             Self::Psp => "psp_cores.json",
             Self::Saturn => "saturn_cores.json",
+            Self::FbNeo => "fbn_cores.json",
         }
     }
 
@@ -92,6 +96,7 @@ impl Section {
             Self::Gba => "GBA",
             Self::Psp => "PSP",
             Self::Saturn => "Saturn",
+            Self::FbNeo => "Final Burn Neo",
         }
     }
 
@@ -107,6 +112,7 @@ impl Section {
             Self::Gba => is_gba_info(fields),
             Self::Psp => is_psp_info(fields),
             Self::Saturn => is_saturn_info(fields),
+            Self::FbNeo => is_fbneo_info(fields),
         }
     }
 }
@@ -696,6 +702,48 @@ fn is_saturn_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
     has_disc_extension && meta
 }
 
+/// Final Burn Neo / arcade cores — Lacrima's arcade-family token set
+/// (fbneo, mame, fbalpha, neogeo, neocd, cps, "final burn", arcade)
+/// in the info metadata, plus an archive extension the section's
+/// romsets actually arrive as (zip/7z/dat). The extension check keeps
+/// cartridge cores out of the arcade catalog; neocd-style cue-only
+/// cores drop out too since they can't consume a zip romset.
+fn is_fbneo_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let corename = fields.get("corename").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_archive_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "zip" | "7z" | "dat"
+        )
+    });
+    let meta = [system, database, display, corename].iter().any(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("finalburn")
+            || lower.contains("final burn")
+            || lower.contains("fb_neo")
+            || lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| {
+                    matches!(
+                        t,
+                        "fbneo" | "fbn" | "mame" | "fbalpha" | "fba" | "neogeo" | "neocd" | "cps"
+                            | "arcade"
+                    )
+                })
+    });
+    has_archive_extension && meta
+}
+
 fn extract_core_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
     std::fs::create_dir_all(destination)
         .map_err(|e| format!("Cannot create core directory: {e}"))?;
@@ -833,7 +881,7 @@ fn set_progress(progress: &CoreDownload, stage: &str, fraction: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_3ds_info, is_gba_info, is_genesis_info, is_n64_info, is_nes_info,
+        is_3ds_info, is_fbneo_info, is_gba_info, is_genesis_info, is_n64_info, is_nes_info,
         is_psp_info, is_saturn_info, is_snes_info, parse_info_fields, select_core, CoreInfo,
     };
 
@@ -1227,12 +1275,59 @@ mod tests {
         assert!(!is_saturn_info(&no_ext));
     }
 
+    /// FBN/arcade cores — real fbneo/mame metadata passes; console
+    /// cores are gated out by the arcade token + archive extension.
+    #[test]
+    fn fbneo_info_filter_accepts_arcade_rejects_consoles() {
+        let fbneo = parse_info_fields(
+            r#"
+                corename = "FinalBurn Neo"
+                display_name = "Arcade (FinalBurn Neo)"
+                systemname = "Arcade (various)"
+                database = "FBNeo - Arcade Games"
+                supported_extensions = "zip|7z"
+            "#,
+        );
+        assert!(is_fbneo_info(&fbneo));
+        let mame = parse_info_fields(
+            r#"
+                corename = "MAME"
+                display_name = "MAME 2003-Plus"
+                systemname = "MAME 2003-Plus"
+                supported_extensions = "zip|7z|chd"
+            "#,
+        );
+        assert!(is_fbneo_info(&mame));
+        // A console core with an archive extension but no arcade
+        // metadata stays out (e.g. NES zips are not romsets).
+        let nestopia = parse_info_fields(
+            r#"
+                corename = "Nestopia"
+                systemname = "Nintendo Entertainment System"
+                supported_extensions = "nes|fds|unf|zip|7z"
+            "#,
+        );
+        assert!(!is_fbneo_info(&nestopia));
+        // Arcade metadata without an archive extension can't consume
+        // the section's zip/7z/dat romsets.
+        let no_ext = parse_info_fields(
+            r#"
+                corename = "FinalBurn Neo"
+                display_name = "Arcade (FinalBurn Neo)"
+                supported_extensions = "cue|chd"
+            "#,
+        );
+        assert!(!is_fbneo_info(&no_ext));
+    }
+
     #[test]
     fn section_key_roundtrips_from_card_key() {
         // The settings cards and download jobs key sections by the
         // same string — a mapping slip shows the wrong card's
         // progress or refreshes the wrong catalog.
-        for key in ["3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP", "SATURN"] {
+        for key in [
+            "3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP", "SATURN", "FBN",
+        ] {
             let section = super::Section::from_key(key).unwrap();
             assert_eq!(section.key(), key);
         }
