@@ -23,8 +23,17 @@ use eframe::epaint::PaintCallbackInfo;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
+#[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D12::{ID3D12Fence, ID3D12Resource};
+
+// The cross-API wait fence is a real COM object only on Windows — the
+// zero-copy ring never exists elsewhere, so the field types just need
+// somewhere to typecheck against.
+#[cfg(not(windows))]
+#[allow(non_camel_case_types)]
+type ID3D12Fence = ();
 
 /// The shipped collection — `(name, source)`; the name is the file
 /// stem shown in the panel ComboBox ("None" is implicit, not a file).
@@ -290,6 +299,7 @@ pub struct CapCallback {
     /// Zero-copy path only: the D3D12 queue waits on this fence value
     /// before the submit that samples the imported ring — the D3D11
     /// side's CopyResource is then guaranteed complete.
+    #[allow(dead_code)] // read only in the cfg(windows) prepare path
     wait: Option<(ID3D12Fence, u64)>,
 }
 
@@ -404,6 +414,15 @@ impl CaptureShader {
     /// pipelines sample in place. `Err(reason)` when the backend
     /// isn't DX12 or an import step fails — the caller then stays on
     /// the CPU mirror path and can show the reason in the overlay.
+    #[cfg(not(windows))]
+    pub fn import_share(
+        &mut self,
+        _share: &crate::wgc::GpuShare,
+    ) -> Result<ImportedRing, String> {
+        Err("zero-copy capture import requires the DX12 backend (Windows)".into())
+    }
+
+    #[cfg(windows)]
     pub fn import_share(
         &mut self,
         share: &crate::wgc::GpuShare,
@@ -807,6 +826,7 @@ impl egui_wgpu::CallbackTrait for CapCallback {
         // Zero-copy path: stage the cross-API wait so the submit that
         // samples the imported ring slot runs after the D3D11
         // CopyResource signaled this fence value.
+        #[cfg(windows)]
         if let Some((fence, v)) = &self.wait {
             unsafe {
                 if let Some(q) = queue.as_hal::<wgpu::hal::api::Dx12>() {

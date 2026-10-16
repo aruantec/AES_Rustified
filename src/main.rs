@@ -283,10 +283,13 @@ fn main() -> eframe::Result<()> {
     // textures through wgpu's DX12 backend; on Vulkan the import
     // silently can't happen and capture falls back to the CPU
     // mirror. Everything else (egui, shadertoys, capture shaders)
-    // runs fine on DX12.
+    // runs fine on DX12. Off Windows the default backend selection
+    // (Vulkan/GL) applies — there is no capture embed there.
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(cn) = &mut wgpu_options.wgpu_setup {
-        cn.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    if cfg!(windows) {
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(cn) = &mut wgpu_options.wgpu_setup {
+            cn.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        }
     }
 
     let native_options = eframe::NativeOptions {
@@ -896,7 +899,26 @@ impl AesRustApp {
 }
 
 impl eframe::App for AesRustApp {
+    /// The clear color outside the painted rounded frame. Windows
+    /// gets DWM corner rounding for free, so Lacrima's default
+    /// dark-tinted clear reads as rounded there; on Wayland/X11
+    /// nothing masks the square corners, so they must be truly
+    /// transparent for the painted corner radius to show.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if cfg!(windows) {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
+        } else {
+            egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(all(not(windows), debug_assertions))]
+        ui.ctx().all_styles_mut(|s| {
+            s.debug.debug_on_hover = true;
+            s.debug.show_interactive_widgets = true;
+            s.debug.show_widget_hits = true;
+        });
         {
             static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -925,10 +947,26 @@ impl eframe::App for AesRustApp {
         // Mirror the current window size into settings (un-maximized only,
         // so the restored size is the normal one).
         if !maximized && !is_fullscreen {
-            if let Some(inner) = ui.ctx().input(|i| i.viewport().inner_rect) {
-                self.settings.window.width = inner.width();
-                self.settings.window.height = inner.height();
+            // Wayland reports no window position, so `inner_rect` is
+            // None there — fall back to the screen rect (identical size
+            // in points) or the size is never persisted.
+            let size = ui
+                .ctx()
+                .input(|i| i.viewport().inner_rect)
+                .map(|r| r.size())
+                .unwrap_or_else(|| ui.ctx().content_rect().size());
+            #[cfg(not(windows))]
+            {
+                static LAST: std::sync::Mutex<Option<egui::Vec2>> =
+                    std::sync::Mutex::new(None);
+                let mut last = LAST.lock().unwrap();
+                if *last != Some(size) {
+                    *last = Some(size);
+                    boot_mark(&format!("window size {size:?}"));
+                }
             }
+            self.settings.window.width = size.x;
+            self.settings.window.height = size.y;
         }
 
         // Global UI scale — Lacrima's ScaleFactor/ScalableDecorator: the
@@ -990,7 +1028,12 @@ impl eframe::App for AesRustApp {
             if alpha_main > 0.001 && self.settings.effects.show_shadertoy {
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                     frame_rect,
-                    toy.callback(f32::from(radius), alpha_main),
+                    // u_corner is measured in physical px
+                    // (gl_FragCoord space) — convert the radius.
+                    toy.callback(
+                        f32::from(radius) * ui.ctx().pixels_per_point(),
+                        alpha_main,
+                    ),
                 ));
                 // The shader animates — keep the frame loop going.
                 ui.ctx().request_repaint();
@@ -3308,7 +3351,18 @@ fn lacrima_window_frame(
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
-                .fill(Color32::TRANSPARENT)
+                // Off Windows the clear color is fully transparent, so
+                // this base fill replicates what the Windows
+                // (12,12,12,180) clear produced beneath all chrome —
+                // without it the 1px seams inside the stroke and the
+                // translucent title bar show the bare desktop. On
+                // Windows the clear already provides it; painting it
+                // again would double-blend.
+                .fill(if cfg!(windows) {
+                    Color32::TRANSPARENT
+                } else {
+                    Color32::from_rgba_unmultiplied(12, 12, 12, 180)
+                })
                 .corner_radius(corner_radius)
                 .stroke(if maximized || is_fullscreen {
                     Stroke::NONE
@@ -3321,17 +3375,30 @@ fn lacrima_window_frame(
 
             let resize_dir =
                 resize_direction(&ctx, app_rect, maximized || is_fullscreen, resize_exclude);
+            #[cfg(not(windows))]
+            if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
+                boot_mark(&format!(
+                    "press {:?} app_rect={app_rect:?} panel={panel_rect:?} resize_dir={resize_dir:?} maximized={} fs={}",
+                    ctx.input(|i| i.pointer.interact_pos()),
+                    maximized, is_fullscreen,
+                ));
+            }
             if let Some(dir) = resize_dir {
                 ctx.set_cursor_icon(cursor_icon_for(dir));
                 if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
+                    boot_mark(&format!("resize grip {dir:?}"));
                     ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
                 }
             }
 
+            // The bar reaches the panel's edges — past the 1px
+            // frame-stroke inset — so its corner arcs share the stroke's
+            // arc centers instead of drawing a second, inset curve that
+            // leaves a wedge of clear-color/desktop at the corners.
             let title_bar_rect = Rect::from_min_max(
-                app_rect.min,
+                panel_rect.min,
                 Pos2::new(
-                    app_rect.max.x,
+                    panel_rect.max.x,
                     app_rect.min.y
                         + if is_fullscreen {
                             0.0
@@ -3340,7 +3407,15 @@ fn lacrima_window_frame(
                         },
                 ),
             );
+            add_contents(ui);
+
             if !is_fullscreen {
+                // The bar is painted as an overlay IN FRONT of the
+                // content below, so the interact must register AFTER
+                // it too — egui gives `hits.drag` to the last-registered
+                // drag-sensing widget under the pointer, and content
+                // widgets underneath (scroll areas, sliders) would
+                // otherwise steal window drags from the bar's dead zones.
                 let title_bar_response = ui.interact(
                     title_bar_rect,
                     ui.id().with("title_bar"),
@@ -3351,12 +3426,29 @@ fn lacrima_window_frame(
                 {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
+                #[cfg(not(windows))]
+                if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary))
+                    && title_bar_rect.contains(
+                        ctx.input(|i| i.pointer.interact_pos().unwrap_or_default()),
+                    )
+                {
+                    let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+                    let covering: Vec<Rect> = ctx
+                        .interactive_rects_last_pass()
+                        .into_iter()
+                        .filter(|r| r.contains(pos))
+                        .collect();
+                    boot_mark(&format!(
+                        "titlebar press: hovered={} contains={} down={} resize_dir={resize_dir:?} covering={covering:?}",
+                        title_bar_response.hovered(),
+                        title_bar_response.contains_pointer(),
+                        title_bar_response.is_pointer_button_down_on(),
+                    ));
+                }
                 if title_bar_response.double_clicked_by(PointerButton::Primary) {
                     ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                 }
             }
-
-            add_contents(ui);
 
             // Fullscreen renders content only — no bar, title, or
             // window buttons (Esc exits fullscreen; Esc/Backspace
@@ -3373,7 +3465,9 @@ fn lacrima_window_frame(
             // instead of drawing over it. A foreground LAYER would do
             // the same visually but blocks hit-testing for every widget
             // underneath it, so paint order is used instead.
-            let painter = ui.painter().clone().with_clip_rect(app_rect);
+            // Panel clip (not app_rect): the bar reaches past the
+            // frame-stroke inset to the window edge.
+            let painter = ui.painter().clone().with_clip_rect(panel_rect);
             // Mostly-opaque charcoal bar at the back button's face
             // tone (Lacrima's Black@0.8 bar, tinted to the corner
             // button's perceived #12 so the two read as one surface).
@@ -3473,7 +3567,7 @@ fn lacrima_window_frame(
 
             painter.line_segment(
                 [
-                    Pos2::new(app_rect.min.x, title_bar_rect.max.y),
+                    Pos2::new(panel_rect.min.x, title_bar_rect.max.y),
                     title_bar_rect.right_bottom(),
                 ],
                 Stroke::new((1.5 * scale).max(1.0), Color32::from_gray(85)),
@@ -3541,6 +3635,18 @@ fn lacrima_window_frame(
                     gear.on_hover_text("Settings");
                 });
             });
+
+            // Repaint the frame border once over all bar content — the
+            // translucent fills now reach the window edge and would
+            // ghost the gray arc through them.
+            if !(maximized || is_fullscreen) {
+                painter.rect_stroke(
+                    panel_rect,
+                    corner_radius,
+                    Stroke::new(1.0, Color32::from_rgb(105, 105, 105)),
+                    StrokeKind::Inside,
+                );
+            }
         });
 }
 
@@ -5824,6 +5930,9 @@ enum DialogAction {
 /// reach `egui::Key`), so pressed-edges are polled via
 /// GetAsyncKeyState: bit 0 of the return is "pressed since the
 /// previous call", which is exactly the tap event we want.
+/// Off Windows `media_key_events` is a no-op — the variants are
+/// never constructed there.
+#[cfg_attr(not(windows), allow(dead_code))]
 enum MediaKey {
     PlayPause,
     Stop,

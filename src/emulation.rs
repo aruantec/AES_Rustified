@@ -22,7 +22,12 @@ use crate::{
     xenia_overlay, xenia_profile,
 };
 
+// The input tunnel only exists on Windows (PostMessage into the
+// hidden emulator window) — off-Windows the emulator runs in its own
+// window and handles input natively.
+#[cfg(windows)]
 use windows::Win32::Foundation::{LPARAM, WPARAM};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -582,6 +587,7 @@ pub struct EmuView {
     render_dirty: bool,
     /// Extracted handler-exe icon for the setup button — keyed by
     /// the resolved exe path so a handler switch reloads it.
+    #[cfg(windows)]
     handler_icon_key: Option<String>,
     handler_icon: Option<egui::TextureHandle>,
     /// Resolved handler exe for the setup button — cached on the
@@ -646,7 +652,9 @@ pub struct EmuView {
     tun_map: Option<(Rect, Rect)>,
     /// Held mouse-button mask (MK_* bits) + tracked modifier state so
     /// tunneled wParams carry correct key flags.
+    #[cfg(windows)]
     tun_buttons: u8,
+    #[cfg(windows)]
     tun_mods: u8,
     /// Diagnostics — forwarded-event count + last post result, shown
     /// in the stats overlay so tunnel issues are visible instead of
@@ -734,6 +742,7 @@ impl EmuView {
             render_open: false,
             render: settings::RenderOpts::default(),
             render_dirty: false,
+            #[cfg(windows)]
             handler_icon_key: None,
             handler_icon: None,
             setup_exe_key: String::new(),
@@ -761,7 +770,9 @@ impl EmuView {
             aspect_applied: false,
             input_tun: false,
             tun_map: None,
+            #[cfg(windows)]
             tun_buttons: 0,
+            #[cfg(windows)]
             tun_mods: 0,
             tun_sent: 0,
             tun_dbg: None,
@@ -1401,6 +1412,7 @@ pub fn view(
     // ApplyCaptureAspectRatioToRunningTarget — once the worker
     // resolves the render window, resize it to the section's saved
     // aspect ("handler" leaves the emulator's own).
+    #[cfg(windows)]
     if !emu.aspect_applied {
         if let Some(session) = &emu.session {
             let hwnd = session.hwnd();
@@ -1411,6 +1423,10 @@ pub fn view(
                 emu.aspect_applied = true;
             }
         }
+    }
+    #[cfg(not(windows))]
+    {
+        emu.aspect_applied = true;
     }
 
     // Session teardown once the emulator reports exit. The last
@@ -1672,6 +1688,7 @@ pub fn view(
                         if emu.render.aspect_key != key {
                             emu.render.aspect_key = key.to_string();
                             emu.render_dirty = true;
+                            #[cfg(windows)]
                             if let Some(session) = &emu.session {
                                 let hwnd = session.hwnd();
                                 if !hwnd.is_invalid() {
@@ -1854,8 +1871,9 @@ pub fn view(
 
         // Input-tunnel toggle — while lit, clicks/keys inside the frame
         // reach the emulator's hidden window so its own dialogs are
-        // usable in the captured stream.
-        if !tun_x.is_nan() {
+        // usable in the captured stream. (Windows-only: off Windows
+        // the emulator owns its own window.)
+        if cfg!(windows) && !tun_x.is_nan() {
             let tb = Rect::from_center_size(Pos2::new(tun_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
                 ui.interact(tb, ui.id().with("emu-tun"), Sense::click())
@@ -1907,6 +1925,7 @@ pub fn view(
         // The handler's own exe icon (ExtractIconEx → 48px) inside a
         // rounded-rect button like Lacrima's setup tile — dimmed while
         // unavailable, a gear glyph when extraction fails.
+        #[cfg(windows)]
         if let Some(p) = &setup_exe {
             let key = p.to_string_lossy().into_owned();
             if emu.handler_icon_key.as_deref() != Some(key.as_str()) {
@@ -2354,6 +2373,7 @@ fn frame_dest_uv(
 /// the captured stream. LMB/MMB/wheel/keys forward; RMB keeps the
 /// app context menu and Esc releases the tunnel (it never reaches
 /// the game — see the Esc chain in main.rs).
+#[cfg(windows)]
 fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
     if !emu.input_tun || !active {
         return;
@@ -2546,6 +2566,13 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
     });
 }
 
+/// Off Windows there is no hidden emulator window to post into —
+/// the emulator runs in its own window and owns its input.
+#[cfg(not(windows))]
+fn tunnel_input(_ui: &egui::Ui, emu: &mut EmuView, _active: bool) {
+    emu.input_tun = false;
+}
+
 /// Live render adjustments for the zero-copy path — the GPU-side
 /// shader/passthrough applies these since no CPU swizzle ran.
 fn render_adjust(emu: &EmuView) -> (f32, f32, [f32; 4]) {
@@ -2559,6 +2586,7 @@ fn render_adjust(emu: &EmuView) -> (f32, f32, [f32; 4]) {
 
 /// SelectedCaptureAspectRatioKey → ratio — "handler" (or anything
 /// unrecognized) means the emulator's own, no resize.
+#[cfg(windows)]
 fn aspect_ratio_of(key: &str) -> Option<f64> {
     match key {
         "4:3" => Some(4.0 / 3.0),
@@ -3033,7 +3061,11 @@ fn draw_session(
         xenia::Status::Failed(e) => Some(format!("Capture failed: {e}")),
         xenia::Status::Exited => Some("Emulator exited".into()),
         xenia::Status::Capturing => {
-            (emu.frame_seq == 0).then(|| format!("Waiting for frames — {game_name}"))
+            if cfg!(windows) {
+                (emu.frame_seq == 0).then(|| format!("Waiting for frames — {game_name}"))
+            } else {
+                Some(format!("{game_name} is running in its own window"))
+            }
         }
     };
     if let Some(msg) = msg {

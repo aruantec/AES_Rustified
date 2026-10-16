@@ -36,10 +36,10 @@ rfd = "0.15"
 # GLSL -> WGSL translation for the Shadertoy .frag collection (same
 # naga wgpu already uses internally).
 naga = { version = "30", features = ["glsl-in", "wgsl-out"] }
-# Direct dep only to enable static-dxc: links DXC into the exe so
-# DX12 shader compiles are ~5x faster than the FXC fallback without
-# shipping a dxcompiler.dll alongside the binary.
-wgpu = { version = "30.0.1", features = ["static-dxc"] }
+# Direct dep for the Shadertoy/capture pipelines. static-dxc is
+# Windows-only (DXC exists to speed up DX12 shader compiles — the
+# capture embed only runs on DX12 anyway).
+wgpu = "30.0.1"
 ureq = "3.4.2"
 sha2 = "0.10"
 zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
@@ -50,10 +50,18 @@ sha1 = "0.10"
 crc32fast = "1"
 encoding_rs = "0.8"
 
+# POSIX kill()/SIGSTOP/SIGCONT for session stop+pause on unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Native Windows Graphics Capture for emulator frame capture (the
 # WgcBridge-equivalent path — WinRT WGC + D3D11 staging readback) plus
 # the Win32 window plumbing the emulator handlers need.
 [target.'cfg(windows)'.dependencies]
+# Direct dep only to enable static-dxc: links DXC into the exe so
+# DX12 shader compiles are ~5x faster than the FXC fallback without
+# shipping a dxcompiler.dll alongside the binary.
+wgpu = { version = "30.0.1", features = ["static-dxc"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

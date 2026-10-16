@@ -9,30 +9,52 @@
 //! The capture target is an HWND — hidden (moved + opacity-0) windows
 //! keep rendering to DWM, so WGC still produces frames for them, which
 //! is exactly the trick Lacrima uses to "embed" an emulator.
+//!
+//! The shared frame/GPU-state types are platform-neutral — only the
+//! capture machinery is Windows (WGC + D3D11). On other OSes a
+//! session still reports through the same slots, they just never
+//! receive pixels.
 
-#![cfg(windows)]
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
+#[cfg(windows)]
+use std::sync::atomic::Ordering;
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
 use std::thread::JoinHandle;
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use windows::core::{Interface, Result};
+#[cfg(windows)]
 use windows::Foundation::TypedEventHandler;
+#[cfg(windows)]
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
 };
+#[cfg(windows)]
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+#[cfg(windows)]
 use windows::Graphics::DirectX::DirectXPixelFormat;
+#[cfg(windows)]
 use windows::Graphics::SizeInt32;
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HMODULE, HWND, HANDLE};
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D11::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE};
+#[cfg(windows)]
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
+#[cfg(windows)]
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+#[cfg(windows)]
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
 /// The frame slot the capture thread publishes into. `seq` bumps on
@@ -46,6 +68,8 @@ pub struct FrameSlot {
     pub seq: u64,
     /// Set once when session setup fails (device creation, capture
     /// attach, …) — the session reports it as a launch error.
+    /// Written/read only in the cfg(windows) capture path.
+    #[allow(dead_code)]
     pub err: Option<String>,
 }
 
@@ -102,20 +126,26 @@ pub struct GpuState {
 /// the same for every generation.
 #[derive(Clone)]
 pub struct GpuShare {
+    #[allow(dead_code)] // opened only in the cfg(windows) import path
     pub tex: [isize; 3],
+    #[allow(dead_code)]
     pub fence: isize,
+    #[allow(dead_code)]
     pub w: u32,
+    #[allow(dead_code)]
     pub h: u32,
     pub gen: u64,
 }
 
 /// A live capture session. Drop it to stop capturing — the thread
 /// joins quickly since the stop flag is checked every few ms.
+#[cfg(windows)]
 pub struct Capture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(windows)]
 impl Capture {
     /// Start capturing `hwnd` on a background thread, publishing
     /// frames into `frames` (CPU readback) and `gpu` (the zero-copy
@@ -156,6 +186,7 @@ impl Capture {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -168,6 +199,7 @@ impl Drop for Capture {
 /// First DXGI adapter — the "GPU: name (vendor)" line of Lacrima's
 /// detailed GPU info in the stats overlay. One factory enum, so the
 /// caller should cache the result.
+#[cfg(windows)]
 pub fn gpu_desc() -> Option<(String, String)> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
     unsafe {
@@ -187,9 +219,16 @@ pub fn gpu_desc() -> Option<(String, String)> {
     }
 }
 
+/// No DXGI factory off Windows — the stats overlay shows "Unknown".
+#[cfg(not(windows))]
+pub fn gpu_desc() -> Option<(String, String)> {
+    None
+}
+
 /// Everything the FrameArrived callback needs — Mutex-guarded so
 /// concurrent pool threads serialize through it (the device is also
 /// put in multithread-protected mode like WgcBridge does).
+#[cfg(windows)]
 struct Ctx {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -226,8 +265,10 @@ struct Ctx {
 // The callback fires on the frame pool's own threads — access is
 // serialized by the Mutex, and the D3D11 device is put in
 // multithread-protected mode like WgcBridge does.
+#[cfg(windows)]
 unsafe impl Send for Ctx {}
 
+#[cfg(windows)]
 fn run(
     hwnd: HWND,
     frames: Arc<Mutex<FrameSlot>>,
@@ -351,6 +392,7 @@ fn run(
 
 /// Drain the pool to the freshest frame, copy it to the staging
 /// texture, map, and publish RGBA pixels into the frame slot.
+#[cfg(windows)]
 fn drain_frames(pool: &Direct3D11CaptureFramePool, ctx: &mut Ctx) {
     let mut frame: Option<Direct3D11CaptureFrame> = None;
     while let Ok(next) = pool.TryGetNextFrame() {
@@ -513,6 +555,7 @@ fn drain_frames(pool: &Direct3D11CaptureFramePool, ctx: &mut Ctx) {
 /// consumer can queue a `Wait` and sample the slot in place —
 /// Lacrima's GPU interop, minus the GL layer (wgpu samples the
 /// imported D3D12 resource directly).
+#[cfg(windows)]
 fn gpu_copy(
     ctx: &mut Ctx,
     src: &ID3D11Texture2D,

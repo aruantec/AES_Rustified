@@ -376,16 +376,20 @@ pub fn download_patches(root: PathBuf) -> Shared {
 }
 
 /// Handler-agnostic download spec — which release feed, which asset
-/// marks the windows build, which exe names the install is complete.
+/// marks the platform build, which exe names the install is complete.
 struct EmuSpec {
     name: &'static str,
     releases_api: &'static str,
     version_marker: &'static str,
     dir: fn() -> Option<PathBuf>,
-    /// True when the release asset is the windows archive.
+    /// True when the release asset is this platform's build
+    /// (branches on `cfg!` internally — most emulators ship a
+    /// Linux AppImage or tarball alongside the windows zip).
     asset_ok: fn(&str) -> bool,
     /// Preferred exe filenames, in order, then any exe containing
-    /// `exe_contains`.
+    /// `exe_contains`. The list holds both platforms' names —
+    /// entries are matched exactly, so foreign-platform names
+    /// simply never hit.
     exe_names: &'static [&'static str],
     exe_contains: &'static str,
     /// Pull the game-patches pack too (Xenia only).
@@ -402,9 +406,11 @@ const XENIA_SPEC: EmuSpec = EmuSpec {
     dir: xenia_dir,
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("windows") && n.contains("canary")
+        // Xenia ships no official Linux build — nothing matches, and
+        // the generic "no compatible asset" error is the honest answer.
+        cfg!(windows) && n.contains("windows") && n.contains("canary")
     },
-    exe_names: &["xenia_canary.exe", "xenia.exe"],
+    exe_names: &["xenia_canary.exe", "xenia.exe", "xenia_canary", "xenia"],
     exe_contains: "xenia",
     patches: true,
     allow_prerelease: false,
@@ -417,9 +423,13 @@ const FLYCAST_SPEC: EmuSpec = EmuSpec {
     dir: flycast_dir,
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("win64") || n.contains("windows")
+        if cfg!(windows) {
+            n.contains("win64") || n.contains("windows")
+        } else {
+            n.contains("linux") || n.contains("appimage")
+        }
     },
-    exe_names: &["flycast.exe"],
+    exe_names: &["flycast.exe", "flycast"],
     exe_contains: "flycast",
     patches: false,
     allow_prerelease: false,
@@ -432,13 +442,20 @@ const XEMU_SPEC: EmuSpec = EmuSpec {
     dir: xemu_dir,
     // Lacrima's SelectAssetForPlatform: xemu-win-x86_64-release.zip
     // first, then any win+x86_64 zip that isn't debug symbols.
+    // On Linux xemu ships an ubuntu tarball.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        (n == "xemu-win-x86_64-release.zip" || (n.contains("win") && n.contains("x86_64")))
-            && !n.contains("dbg")
-            && !n.contains("pdb")
+        if cfg!(windows) {
+            (n == "xemu-win-x86_64-release.zip" || (n.contains("win") && n.contains("x86_64")))
+                && !n.contains("dbg")
+                && !n.contains("pdb")
+        } else {
+            (n.contains("linux") || n.contains("ubuntu"))
+                && !n.contains("dbg")
+                && !n.contains("source")
+        }
     },
-    exe_names: &["xemu.exe"],
+    exe_names: &["xemu.exe", "xemu"],
     exe_contains: "xemu",
     patches: false,
     allow_prerelease: false,
@@ -458,12 +475,17 @@ const RPCS3_SPEC: EmuSpec = EmuSpec {
     version_marker: RPCS3_VERSION_MARKER,
     dir: rpcs3_dir,
     // Lacrima's SelectAssetForPlatform: a windows archive minus the
-    // symbols payload (rpcs3-v<ver>-<sha>_win64.7z).
+    // symbols payload (rpcs3-v<ver>-<sha>_win64.7z). The Linux build
+    // is an AppImage (rpcs3-v<ver>-<sha>_linux.AppImage).
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("win") && !n.contains("symbols")
+        if cfg!(windows) {
+            n.contains("win") && !n.contains("symbols")
+        } else {
+            n.contains("linux") && n.ends_with(".appimage")
+        }
     },
-    exe_names: &["rpcs3.exe"],
+    exe_names: &["rpcs3.exe", "rpcs3"],
     exe_contains: "rpcs3",
     patches: false,
     allow_prerelease: false,
@@ -483,12 +505,23 @@ const SHADPS4_SPEC: EmuSpec = EmuSpec {
     version_marker: SHADPS4_VERSION_MARKER,
     dir: shadps4_dir,
     // Lacrima's SelectAssetForPlatform: the windows Qt zip first
-    // (older releases), the win64-sdl zip on current ones.
+    // (older releases), the win64-sdl zip on current ones. Linux
+    // builds are zips/appimages marked linux.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("win") && n.ends_with(".zip")
+        if cfg!(windows) {
+            n.contains("win") && n.ends_with(".zip")
+        } else {
+            n.contains("linux") && !n.contains("source")
+        }
     },
-    exe_names: &["shadPS4.exe", "shadps4.exe", "shadPS4QtLauncher.exe"],
+    exe_names: &[
+        "shadPS4.exe",
+        "shadps4.exe",
+        "shadPS4QtLauncher.exe",
+        "shadps4",
+        "ShadPs4QtLauncher",
+    ],
     exe_contains: "shad",
     patches: false,
     allow_prerelease: false,
@@ -509,11 +542,18 @@ const DUCKSTATION_SPEC: EmuSpec = EmuSpec {
     // release's asset list, so exclude them explicitly.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("duckstation-windows")
-            && n.contains("x64")
-            && !n.contains("symbols")
-            && !n.contains("sse2")
-            && !n.contains("arm64")
+        if cfg!(windows) {
+            n.contains("duckstation-windows")
+                && n.contains("x64")
+                && !n.contains("symbols")
+                && !n.contains("sse2")
+                && !n.contains("arm64")
+        } else {
+            // DuckStation-x64.AppImage / linux release archives.
+            (n.contains("appimage") || n.contains("linux"))
+                && !n.contains("arm64")
+                && !n.contains("source")
+        }
     },
     // ResolveLauncherPath — the LTCG build first, then the plain Qt
     // exe and renames.
@@ -522,6 +562,8 @@ const DUCKSTATION_SPEC: EmuSpec = EmuSpec {
         "duckstation-qt-x64-Release.exe",
         "duckstation-qt.exe",
         "duckstation.exe",
+        "duckstation-qt",
+        "duckstation",
     ],
     exe_contains: "duckstation",
     patches: false,
@@ -538,16 +580,23 @@ const PCSX2_SPEC: EmuSpec = EmuSpec {
     version_marker: PCSX2_VERSION_MARKER,
     dir: pcsx2_dir,
     // SelectAssetForPlatform: the windows Qt 7z minus symbols
-    // (pcsx2-v<ver>-windows-x64-Qt.7z).
+    // (pcsx2-v<ver>-windows-x64-Qt.7z). Linux ships an AppImage
+    // (pcsx2-v<ver>-linux-appimage-x64-Qt.AppImage).
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("windows") && n.contains("qt") && !n.contains("symbols") && n.ends_with(".7z")
+        if cfg!(windows) {
+            n.contains("windows") && n.contains("qt") && !n.contains("symbols") && n.ends_with(".7z")
+        } else {
+            n.contains("linux") && n.contains("x64") && !n.contains("symbols")
+        }
     },
     exe_names: &[
         "pcsx2-qt.exe",
         "pcsx2-qtx64-avx2.exe",
         "pcsx2-qtx64.exe",
         "pcsx2.exe",
+        "pcsx2-qt",
+        "pcsx2",
     ],
     exe_contains: "pcsx2",
     patches: false,
@@ -565,9 +614,14 @@ const DOLPHIN_SPEC: EmuSpec = EmuSpec {
     version_marker: DOLPHIN_VERSION_MARKER,
     dir: dolphin_dir,
     // dl.dolphin-emu.org asset names: dolphin-<ver>-x64.7z.
+    // Dolphin ships no official Linux binaries — nothing matches
+    // off Windows and the user gets the browse-instead path.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("dolphin") && n.contains("x64") && (n.ends_with(".7z") || n.ends_with(".zip"))
+        cfg!(windows)
+            && n.contains("dolphin")
+            && n.contains("x64")
+            && (n.ends_with(".7z") || n.ends_with(".zip"))
     },
     // DolphinHandler's DolphinExecutableNames.
     exe_names: &[
@@ -579,6 +633,8 @@ const DOLPHIN_SPEC: EmuSpec = EmuSpec {
         "dolphinwx.exe",
         "Dolphin-emu.exe",
         "dolphin-emu.exe",
+        "dolphin-emu",
+        "dolphin",
     ],
     exe_contains: "dolphin",
     patches: false,
@@ -605,14 +661,18 @@ const CEMU_SPEC: EmuSpec = EmuSpec {
     version_marker: CEMU_VERSION_MARKER,
     dir: cemu_dir,
     // SelectAssetForPlatform: cemu-<ver>-windows-x64.zip — the
-    // windows archive (mac .dmg/linux zips are filtered by the
-    // windows+zip pair).
+    // windows archive. Linux builds are
+    // Cemu-<ver>-linux-x86_64.AppImage.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("windows") && n.ends_with(".zip")
+        if cfg!(windows) {
+            n.contains("windows") && n.ends_with(".zip")
+        } else {
+            n.contains("linux") && n.contains("x86_64")
+        }
     },
     // CemuHandler's CemuExecutableNames.
-    exe_names: &["Cemu.exe", "cemu.exe"],
+    exe_names: &["Cemu.exe", "cemu.exe", "Cemu", "cemu"],
     exe_contains: "cemu",
     patches: false,
     allow_prerelease: false,
@@ -635,10 +695,15 @@ const EDEN_SPEC: EmuSpec = EmuSpec {
     // fail the amd64+zip pair on their own.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("windows") && (n.contains("amd64") || n.contains("x64")) && n.ends_with(".zip")
+        if cfg!(windows) {
+            n.contains("windows") && (n.contains("amd64") || n.contains("x64")) && n.ends_with(".zip")
+        } else {
+            // Eden-Linux-v<ver>-amd64-<toolchain>.AppImage.
+            n.contains("linux") && n.contains("amd64") && !n.contains("zsync")
+        }
     },
     // ResolveLauncherPath — eden-cli.exe first, then the Qt gui.
-    exe_names: &["eden-cli.exe", "eden.exe"],
+    exe_names: &["eden-cli.exe", "eden.exe", "eden-cli", "eden"],
     exe_contains: "eden",
     patches: false,
     allow_prerelease: false,
@@ -861,7 +926,9 @@ fn work_dolphin(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
     let _ = std::fs::create_dir_all(&update_dir);
 
     set(dl, "Done", 1.0);
-    resolve_exe(&emu_dir, spec).map(|p| p.to_string_lossy().into_owned())
+    let exe = resolve_exe(&emu_dir, spec)?;
+    mark_exec(&exe);
+    Ok(exe.to_string_lossy().into_owned())
 }
 
 fn get_text(url: &str) -> Result<String, String> {
@@ -968,30 +1035,57 @@ fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let is_archive = |n: &str| n.ends_with(".zip") || n.ends_with(".7z");
+    let is_archive = |n: &str| {
+        let n = n.to_lowercase();
+        n.ends_with(".zip")
+            || n.ends_with(".7z")
+            || (cfg!(unix)
+                && (n.ends_with(".tar.gz")
+                    || n.ends_with(".tgz")
+                    || n.ends_with(".tar.xz")
+                    || n.ends_with(".tar.zst")
+                    || n.ends_with(".tar.bz2")))
+    };
     let pick = |pred: &dyn Fn(&str) -> bool| assets.iter().find(|(n, _)| pred(n)).cloned();
+    // Windows picks must land on an archive (the extractor only
+    // handles zip/7z there); Linux picks may be a bare AppImage or a
+    // tar.* the system tar unpacks.
+    #[cfg(windows)]
+    let picked = pick(&|n: &str| (spec.asset_ok)(n) && is_archive(n))
+        .or_else(|| pick(&|n: &str| n.to_lowercase().contains("win") && is_archive(n)))
+        .or_else(|| pick(&|n: &str| is_archive(n)));
+    #[cfg(not(windows))]
+    let picked = pick(&|n: &str| (spec.asset_ok)(n)).or_else(|| {
+        pick(&|n: &str| {
+            let n = n.to_lowercase();
+            is_archive(&n) && (n.contains("linux") || n.contains("ubuntu"))
+        })
+    });
     let (asset_name, asset_url) =
-        pick(&|n: &str| (spec.asset_ok)(n) && is_archive(&n.to_lowercase()))
-            .or_else(|| {
-                pick(&|n: &str| n.to_lowercase().contains("win") && is_archive(&n.to_lowercase()))
-            })
-            .or_else(|| pick(&|n: &str| is_archive(&n.to_lowercase())))
-            .ok_or_else(|| format!("No compatible {} asset found", spec.name))?;
+        picked.ok_or_else(|| format!("No compatible {} asset found", spec.name))?;
 
-    // Download the zip.
+    // Download the asset.
     let stage = format!("Downloading {asset_name} ({tag})…");
     let zip_path = update_dir.join(&asset_name);
     download(dl, &stage, &asset_url, &zip_path)?;
 
-    // Extract to a staging dir, normalize a single root folder, then
-    // copy into the emulator dir (skipping Emu_Update payloads).
+    // Archives extract to a staging dir, normalize a single root
+    // folder, then copy into the emulator dir (skipping Emu_Update
+    // payloads). Bare binaries/AppImages drop straight into the
+    // emulator dir and get the exec bit.
     set(dl, &format!("Extracting {}…", spec.name), 0.0);
-    let extracted = update_dir.join("extracted");
-    let _ = std::fs::remove_dir_all(&extracted);
-    std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
-    extract_archive(&zip_path, &extracted)?;
-    let root = normalize_root(&extracted);
-    copy_dir_contents(&root, &emu_dir, "Emu_Update")?;
+    if is_archive(&asset_name) {
+        let extracted = update_dir.join("extracted");
+        let _ = std::fs::remove_dir_all(&extracted);
+        std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
+        extract_archive(&zip_path, &extracted)?;
+        let root = normalize_root(&extracted);
+        copy_dir_contents(&root, &emu_dir, "Emu_Update")?;
+    } else {
+        let dest = emu_dir.join(&asset_name);
+        std::fs::copy(&zip_path, &dest).map_err(|e| format!("Install failed: {e}"))?;
+        mark_exec(&dest);
+    }
 
     // Game patches — best effort (Lacrima tolerates failure here too).
     if spec.patches {
@@ -1005,7 +1099,9 @@ fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
     let _ = std::fs::create_dir_all(&update_dir);
 
     set(dl, "Done", 1.0);
-    resolve_exe(&emu_dir, spec).map(|p| p.to_string_lossy().into_owned())
+    let exe = resolve_exe(&emu_dir, spec)?;
+    mark_exec(&exe);
+    Ok(exe.to_string_lossy().into_owned())
 }
 
 /// Preferred exe names in order, then any exe containing
@@ -1025,11 +1121,29 @@ fn resolve_exe(dir: &Path, spec: &EmuSpec) -> Result<PathBuf, String> {
     all.into_iter()
         .find(|p| {
             p.file_name().and_then(|f| f.to_str()).is_some_and(|f| {
-                f.to_lowercase().contains(spec.exe_contains) && f.ends_with(".exe")
+                let low = f.to_lowercase();
+                low.contains(spec.exe_contains)
+                    && (low.ends_with(".exe")
+                        || (cfg!(unix) && (low.ends_with(".appimage") || !low.contains('.'))))
             })
         })
         .ok_or_else(|| format!("{} exe not found after install", spec.name))
 }
+
+/// Set the exec bit on a unix binary — downloads and zip/7z
+/// extraction don't preserve it (Lacrima's
+/// TryMarkRetroArchLinuxBinaryExecutable).
+#[cfg(unix)]
+fn mark_exec(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(mut perm) = p.metadata().map(|m| m.permissions()) {
+        perm.set_mode(perm.mode() | 0o111);
+        let _ = std::fs::set_permissions(p, perm);
+    }
+}
+
+#[cfg(not(unix))]
+fn mark_exec(_p: &Path) {}
 
 fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), String> {
     let mut resp = agent()
@@ -1071,7 +1185,31 @@ fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), Stri
 /// Zip via `zip`, 7z via `sevenz_rust2` — falling back to the
 /// system `tar.exe` (Windows' bsdtar reads 7z) like Lacrima's
 /// ArchiveExtractionHelper does when managed extraction fails.
+/// Unix tarballs go through the system `tar` (GNU tar auto-detects
+/// gz/xz/zst/bz2 by content).
 fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    let name = archive
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    #[cfg(unix)]
+    if name.ends_with(".tar.gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tar.bz2")
+    {
+        let ok = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(archive)
+            .arg("-C")
+            .arg(dest)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        return ok.then_some(()).ok_or_else(|| "tar extract failed".to_string());
+    }
     let is_7z = archive
         .extension()
         .and_then(|e| e.to_str())
@@ -1081,6 +1219,7 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             // System-tool fallback (Lacrima's TryExtract7zWithSystemTool).
             // Call Windows' bsdtar by full path — a bare "tar" can
             // resolve to GNU tar (no 7z support) on dev machines.
+            #[cfg(windows)]
             let ok = std::process::Command::new(r"C:\Windows\System32\tar.exe")
                 .arg("-xf")
                 .arg(archive)
@@ -1089,6 +1228,18 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
+            // On unix, bsdtar reads 7z too; GNU tar doesn't, but
+            // sevenz_rust2 already handled the archive when present.
+            #[cfg(unix)]
+            let ok = ["7z", "7za", "tar"].iter().any(|tool| {
+                let mut cmd = std::process::Command::new(tool);
+                if *tool == "tar" {
+                    cmd.arg("-xf").arg(archive).arg("-C").arg(dest);
+                } else {
+                    cmd.arg("x").arg("-y").arg(format!("-o{}", dest.display())).arg(archive);
+                }
+                cmd.output().map(|o| o.status.success()).unwrap_or(false)
+            });
             if !ok {
                 return Err(format!("Extract failed: {e}"));
             }
@@ -1202,12 +1353,17 @@ mod tests {
             <a href="https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-arm64.7z">arm</a>
             <a href="https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.dmg">mac</a>
         "#;
-        let (name, url) = emucr_dolphin_asset(html, &DOLPHIN_SPEC).unwrap();
-        assert_eq!(name, "dolphin-2609a-x64.7z");
-        assert_eq!(
-            url,
-            "https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z"
-        );
+        if cfg!(windows) {
+            let (name, url) = emucr_dolphin_asset(html, &DOLPHIN_SPEC).unwrap();
+            assert_eq!(name, "dolphin-2609a-x64.7z");
+            assert_eq!(
+                url,
+                "https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z"
+            );
+        } else {
+            // Dolphin ships no official Linux build — nothing matches.
+            assert!(emucr_dolphin_asset(html, &DOLPHIN_SPEC).is_none());
+        }
         assert!(emucr_dolphin_asset("<a href=\"https://example.com/x\">", &DOLPHIN_SPEC).is_none());
     }
 
@@ -1251,13 +1407,19 @@ mod tests {
     }
 
     /// SelectAssetForPlatform — Cemu ships windows/macos/linux per
-    /// release; only the `windows` `.zip` must pass the filter.
+    /// release; only this platform's asset must pass the filter.
     #[test]
     fn cemu_asset_prefers_windows_zip() {
         let ok = |n: &str| (CEMU_SPEC.asset_ok)(n);
-        assert!(ok("cemu-2.6-windows-x64.zip"));
-        assert!(!ok("cemu-2.6-macos-15-arm64.dmg"));
-        assert!(!ok("cemu-2.6-linux-x86_64.zip"));
-        assert!(!ok("cemu-2.6-windows-x64.zip.sig"));
+        if cfg!(windows) {
+            assert!(ok("cemu-2.6-windows-x64.zip"));
+            assert!(!ok("cemu-2.6-macos-15-arm64.dmg"));
+            assert!(!ok("cemu-2.6-linux-x86_64.zip"));
+            assert!(!ok("cemu-2.6-windows-x64.zip.sig"));
+        } else {
+            assert!(ok("Cemu-2.6-linux-x86_64.AppImage"));
+            assert!(!ok("cemu-2.6-windows-x64.zip"));
+            assert!(!ok("cemu-2.6-macos-15-arm64.dmg"));
+        }
     }
 }

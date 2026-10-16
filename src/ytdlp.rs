@@ -434,7 +434,9 @@ fn download_and_install(progress: &mut dyn FnMut(f32)) -> Result<(), String> {
 }
 
 fn uninstall_work() -> Result<(), String> {
-    let tools = tools_dir();
+    let _tools = tools_dir();
+    #[cfg(windows)]
+    let tools = &_tools;
     #[cfg(windows)]
     {
         let internal = tools.join("_internal");

@@ -5,47 +5,63 @@
 //! strips decorations, parks it at the far corner of the virtual
 //! desktop at 0% opacity — still visible to DWM so Windows Graphics
 //! Capture keeps producing frames — and hands the HWND to `wgc`.
-
-#![cfg(windows)]
+//!
+//! On non-Windows platforms there is no HWND/WGC embedding — the
+//! session spawns the emulator as an external process instead. The
+//! launch/args/config-seeding logic is shared.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use std::thread::JoinHandle;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+#[cfg(windows)]
 use windows::core::BOOL;
+#[cfg(windows)]
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HWND, LPARAM, POINT, RECT, WAIT_TIMEOUT, WPARAM,
 };
+#[cfg(windows)]
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+#[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+#[cfg(windows)]
 use windows::Win32::System::Console::{
     AttachConsole, FreeConsole, GetConsoleWindow, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE,
 };
+#[cfg(windows)]
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+#[cfg(windows)]
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+#[cfg(windows)]
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, TerminateProcess, WaitForSingleObject,
     PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
     PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
+#[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+#[cfg(windows)]
 use eframe::egui;
 
 use crate::wgc;
@@ -82,12 +98,14 @@ pub fn session_log(msg: &str) {
 
 // Lacrima's PauseEmulator/ResumeEmulator — the ntdll suspend pair
 // (OpenProcess + NtSuspendProcess / NtResumeProcess).
+#[cfg(windows)]
 #[link(name = "ntdll")]
 extern "system" {
     fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
     fn NtResumeProcess(process: *mut core::ffi::c_void) -> i32;
 }
 
+#[cfg(windows)]
 const SUSPEND_ACCESS: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(PROCESS_SUSPEND_RESUME.0 | PROCESS_QUERY_LIMITED_INFORMATION.0);
 
@@ -96,12 +114,15 @@ const SUSPEND_ACCESS: PROCESS_ACCESS_RIGHTS =
 /// death where destructors never run (panic=abort, crash, kill) — the
 /// OS terminates every process assigned to it. This is what keeps a
 /// launched emulator from being orphaned when the app dies.
+#[cfg(windows)]
 struct JobGuard(HANDLE);
 
 // A job handle is a process-global kernel handle — safe to move
 // across threads.
+#[cfg(windows)]
 unsafe impl Send for JobGuard {}
 
+#[cfg(windows)]
 impl JobGuard {
     /// Job with kill-on-close containing `child`. `None` when the OS
     /// refuses (assignment can fail if the process is already in a
@@ -133,6 +154,7 @@ impl JobGuard {
     }
 }
 
+#[cfg(windows)]
 impl Drop for JobGuard {
     fn drop(&mut self) {
         unsafe {
@@ -149,6 +171,8 @@ pub enum Status {
     /// Capture session attached — frames are flowing.
     Capturing,
     /// Setup failed (no window, WGC attach error, …).
+    /// Off Windows spawn errors surface as start() Err instead.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Failed(String),
     /// The emulator process exited or was stopped.
     Exited,
@@ -196,11 +220,16 @@ pub struct Session {
     /// The captured render window — written by the worker once the
     /// capture target resolves; the Aspect-Ratio context menu resizes
     /// it (Lacrima's EmulatorTargetHwnd).
+    #[cfg(windows)]
     hwnd: Arc<std::sync::atomic::AtomicUsize>,
+    /// The resolve/capture worker (Windows only — Linux sessions run
+    /// the emulator in its own window, nothing to resolve).
+    #[cfg(windows)]
     worker: Option<JoinHandle<()>>,
     /// Kill-on-close job containing the emulator — keeps it from
     /// being orphaned even by a hard crash. Declared last so it is
     /// the final field to drop.
+    #[cfg(windows)]
     _job: Option<JobGuard>,
 }
 
@@ -216,6 +245,9 @@ impl Session {
     /// in without the (unclickable through capture) NoProfileDialog.
     /// `retroarch_core` (RetroArch kind only) is the selected
     /// Libretro core library RetroArch loads via `-L`.
+    /// On non-Windows the emulator runs in its own window — no WGC
+    /// capture, no window hiding, no input tunnel.
+    #[cfg_attr(not(windows), allow(unused_variables))]
     pub fn start(
         exe: &str,
         game: &Path,
@@ -288,8 +320,11 @@ impl Session {
                 // the allocation; the transcript above keeps the log.
                 // (Lacrima achieves the same via `cmd /d /c` +
                 // CreateNoWindow.)
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
             }
             // DuckStation: `-batch -nofullscreen -nogui -- <rom>` —
             // switches before `--`, the image path after so the
@@ -373,8 +408,11 @@ impl Session {
                             transcript = Some(tp);
                         }
                     }
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                    }
                 }
                 cmd.arg("-g").arg(game);
             }
@@ -412,8 +450,11 @@ impl Session {
                 // window". --verbose makes RA AllocConsole() when the
                 // parent has none; the flag keeps that console
                 // invisible instead of flashing a cmd window.
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
             }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
@@ -443,6 +484,14 @@ impl Session {
             // hides the in-frame menubar and the first-run welcome.
             ensure_xemu_settings(&work_dir);
         }
+        // Own process group — stop() can kill the whole tree on unix
+        // (emulators spawn helper processes), matching the Windows
+        // kill-on-close job guard.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let child = cmd
             .current_dir(work_dir)
             .spawn()
@@ -452,8 +501,10 @@ impl Session {
 
         // Kill-on-close job FIRST — if anything below panics the
         // guard unwinds and the OS reaps the emulator for us.
+        #[cfg(windows)]
         let job = JobGuard::new(&child);
 
+        #[cfg_attr(not(windows), allow(unused_variables))]
         let pid = child.id();
         let status = Arc::new(Mutex::new(Shared {
             status: Status::Resolving,
@@ -463,7 +514,9 @@ impl Session {
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let render = Arc::new(wgc::RenderShared::default());
+        #[cfg(windows)]
         let hwnd = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(windows)]
         let worker = {
             let status = status.clone();
             let frames = frames.clone();
@@ -500,6 +553,14 @@ impl Session {
                 })
                 .expect("spawn xenia worker")
         };
+        // No window resolution or capture off Windows — the emulator
+        // runs in its own window; the session layer reports it as
+        // live for as long as the process is up.
+        #[cfg(not(windows))]
+        {
+            let _ = transcript;
+            status.lock().unwrap_or_else(|p| p.into_inner()).status = Status::Capturing;
+        }
         Ok(Self {
             child,
             game: game.to_path_buf(),
@@ -509,8 +570,11 @@ impl Session {
             stop,
             paused,
             render,
+            #[cfg(windows)]
             hwnd,
+            #[cfg(windows)]
             worker: Some(worker),
+            #[cfg(windows)]
             _job: job,
         })
     }
@@ -523,6 +587,7 @@ impl Session {
 
     /// The captured render window — invalid until the worker resolves
     /// the capture target.
+    #[cfg(windows)]
     pub fn hwnd(&self) -> HWND {
         HWND(self.hwnd.load(Ordering::Relaxed) as *mut _)
     }
@@ -557,6 +622,17 @@ impl Session {
         if self.paused.swap(false, Ordering::Relaxed) {
             set_process_suspended(self.child.id(), false);
         }
+        // No capture worker off Windows — signal the whole process
+        // group (the emulator plus helpers it spawned), then the
+        // direct child as a fallback.
+        #[cfg(not(windows))]
+        {
+            let pid = self.child.id() as i32;
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
     }
 
     /// Lacrima's ToggleEmulatorPause — suspend/resume the emulator
@@ -581,6 +657,7 @@ impl Session {
     /// hwnd, its root ancestor AND its root-owner ancestor, deduped.
     /// Each WndProc ignores what isn't its own, so multiple targets
     /// are harmless.
+    #[cfg(windows)]
     fn input_targets(&self) -> Vec<HWND> {
         let hwnd = self.hwnd();
         if hwnd.is_invalid() {
@@ -599,6 +676,7 @@ impl Session {
     /// Post a pointer message (`(x, y)` = client coords of the
     /// captured window) to every input target, each translated into
     /// its own client space. Returns how many windows got a post.
+    #[cfg(windows)]
     pub fn post_at(&self, msg: u32, w: WPARAM, x: i32, y: i32) -> usize {
         let targets = self.input_targets();
         let n = targets.len();
@@ -618,6 +696,7 @@ impl Session {
 
     /// Key/char messages carry no coords — post the same lParam to
     /// every input target. Returns how many windows got a post.
+    #[cfg(windows)]
     pub fn post(&self, msg: u32, w: WPARAM, l: LPARAM) -> usize {
         let targets = self.input_targets();
         let n = targets.len();
@@ -630,6 +709,7 @@ impl Session {
     /// The render window's client size in its own pixel space — the
     /// tunnel scales captured-frame coords by client/frame rather
     /// than assuming they're equal.
+    #[cfg(windows)]
     pub fn client_size(&self) -> Option<(i32, i32)> {
         let hwnd = self.hwnd();
         if hwnd.is_invalid() {
@@ -642,6 +722,7 @@ impl Session {
 
     /// WM_MOUSEWHEEL takes *screen* coords in lParam — translate a
     /// client point for it.
+    #[cfg(windows)]
     pub fn client_to_screen(&self, x: i32, y: i32) -> (i32, i32) {
         let hwnd = self.hwnd();
         let mut p = POINT { x, y };
@@ -658,7 +739,19 @@ impl Session {
         // emulator still running must end the session (Lacrima tears
         // the emulator down on capture failure); otherwise the game
         // runs forever, hidden and uncaptured.
-        status_finished(&self.status()) || matches!(self.child.try_wait(), Ok(Some(_)))
+        if status_finished(&self.status()) {
+            return true;
+        }
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            // No worker turns the status to Exited off Windows — set
+            // it here so the final status shown is true.
+            self.status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .status = Status::Exited;
+            return true;
+        }
+        false
     }
 }
 
@@ -675,12 +768,14 @@ impl Drop for Session {
         let _ = self.child.kill();
         let _ = self.child.wait();
         // Detach — the worker finishes teardown on its own.
+        #[cfg(windows)]
         self.worker.take();
     }
 }
 
 /// OpenProcess + NtSuspend/Resume — returns false when the process is
 /// gone or the call fails (UI keeps the un-paused state then).
+#[cfg(windows)]
 fn set_process_suspended(pid: u32, on: bool) -> bool {
     unsafe {
         let Ok(h) = OpenProcess(SUSPEND_ACCESS, false, pid) else {
@@ -693,6 +788,17 @@ fn set_process_suspended(pid: u32, on: bool) -> bool {
         };
         let _ = CloseHandle(h);
         ok
+    }
+}
+
+/// SIGSTOP/SIGCONT — the POSIX counterpart of the ntdll suspend pair.
+#[cfg(not(windows))]
+fn set_process_suspended(pid: u32, on: bool) -> bool {
+    unsafe {
+        libc::kill(
+            pid as i32,
+            if on { libc::SIGSTOP } else { libc::SIGCONT },
+        ) == 0
     }
 }
 
@@ -904,6 +1010,7 @@ fn ensure_cemu_setup(exe_dir: &Path) {
 /// `exe_dir`: portable-mode log first (what our `-g` launch writes),
 /// then the exe dir, then the %APPDATA% fallback for un-portable
 /// configured exes.
+#[cfg(windows)]
 fn cemu_log_candidates(exe_dir: &Path) -> [PathBuf; 3] {
     [
         exe_dir.join("portable").join("log.txt"),
@@ -1155,6 +1262,7 @@ fn retroarch_log_path(core: Option<&Path>) -> Option<PathBuf> {
 /// "RenderReady" once the render surface exists; the resolve gate
 /// reads the launch transcript incrementally so the token can skip
 /// the remaining stability polls.
+#[cfg(windows)]
 fn eden_render_ready(transcript: Option<&Path>, pos: &mut u64) -> bool {
     let Some(tp) = transcript else {
         return false;
@@ -1256,6 +1364,7 @@ fn ps3_boot_path(game: &Path) -> PathBuf {
 
 /// Resolve window → prepare/hide → attach capture → monitor. Runs on
 /// its own thread so the UI never blocks on the ~12s resolve window.
+#[cfg(windows)]
 fn worker_main(
     pid: u32,
     status: Arc<Mutex<Shared>>,
@@ -1960,6 +2069,7 @@ fn worker_main(
 // fall back to the best-looking top-level window.
 
 /// Snapshot of state we strip so a failed capture can restore it.
+#[cfg(windows)]
 struct SavedWindow {
     style: i64,
     exstyle: i64,
@@ -1971,12 +2081,14 @@ struct SavedWindow {
     cloaked: bool,
 }
 
+#[cfg(windows)]
 struct EnumCtx {
     pids: Vec<u32>,
     include_hidden: bool,
     out: Vec<HWND>,
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut EnumCtx);
     if !ctx.include_hidden && !IsWindowVisible(hwnd).as_bool() {
@@ -1990,10 +2102,12 @@ unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
+#[cfg(windows)]
 fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
     process_windows_of(&[pid], include_hidden)
 }
 
+#[cfg(windows)]
 fn process_windows_of(pids: &[u32], include_hidden: bool) -> Vec<HWND> {
     let mut ctx = EnumCtx {
         pids: pids.to_vec(),
@@ -2010,6 +2124,7 @@ fn process_windows_of(pids: &[u32], include_hidden: bool) -> Vec<HWND> {
 /// every emulator except Eden, which can render on a child process
 /// (ResolveRuntimeProcessAsync walks descendants for the same
 /// reason): pid + every live descendant.
+#[cfg(windows)]
 fn win_pids(pid: u32, kind: Kind) -> Vec<u32> {
     if kind != Kind::Eden {
         return vec![pid];
@@ -2021,6 +2136,7 @@ fn win_pids(pid: u32, kind: Kind) -> Vec<u32> {
 
 /// Lacrima's EnumerateDescendantProcesses — a Toolhelp32 snapshot
 /// BFS over parent-pid edges (children of children included).
+#[cfg(windows)]
 fn descendant_pids(root: u32) -> Vec<u32> {
     let mut out = Vec::new();
     unsafe {
@@ -2059,6 +2175,7 @@ fn descendant_pids(root: u32) -> Vec<u32> {
 /// when the spawned eden.exe/eden-cli.exe hands off to a child and
 /// exits, re-home the tracked handle to a live descendant so window
 /// enumeration, the alive check, and teardown keep working.
+#[cfg(windows)]
 fn eden_rehome(proc: &mut HANDLE, pid: &mut u32) -> bool {
     for dp in descendant_pids(*pid) {
         let Ok(h) = (unsafe {
@@ -2087,6 +2204,7 @@ fn eden_rehome(proc: &mut HANDLE, pid: &mut u32) -> bool {
     false
 }
 
+#[cfg(windows)]
 struct ChildCtx {
     pid: u32,
     kind: Kind,
@@ -2096,6 +2214,7 @@ struct ChildCtx {
     best: HWND,
     best_score: i64,
 }
+#[cfg(windows)]
 
 unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut ChildCtx);
@@ -2113,6 +2232,7 @@ unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 /// Score a window as a Xenia render-surface child
 /// (ScoreXeniaRenderChildCandidate).
+#[cfg(windows)]
 fn score_render_child(hwnd: HWND, pid: u32) -> i64 {
     if hwnd.is_invalid() {
         return i64::MIN;
@@ -2168,6 +2288,7 @@ fn score_render_child(hwnd: HWND, pid: u32) -> i64 {
 /// SDL/Qt surface; dialogs (settings/audio/video/…) are filtered by
 /// title, and Flycast's own chrome gets excluded the same way
 /// Lacrima does.
+#[cfg(windows)]
 fn is_likely_flycast_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2223,6 +2344,7 @@ fn is_likely_flycast_window(hwnd: HWND, main: HWND) -> bool {
 /// window; dialog-ish titles (settings/monitor/about/…) are
 /// rejected, xemu/xbox titles and SDL-class windows win, and a
 /// non-primary top-level is accepted as the last resort.
+#[cfg(windows)]
 fn is_likely_xemu_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2257,6 +2379,7 @@ fn is_likely_xemu_window(hwnd: HWND, main: HWND) -> bool {
 }
 
 /// A window's client size in pixels (GetClientRect).
+#[cfg(windows)]
 fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
     let mut r = RECT::default();
     unsafe { GetClientRect(hwnd, &mut r) }.ok()?;
@@ -2265,6 +2388,7 @@ fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
 
 /// IsRpcs3DialogOrOverlayWindow — boot progress/trophy/shader
 /// dialogs that must never be picked as the render surface.
+#[cfg(windows)]
 fn is_rpcs3_dialog_title(t: &str) -> bool {
     [
         "trophy",
@@ -2285,6 +2409,7 @@ fn is_rpcs3_dialog_title(t: &str) -> bool {
 
 /// IsRpcs3UiWindow — RPCS3's own chrome (settings/log/launcher),
 /// not a game surface.
+#[cfg(windows)]
 fn is_rpcs3_ui_title(t: &str) -> bool {
     t.starts_with("rpcs3 ")
         || [
@@ -2311,6 +2436,7 @@ fn is_rpcs3_ui_title(t: &str) -> bool {
 /// non-child window ≥480×270 (client) that isn't dialog/UI chrome.
 /// Render-ish titles (FPS:/vulkan/opengl/…) accept outright;
 /// otherwise a non-primary Qt/QWindow top-level with a title.
+#[cfg(windows)]
 fn is_likely_rpcs3_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2358,6 +2484,7 @@ fn is_likely_rpcs3_window(hwnd: HWND, main: HWND) -> bool {
 /// ScoreRpcs3RenderChildWindow — gs_frame can also hang off the main
 /// window as a Qt child; same gates as the top-level path with
 /// render-class bonuses.
+#[cfg(windows)]
 fn score_rpcs3_child(hwnd: HWND, pid: u32) -> i64 {
     if hwnd.is_invalid() {
         return i64::MIN;
@@ -2400,6 +2527,7 @@ fn score_rpcs3_child(hwnd: HWND, pid: u32) -> i64 {
 /// window; the launcher/settings chrome and child surfaces are
 /// filtered out, then a direct render-class child of the top-level
 /// can win over it (FindBestRenderChildWindow).
+#[cfg(windows)]
 fn is_likely_shadps4_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2456,6 +2584,7 @@ fn is_likely_shadps4_window(hwnd: HWND, main: HWND) -> bool {
 
 /// ScoreRenderChildWindow — a direct render-class child of the
 /// resolved top-level (SDL/Vulkan surface) wins the capture.
+#[cfg(windows)]
 fn score_shadps4_child(hwnd: HWND, pid: u32, parent: HWND) -> i64 {
     if hwnd.is_invalid() {
         return i64::MIN;
@@ -2487,6 +2616,7 @@ fn score_shadps4_child(hwnd: HWND, pid: u32, parent: HWND) -> i64 {
 /// top-level; the duckstation chrome (settings/input/cheats/…) and
 /// IME/tooltip windows are rejected. It can also render in the main
 /// window with an EMPTY title while a game loads.
+#[cfg(windows)]
 fn is_likely_duckstation_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2548,6 +2678,7 @@ fn is_likely_duckstation_window(hwnd: HWND, main: HWND) -> bool {
 /// pcsx2 chrome (settings/graphics/controller/…) and IME/tooltip
 /// windows are rejected. Qt class names like "Qt6110QWindowIcon" on
 /// a non-primary window count as candidates.
+#[cfg(windows)]
 fn is_likely_pcsx2_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2605,6 +2736,7 @@ fn is_likely_pcsx2_window(hwnd: HWND, main: HWND) -> bool {
 /// captioned dolphin-class windows count as candidates, while the
 /// config/audio/controller dialogs, IME helpers and the primary UI
 /// shell are rejected.
+#[cfg(windows)]
 fn is_likely_dolphin_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2676,6 +2808,7 @@ fn is_likely_dolphin_window(hwnd: HWND, main: HWND) -> bool {
 /// reject the shell/dialog titles, accept "fps:/loading/compiling"
 /// boot titles and any well-formed game title, and fall back to a
 /// Qt-class non-main window with a real client size.
+#[cfg(windows)]
 fn is_likely_cemu_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2727,6 +2860,7 @@ fn is_likely_cemu_window(hwnd: HWND, main: HWND) -> bool {
 /// out (their titles carry the dialog kind), then SDL/GLFW/Qt/Eden
 /// classes, an "eden"-titled window, the main window, or a window
 /// missing caption/thick-frame chrome (a bare render surface).
+#[cfg(windows)]
 fn is_likely_eden_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2776,6 +2910,7 @@ fn is_likely_eden_window(hwnd: HWND, main: HWND) -> bool {
 /// lose, then frontend/emulator title and class hints, then the
 /// process-main-window fallback. No size floor: RA's window can be
 /// small before the core's first SET_GEOMETRY resize.
+#[cfg(windows)]
 fn is_likely_retroarch_window(hwnd: HWND, main: HWND) -> bool {
     if hwnd.is_invalid() {
         return false;
@@ -2831,6 +2966,7 @@ fn is_likely_retroarch_window(hwnd: HWND, main: HWND) -> bool {
 
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
+#[cfg(windows)]
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
     match kind {
         Kind::Flycast => return is_likely_flycast_window(hwnd, main),
@@ -2892,6 +3028,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
 }
 
 /// ScoreProcessWindowCandidate (base) restricted to render windows.
+#[cfg(windows)]
 fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
     if hwnd.is_invalid() {
         return i64::MIN;
@@ -2945,6 +3082,7 @@ fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
 /// One poll of ResolveCaptureTargetAsync: best render child, else
 /// best render-like top-level window. `main` ≈ the biggest titled
 /// visible top-level (Process.MainWindowHandle approximation).
+#[cfg(windows)]
 fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
     let pids = win_pids(pid, kind);
     let tops = process_windows_of(&pids, true);
@@ -3037,6 +3175,7 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
 
 /// TryDismissXeniaWarningDialogs — click OK on "Xenia Warning/Error/
 /// Help" dialogs (or WM_CLOSE them) so boot isn't blocked by a modal.
+#[cfg(windows)]
 fn dismiss_warning_dialogs(pid: u32) {
     for hwnd in process_windows(pid, true) {
         let title = window_title(hwnd);
@@ -3054,11 +3193,13 @@ fn dismiss_warning_dialogs(pid: u32) {
     }
 }
 
+#[cfg(windows)]
 struct ClickCtx {
     text: String,
     clicked: bool,
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn enum_button(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut ClickCtx);
     if ctx.clicked {
@@ -3078,6 +3219,7 @@ unsafe extern "system" fn enum_button(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(0)
 }
 
+#[cfg(windows)]
 fn click_dialog_button(dialog: HWND, text: &str) -> bool {
     let mut ctx = ClickCtx {
         text: text.to_string(),
@@ -3095,6 +3237,7 @@ fn click_dialog_button(dialog: HWND, text: &str) -> bool {
 
 /// IsXeniaMessageBoxWindow — dialog class or warning title or a small
 /// warning/error-sized window.
+#[cfg(windows)]
 fn is_xenia_message_box(hwnd: HWND, title: &str, class: &str) -> bool {
     let t = title.trim().to_lowercase();
     let c = class.trim().to_lowercase();
@@ -3124,6 +3267,7 @@ fn is_xenia_message_box(hwnd: HWND, title: &str, class: &str) -> bool {
 /// RemoveWindowDecorations: strip caption/sysmenu/thickframe/min/max,
 /// drop the menu, and keep the *client* size (AdjustWindowRectEx) so
 /// the render surface doesn't change aspect.
+#[cfg(windows)]
 fn prepare_window_for_capture(hwnd: HWND) -> SavedWindow {
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
     let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as i64;
@@ -3198,6 +3342,7 @@ fn prepare_window_for_capture(hwnd: HWND) -> SavedWindow {
 /// Read-only window snapshot — the same restore record
 /// `prepare_window_for_capture` makes, but without touching the
 /// window (for the cloak-only hide path).
+#[cfg(windows)]
 fn snapshot_window(hwnd: HWND) -> SavedWindow {
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as i64;
     let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as i64;
@@ -3216,6 +3361,7 @@ fn snapshot_window(hwnd: HWND) -> SavedWindow {
 /// hides a window from the screen without touching its geometry,
 /// style or opacity — and DWM/WGC keep producing frames for it. The
 /// hide that can't race a still-constructing render window.
+#[cfg(windows)]
 fn set_cloaked(hwnd: HWND, on: bool) {
     let v: BOOL = on.into();
     unsafe {
@@ -3231,6 +3377,7 @@ fn set_cloaked(hwnd: HWND, on: bool) {
 /// MoveAway + SetWindowOpacity(0): park the window at the virtual
 /// desktop's far corner (still on the desktop — SW_HIDE would kill
 /// rendering) and make it fully transparent.
+#[cfg(windows)]
 fn hide_window(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -3279,6 +3426,7 @@ fn hide_window(hwnd: HWND) {
 /// ConsoleWindowClass (conhost-drawn, not a normal DWM surface) —
 /// SW_HIDE is the reliable console hide. Cloak anyway as a fallback
 /// for pseudo-console hosts that do compose.
+#[cfg(windows)]
 fn hide_console_window(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -3299,6 +3447,7 @@ fn hide_console_window(hwnd: HWND) {
 /// the watchdog whenever the style creeps back or the hwnd is
 /// retargeted. Runs only after the capture exists so the style
 /// change can't stall boot-time rendering.
+#[cfg(windows)]
 fn undecorate_retroarch_window(hwnd: HWND) {
     if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return;
@@ -3347,6 +3496,7 @@ fn undecorate_retroarch_window(hwnd: HWND) {
 /// corner and NOTHING else. No toolwindow restyle: SWP_FRAMECHANGED →
 /// WM_STYLECHANGED lands in RA's window proc while a core's emu
 /// thread is mid-frame. No-op when the window already sits there.
+#[cfg(windows)]
 fn park_retroarch_window(hwnd: HWND) {
     unsafe {
         let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -3375,6 +3525,7 @@ fn park_retroarch_window(hwnd: HWND) {
 /// RetroArch needs a re-target decision when its render window was
 /// recreated — the capture hangs off the destroyed hwnd and gets zero
 /// frames otherwise (Lacrima's OnTargetHwndChanged re-attach).
+#[cfg(windows)]
 fn retroarch_needs_retarget(captured: HWND, resolved: HWND) -> bool {
     !resolved.is_invalid() && resolved != captured
 }
@@ -3390,6 +3541,7 @@ fn retroarch_needs_retarget(captured: HWND, resolved: HWND) -> bool {
 ///   Console" window inside retroarch.exe. Consoles are conhost-
 ///   owned, outside the pid sweep; AttachConsole→GetConsoleWindow is
 ///   the only reliable way to reach one we don't own.
+#[cfg(windows)]
 fn retroarch_watchdog(
     pid: u32,
     hwnd: &mut HWND,
@@ -3450,6 +3602,7 @@ fn retroarch_watchdog(
 
 /// Undo prepare+hide — used when capture attach fails so the user can
 /// still see/close the emulator window.
+#[cfg(windows)]
 fn restore_window(hwnd: HWND, saved: &SavedWindow) {
     if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return;
@@ -3502,6 +3655,7 @@ fn restore_window(hwnd: HWND, saved: &SavedWindow) {
 /// construction races Qt and produces stale aspect ratios. Cloaking
 /// hides it without touching geometry — the real prepare+park runs
 /// once the window proves stable.
+#[cfg(windows)]
 fn sweep_hide(
     pid: u32,
     skip: HWND,
@@ -3585,6 +3739,7 @@ fn sweep_hide(
 /// WM_KEYDOWNs don't reach Qt's shortcut map on an inactive window.
 /// The window stays cloaked — SetForegroundWindow doesn't undo a DWM
 /// cloak, so nothing flashes while it stops.
+#[cfg(windows)]
 fn send_ctrl_s(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -3631,6 +3786,7 @@ fn send_ctrl_s(hwnd: HWND) {
 
 /// Remove a window's menu bar if it has one — a no-op when there
 /// isn't (cheap enough to run on every sweep).
+#[cfg(windows)]
 fn strip_menu(hwnd: HWND) {
     unsafe {
         if !GetMenu(hwnd).is_invalid() {
@@ -3640,12 +3796,14 @@ fn strip_menu(hwnd: HWND) {
     }
 }
 
+#[cfg(windows)]
 fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
+#[cfg(windows)]
 fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 128];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
@@ -3656,6 +3814,7 @@ fn class_name(hwnd: HWND) -> String {
 /// (launch_setup). Kept for the process lifetime so the kill-on-close
 /// job still fires if the app exits or crashes while a setup window
 /// is open — the guards themselves only matter at process teardown.
+#[cfg(windows)]
 static SETUP_JOBS: Mutex<Vec<JobGuard>> = Mutex::new(Vec::new());
 
 /// Lacrima's ResizeWindowToAspectRatioInPlace — resize the captured
@@ -3663,6 +3822,7 @@ static SETUP_JOBS: Mutex<Vec<JobGuard>> = Mutex::new(Vec::new());
 /// to the virtual screen (the render child follows its parent's
 /// bounds). The window stays parked at its hidden spot — only its
 /// size, and so the capture's native aspect, changes.
+#[cfg(windows)]
 pub fn apply_aspect_ratio(hwnd: HWND, aspect: f64) {
     if hwnd.is_invalid() || aspect <= 0.0 {
         return;
@@ -3752,12 +3912,15 @@ pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
         .current_dir(work_dir)
         .spawn()
         .map_err(|e| format!("failed to start emulator: {e}"))?;
+    #[cfg(windows)]
     if let Some(job) = JobGuard::new(&child) {
         SETUP_JOBS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(job);
     }
+    #[cfg(not(windows))]
+    drop(child);
     Ok(())
 }
 
@@ -3770,6 +3933,7 @@ pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
 /// egui::Key → Win32 virtual-key code. Punctuation maps to the OEM
 /// VK the char lives on — the *shifted* char itself arrives through
 /// the tunneled WM_CHAR stream, so the VK only needs the right key.
+#[cfg(windows)]
 pub fn key_vk(key: egui::Key) -> Option<u16> {
     use egui::Key as K;
     // Letter/digit/F-key runs are contiguous in the enum — range
@@ -3821,6 +3985,7 @@ pub fn key_vk(key: egui::Key) -> Option<u16> {
 /// (previous-state for repeats, transition for releases). WndProcs
 /// that only read wParam (Xenia's ImGui) don't care, but proper
 /// lParams keep anyone who does honest.
+#[cfg(windows)]
 pub fn key_lparam(vk: u16, pressed: bool, repeat: bool) -> LPARAM {
     let sc = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) };
     let ext = matches!(vk, 0x21..=0x28 | 0x2D | 0x2E) as isize;
@@ -3837,6 +4002,7 @@ pub fn key_lparam(vk: u16, pressed: bool, repeat: bool) -> LPARAM {
 /// WM_KEYDOWN for a held modifier while the tunnel runs — Xenia's UI
 /// tracks Shift/Ctrl/Alt via their own key messages, so transitions
 /// post too.
+#[cfg(windows)]
 pub fn sync_mods(session: &Session, m: &egui::Modifiers, cur: &mut u8) {
     let want = m.shift as u8 | (m.ctrl as u8) << 1 | (m.alt as u8) << 2;
     for (bit, vk) in [(0x01u8, 0x10u16), (0x02, 0x11), (0x04, 0x12)] {
@@ -3854,6 +4020,8 @@ pub fn sync_mods(session: &Session, m: &egui::Modifiers, cur: &mut u8) {
 
 /// Lacrima's `RetroArchHandler.IsRetroArchErrorLine` — the lines that
 /// count as errors when the process dies before creating a window.
+/// Called by the windows session-log path + cross-platform tests.
+#[allow(dead_code)]
 fn retroarch_is_error_line(line: &str) -> bool {
     let l = line.trim().to_lowercase();
     if l.is_empty() {
@@ -3875,6 +4043,7 @@ fn retroarch_is_error_line(line: &str) -> bool {
 /// `TryParseRetroArchSystemDirectoryFromLog` — the core's
 /// GET_SYSTEM_DIRECTORY env reply names the dir the user has to drop
 /// firmware into.
+#[allow(dead_code)]
 fn retroarch_system_dir_from_log<'a>(lines: &[&'a str]) -> Option<String> {
     const MARKER: &str = "GET_SYSTEM_DIRECTORY:";
     lines.iter().find_map(|line| {
@@ -3893,6 +4062,7 @@ fn retroarch_system_dir_from_log<'a>(lines: &[&'a str]) -> Option<String> {
 /// (the real Beetle Saturn failure is `Cannot open BIOS file
 /// mpr-17933.bin` — the last [ERROR] tail just says content load
 /// failed, which is useless as a notice).
+#[allow(dead_code)]
 fn retroarch_error_notice(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let errors: Vec<String> = lines
@@ -3948,6 +4118,7 @@ mod tests {
     /// capturing a destroyed hwnd yields zero frames ("game runs but
     /// never gets captured").
     #[test]
+    #[cfg(windows)]
     fn retroarch_retarget_on_recreated_window() {
         use super::HWND;
         let dead = HWND(0x1000usize as _);

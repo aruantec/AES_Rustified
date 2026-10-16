@@ -163,6 +163,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "image",
+ "libc",
  "lofty",
  "md-5",
  "naga",
