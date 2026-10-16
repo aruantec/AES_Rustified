@@ -1069,10 +1069,17 @@ fn hash_title_db(file: &'static str) -> &'static HashTitleDb {
     static GENESIS: OnceLock<HashTitleDb> = OnceLock::new();
     static SNES: OnceLock<HashTitleDb> = OnceLock::new();
     static GBA: OnceLock<HashTitleDb> = OnceLock::new();
+    static PSP: OnceLock<HashTitleDb> = OnceLock::new();
+    static PSP_REDUMP: OnceLock<HashTitleDb> = OnceLock::new();
     let (slot, json) = match file {
         "nes.json" => (&NES, include_str!("../assets/database/nes.json")),
         "snes.json" => (&SNES, include_str!("../assets/database/snes.json")),
         "gba.json" => (&GBA, include_str!("../assets/database/gba.json")),
+        "psp.json" => (&PSP, include_str!("../assets/database/psp.json")),
+        "psp_redump.json" => (
+            &PSP_REDUMP,
+            include_str!("../assets/database/psp_redump.json"),
+        ),
         _ => (
             &GENESIS,
             include_str!("../assets/database/genesis.json"),
@@ -1534,6 +1541,312 @@ fn gba_title(path: &Path) -> Option<String> {
     gba_header_title(&bytes)
 }
 
+// ------------------------------------------------------------------
+// PSP: PARAM.SFO TITLE first (Lacrima's TryResolvePspTitle), then the
+// redump hash db, then the No-Intro hash db — the opposite order of
+// the cart sections, since every retail UMD image carries an SFO.
+// ------------------------------------------------------------------
+
+const SFO_MAGIC: u32 = 0x46535000; // "\0PSF"
+const SFO_MAGIC_ALT: u32 = 0x00465350; // "PSF\0" (some homebrew/tools)
+const PSP_SCAN_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Lacrima's `PspParamSfoReader.TryReadSfo` — returns (DISC_ID,
+/// TITLE). Index entries are 16 bytes: key_off u16, data_format u16,
+/// data_len u32, _max_len u32, data_off u32.
+fn psp_sfo_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
+    let u32le = |o: usize| -> Option<u32> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let magic = u32le(0).unwrap_or(0);
+    if magic != SFO_MAGIC && magic != SFO_MAGIC_ALT {
+        return (None, None);
+    }
+    let key_table = u32le(8).unwrap_or(0) as usize;
+    let data_table = u32le(12).unwrap_or(0) as usize;
+    let count = u32le(16).unwrap_or(0) as usize;
+    if count == 0 || count > 128 {
+        return (None, None);
+    }
+    let (mut disc_id, mut title) = (None, None);
+    for i in 0..count {
+        let e = 0x14 + i * 16;
+        let Some(entry) = bytes.get(e..e + 16) else { break };
+        let key_off = u16::from_le_bytes(entry[0..2].try_into().unwrap()) as usize;
+        let data_format = u16::from_le_bytes(entry[2..4].try_into().unwrap());
+        let data_len = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
+        let data_off = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+        // Key: cstring at key_table+key_off, ≤64 bytes.
+        let key_start = key_table + key_off;
+        let key: String = bytes
+            .get(key_start..key_start.saturating_add(64).min(bytes.len()))
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
+        if key.is_empty() {
+            continue;
+        }
+        let value = if (data_format == 0x0404 || data_format == 0x0204) && data_len > 0 {
+            let start = data_table + data_off;
+            let take = data_len.min(512);
+            bytes
+                .get(start..start + take)
+                .map(|raw| psp_decode_sfo_string(raw))
+        } else if data_format == 0x0402 && data_len >= 4 {
+            bytes
+                .get(data_table + data_off..data_table + data_off + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()).to_string())
+        } else {
+            None
+        };
+        let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("DISC_ID") {
+            disc_id = Some(value.clone());
+        } else if key.eq_ignore_ascii_case("TITLE") {
+            title = Some(value.clone());
+        }
+    }
+    (disc_id, title)
+}
+
+/// Lacrima's `DecodeSfoString` — strict UTF-8, then ShiftJIS, then a
+/// printable-ASCII prefix.
+fn psp_decode_sfo_string(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let span = &raw[..end];
+    if span.is_empty() {
+        return String::new();
+    }
+    let decoded = std::str::from_utf8(span)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| {
+            let (cow, _, _) = encoding_rs::SHIFT_JIS.decode(span);
+            cow.into_owned()
+        });
+    let cleaned = sanitize_psp_title(&decoded);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    sanitize_psp_title(
+        &span
+            .iter()
+            .take_while(|&&b| (32..=126).contains(&b))
+            .map(|&b| b as char)
+            .collect::<String>(),
+    )
+}
+
+/// Lacrima's `SanitizePspTitle` — trim, drop NUL/space padding, then
+/// any trailing '?'/replacement chars left by a failed decode.
+fn sanitize_psp_title(value: &str) -> String {
+    let v = value.trim().trim_end_matches(['\0', ' ']);
+    v.trim_end_matches(['?', '\u{FFFD}']).trim_end().to_string()
+}
+
+/// Read `PSP_GAME/PARAM.SFO` out of an ISO9660 image — PVD at sector
+/// 16, root dir record at +156, two-level directory walk (Lacrima's
+/// `TryLocateIso9660File`). `read_at` abstracts the file/CSO-block
+/// source.
+fn psp_iso9660_sfo(
+    read_at: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<(Option<String>, Option<String>)> {
+    let pvd = read_at(16 * PS_SECTOR, PS_SECTOR as usize)?;
+    if pvd.first() != Some(&1) || pvd.len() < 156 + 34 || pvd[156] == 0 {
+        return None;
+    }
+    let root_lba = le32(&pvd, 156 + 2)? as u64;
+    let root_size = le32(&pvd, 156 + 10)?.min(64 * 1024 * 1024) as usize;
+    if root_lba == 0 || root_size == 0 {
+        return None;
+    }
+    let root_dir = read_at(root_lba * PS_SECTOR, root_size)?;
+    let sfo_dir = iso_dir_data(&root_dir, "PSP_GAME", read_at)?;
+    let sfo = iso_dir_data(&sfo_dir, "PARAM.SFO", read_at)?;
+    let bytes = &sfo[..sfo.len().min(64 * 1024)];
+    Some(psp_sfo_fields(bytes))
+}
+
+/// One ISO9660 directory level — find `name` in `dir` and return its
+/// data extent (a directory's extent is the next level's dir bytes).
+fn iso_dir_data(
+    dir: &[u8],
+    name: &str,
+    read_at: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    while pos < dir.len() {
+        let rec = dir[pos] as usize;
+        if rec == 0 {
+            // Directory records can't cross a sector boundary.
+            pos += (PS_SECTOR as usize - pos % PS_SECTOR as usize).max(1);
+            continue;
+        }
+        if pos + rec > dir.len() {
+            break;
+        }
+        let name_len = dir[pos + 32] as usize;
+        if name_len > 0 {
+            if let Some(raw) = dir.get(pos + 33..pos + 33 + name_len) {
+                let n = String::from_utf8_lossy(raw);
+                let n = n.split(';').next().unwrap_or("").trim_end_matches(['\0', ' ']);
+                if n.eq_ignore_ascii_case(name) {
+                    let lba = le32(dir, pos + 2)? as u64;
+                    let size = le32(dir, pos + 10)?.min(64 * 1024 * 1024) as usize;
+                    return (lba != 0 && size != 0)
+                        .then(|| read_at(lba * PS_SECTOR, size))
+                        .flatten();
+                }
+            }
+        }
+        pos += rec;
+    }
+    None
+}
+
+/// Raw scan for `\0PSF`/`PSF\0` magic in the first bytes of a source
+/// (Lacrima's `TryScanForSfo` — the fallback for images whose PVD
+/// path lookup fails).
+fn psp_scan_sfo(bytes: &[u8]) -> Option<(Option<String>, Option<String>)> {
+    let mut off = 0usize;
+    while off + 0x14 <= bytes.len() {
+        let magic = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        if magic == SFO_MAGIC || magic == SFO_MAGIC_ALT {
+            let (id, title) = psp_sfo_fields(&bytes[off..]);
+            if id.is_some() || title.is_some() {
+                return Some((id, title));
+            }
+        }
+        off += 1;
+    }
+    None
+}
+
+/// Read `(DISC_ID, TITLE)` from a PSP package — PBP via its param
+/// offset, ISO via ISO9660 → raw scan, CSO via its first data block
+/// (stored uncompressed when the index high bit is set; Lacrima
+/// reads the block raw either way).
+fn psp_sfo_read(path: &Path) -> Option<(Option<String>, Option<String>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let mut read_at = |off: u64, len: usize| -> Option<Vec<u8>> {
+        if off >= file_len {
+            return None;
+        }
+        let take = len.min((file_len - off) as usize);
+        let mut b = vec![0u8; take];
+        f.seek(SeekFrom::Start(off)).ok()?;
+        f.read_exact(&mut b).ok()?;
+        Some(b)
+    };
+    match ext.as_str() {
+        "pbp" => {
+            let hdr = read_at(0, 0x20)?;
+            if hdr[0..4] != [0x00, b'P', b'B', b'P'] {
+                return None;
+            }
+            let sfo_off = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
+            if sfo_off == 0 || sfo_off >= file_len {
+                return None;
+            }
+            let sfo = read_at(sfo_off, (file_len - sfo_off).min(64 * 1024) as usize)?;
+            Some(psp_sfo_fields(&sfo))
+        }
+        "cso" => {
+            let hdr = read_at(0, 0x20)?;
+            if hdr[0..4] != *b"CISO" {
+                return None;
+            }
+            let header_size = le32(&hdr, 4)? as u64;
+            let block_size = le32(&hdr, 0x0C)? as u64;
+            if header_size == 0 || block_size == 0 || header_size + 4 > file_len {
+                return None;
+            }
+            let idx = read_at(header_size, 4)?;
+            let block_off = (le32(&idx, 0)? & 0x7FFF_FFFF) as u64;
+            if block_off == 0 || block_off >= file_len {
+                return None;
+            }
+            let block = read_at(block_off, block_size as usize)?;
+            psp_iso9660_sfo(&mut |off, len| {
+                let take = len.min(block.len().saturating_sub(off as usize));
+                block
+                    .get(off as usize..off as usize + take)
+                    .map(|s| s.to_vec())
+            })
+            .or_else(|| psp_scan_sfo(&block))
+        }
+        "iso" => psp_iso9660_sfo(&mut read_at).or_else(|| {
+            let head = read_at(0, PSP_SCAN_LIMIT.min(file_len as usize))?;
+            psp_scan_sfo(&head)
+        }),
+        _ => None,
+    }
+}
+
+/// Stream-hash a (potentially multi-GB) PSP image and look it up in
+/// the redump db first, then the No-Intro db — Lacrima's
+/// TryResolvePspTitle fallback order.
+fn psp_hash_title(path: &Path) -> Option<String> {
+    use md5::Digest as _;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let (mut md5, mut sha1, mut crc) =
+        (md5::Md5::new(), sha1::Sha1::new(), crc32fast::Hasher::new());
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        md5.update(&buf[..n]);
+        sha1.update(&buf[..n]);
+        crc.update(&buf[..n]);
+    }
+    let (md5, sha1, crc) = (
+        format!("{:x}", md5.finalize()),
+        format!("{:x}", sha1.finalize()),
+        format!("{:08X}", crc.finalize()),
+    );
+    for file in ["psp_redump.json", "psp.json"] {
+        let db = hash_title_db(file);
+        if let Some(t) = db
+            .md5
+            .get(&md5)
+            .or_else(|| db.sha1.get(&sha1))
+            .or_else(|| db.crc.get(&crc))
+        {
+            return Some(t.clone());
+        }
+    }
+    None
+}
+
+/// PSP title — Lacrima's `TryResolvePspTitle`: the PARAM.SFO TITLE
+/// wins (every UMD carries one), then redump → No-Intro hash lookups,
+/// then the caller's stem.
+fn psp_title(path: &Path) -> Option<String> {
+    if let Some((_id, title)) = psp_sfo_read(path) {
+        if let Some(t) = title {
+            let cleaned = clean_ascii_text(sanitize_psp_title(&t).trim());
+            if valid_rom_title(&cleaned) {
+                return Some(cleaned);
+            }
+        }
+    }
+    psp_hash_title(path)
+}
+
 /// The disc serial — Lacrima's GetTitleId dispatch on extension.
 pub(crate) fn ps_disc_serial(path: &Path) -> Option<String> {
     let ext = path
@@ -1559,7 +1872,9 @@ fn ps_pbp_serial(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut hdr = [0u8; 0x28];
     f.read_exact(&mut hdr).ok()?;
-    if &hdr[0..4] != b"PBP\0" {
+    // Real PBP magic is 00 50 42 50 ("\0PBP") — the earlier "PBP\0"
+    // check could never match an actual file.
+    if &hdr[0..4] != b"\0PBP" {
         return None;
     }
     let sfo_off = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
@@ -3976,6 +4291,9 @@ fn resolve_one(
                 "SNES" => snes_title(path),
                 // No-Intro hash DB → 12-byte header title at 0xA0.
                 "GBA" => gba_title(path),
+                // PARAM.SFO TITLE (PBP/ISO9660/CSO) → redump →
+                // No-Intro hash DBs (psp_redump.json / psp.json).
+                "PSP" => psp_title(path),
                 "PS3" => ps3_title(path),
                 "PS4" => ps4_title(path),
                 _ => None,
@@ -4775,6 +5093,74 @@ mod tests {
         // All-NUL field → no title.
         rom[0xA0..0xA0 + 12].fill(0);
         assert!(gba_header_title(&rom).is_none());
+    }
+
+    /// PSP PARAM.SFO index parsing — DISC_ID + TITLE fields out of a
+    /// hand-built SFO (magic \0PSF, 2 index entries, key + data tables).
+    #[test]
+    fn psp_sfo_fields_parse() {
+        let mut sfo = vec![0u8; 0x44 + 32];
+        sfo[0..4].copy_from_slice(&[0x00, 0x50, 0x53, 0x46]); // \0PSF
+        sfo[8..12].copy_from_slice(&0x34u32.to_le_bytes()); // key table
+        sfo[12..16].copy_from_slice(&0x44u32.to_le_bytes()); // data table
+        sfo[16..20].copy_from_slice(&2u32.to_le_bytes()); // index count
+        // entry 0 — DISC_ID, string (0x0404), 12 bytes at data+0.
+        sfo[0x16..0x18].copy_from_slice(&0x0404u16.to_le_bytes());
+        sfo[0x18..0x1C].copy_from_slice(&12u32.to_le_bytes());
+        // entry 1 — TITLE, key at +8, 12 bytes at data+16.
+        sfo[0x24..0x26].copy_from_slice(&8u16.to_le_bytes());
+        sfo[0x26..0x28].copy_from_slice(&0x0404u16.to_le_bytes());
+        sfo[0x28..0x2C].copy_from_slice(&12u32.to_le_bytes());
+        sfo[0x30..0x34].copy_from_slice(&16u32.to_le_bytes());
+        sfo[0x34..0x3C].copy_from_slice(b"DISC_ID\0");
+        sfo[0x3C..0x42].copy_from_slice(b"TITLE\0");
+        sfo[0x44..0x50].copy_from_slice(b"ULUS-12345\0\0");
+        sfo[0x54..0x60].copy_from_slice(b"MY PSP GAME\0");
+
+        let (id, title) = psp_sfo_fields(&sfo);
+        assert_eq!(id.as_deref(), Some("ULUS-12345"));
+        assert_eq!(title.as_deref(), Some("MY PSP GAME"));
+
+        // Bad magic → nothing.
+        sfo[0] = 0x50;
+        assert_eq!(psp_sfo_fields(&sfo), (None, None));
+    }
+
+    /// SFO string decode — NUL-truncated UTF-8, ShiftJIS fallback,
+    /// and the trailing '?'/U+FFFD sanitize step.
+    #[test]
+    fn psp_sfo_string_decode() {
+        assert_eq!(psp_decode_sfo_string(b"GAME\0PAD").as_str(), "GAME");
+        // 0x93 0xFA 0x96 0x75 = 真紅 in ShiftJIS — not valid UTF-8.
+        let sjis = psp_decode_sfo_string(&[0x93, 0xFA, 0x96, 0x75]);
+        assert!(!sjis.is_empty());
+        // Decode garbage that sanitizes empty → ASCII prefix path.
+        assert_eq!(sanitize_psp_title("Title???\u{FFFD}").as_str(), "Title");
+    }
+
+    /// The PBP reader honors the \0PBP magic + param offset (the PS1
+    /// serial path checked "PBP\0", which real files never match).
+    #[test]
+    fn psp_pbp_sfo_offset() {
+        // Build a minimal PBP: \0PBP + param_offset → SFO.
+        let mut pbp = vec![0u8; 0x100];
+        pbp[0..4].copy_from_slice(&[0x00, 0x50, 0x42, 0x50]);
+        pbp[8..12].copy_from_slice(&0x40u32.to_le_bytes());
+        let mut sfo = vec![0u8; 0x60];
+        sfo[0..4].copy_from_slice(&[0x00, 0x50, 0x53, 0x46]);
+        sfo[8..12].copy_from_slice(&0x34u32.to_le_bytes());
+        sfo[12..16].copy_from_slice(&0x40u32.to_le_bytes());
+        sfo[16..20].copy_from_slice(&1u32.to_le_bytes());
+        sfo[0x16..0x18].copy_from_slice(&0x0404u16.to_le_bytes());
+        sfo[0x18..0x1C].copy_from_slice(&6u32.to_le_bytes());
+        sfo[0x34..0x3A].copy_from_slice(b"TITLE\0");
+        sfo[0x40..0x46].copy_from_slice(b"HELLO\0");
+        pbp[0x40..0x40 + 0x60].copy_from_slice(&sfo);
+        // parse directly at the offset — same code path psp_sfo_read
+        // drives after seeking.
+        let (id, title) = psp_sfo_fields(&pbp[0x40..]);
+        assert!(id.is_none());
+        assert_eq!(title.as_deref(), Some("HELLO"));
     }
 
     /// SYSTEM.CNF parsing — PSX `BOOT = cdrom:\...` and PS2

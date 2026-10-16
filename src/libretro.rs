@@ -28,11 +28,13 @@ pub enum Section {
     Genesis,
     Snes,
     Gba,
+    Psp,
 }
 
 impl Section {
-    /// Section key ("3DS", "N64", "NES", "GENESIS", "SNES", "GBA") →
-    /// core section. `None` for sections with no RetroArch handler.
+    /// Section key ("3DS", "N64", "NES", "GENESIS", "SNES", "GBA",
+    /// "PSP") → core section. `None` for sections with no RetroArch
+    /// handler.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "3DS" => Some(Self::ThreeDs),
@@ -41,6 +43,7 @@ impl Section {
             "GENESIS" => Some(Self::Genesis),
             "SNES" => Some(Self::Snes),
             "GBA" => Some(Self::Gba),
+            "PSP" => Some(Self::Psp),
             _ => None,
         }
     }
@@ -59,6 +62,7 @@ impl Section {
             Self::Genesis => "GENESIS",
             Self::Snes => "SNES",
             Self::Gba => "GBA",
+            Self::Psp => "PSP",
         }
     }
 
@@ -70,6 +74,7 @@ impl Section {
             Self::Genesis => "genesis_cores.json",
             Self::Snes => "snes_cores.json",
             Self::Gba => "gba_cores.json",
+            Self::Psp => "psp_cores.json",
         }
     }
 
@@ -81,6 +86,7 @@ impl Section {
             Self::Genesis => "Genesis",
             Self::Snes => "SNES",
             Self::Gba => "GBA",
+            Self::Psp => "PSP",
         }
     }
 
@@ -94,6 +100,7 @@ impl Section {
             Self::Genesis => is_genesis_info(fields),
             Self::Snes => is_snes_info(fields),
             Self::Gba => is_gba_info(fields),
+            Self::Psp => is_psp_info(fields),
         }
     }
 }
@@ -621,6 +628,38 @@ fn is_gba_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
     has_gba_extension && meta
 }
 
+/// PSP cores — "PlayStation Portable"/"PSP" metadata plus a real UMD
+/// image/package extension (iso/cso/pbp/chd). psx/pcsx2 cores fail
+/// the metadata check ("PlayStation"/"PlayStation 2" have no "psp"
+/// token and no "portable"), so the extension set alone isn't enough
+/// to pull them in.
+fn is_psp_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_psp_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "iso" | "cso" | "pbp" | "chd" | "prx" | "elf"
+        )
+    });
+    let meta = [system, database, display].iter().any(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("playstation portable")
+            || lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| t == "psp")
+    });
+    has_psp_extension && meta
+}
+
 fn extract_core_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
     std::fs::create_dir_all(destination)
         .map_err(|e| format!("Cannot create core directory: {e}"))?;
@@ -759,7 +798,7 @@ fn set_progress(progress: &CoreDownload, stage: &str, fraction: f32) {
 mod tests {
     use super::{
         is_3ds_info, is_gba_info, is_genesis_info, is_n64_info, is_nes_info,
-        is_snes_info, parse_info_fields, select_core, CoreInfo,
+        is_psp_info, is_snes_info, parse_info_fields, select_core, CoreInfo,
     };
 
     #[test]
@@ -1060,11 +1099,53 @@ mod tests {
     }
 
     #[test]
+    fn psp_info_filter_accepts_ppsspp_rejects_psx_pcsx2() {
+        // The real ppsspp_libretro.info metadata.
+        let ppsspp = parse_info_fields(
+            r#"
+                corename = "PPSSPP"
+                display_name = "Sony - PlayStation Portable (PPSSPP)"
+                systemname = "PlayStation Portable"
+                database = "Sony - PlayStation Portable"
+                supported_extensions = "elf|iso|cso|prx|pbp|chd"
+            "#,
+        );
+        assert!(is_psp_info(&ppsspp));
+        // PS1/PS2 cores share the "PlayStation" brand and the iso/chd
+        // extension space — the metadata gate keeps them out.
+        let pcsx2 = parse_info_fields(
+            r#"
+                corename = "PCSX2"
+                systemname = "PlayStation 2"
+                supported_extensions = "iso|chd|ciso|bin|mdf|z|znx|bz2|dump|gz|pbp|cbn"
+            "#,
+        );
+        assert!(!is_psp_info(&pcsx2));
+        let duckstation = parse_info_fields(
+            r#"
+                corename = "DuckStation"
+                systemname = "PlayStation"
+                supported_extensions = "cue|chd|iso|pbp|ecm|img|mdf|mds|exe|psx|psf|m3u"
+            "#,
+        );
+        assert!(!is_psp_info(&duckstation));
+        // A PSP-marked core that can't open UMD packages is no use.
+        let no_ext = parse_info_fields(
+            r#"
+                corename = "PPSSPP"
+                systemname = "PlayStation Portable"
+                supported_extensions = "sav|srm"
+            "#,
+        );
+        assert!(!is_psp_info(&no_ext));
+    }
+
+    #[test]
     fn section_key_roundtrips_from_card_key() {
         // The settings cards and download jobs key sections by the
         // same string — a mapping slip shows the wrong card's
         // progress or refreshes the wrong catalog.
-        for key in ["3DS", "N64", "NES", "GENESIS", "SNES", "GBA"] {
+        for key in ["3DS", "N64", "NES", "GENESIS", "SNES", "GBA", "PSP"] {
             let section = super::Section::from_key(key).unwrap();
             assert_eq!(section.key(), key);
         }

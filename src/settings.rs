@@ -399,6 +399,8 @@ pub struct Emulation {
     pub selected_snes_core: String,
     /// Same for the GBA section — `Emulators/GBA/Libretro`.
     pub selected_gba_core: String,
+    /// Same for the PSP section — `Emulators/PSP/Libretro`.
+    pub selected_psp_core: String,
     /// Per-section capture/render options (Lacrima's RenderOptions
     /// overlay, "Rendering" tab) — keyed by section key.
     pub render: std::collections::BTreeMap<String, RenderOpts>,
@@ -486,6 +488,7 @@ impl Default for Emulation {
             selected_genesis_core: String::new(),
             selected_snes_core: String::new(),
             selected_gba_core: String::new(),
+            selected_psp_core: String::new(),
             render: Default::default(),
         }
     }

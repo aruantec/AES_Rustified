@@ -160,6 +160,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "embed-resource",
+ "encoding_rs",
  "flate2",
  "image",
  "lofty",

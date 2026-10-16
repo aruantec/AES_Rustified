@@ -58,6 +58,7 @@ const NES_SECTION: &str = "NES";
 const GENESIS_SECTION: &str = "GENESIS";
 const SNES_SECTION: &str = "SNES";
 const GBA_SECTION: &str = "GBA";
+const PSP_SECTION: &str = "PSP";
 const RETROARCH_HANDLER: &str = "retroarch";
 
 /// The persisted selected-core field for a RetroArch-backed section —
@@ -74,6 +75,7 @@ fn selected_core<'a>(
         libretro::Section::Genesis => &mut cfg.selected_genesis_core,
         libretro::Section::Snes => &mut cfg.selected_snes_core,
         libretro::Section::Gba => &mut cfg.selected_gba_core,
+        libretro::Section::Psp => &mut cfg.selected_psp_core,
     }
 }
 
@@ -86,6 +88,7 @@ fn selected_core_id<'a>(cfg: &'a settings::Emulation, section: libretro::Section
         libretro::Section::Genesis => cfg.selected_genesis_core.as_str(),
         libretro::Section::Snes => cfg.selected_snes_core.as_str(),
         libretro::Section::Gba => cfg.selected_gba_core.as_str(),
+        libretro::Section::Psp => cfg.selected_psp_core.as_str(),
     }
 }
 
@@ -212,6 +215,7 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
         GENESIS_SECTION => retroarch_spec(GENESIS_SECTION),
         SNES_SECTION => retroarch_spec(SNES_SECTION),
         GBA_SECTION => retroarch_spec(GBA_SECTION),
+        PSP_SECTION => retroarch_spec(PSP_SECTION),
         _ => return None,
     })
 }
@@ -1051,7 +1055,8 @@ impl EmuView {
             | NES_SECTION
             | GENESIS_SECTION
             | SNES_SECTION
-            | GBA_SECTION => Some(RETROARCH_HANDLER.to_string()),
+            | GBA_SECTION
+            | PSP_SECTION => Some(RETROARCH_HANDLER.to_string()),
             _ => None,
         }
     }
