@@ -598,6 +598,87 @@ fn claim_export_name(base: &str, used: &mut std::collections::HashSet<String>) -
     name
 }
 
+/// Albums holding URL items — the .apl-exportable set ("Export All
+/// Playlists" writes one file per entry, selection-independent).
+fn exportable_dirs(albums: &[library::Album]) -> Vec<String> {
+    albums
+        .iter()
+        .filter(|a| a.url_count > 0)
+        .map(|a| a.dir.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The tile menu's export — same document as the cover-view export;
+/// labels come from the loaded carousel when this album is open,
+/// persisted urls otherwise. A single dir gets a save-file dialog;
+/// several write one .apl per album into a picked folder.
+fn export_playlists(
+    dirs: &[String],
+    albums: &[library::Album],
+    carousel: &carousel::Carousel,
+    settings: &settings::Settings,
+) {
+    let items_for = |dir: &str| -> Option<(String, Vec<apl::Item>)> {
+        let i = albums.iter().position(|a| a.dir.to_string_lossy() == dir)?;
+        let title = albums[i].title.clone();
+        let items = if carousel.album_key() == Some(dir) {
+            carousel.export_items()
+        } else {
+            settings
+                .library
+                .url_items
+                .get(dir)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|url| apl::Item {
+                    url,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        (!items.is_empty()).then_some((title, items))
+    };
+    let file_name_for = |title: &str| {
+        let n = apl::sanitize_file_name(title);
+        if n.is_empty() {
+            "playlist".to_string()
+        } else {
+            n
+        }
+    };
+    if dirs.len() == 1 {
+        if let Some((title, items)) = items_for(&dirs[0]) {
+            let file_name = file_name_for(&title);
+            if let Some(file) = rfd::FileDialog::new()
+                .set_title("Export Online Playlist")
+                .set_file_name(format!("{file_name}.apl"))
+                .add_filter("AES Online Playlist", &["apl"])
+                .save_file()
+            {
+                if let Err(e) = apl::write(&file, &title, items) {
+                    eprintln!("apl export failed: {e}");
+                }
+            }
+        }
+    } else if let Some(folder) = rfd::FileDialog::new()
+        .set_title("Export Online Playlists")
+        .pick_folder()
+    {
+        let mut used: std::collections::HashSet<String> = Default::default();
+        for dir in dirs {
+            let Some((title, items)) = items_for(dir) else {
+                continue;
+            };
+            let name = claim_export_name(&file_name_for(&title), &mut used);
+            let file = folder.join(format!("{name}.apl"));
+            if let Err(e) = apl::write(&file, &title, items) {
+                eprintln!("apl export failed: {e}");
+            }
+        }
+    }
+}
+
 impl AesRustApp {
     fn new(cc: &eframe::CreationContext<'_>, settings: settings::Settings) -> Self {
         // Lacrima renders its title in Consolas Bold and widgets in Segoe UI
@@ -1798,7 +1879,15 @@ impl eframe::App for AesRustApp {
                     match *sel_owner {
                         SelOwner::Albums => album_row.select_all(albums),
                         SelOwner::Cards => carousel.select_all(&search.text),
-                        SelOwner::None => {}
+                        // Same default as the arrow keys: a loaded
+                        // album's cards own it, else the strip.
+                        SelOwner::None => {
+                            if carousel.has_items() {
+                                carousel.select_all(&search.text)
+                            } else {
+                                album_row.select_all(albums)
+                            }
+                        }
                     }
                 }
                 // Arrow-key navigation — same owner routing. With no
@@ -2206,77 +2295,14 @@ impl eframe::App for AesRustApp {
                         settings::save(settings);
                     }
                     album_row::Action::Export(dirs) => {
-                        // The tile menu's export — same document as the
-                        // cover-view export; labels come from the
-                        // loaded carousel when this album is open,
-                        // persisted urls otherwise. A multi-selection
-                        // exports one .apl per album into a folder.
-                        let items_for = |dir: &str| -> Option<(String, Vec<apl::Item>)> {
-                            let i = albums.iter().position(|a| a.dir.to_string_lossy() == dir)?;
-                            let title = albums[i].title.clone();
-                            let items = if carousel.album_key() == Some(dir) {
-                                carousel.export_items()
-                            } else {
-                                settings
-                                    .library
-                                    .url_items
-                                    .get(dir)
-                                    .cloned()
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|url| apl::Item {
-                                        url,
-                                        ..Default::default()
-                                    })
-                                    .collect()
-                            };
-                            (!items.is_empty()).then_some((title, items))
-                        };
-                        if dirs.len() == 1 {
-                            if let Some((title, items)) = items_for(&dirs[0]) {
-                                let file_name = {
-                                    let n = apl::sanitize_file_name(&title);
-                                    if n.is_empty() {
-                                        "playlist".to_string()
-                                    } else {
-                                        n
-                                    }
-                                };
-                                if let Some(file) = rfd::FileDialog::new()
-                                    .set_title("Export Online Playlist")
-                                    .set_file_name(format!("{file_name}.apl"))
-                                    .add_filter("AES Online Playlist", &["apl"])
-                                    .save_file()
-                                {
-                                    if let Err(e) = apl::write(&file, &title, items) {
-                                        eprintln!("apl export failed: {e}");
-                                    }
-                                }
-                            }
-                        } else if let Some(folder) = rfd::FileDialog::new()
-                            .set_title("Export Online Playlists")
-                            .pick_folder()
-                        {
-                            let mut used: std::collections::HashSet<String> = Default::default();
-                            for dir in &dirs {
-                                let Some((title, items)) = items_for(dir) else {
-                                    continue;
-                                };
-                                let base = {
-                                    let n = apl::sanitize_file_name(&title);
-                                    if n.is_empty() {
-                                        "playlist".to_string()
-                                    } else {
-                                        n
-                                    }
-                                };
-                                let name = claim_export_name(&base, &mut used);
-                                let file = folder.join(format!("{name}.apl"));
-                                if let Err(e) = apl::write(&file, &title, items) {
-                                    eprintln!("apl export failed: {e}");
-                                }
-                            }
-                        }
+                        export_playlists(&dirs, albums, carousel, settings);
+                    }
+                    album_row::Action::ExportAll => {
+                        // "Export All Playlists" — every album holding
+                        // url items, one .apl each into a folder,
+                        // independent of the tile selection.
+                        let dirs = exportable_dirs(albums);
+                        export_playlists(&dirs, albums, carousel, settings);
                     }
                     album_row::Action::Import => {
                         // Lacrima's ImportPlaylistAsync, plural: pick
@@ -6363,5 +6389,25 @@ mod tests {
         assert_eq!(claim_export_name("Mix", &mut used), "Mix (3)");
         assert_eq!(claim_export_name("Other", &mut used), "Other");
         assert_eq!(used.len(), 4);
+    }
+
+    /// "Export All Playlists" covers every album holding url items —
+    /// file-only albums never produce an .apl.
+    #[test]
+    fn exportable_dirs_picks_url_albums() {
+        let mk = |dir: &str, url_count: usize| library::Album {
+            title: dir.to_string(),
+            dir: std::path::PathBuf::from(dir),
+            tracks: Vec::new(),
+            covers: Vec::new(),
+            url_count,
+        };
+        let albums = vec![
+            mk("apl://Mix", 3),
+            mk("C:/Music/Rock", 0),
+            mk("apl://Chill", 12),
+        ];
+        assert_eq!(exportable_dirs(&albums), ["apl://Mix", "apl://Chill"]);
+        assert!(exportable_dirs(&[]).is_empty());
     }
 }

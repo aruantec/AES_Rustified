@@ -87,6 +87,9 @@ pub enum Action {
     /// the pointed tile sits inside a multi-selection the payload is
     /// every selected album's dir (one .apl each), like Delete.
     Export(Vec<String>),
+    /// "Export All Playlists" — every album holding URL items gets
+    /// its own .apl in a picked folder, regardless of selection.
+    ExportAll,
     /// "Import Playlist" — pick an .apl file to add as an album
     /// (Lacrima's ImportOnlinePlaylistCommand).
     Import,
@@ -1169,6 +1172,22 @@ impl AlbumRow {
                 .map(|p| self.hit_tile(rect, &m, albums.len(), p))
                 .filter(|&h| h >= 0)
                 .map(|h| h as usize);
+            // Explorer semantics: right-clicking an unselected tile
+            // selects just it; right-clicking a selected one keeps the
+            // group so the menu acts on the whole selection. Without
+            // this the menu ran on a STALE sel_dirs (right-click never
+            // touches selection) — a partial leftover set labelled
+            // "Export Playlists" but exported only the pointed album.
+            if let Some(i) = self.menu_album {
+                let dir = albums[i].dir.to_string_lossy().into_owned();
+                if !self.sel_dirs.contains(&dir) {
+                    self.sel_dirs.clear();
+                    self.sel_dirs.insert(dir.clone());
+                    self.sel_anchor = dir;
+                    self.selected = i as i32;
+                    self.sel_touched = true;
+                }
+            }
         }
 
         // --- Physics (ported: spring 680 / zeta 0.9, rubber-band 12/s) --
@@ -1719,6 +1738,14 @@ impl AlbumRow {
         }
         if ui.button("Import Playlist").clicked() {
             *action = Action::Import;
+            ui.close();
+        }
+        // Every url-holding album exports its own .apl into a picked
+        // folder — independent of what happens to be selected.
+        if albums.iter().any(|a| a.url_count > 0)
+            && ui.button("Export All Playlists").clicked()
+        {
+            *action = Action::ExportAll;
             ui.close();
         }
         if ui.button("Create Album").clicked() {
