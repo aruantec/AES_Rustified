@@ -26,19 +26,29 @@ pub enum Section {
     N64,
     Nes,
     Genesis,
+    Snes,
+    Gba,
 }
 
 impl Section {
-    /// Section key ("3DS", "N64", "NES", "GENESIS") → core section.
-    /// `None` for sections with no RetroArch handler.
+    /// Section key ("3DS", "N64", "NES", "GENESIS", "SNES", "GBA") →
+    /// core section. `None` for sections with no RetroArch handler.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "3DS" => Some(Self::ThreeDs),
             "N64" => Some(Self::N64),
             "NES" => Some(Self::Nes),
             "GENESIS" => Some(Self::Genesis),
+            "SNES" => Some(Self::Snes),
+            "GBA" => Some(Self::Gba),
             _ => None,
         }
+    }
+
+    /// The catalog section key — same string as the `Emulators/`
+    /// subdir for every RetroArch-backed section.
+    pub fn key(self) -> &'static str {
+        self.dir()
     }
 
     fn dir(self) -> &'static str {
@@ -47,6 +57,8 @@ impl Section {
             Self::N64 => "N64",
             Self::Nes => "NES",
             Self::Genesis => "GENESIS",
+            Self::Snes => "SNES",
+            Self::Gba => "GBA",
         }
     }
 
@@ -56,6 +68,8 @@ impl Section {
             Self::N64 => "n64_cores.json",
             Self::Nes => "nes_cores.json",
             Self::Genesis => "genesis_cores.json",
+            Self::Snes => "snes_cores.json",
+            Self::Gba => "gba_cores.json",
         }
     }
 
@@ -65,6 +79,8 @@ impl Section {
             Self::N64 => "N64",
             Self::Nes => "NES",
             Self::Genesis => "Genesis",
+            Self::Snes => "SNES",
+            Self::Gba => "GBA",
         }
     }
 
@@ -76,6 +92,8 @@ impl Section {
             Self::N64 => is_n64_info(fields),
             Self::Nes => is_nes_info(fields),
             Self::Genesis => is_genesis_info(fields),
+            Self::Snes => is_snes_info(fields),
+            Self::Gba => is_gba_info(fields),
         }
     }
 }
@@ -545,6 +563,64 @@ fn is_genesis_info(fields: &std::collections::BTreeMap<String, String>) -> bool 
     has_gen_extension && meta
 }
 
+/// SNES counterpart — snes9x/bsnes/mesen-s. "snes" appears in core
+/// names as a substring (bsnes, snes9x) so a plain `contains` is the
+/// right test here; the extension list still has to carry a real
+/// Super Famicom container.
+fn is_snes_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_snes_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "sfc" | "smc" | "fig" | "swc" | "bs" | "bsx" | "st"
+        )
+    });
+    let meta = [system, database, display].iter().any(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("snes") || lower.contains("super nintendo")
+    });
+    has_snes_extension && meta
+}
+
+/// GBA counterpart — mgba/vbam/gpsp. Meta must name the handheld
+/// (token "gba" or the "game boy advance" phrase — GB/GBC-only cores
+/// like gambatte match neither) and carry a `.gba` extension.
+fn is_gba_info(fields: &std::collections::BTreeMap<String, String>) -> bool {
+    let system = fields.get("systemname").map(String::as_str).unwrap_or("");
+    let database = fields.get("database").map(String::as_str).unwrap_or("");
+    let display = fields.get("display_name").map(String::as_str).unwrap_or("");
+    let extensions = fields
+        .get("supported_extensions")
+        .map(String::as_str)
+        .unwrap_or("");
+    let has_gba_extension = extensions.split('|').any(|e| {
+        matches!(
+            e.trim()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+                .as_str(),
+            "gba" | "agb"
+        )
+    });
+    let meta = [system, database, display].iter().any(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("game boy advance")
+            || lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| t == "gba")
+    });
+    has_gba_extension && meta
+}
+
 fn extract_core_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
     std::fs::create_dir_all(destination)
         .map_err(|e| format!("Cannot create core directory: {e}"))?;
@@ -682,8 +758,8 @@ fn set_progress(progress: &CoreDownload, stage: &str, fraction: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_3ds_info, is_genesis_info, is_n64_info, is_nes_info, parse_info_fields,
-        select_core, CoreInfo,
+        is_3ds_info, is_gba_info, is_genesis_info, is_n64_info, is_nes_info,
+        is_snes_info, parse_info_fields, select_core, CoreInfo,
     };
 
     #[test]
@@ -878,5 +954,120 @@ mod tests {
             "#,
         );
         assert!(!is_genesis_info(&sms));
+    }
+
+    #[test]
+    fn snes_info_filter_accepts_snes9x_and_bsnes() {
+        let snes9x = parse_info_fields(
+            r#"
+                corename = "Snes9x"
+                display_name = "Nintendo - SNES / SFC (Snes9x)"
+                systemname = "Super Nintendo Entertainment System"
+                supported_extensions = "smc|fig|sfc|gd3|gd7|dx2|bsx|bs|swc"
+            "#,
+        );
+        assert!(is_snes_info(&snes9x));
+        let bsnes = parse_info_fields(
+            r#"
+                corename = "bsnes-mercury"
+                display_name = "Nintendo - SNES / Famicom (bsnes-mercury)"
+                database = "Nintendo - Super Nintendo Entertainment System"
+                supported_extensions = "sfc|smc|bml|rom"
+            "#,
+        );
+        assert!(is_snes_info(&bsnes));
+    }
+
+    #[test]
+    fn snes_info_filter_rejects_nes_and_genesis() {
+        let fceumm = parse_info_fields(
+            r#"
+                corename = "FCEUmm"
+                display_name = "Nintendo - NES / Famicom (FCEUmm)"
+                systemname = "Nintendo Entertainment System"
+                supported_extensions = "fds|nes|unf|unif"
+            "#,
+        );
+        assert!(!is_snes_info(&fceumm));
+        let genplusgx = parse_info_fields(
+            r#"
+                corename = "Genesis Plus GX"
+                display_name = "Sega - MS/GG/MD/CD (Genesis Plus GX)"
+                supported_extensions = "mdx|md|smd|gen|bin|cue|iso|sms|68k|sg"
+            "#,
+        );
+        assert!(!is_snes_info(&genplusgx));
+    }
+
+    #[test]
+    fn gba_info_filter_accepts_mgba_rejects_gambatte() {
+        let mgba = parse_info_fields(
+            r#"
+                corename = "mGBA"
+                display_name = "Nintendo - Game Boy Advance (mGBA)"
+                systemname = "Game Boy Advance"
+                supported_extensions = "gba|agb|gb|gbc|mb|elf"
+            "#,
+        );
+        assert!(is_gba_info(&mgba));
+        // GB/GBC only — "game boy" alone is not "game boy advance".
+        let gambatte = parse_info_fields(
+            r#"
+                corename = "Gambatte"
+                display_name = "Nintendo - Game Boy / Color (Gambatte)"
+                systemname = "Game Boy/Game Boy Color"
+                supported_extensions = "gb|gbc|dmg"
+            "#,
+        );
+        assert!(!is_gba_info(&gambatte));
+        let snes9x = parse_info_fields(
+            r#"
+                corename = "Snes9x"
+                systemname = "Super Nintendo Entertainment System"
+                supported_extensions = "smc|sfc|swc"
+            "#,
+        );
+        assert!(!is_gba_info(&snes9x));
+    }
+
+    #[test]
+    fn gba_info_filter_accepts_real_buildbot_metadata() {
+        // The actual mgba_libretro.info from the buildbot info.zip —
+        // its extension list leads with gb|gbc and its metadata is a
+        // combined "Game Boy/Game Boy Color/Game Boy Advance" string,
+        // both of which a naive "starts with gba" check misses.
+        let mgba = parse_info_fields(
+            r#"
+                corename = "mGBA"
+                display_name = "Nintendo - Game Boy Advance (mGBA)"
+                systemname = "Game Boy/Game Boy Color/Game Boy Advance"
+                database = "Nintendo - Game Boy|Nintendo - Game Boy Color|Nintendo - Game Boy Advance"
+                supported_extensions = "gb|gbc|gba"
+            "#,
+        );
+        assert!(is_gba_info(&mgba));
+        // And the other real GBA entries from the same bundle.
+        for (name, system) in [
+            ("gpSP", "Game Boy Advance"),
+            ("VBA-M", "Game Boy/Game Boy Color/Game Boy Advance"),
+            ("SkyEmu", "Game Boy/Game Boy Color/Game Boy Advance"),
+        ] {
+            let info = parse_info_fields(&format!(
+                "corename = \"{name}\"\nsystemname = \"{system}\"\nsupported_extensions = \"gba|gb|gbc\""
+            ));
+            assert!(is_gba_info(&info), "{name} should be a GBA core");
+        }
+    }
+
+    #[test]
+    fn section_key_roundtrips_from_card_key() {
+        // The settings cards and download jobs key sections by the
+        // same string — a mapping slip shows the wrong card's
+        // progress or refreshes the wrong catalog.
+        for key in ["3DS", "N64", "NES", "GENESIS", "SNES", "GBA"] {
+            let section = super::Section::from_key(key).unwrap();
+            assert_eq!(section.key(), key);
+        }
+        assert!(super::Section::from_key("PS2").is_none());
     }
 }

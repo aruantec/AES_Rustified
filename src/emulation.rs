@@ -56,6 +56,8 @@ const THREE_DS_SECTION: &str = "3DS";
 const N64_SECTION: &str = "N64";
 const NES_SECTION: &str = "NES";
 const GENESIS_SECTION: &str = "GENESIS";
+const SNES_SECTION: &str = "SNES";
+const GBA_SECTION: &str = "GBA";
 const RETROARCH_HANDLER: &str = "retroarch";
 
 /// The persisted selected-core field for a RetroArch-backed section —
@@ -70,6 +72,8 @@ fn selected_core<'a>(
         libretro::Section::N64 => &mut cfg.selected_n64_core,
         libretro::Section::Nes => &mut cfg.selected_nes_core,
         libretro::Section::Genesis => &mut cfg.selected_genesis_core,
+        libretro::Section::Snes => &mut cfg.selected_snes_core,
+        libretro::Section::Gba => &mut cfg.selected_gba_core,
     }
 }
 
@@ -80,6 +84,8 @@ fn selected_core_id<'a>(cfg: &'a settings::Emulation, section: libretro::Section
         libretro::Section::N64 => cfg.selected_n64_core.as_str(),
         libretro::Section::Nes => cfg.selected_nes_core.as_str(),
         libretro::Section::Genesis => cfg.selected_genesis_core.as_str(),
+        libretro::Section::Snes => cfg.selected_snes_core.as_str(),
+        libretro::Section::Gba => cfg.selected_gba_core.as_str(),
     }
 }
 
@@ -198,11 +204,14 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             download: emu_dl::download_eden,
         },
         THREE_DS_SECTION => retroarch_spec(THREE_DS_SECTION),
-        // N64, NES + Genesis share the RetroArch handler + frontend
-        // install — only the Libretro core set is section-specific.
+        // N64, NES, Genesis, SNES + GBA share the RetroArch handler +
+        // frontend install — only the Libretro core set is
+        // section-specific.
         N64_SECTION => retroarch_spec(N64_SECTION),
         NES_SECTION => retroarch_spec(NES_SECTION),
         GENESIS_SECTION => retroarch_spec(GENESIS_SECTION),
+        SNES_SECTION => retroarch_spec(SNES_SECTION),
+        GBA_SECTION => retroarch_spec(GBA_SECTION),
         _ => return None,
     })
 }
@@ -385,6 +394,22 @@ fn extract_art() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// A running settings-card download. `cores` marks a Libretro core
+/// pack (the `done` result is a summary and the section's core list
+/// refreshes); `None` means a handler-exe install (the result is a
+/// path written to `emulators[handler]`).
+pub struct DlJob {
+    /// `spec.handler` — the `cfg.emulators` key for exe installs and
+    /// the `installed_hint` key to invalidate.
+    pub handler: &'static str,
+    /// `spec.name` — the display name for the "installed" line.
+    pub name: &'static str,
+    /// Libretro core-pack section, when this is a core download.
+    pub cores: Option<libretro::Section>,
+    /// The shared progress handle the worker thread updates.
+    pub shared: emu_dl::Shared,
+}
+
 /// Per-view state for Emulation.
 pub struct EmuView {
     /// The console-section strip — Lacrima's EmulationListView shares
@@ -484,26 +509,27 @@ pub struct EmuView {
     frame_buf: Vec<u8>,
     /// One-line notice for the item area (launch errors, hints).
     pub notice: Option<String>,
-    /// In-flight emulator download (Xenia install/update) — the
-    /// settings card polls the shared progress.
-    pub dl: Option<emu_dl::Shared>,
-    /// The in-flight download is a Libretro core pack, not the
-    /// handler executable — its `done` result is a summary, not an
-    /// exe path. Carries the section the cores belong to.
-    pub dl_cores: Option<libretro::Section>,
-    /// Last download result line shown under the progress bar.
-    pub dl_msg: Option<String>,
+    /// In-flight emulator downloads (handler install or Libretro
+    /// core pack), keyed by the OWNING card's section ("GBA") — the
+    /// progress bar renders only there and its button disables only
+    /// there; other cards can still start their own downloads. A
+    /// finished job is released by whichever card renders first —
+    /// the job carries the handler/name/section so the result lands
+    /// in the right slot regardless.
+    pub dl: HashMap<String, DlJob>,
+    /// Last download result line per card (owner key → message).
+    pub dl_msg: HashMap<String, String>,
     /// Cached `spec.installed_exe` results per handler — the
     /// resolvers walk the whole managed install (RetroArch alone is
     /// ~10k files) and this ran once per expanded card per frame,
     /// which is what made the settings tab crawl during/after a
     /// download.
     installed_hint: HashMap<String, (std::time::Instant, Option<PathBuf>)>,
-    /// Cached Libretro core list — catalog read + per-core file
-    /// stats, refreshed at most once a second instead of every
-    /// frame. Keyed by section ("3DS"/"N64") so expanding one card
-    /// never shows another's cores.
-    cores_hint: Option<(String, std::time::Instant, Vec<libretro::CoreInfo>)>,
+    /// Cached Libretro core list per section — catalog read +
+    /// per-core file stats, refreshed at most once a second instead
+    /// of every frame. A single-slot cache thrashed between expanded
+    /// RetroArch cards (each frame: key mismatch → filesystem scan).
+    cores_hint: HashMap<String, (std::time::Instant, Vec<libretro::CoreInfo>)>,
     /// The ROM metadata editor overlay (EmulationMetadataOverlay).
     pub editor: rom_editor::RomEditor,
     /// Xenia per-game Patches overlay (XeniaPatchesOverlay).
@@ -677,11 +703,10 @@ impl EmuView {
             frame_seq: 0,
             frame_buf: Vec::new(),
             notice: None,
-            dl: None,
-            dl_cores: None,
-            dl_msg: None,
+            dl: HashMap::new(),
+            dl_msg: HashMap::new(),
             installed_hint: HashMap::new(),
-            cores_hint: None,
+            cores_hint: HashMap::new(),
             editor: rom_editor::RomEditor::new(),
             patches: xenia_overlay::PatchesOverlay::new(),
             cfg_ov: xenia_overlay::ConfigOverlay::new(),
@@ -1021,9 +1046,12 @@ impl EmuView {
             GCN_SECTION | WII_SECTION => Some(DOLPHIN_HANDLER.to_string()),
             WIIU_SECTION => Some(CEMU_HANDLER.to_string()),
             SWITCH_SECTION => Some(EDEN_HANDLER.to_string()),
-            THREE_DS_SECTION | N64_SECTION | NES_SECTION | GENESIS_SECTION => {
-                Some(RETROARCH_HANDLER.to_string())
-            }
+            THREE_DS_SECTION
+            | N64_SECTION
+            | NES_SECTION
+            | GENESIS_SECTION
+            | SNES_SECTION
+            | GBA_SECTION => Some(RETROARCH_HANDLER.to_string()),
             _ => None,
         }
     }
@@ -3772,19 +3800,21 @@ pub fn settings_tab(
                             .layout(Layout::left_to_right(Align::Center)),
                     );
                     cui2.set_opacity(t);
-                    if emu.cores_hint.as_ref().map_or(true, |(k, t, _)| {
-                        k != key || t.elapsed() > std::time::Duration::from_secs(1)
+                    if emu.cores_hint.get(key).map_or(true, |(t, _)| {
+                        t.elapsed() > std::time::Duration::from_secs(1)
                     }) {
-                        emu.cores_hint = Some((
+                        emu.cores_hint.insert(
                             key.to_string(),
-                            std::time::Instant::now(),
-                            libretro::installed_cores(core_section),
-                        ));
+                            (
+                                std::time::Instant::now(),
+                                libretro::installed_cores(core_section),
+                            ),
+                        );
                     }
                     let cores = emu
                         .cores_hint
-                        .as_ref()
-                        .map(|(_, _, c)| c.clone())
+                        .get(key)
+                        .map(|(_, c)| c.clone())
                         .unwrap_or_default();
                     if let Some(first) = cores.first() {
                         let sel = selected_core(cfg, core_section);
@@ -3919,7 +3949,7 @@ pub fn settings_tab(
 
                 // Right-aligned button row — Lacrima's
                 // Set default | Browse | Clear | Download.
-                let downloading = emu.dl.is_some();
+                let downloading = emu.dl.contains_key(key);
                 let is_default = cfg
                     .default_handlers
                     .get(spec.section)
@@ -3954,9 +3984,16 @@ pub fn settings_tab(
                     t,
                 );
                 if dl_clicked {
-                    emu.dl = Some((spec.download)());
-                    emu.dl_cores = None;
-                    emu.dl_msg = None;
+                    emu.dl.insert(
+                        key.to_string(),
+                        DlJob {
+                            handler: spec.handler,
+                            name: spec.name,
+                            cores: None,
+                            shared: (spec.download)(),
+                        },
+                    );
+                    emu.dl_msg.remove(key);
                 }
                 bx -= 12.0 * s;
 
@@ -3977,9 +4014,16 @@ pub fn settings_tab(
                         t,
                     );
                     if cores_clicked {
-                        emu.dl = Some(libretro::download_cores(core_section));
-                        emu.dl_cores = Some(core_section);
-                        emu.dl_msg = None;
+                        emu.dl.insert(
+                            key.to_string(),
+                            DlJob {
+                                handler: spec.handler,
+                                name: spec.name,
+                                cores: Some(core_section),
+                                shared: libretro::download_cores(core_section),
+                            },
+                        );
+                        emu.dl_msg.remove(key);
                     }
                     bx -= 12.0 * s;
                 }
@@ -4064,28 +4108,44 @@ pub fn settings_tab(
                 }
 
                 // Progress block (Lacrima's IsDownloading row) + the
-                // last result line.
+                // last result line. Finished jobs are released by
+                // whichever card renders first — the result is keyed
+                // to the owner so the right card shows the message
+                // and refreshes the right core list.
                 let py = by + 38.0 * s;
-                let mut status_line = emu.dl_msg.clone();
-                if let Some(dl) = &emu.dl {
-                    let (stage, frac, done) = {
-                        let p = dl.lock().unwrap_or_else(|e| e.into_inner());
-                        (p.stage.clone(), p.frac, p.done.clone())
-                    };
-                    if let Some(res) = done {
-                        match res {
+                let finished: Vec<String> = emu
+                    .dl
+                    .iter()
+                    .filter(|(_, job)| {
+                        job.shared
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .done
+                            .is_some()
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in finished {
+                    if let Some(job) = emu.dl.remove(&k) {
+                        let res = job
+                            .shared
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .done
+                            .clone()
+                            .unwrap_or_else(|| Err("download aborted".to_string()));
+                        let msg = match res {
                             Ok(result) => {
-                                if let Some(core_section) = emu.dl_cores {
+                                if let Some(core_section) = job.cores {
                                     // The core pack returns a summary,
                                     // not a path — re-default the
                                     // selection to the first install
                                     // when the stored id is gone.
                                     let cores = libretro::installed_cores(core_section);
-                                    emu.cores_hint = Some((
-                                        key.to_string(),
-                                        std::time::Instant::now(),
-                                        cores.clone(),
-                                    ));
+                                    emu.cores_hint.insert(
+                                        core_section.key().to_string(),
+                                        (std::time::Instant::now(), cores.clone()),
+                                    );
                                     if let Some(first) = cores.first() {
                                         let sel = selected_core(cfg, core_section);
                                         if !cores.iter().any(|c| c.id.eq_ignore_ascii_case(sel)) {
@@ -4093,43 +4153,48 @@ pub fn settings_tab(
                                         }
                                     }
                                     emu.settings_dirty = true;
-                                    status_line = Some(result);
+                                    result
                                 } else {
-                                    cfg.emulators.insert(spec.handler.into(), result);
+                                    cfg.emulators.insert(job.handler.into(), result);
                                     emu.settings_dirty = true;
-                                    emu.installed_hint.remove(spec.handler);
-                                    status_line = Some(format!("{} installed", spec.name));
+                                    emu.installed_hint.remove(job.handler);
+                                    format!("{} installed", job.name)
                                 }
                             }
-                            Err(e) => status_line = Some(e),
-                        }
-                        emu.dl = None;
-                    } else {
-                        // Keep repainting while the download runs —
-                        // egui is reactive, so without this the bar
-                        // only moves on input events.
-                        ui.ctx().request_repaint();
-                        let track = Rect::from_min_size(
-                            Pos2::new(inner.min.x + m, py),
-                            Vec2::new(inner.width() - m * 2.0, 6.0 * s),
-                        );
-                        painter.rect_filled(
-                            track,
-                            CornerRadius::same(3),
-                            Color32::from_gray(50).gamma_multiply(t),
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_size(
-                                track.min,
-                                Vec2::new(track.width() * frac, track.height()),
-                            ),
-                            CornerRadius::same(3),
-                            Color32::from_rgb(0x1E, 0x6B, 0x3A).gamma_multiply(t),
-                        );
-                        status_line = Some(stage);
+                            Err(e) => e,
+                        };
+                        emu.dl_msg.insert(k, msg);
                     }
                 }
-                emu.dl_msg = status_line.clone();
+                let mut status_line = emu.dl_msg.get(key).cloned();
+                if let Some(job) = emu.dl.get(key) {
+                    let (stage, frac) = {
+                        let p = job.shared.lock().unwrap_or_else(|e| e.into_inner());
+                        (p.stage.clone(), p.frac)
+                    };
+                    // Keep repainting while the download runs —
+                    // egui is reactive, so without this the bar
+                    // only moves on input events.
+                    ui.ctx().request_repaint();
+                    let track = Rect::from_min_size(
+                        Pos2::new(inner.min.x + m, py),
+                        Vec2::new(inner.width() - m * 2.0, 6.0 * s),
+                    );
+                    painter.rect_filled(
+                        track,
+                        CornerRadius::same(3),
+                        Color32::from_gray(50).gamma_multiply(t),
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            track.min,
+                            Vec2::new(track.width() * frac, track.height()),
+                        ),
+                        CornerRadius::same(3),
+                        Color32::from_rgb(0x1E, 0x6B, 0x3A).gamma_multiply(t),
+                    );
+                    status_line = Some(stage);
+                }
                 if let Some(msg) = status_line {
                     // Fixed slot above the hint — ~14px of clear
                     // margin between the status and the hint text.

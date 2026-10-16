@@ -395,6 +395,10 @@ pub struct Emulation {
     pub selected_nes_core: String,
     /// Same for the Genesis section — `Emulators/GENESIS/Libretro`.
     pub selected_genesis_core: String,
+    /// Same for the SNES section — `Emulators/SNES/Libretro`.
+    pub selected_snes_core: String,
+    /// Same for the GBA section — `Emulators/GBA/Libretro`.
+    pub selected_gba_core: String,
     /// Per-section capture/render options (Lacrima's RenderOptions
     /// overlay, "Rendering" tab) — keyed by section key.
     pub render: std::collections::BTreeMap<String, RenderOpts>,
@@ -480,6 +484,8 @@ impl Default for Emulation {
             selected_n64_core: String::new(),
             selected_nes_core: String::new(),
             selected_genesis_core: String::new(),
+            selected_snes_core: String::new(),
+            selected_gba_core: String::new(),
             render: Default::default(),
         }
     }

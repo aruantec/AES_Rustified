@@ -55,8 +55,18 @@ const GRID_BOTTOM: f32 = 28.0;
 const SCROLLBAR_RESERVE: f32 = 40.0;
 const H_PAD_X: f32 = 36.0;
 const TITLE_AREA: f32 = 0.24;
-/// Scrollbar track width and reserved edge zone for the grid bars.
-const SB_W: f32 = 5.0;
+/// Scrollbar track thickness for the grid bars — the vertical bar is
+/// the grid's main scroll affordance, so it gets a wider face; the
+/// horizontal bar doubles the old 5px so the thumb is grabbable.
+const SB_W_V: f32 = 15.0;
+const SB_W_H: f32 = 10.0;
+/// Vertical track inset from the view's right edge: must clear the
+/// window's 8px resize border plus the hit-zone expansion, or the
+/// resize cursor swallows every scrollbar grab.
+const SB_INSET_V: f32 = 16.0;
+/// Horizontal track inset from the view's bottom edge.
+const SB_INSET_H: f32 = 3.0;
+/// Reserved bottom zone for the horizontal bar's grid layout.
 const SB_ZONE: f32 = 14.0;
 /// Wheel multiplier for grid scrolling (egui's ~24-50px/notch is too
 /// sluggish for long card lists).
@@ -3259,16 +3269,22 @@ impl GridGeo {
         let (track, horizontal) = if self.horizontal {
             (
                 Rect::from_min_max(
-                    Pos2::new(rect.min.x + H_PAD_X * s, rect.max.y - SB_W * s - 3.0 * s),
-                    Pos2::new(rect.max.x - H_PAD_X * s, rect.max.y - 3.0 * s),
+                    Pos2::new(
+                        rect.min.x + H_PAD_X * s,
+                        rect.max.y - SB_W_H * s - SB_INSET_H * s,
+                    ),
+                    Pos2::new(rect.max.x - H_PAD_X * s, rect.max.y - SB_INSET_H * s),
                 ),
                 true,
             )
         } else {
             (
                 Rect::from_min_max(
-                    Pos2::new(rect.max.x - SB_W * s - 3.0 * s, rect.min.y + GRID_TOP * s),
-                    Pos2::new(rect.max.x - 3.0 * s, rect.max.y - GRID_BOTTOM * s),
+                    Pos2::new(
+                        rect.max.x - SB_W_V * s - SB_INSET_V * s,
+                        rect.min.y + GRID_TOP * s,
+                    ),
+                    Pos2::new(rect.max.x - SB_INSET_V * s, rect.max.y - GRID_BOTTOM * s),
                 ),
                 false,
             )

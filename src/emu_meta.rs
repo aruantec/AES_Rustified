@@ -1067,8 +1067,12 @@ struct HashTitleDb {
 fn hash_title_db(file: &'static str) -> &'static HashTitleDb {
     static NES: OnceLock<HashTitleDb> = OnceLock::new();
     static GENESIS: OnceLock<HashTitleDb> = OnceLock::new();
+    static SNES: OnceLock<HashTitleDb> = OnceLock::new();
+    static GBA: OnceLock<HashTitleDb> = OnceLock::new();
     let (slot, json) = match file {
         "nes.json" => (&NES, include_str!("../assets/database/nes.json")),
+        "snes.json" => (&SNES, include_str!("../assets/database/snes.json")),
+        "gba.json" => (&GBA, include_str!("../assets/database/gba.json")),
         _ => (
             &GENESIS,
             include_str!("../assets/database/genesis.json"),
@@ -1247,14 +1251,16 @@ fn nes_title(path: &Path) -> Option<String> {
 // (ExtractGenesisTitleFromBytes).
 // ------------------------------------------------------------------
 
-/// Genesis extension list for archive-member selection — the same
-/// cartridge set the section scans, minus the containers.
+/// Cartridge extension lists for archive-member selection — the
+/// same sets the sections scan, minus the containers.
 const GENESIS_CART_EXTS: &[&str] = &["gen", "md", "smd", "32x", "sg", "bin"];
+const SNES_CART_EXTS: &[&str] = &["sfc", "smc", "fig", "swc"];
+const GBA_CART_EXTS: &[&str] = &["gba"];
 
 /// The ROM bytes to inspect: the file itself, or the first
 /// cartridge member inside a zip/7z (member name returned for the
-/// SMD filename hint Lacrima uses).
-fn genesis_rom_bytes(path: &Path) -> Option<(Vec<u8>, Option<String>)> {
+/// container-format hint — e.g. Lacrima's .smd filename rule).
+fn cart_rom_bytes(path: &Path, cart_exts: &[&str]) -> Option<(Vec<u8>, Option<String>)> {
     use std::io::Read as _;
     let ext = path
         .extension()
@@ -1281,7 +1287,7 @@ fn genesis_rom_bytes(path: &Path) -> Option<(Vec<u8>, Option<String>)> {
                     .rsplit_once('.')
                     .map(|(_, x)| x.to_ascii_lowercase())
                     .unwrap_or_default();
-                if !GENESIS_CART_EXTS.contains(&eext.as_str()) {
+                if !cart_exts.contains(&eext.as_str()) {
                     continue;
                 }
                 let mut buf = Vec::with_capacity(e.size() as usize);
@@ -1307,7 +1313,7 @@ fn genesis_rom_bytes(path: &Path) -> Option<(Vec<u8>, Option<String>)> {
                         && e.name()
                             .rsplit_once('.')
                             .map(|(_, x)| {
-                                GENESIS_CART_EXTS
+                                cart_exts
                                     .contains(&x.to_ascii_lowercase().as_str())
                             })
                             .unwrap_or(false)
@@ -1432,7 +1438,7 @@ fn genesis_header_title(normalized: &[u8]) -> Option<String> {
 /// a non-normalizable file still gets the raw-hash shot like
 /// Lacrima's fallback ApplyCartridgeHashes.
 fn genesis_title(path: &Path) -> Option<String> {
-    let (bytes, inner_name) = genesis_rom_bytes(path)?;
+    let (bytes, inner_name) = cart_rom_bytes(path, GENESIS_CART_EXTS)?;
     if let Some(norm) = genesis_lookup_rom(&bytes, inner_name.as_deref()) {
         if let Some(t) = hash_db_resolve("genesis.json", &norm) {
             return Some(t);
@@ -1440,6 +1446,92 @@ fn genesis_title(path: &Path) -> Option<String> {
         return genesis_header_title(&norm);
     }
     hash_db_resolve("genesis.json", &bytes)
+}
+
+// ------------------------------------------------------------------
+// SNES: No-Intro hash DB (snes.json, generated from the libretro
+// No-Intro dat) over the file then the copier-header-stripped body →
+// validated LoROM/HiROM header title (ExtractSnesTitle).
+// ------------------------------------------------------------------
+
+/// SNES header candidates — LoROM and HiROM, each in the clean and
+/// the +512-byte copier-header layout (Lacrima's headerOffsets).
+const SNES_HEADER_OFFSETS: [usize; 4] = [0x7FB0, 0x7FB0 + 0x200, 0xFFB0, 0xFFB0 + 0x200];
+
+/// Lacrima's `IsSnesHeader` — checksum + complement == 0xFFFF with a
+/// nonzero/non-FFFF checksum.
+fn snes_valid_header(buf: &[u8], offset: usize) -> bool {
+    let Some(b) = buf.get(offset + 0x2C..offset + 0x30) else {
+        return false;
+    };
+    let complement = u16::from_le_bytes([b[0], b[1]]);
+    let checksum = u16::from_le_bytes([b[2], b[3]]);
+    checksum != 0 && checksum != 0xFFFF && checksum.wrapping_add(complement) == 0xFFFF
+}
+
+/// Lacrima's `ExtractSnesTitle` — the 21-byte ASCII field 0x10 bytes
+/// into the first validated header.
+fn snes_header_title(bytes: &[u8]) -> Option<String> {
+    for offset in SNES_HEADER_OFFSETS {
+        if !snes_valid_header(bytes, offset) {
+            continue;
+        }
+        let Some(field) = bytes.get(offset + 0x10..offset + 0x10 + 21) else {
+            continue;
+        };
+        let cleaned = clean_ascii_text(&String::from_utf8_lossy(field));
+        if valid_rom_title(&cleaned) {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+/// SNES title — hash the file (then the body minus a 512-byte copier
+/// header, which is what No-Intro actually hashes) against snes.json,
+/// else the header title field, else the caller's stem.
+fn snes_title(path: &Path) -> Option<String> {
+    let (bytes, _inner) = cart_rom_bytes(path, SNES_CART_EXTS)?;
+    if let Some(t) = hash_db_resolve("snes.json", &bytes) {
+        return Some(t);
+    }
+    // Copier-headered dump: strip 512 only when the shifted header
+    // actually validates as SNES.
+    if bytes.len() > 512
+        && (snes_valid_header(&bytes, 0x7FB0 + 0x200)
+            || snes_valid_header(&bytes, 0xFFB0 + 0x200))
+    {
+        if let Some(t) = hash_db_resolve("snes.json", &bytes[512..]) {
+            return Some(t);
+        }
+    }
+    snes_header_title(&bytes)
+}
+
+// ------------------------------------------------------------------
+// GBA: No-Intro hash DB (gba.json) over the file → 12-byte header
+// title at 0xA0 (ExtractGbaTitle).
+// ------------------------------------------------------------------
+
+/// Lacrima's `ExtractGbaTitle` — the 12-byte ASCII title field at
+/// 0xA0, trimmed of NUL/space padding.
+fn gba_header_title(bytes: &[u8]) -> Option<String> {
+    let field = bytes.get(0xA0..0xA0 + 12)?;
+    let cleaned = clean_ascii_text(
+        String::from_utf8_lossy(field)
+            .trim_end_matches(['\0', ' ']),
+    );
+    valid_rom_title(&cleaned).then_some(cleaned)
+}
+
+/// GBA title — hash the file against gba.json (Lacrima has no GBA
+/// normalization), else the header title, else the caller's stem.
+fn gba_title(path: &Path) -> Option<String> {
+    let (bytes, _inner) = cart_rom_bytes(path, GBA_CART_EXTS)?;
+    if let Some(t) = hash_db_resolve("gba.json", &bytes) {
+        return Some(t);
+    }
+    gba_header_title(&bytes)
 }
 
 /// The disc serial — Lacrima's GetTitleId dispatch on extension.
@@ -3880,6 +3972,10 @@ fn resolve_one(
                 // No-Intro hash DB over the normalized dump → SEGA
                 // header name field.
                 "GENESIS" => genesis_title(path),
+                // No-Intro hash DB → LoROM/HiROM header title.
+                "SNES" => snes_title(path),
+                // No-Intro hash DB → 12-byte header title at 0xA0.
+                "GBA" => gba_title(path),
                 "PS3" => ps3_title(path),
                 "PS4" => ps4_title(path),
                 _ => None,
@@ -4621,6 +4717,64 @@ mod tests {
         // No international field → domestic wins.
         rom[0x150..0x180].fill(b' ');
         assert_eq!(genesis_header_title(&rom).as_deref(), Some("DOMESTIC NA"));
+    }
+
+    /// The generated No-Intro SNES/GBA databases parse and land in
+    /// the normalized lookup keys.
+    #[test]
+    fn snes_gba_dbs_load() {
+        let sdb = hash_title_db("snes.json");
+        assert!(sdb.md5.len() > 3000, "snes.json should be ~3700 rows");
+        assert_eq!(
+            sdb.crc.get("2D206BF7").map(String::as_str),
+            Some("Chrono Trigger (USA)")
+        );
+        let g = hash_title_db("gba.json");
+        assert!(g.md5.len() > 1000, "gba.json should be thousands of rows");
+        assert_eq!(
+            g.crc.get("F0815EE7").map(String::as_str),
+            Some("Pokemon - Ruby Version (USA, Europe)")
+        );
+    }
+
+    /// SNES header validation (checksum+complement==0xFFFF) and the
+    /// 21-byte title field — LoROM, and the +0x200 copier-header
+    /// layout.
+    #[test]
+    fn snes_header_title_fields() {
+        fn put_header(rom: &mut Vec<u8>, off: usize) {
+            rom[off + 0x10..off + 0x10 + 16].copy_from_slice(b"SUPER MARIOWORLD");
+            // complement + checksum == 0xFFFF (LE u16s at +0x2C/+0x2E)
+            rom[off + 0x2C..off + 0x2E].copy_from_slice(&0xEDCBu16.to_le_bytes());
+            rom[off + 0x2E..off + 0x30].copy_from_slice(&0x1234u16.to_le_bytes());
+        }
+        let mut rom = vec![0u8; 0x8000];
+        put_header(&mut rom, 0x7FB0);
+        assert!(snes_valid_header(&rom, 0x7FB0));
+        assert_eq!(snes_header_title(&rom).as_deref(), Some("SUPER MARIOWORLD"));
+        // 512-byte copier header shifts every offset by +0x200.
+        let mut headered = vec![0xEE; 512];
+        headered.extend_from_slice(&rom);
+        assert!(snes_valid_header(&headered, 0x7FB0 + 0x200));
+        assert_eq!(
+            snes_header_title(&headered).as_deref(),
+            Some("SUPER MARIOWORLD")
+        );
+        // A broken checksum pair validates nothing.
+        rom[0x7FB0 + 0x2E] ^= 0xFF;
+        assert!(!snes_valid_header(&rom, 0x7FB0));
+        assert!(snes_header_title(&rom).is_none());
+    }
+
+    /// The GBA 12-byte title field at 0xA0, NUL/space padded.
+    #[test]
+    fn gba_header_title_field() {
+        let mut rom = vec![0u8; 0x200];
+        rom[0xA0..0xA0 + 11].copy_from_slice(b"POKEMONRUBY");
+        assert_eq!(gba_header_title(&rom).as_deref(), Some("POKEMONRUBY"));
+        // All-NUL field → no title.
+        rom[0xA0..0xA0 + 12].fill(0);
+        assert!(gba_header_title(&rom).is_none());
     }
 
     /// SYSTEM.CNF parsing — PSX `BOOT = cdrom:\...` and PS2
