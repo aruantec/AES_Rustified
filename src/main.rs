@@ -15,6 +15,7 @@ mod equalizer;
 mod exe_icon;
 mod icons;
 mod library;
+mod libretro;
 mod logo;
 mod meta_cache;
 mod paint;
@@ -558,10 +559,7 @@ impl DeletePrompt {
 /// each frame — the view's idle `Action::None` result must not
 /// clobber it (the delete-confirm regression: Confirm deleted
 /// nothing). A real action from the frame still wins.
-fn or_row_action(
-    pending: album_row::Action,
-    frame: album_row::Action,
-) -> album_row::Action {
+fn or_row_action(pending: album_row::Action, frame: album_row::Action) -> album_row::Action {
     if matches!(frame, album_row::Action::None) {
         pending
     } else {
@@ -740,7 +738,13 @@ impl AesRustApp {
             },
             scan_seen: std::collections::HashSet::new(),
             settings,
-            nav: Nav::Settled(View::Main),
+            // AES_AUTOLAUNCH diagnostics land on the Emulation page
+            // so the hook in emulation::view fires immediately.
+            nav: if std::env::var_os("AES_AUTOLAUNCH").is_some() {
+                Nav::Settled(View::Emulation)
+            } else {
+                Nav::Settled(View::Main)
+            },
             settings_open: false,
             settings_tab: 0,
             last_save: std::time::Instant::now(),
@@ -2196,8 +2200,7 @@ impl eframe::App for AesRustApp {
                         // persisted urls otherwise. A multi-selection
                         // exports one .apl per album into a folder.
                         let items_for = |dir: &str| -> Option<(String, Vec<apl::Item>)> {
-                            let i =
-                                albums.iter().position(|a| a.dir.to_string_lossy() == dir)?;
+                            let i = albums.iter().position(|a| a.dir.to_string_lossy() == dir)?;
                             let title = albums[i].title.clone();
                             let items = if carousel.album_key() == Some(dir) {
                                 carousel.export_items()
@@ -2242,8 +2245,7 @@ impl eframe::App for AesRustApp {
                             .set_title("Export Online Playlists")
                             .pick_folder()
                         {
-                            let mut used: std::collections::HashSet<String> =
-                                Default::default();
+                            let mut used: std::collections::HashSet<String> = Default::default();
                             for dir in &dirs {
                                 let Some((title, items)) = items_for(dir) else {
                                     continue;
@@ -2330,8 +2332,7 @@ impl eframe::App for AesRustApp {
                                 // the imported source of truth) whether
                                 // or not it ends up the open one.
                                 for u in &urls {
-                                    let Some(it) =
-                                        doc.items.iter().find(|i| i.url.trim() == u)
+                                    let Some(it) = doc.items.iter().find(|i| i.url.trim() == u)
                                     else {
                                         continue;
                                     };
@@ -2369,8 +2370,7 @@ impl eframe::App for AesRustApp {
                                     // the open view; workers still
                                     // re-resolve fresh metadata.
                                     for u in &urls {
-                                        let Some(it) =
-                                            doc_items.iter().find(|i| i.url.trim() == u)
+                                        let Some(it) = doc_items.iter().find(|i| i.url.trim() == u)
                                         else {
                                             continue;
                                         };

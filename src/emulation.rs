@@ -17,7 +17,7 @@ use eframe::egui::{
 };
 
 use crate::{
-    album_row, carousel, cemu_overlay, emu_dl, emu_meta, library, paint, rom_editor,
+    album_row, carousel, cemu_overlay, emu_dl, emu_meta, library, libretro, paint, rom_editor,
     rpcs3_overlay, search_pill, settings, shadps4, shadps4_overlay, transport, xenia, xenia_cfg,
     xenia_overlay, xenia_profile,
 };
@@ -52,6 +52,33 @@ const WIIU_SECTION: &str = "WIIU";
 const CEMU_HANDLER: &str = "cemu";
 const SWITCH_SECTION: &str = "SWITCH";
 const EDEN_HANDLER: &str = "eden";
+const THREE_DS_SECTION: &str = "3DS";
+const N64_SECTION: &str = "N64";
+const NES_SECTION: &str = "NES";
+const RETROARCH_HANDLER: &str = "retroarch";
+
+/// The persisted selected-core field for a RetroArch-backed section —
+/// each section keeps its own choice; empty means the first
+/// installed core by display name.
+fn selected_core<'a>(
+    cfg: &'a mut settings::Emulation,
+    section: libretro::Section,
+) -> &'a mut String {
+    match section {
+        libretro::Section::ThreeDs => &mut cfg.selected_3ds_core,
+        libretro::Section::N64 => &mut cfg.selected_n64_core,
+        libretro::Section::Nes => &mut cfg.selected_nes_core,
+    }
+}
+
+/// Read-only form for launch — `launch()` only borrows `cfg`.
+fn selected_core_id<'a>(cfg: &'a settings::Emulation, section: libretro::Section) -> &'a str {
+    match section {
+        libretro::Section::ThreeDs => cfg.selected_3ds_core.as_str(),
+        libretro::Section::N64 => cfg.selected_n64_core.as_str(),
+        libretro::Section::Nes => cfg.selected_nes_core.as_str(),
+    }
+}
 
 /// The settings-card handler row for a section — the emulator's
 /// display name, managed-install lookup, and download starter
@@ -167,8 +194,27 @@ fn handler_spec(section_key: &str) -> Option<HandlerSpec> {
             installed_exe: emu_dl::eden_exe,
             download: emu_dl::download_eden,
         },
+        THREE_DS_SECTION => retroarch_spec(THREE_DS_SECTION),
+        // N64 + NES share the RetroArch handler + frontend install —
+        // only the Libretro core set is section-specific.
+        N64_SECTION => retroarch_spec(N64_SECTION),
+        NES_SECTION => retroarch_spec(NES_SECTION),
         _ => return None,
     })
+}
+
+/// Every RetroArch-backed section shows the same handler row — one
+/// shared frontend install; only the Libretro core set differs.
+fn retroarch_spec(section: &'static str) -> HandlerSpec {
+    HandlerSpec {
+        section,
+        handler: RETROARCH_HANDLER,
+        name: "RetroArch",
+        exe_hint: "Path to retroarch.exe",
+        dialog_title: "Locate retroarch.exe",
+        installed_exe: emu_dl::retroarch_exe,
+        download: emu_dl::download_retroarch,
+    }
 }
 
 /// Handler id → launch kind. Shared by `launch` and the setup-gear
@@ -185,6 +231,7 @@ fn handler_kind(handler: Option<&str>) -> Option<xenia::Kind> {
         Some(DOLPHIN_HANDLER) => xenia::Kind::Dolphin,
         Some(CEMU_HANDLER) => xenia::Kind::Cemu,
         Some(EDEN_HANDLER) => xenia::Kind::Eden,
+        Some(RETROARCH_HANDLER) => xenia::Kind::RetroArch,
         _ => return None,
     })
 }
@@ -436,8 +483,23 @@ pub struct EmuView {
     /// In-flight emulator download (Xenia install/update) — the
     /// settings card polls the shared progress.
     pub dl: Option<emu_dl::Shared>,
+    /// The in-flight download is a Libretro core pack, not the
+    /// handler executable — its `done` result is a summary, not an
+    /// exe path. Carries the section the cores belong to.
+    pub dl_cores: Option<libretro::Section>,
     /// Last download result line shown under the progress bar.
     pub dl_msg: Option<String>,
+    /// Cached `spec.installed_exe` results per handler — the
+    /// resolvers walk the whole managed install (RetroArch alone is
+    /// ~10k files) and this ran once per expanded card per frame,
+    /// which is what made the settings tab crawl during/after a
+    /// download.
+    installed_hint: HashMap<String, (std::time::Instant, Option<PathBuf>)>,
+    /// Cached Libretro core list — catalog read + per-core file
+    /// stats, refreshed at most once a second instead of every
+    /// frame. Keyed by section ("3DS"/"N64") so expanding one card
+    /// never shows another's cores.
+    cores_hint: Option<(String, std::time::Instant, Vec<libretro::CoreInfo>)>,
     /// The ROM metadata editor overlay (EmulationMetadataOverlay).
     pub editor: rom_editor::RomEditor,
     /// Xenia per-game Patches overlay (XeniaPatchesOverlay).
@@ -612,7 +674,10 @@ impl EmuView {
             frame_buf: Vec::new(),
             notice: None,
             dl: None,
+            dl_cores: None,
             dl_msg: None,
+            installed_hint: HashMap::new(),
+            cores_hint: None,
             editor: rom_editor::RomEditor::new(),
             patches: xenia_overlay::PatchesOverlay::new(),
             cfg_ov: xenia_overlay::ConfigOverlay::new(),
@@ -952,6 +1017,9 @@ impl EmuView {
             GCN_SECTION | WII_SECTION => Some(DOLPHIN_HANDLER.to_string()),
             WIIU_SECTION => Some(CEMU_HANDLER.to_string()),
             SWITCH_SECTION => Some(EDEN_HANDLER.to_string()),
+            THREE_DS_SECTION | N64_SECTION | NES_SECTION => {
+                Some(RETROARCH_HANDLER.to_string())
+            }
             _ => None,
         }
     }
@@ -982,6 +1050,7 @@ impl EmuView {
                     DOLPHIN_HANDLER => emu_dl::dolphin_exe(),
                     CEMU_HANDLER => emu_dl::cemu_exe(),
                     EDEN_HANDLER => emu_dl::eden_exe(),
+                    RETROARCH_HANDLER => emu_dl::retroarch_exe(),
                     _ => None,
                 }
             };
@@ -994,9 +1063,11 @@ impl EmuView {
     /// worker thread.
     pub fn launch(&mut self, cfg: &settings::Emulation, game: &Path) {
         self.notice = None;
+        xenia::session_log(&format!("launch request game={}", game.display()));
         let handler = self.active_handler(cfg);
         let Some(kind) = handler_kind(handler.as_deref()) else {
             self.notice = Some("No emulator handler configured for this section".into());
+            xenia::session_log(&format!("launch aborted: no handler (active={handler:?})"));
             return;
         };
         let name = match kind {
@@ -1010,11 +1081,13 @@ impl EmuView {
             xenia::Kind::Dolphin => "Dolphin",
             xenia::Kind::Cemu => "Cemu",
             xenia::Kind::Eden => "Eden",
+            xenia::Kind::RetroArch => "RetroArch",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
                 "No {name} executable — set a path or press Download in Settings → Emulation"
             ));
+            xenia::session_log(&format!("launch aborted: no {name} exe"));
             return;
         };
         // A qtlauncher selection upgrades to the sibling core exe —
@@ -1024,6 +1097,36 @@ impl EmuView {
             shadps4::resolve_exe_path(&exe)
         } else {
             exe
+        };
+        // RetroArch needs the section's selected core for `-L` — the
+        // combobox selection (or the first installed core) is the
+        // default. The section decides WHICH Libretro set (3DS cores
+        // for 3DS, N64 cores for N64).
+        let retroarch_core = if kind == xenia::Kind::RetroArch {
+            let Some(section) = self
+                .loaded_key
+                .as_deref()
+                .and_then(libretro::Section::from_key)
+            else {
+                self.notice = Some("No Libretro core catalog for this section".into());
+                xenia::session_log("launch aborted: section has no core catalog");
+                return;
+            };
+            match libretro::resolve_core(section, selected_core_id(cfg, section))
+                .map(|c| c.core_path)
+            {
+                Some(core) => Some(core),
+                None => {
+                    self.notice = Some(format!(
+                        "No {} core installed — press Download all cores in Settings → Emulation",
+                        section.label()
+                    ));
+                    xenia::session_log(&format!("launch aborted: no {} core", section.label()));
+                    return;
+                }
+            }
+        } else {
+            None
         };
         // Per-section capture pool depth (Lacrima's LowLatencyCapture
         // → FramePoolSize 1 vs 2).
@@ -1056,6 +1159,7 @@ impl EmuView {
                 low_latency,
                 xuid,
                 kind,
+                retroarch_core,
             ));
         });
         self.launch_rx = Some(rx);
@@ -1125,6 +1229,31 @@ pub fn view(
     // Row 0's Border Background=#FF000000 — a pure black item area.
     painter.rect_filled(upper, 0.0, Color32::BLACK.gamma_multiply(alpha));
 
+    // Diagnostics: AES_AUTOLAUNCH=<rom path> opens the game's section
+    // and launches it through the real UI path — the same call chain
+    // a carousel double-click takes (open_section → launch →
+    // Session::start → viewport capture). Lets a harness reproduce
+    // app-side launches without UI automation.
+    static AUTOLAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !AUTOLAUNCH.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(rom) = std::env::var("AES_AUTOLAUNCH") {
+            let rom = PathBuf::from(rom);
+            match emu.sections.iter().position(|sec| {
+                cfg.games
+                    .get(&section_key(sec))
+                    .is_some_and(|gs| gs.iter().any(|g| PathBuf::from(g) == rom))
+            }) {
+                Some(i) => {
+                    emu.open_section(i, cfg);
+                    emu.launch(cfg, &rom);
+                }
+                None => {
+                    emu.notice = Some(format!("AES_AUTOLAUNCH: {rom:?} is not in any section"));
+                }
+            }
+        }
+    }
+
     // The overlays own the pointer while one is up — cards, the
     // section strip and the band stop receiving input.
     let interactive = interactive
@@ -1170,11 +1299,16 @@ pub fn view(
                 emu.viewport_dismissed = false;
             }
             Ok(Err(e)) => {
+                xenia::session_log(&format!("launch failed: {e}"));
                 emu.notice = Some(e);
                 emu.launch_rx = None;
             }
             Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
-            Err(mpsc::TryRecvError::Disconnected) => emu.launch_rx = None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                xenia::session_log("launch worker died before producing a session");
+                emu.notice = Some("Launch failed (worker died — see session.log)".into());
+                emu.launch_rx = None;
+            }
         }
     }
 
@@ -2019,6 +2153,9 @@ pub fn view(
 /// else the cleaned file stem.
 fn rom_title(p: &Path) -> String {
     emu_meta::cached_title(p)
+        // A cached 3DS product code is a stale scan artifact — the
+        // resolver heals it, but headers shouldn't flash it meanwhile.
+        .filter(|t| !emu_meta::looks_like_3ds_product_code(t))
         .or_else(|| {
             p.file_stem()
                 .and_then(|s| s.to_str())
@@ -2559,10 +2696,10 @@ fn draw_session(
     // The capture's CPU readback only earns its keep when something
     // actually needs pixels there — display on the mirror path, or
     // pillarbox detection.
-    session.render().want_cpu.store(
-        pillar_active || emu.gpu_cap.is_none(),
-        Ordering::Relaxed,
-    );
+    session
+        .render()
+        .want_cpu
+        .store(pillar_active || emu.gpu_cap.is_none(), Ordering::Relaxed);
 
     // Pull the newest captured frame — on the zero-copy path only the
     // ring seq matters (stats + shader FrameCount); on the CPU mirror
@@ -3126,8 +3263,7 @@ fn draw_items(
         // CemuGraphicPacksMenuItem).
         carousel::Action::GraphicPacks(p) => {
             if key == WIIU_SECTION && emu.active_handler(cfg).as_deref() == Some(CEMU_HANDLER) {
-                emu.cemu_packs
-                    .open(&p, &rom_title(&p), cemu_storage(cfg));
+                emu.cemu_packs.open(&p, &rom_title(&p), cemu_storage(cfg));
             }
         }
         // Confirmed deletes come back through `pending_delete` —
@@ -3562,6 +3698,11 @@ pub fn settings_tab(
                 // download progress block underneath.
                 let m = 12.0 * s;
                 let ry = inner.min.y + m;
+                // RetroArch-backed sections (3DS, N64) get a second
+                // row: the core selector beneath the retroarch.exe
+                // path box — listing only THAT section's cores.
+                let core_section = libretro::Section::from_key(key);
+                let core_select = spec.handler == RETROARCH_HANDLER && core_section.is_some();
                 let font14 = FontId::proportional(14.0 * s);
                 painter.text(
                     Pos2::new(inner.min.x + m, ry + 2.0 * s),
@@ -3571,16 +3712,26 @@ pub fn settings_tab(
                     whitesmoke.gamma_multiply(t),
                 );
                 // Installed/version hint next to the name.
-                if let Some(exe) = (spec.installed_exe)() {
-                    painter.text(
-                        Pos2::new(inner.min.x + m + 64.0 * s, ry + 7.0 * s),
-                        Align2::LEFT_TOP,
-                        exe.parent()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default(),
-                        FontId::proportional(12.0 * s),
-                        darkgray.gamma_multiply(t * 0.8),
-                    );
+                {
+                    let stale = emu.installed_hint.get(spec.handler).map_or(true, |(t, _)| {
+                        t.elapsed() > std::time::Duration::from_millis(1500)
+                    });
+                    if stale {
+                        let exe = (spec.installed_exe)();
+                        emu.installed_hint
+                            .insert(spec.handler.to_string(), (std::time::Instant::now(), exe));
+                    }
+                    if let Some(Some(exe)) = emu.installed_hint.get(spec.handler).map(|(_, p)| p) {
+                        painter.text(
+                            Pos2::new(inner.min.x + m + 64.0 * s, ry + 7.0 * s),
+                            Align2::LEFT_TOP,
+                            exe.parent()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                            FontId::proportional(12.0 * s),
+                            darkgray.gamma_multiply(t * 0.8),
+                        );
+                    }
                 }
 
                 // Path TextBox — Lacrima shows the launcher path; ours
@@ -3589,19 +3740,102 @@ pub fn settings_tab(
                     Pos2::new(inner.min.x + m, ry + 32.0 * s),
                     Vec2::new(inner.width() - m * 2.0, 26.0 * s),
                 );
-                let entry = cfg.emulators.entry(spec.handler.to_string()).or_default();
                 let mut tui = cui.new_child(
                     UiBuilder::new()
                         .max_rect(box_rect)
                         .layout(Layout::left_to_right(Align::Center)),
                 );
                 tui.set_opacity(t);
+                let entry = cfg.emulators.entry(spec.handler.to_string()).or_default();
                 tui.add(
                     egui::TextEdit::singleline(entry)
                         .desired_width(box_rect.width())
                         .hint_text(egui::RichText::new(spec.exe_hint).font(font14.clone()))
                         .font(font14.clone()),
                 );
+                let mut combo_response = None;
+                let mut combo_open = false;
+                let mut combo_text = String::new();
+                let mut combo_rect = box_rect;
+                if let Some(core_section) = core_section.filter(|_| core_select) {
+                    combo_rect = Rect::from_min_size(
+                        Pos2::new(inner.min.x + m, ry + 64.0 * s),
+                        Vec2::new(inner.width() - m * 2.0, 26.0 * s),
+                    );
+                    let mut cui2 = cui.new_child(
+                        UiBuilder::new()
+                            .max_rect(combo_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    cui2.set_opacity(t);
+                    if emu.cores_hint.as_ref().map_or(true, |(k, t, _)| {
+                        k != key || t.elapsed() > std::time::Duration::from_secs(1)
+                    }) {
+                        emu.cores_hint = Some((
+                            key.to_string(),
+                            std::time::Instant::now(),
+                            libretro::installed_cores(core_section),
+                        ));
+                    }
+                    let cores = emu
+                        .cores_hint
+                        .as_ref()
+                        .map(|(_, _, c)| c.clone())
+                        .unwrap_or_default();
+                    if let Some(first) = cores.first() {
+                        let sel = selected_core(cfg, core_section);
+                        if !cores.iter().any(|c| c.id.eq_ignore_ascii_case(sel)) {
+                            *sel = first.id.clone();
+                            emu.settings_dirty = true;
+                        }
+                    }
+                    let selected = cores
+                        .iter()
+                        .find(|c| {
+                            c.id.eq_ignore_ascii_case(selected_core(cfg, core_section).as_str())
+                        })
+                        .or_else(|| cores.first());
+                    combo_text = selected
+                        .map(|c| c.display_name.clone())
+                        .unwrap_or_else(|| "No cores installed".to_string());
+                    let response = cui2.interact(
+                        combo_rect,
+                        cui2.id().with(format!("{key}-libretro-core")),
+                        Sense::click(),
+                    );
+                    let popup_id = egui::Popup::default_response_id(&response);
+                    combo_open = egui::Popup::is_id_open(cui2.ctx(), popup_id);
+                    if !cores.is_empty() {
+                        egui::Popup::menu(&response)
+                            .width(combo_rect.width())
+                            .show(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0 * s)
+                                    .show(ui, |ui| {
+                                        ui.style_mut().wrap_mode =
+                                            Some(egui::TextWrapMode::Truncate);
+                                        for core in &cores {
+                                            if ui
+                                                .selectable_label(
+                                                    selected_core(cfg, core_section)
+                                                        .eq_ignore_ascii_case(&core.id),
+                                                    RichText::new(&core.display_name)
+                                                        .font(font14.clone()),
+                                                )
+                                                .clicked()
+                                                && *selected_core(cfg, core_section) != core.id
+                                            {
+                                                *selected_core(cfg, core_section) = core.id.clone();
+                                                emu.settings_dirty = true;
+                                            }
+                                        }
+                                    });
+                            });
+                    }
+                    combo_response = Some(response);
+                }
                 painter.rect_filled(
                     box_rect,
                     CornerRadius::same(4),
@@ -3613,6 +3847,71 @@ pub fn settings_tab(
                     Stroke::new(1.0, Color32::from_gray(105).gamma_multiply(t)),
                     StrokeKind::Outside,
                 );
+                if let Some(response) = combo_response {
+                    let fill = if response.is_pointer_button_down_on() {
+                        Color32::from_rgb(0x20, 0x20, 0x20)
+                    } else if response.hovered() || combo_open {
+                        Color32::from_rgb(0x34, 0x34, 0x34)
+                    } else {
+                        Color32::from_rgb(0x2B, 0x2B, 0x2B)
+                    };
+                    painter.rect_filled(
+                        combo_rect,
+                        CornerRadius::same(4),
+                        fill.gamma_multiply(0.55 * t),
+                    );
+                    painter.rect_stroke(
+                        combo_rect,
+                        CornerRadius::same(4),
+                        Stroke::new(
+                            1.0,
+                            Color32::from_gray(if response.hovered() { 125 } else { 85 })
+                                .gamma_multiply(t),
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    let text_clip = Rect::from_min_max(
+                        Pos2::new(combo_rect.min.x + 10.0 * s, combo_rect.min.y),
+                        Pos2::new(combo_rect.max.x - 30.0 * s, combo_rect.max.y),
+                    );
+                    let text_color = if combo_text == "No cores installed" {
+                        darkgray
+                    } else {
+                        whitesmoke
+                    };
+                    painter.with_clip_rect(text_clip).text(
+                        Pos2::new(text_clip.min.x, combo_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        combo_text,
+                        font14.clone(),
+                        text_color.gamma_multiply(t),
+                    );
+                    let chevron = Rect::from_center_size(
+                        Pos2::new(combo_rect.max.x - 17.0 * s, combo_rect.center().y),
+                        Vec2::new(9.0 * s, 5.0 * s),
+                    );
+                    let points = if combo_open {
+                        vec![
+                            chevron.left_bottom(),
+                            chevron.right_bottom(),
+                            chevron.center_top(),
+                        ]
+                    } else {
+                        vec![
+                            chevron.left_top(),
+                            chevron.right_top(),
+                            chevron.center_bottom(),
+                        ]
+                    };
+                    painter.add(Shape::convex_polygon(
+                        points,
+                        Color32::from_gray(145).gamma_multiply(t),
+                        Stroke::NONE,
+                    ));
+                    if response.hovered() {
+                        cui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                }
 
                 // Right-aligned button row — Lacrima's
                 // Set default | Browse | Clear | Download.
@@ -3632,7 +3931,9 @@ pub fn settings_tab(
                         .width()
                         + 30.0 * s
                 };
-                let by = ry + 68.0 * s;
+                // The extra combo row pushes the buttons down on the
+                // 3DS card.
+                let by = ry + if core_select { 96.0 } else { 68.0 } * s;
                 let mut bx = inner.max.x - m;
 
                 // Download (green #1E6B3A).
@@ -3650,9 +3951,34 @@ pub fn settings_tab(
                 );
                 if dl_clicked {
                     emu.dl = Some((spec.download)());
+                    emu.dl_cores = None;
                     emu.dl_msg = None;
                 }
                 bx -= 12.0 * s;
+
+                // RetroArch-backed sections: the Libretro core
+                // packages download separately from the frontend —
+                // and only the cores matching THIS section's filter.
+                if let Some(core_section) = core_section.filter(|_| core_select) {
+                    let w = measure(&painter, "Download all cores");
+                    bx -= w;
+                    let (cores_clicked, _) = crate::flat_button(
+                        &mut cui,
+                        Pos2::new(bx, by),
+                        "Download all cores",
+                        s,
+                        !downloading,
+                        Color32::from_rgb(0x1E, 0x6B, 0x3A),
+                        Color32::WHITE,
+                        t,
+                    );
+                    if cores_clicked {
+                        emu.dl = Some(libretro::download_cores(core_section));
+                        emu.dl_cores = Some(core_section);
+                        emu.dl_msg = None;
+                    }
+                    bx -= 12.0 * s;
+                }
 
                 // Clear (dark red #3A2020 — Lacrima shows it only when
                 // a path is set).
@@ -3677,30 +4003,32 @@ pub fn settings_tab(
                 }
 
                 // Browse.
-                let w = measure(&painter, "Browse");
-                bx -= w;
-                let (browse, _) = crate::flat_button(
-                    &mut cui,
-                    Pos2::new(bx, by),
-                    "Browse",
-                    s,
-                    true,
-                    Color32::from_rgb(0x22, 0x22, 0x22),
-                    Color32::WHITE,
-                    t,
-                );
-                if browse {
-                    if let Some(file) = rfd::FileDialog::new()
-                        .set_title(spec.dialog_title)
-                        .add_filter(spec.name, &["exe"])
-                        .pick_file()
-                    {
-                        cfg.emulators
-                            .insert(spec.handler.into(), file.to_string_lossy().into_owned());
-                        emu.settings_dirty = true;
+                {
+                    let w = measure(&painter, "Browse");
+                    bx -= w;
+                    let (browse, _) = crate::flat_button(
+                        &mut cui,
+                        Pos2::new(bx, by),
+                        "Browse",
+                        s,
+                        true,
+                        Color32::from_rgb(0x22, 0x22, 0x22),
+                        Color32::WHITE,
+                        t,
+                    );
+                    if browse {
+                        if let Some(file) = rfd::FileDialog::new()
+                            .set_title(spec.dialog_title)
+                            .add_filter(spec.name, &["exe"])
+                            .pick_file()
+                        {
+                            cfg.emulators
+                                .insert(spec.handler.into(), file.to_string_lossy().into_owned());
+                            emu.settings_dirty = true;
+                        }
                     }
+                    bx -= 12.0 * s;
                 }
-                bx -= 12.0 * s;
 
                 // Set default (blue #1E4B7A) / Default chip (#7CFF7C).
                 if is_default {
@@ -3742,10 +4070,32 @@ pub fn settings_tab(
                     };
                     if let Some(res) = done {
                         match res {
-                            Ok(exe) => {
-                                cfg.emulators.insert(spec.handler.into(), exe);
-                                emu.settings_dirty = true;
-                                status_line = Some(format!("{} installed", spec.name));
+                            Ok(result) => {
+                                if let Some(core_section) = emu.dl_cores {
+                                    // The core pack returns a summary,
+                                    // not a path — re-default the
+                                    // selection to the first install
+                                    // when the stored id is gone.
+                                    let cores = libretro::installed_cores(core_section);
+                                    emu.cores_hint = Some((
+                                        key.to_string(),
+                                        std::time::Instant::now(),
+                                        cores.clone(),
+                                    ));
+                                    if let Some(first) = cores.first() {
+                                        let sel = selected_core(cfg, core_section);
+                                        if !cores.iter().any(|c| c.id.eq_ignore_ascii_case(sel)) {
+                                            *sel = first.id.clone();
+                                        }
+                                    }
+                                    emu.settings_dirty = true;
+                                    status_line = Some(result);
+                                } else {
+                                    cfg.emulators.insert(spec.handler.into(), result);
+                                    emu.settings_dirty = true;
+                                    emu.installed_hint.remove(spec.handler);
+                                    status_line = Some(format!("{} installed", spec.name));
+                                }
                             }
                             Err(e) => status_line = Some(e),
                         }

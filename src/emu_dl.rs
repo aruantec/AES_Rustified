@@ -24,8 +24,7 @@ const SHADPS4_RELEASES_API: &str =
     "https://api.github.com/repos/shadps4-emu/shadPS4/releases?per_page=20";
 const DUCKSTATION_RELEASES_API: &str =
     "https://api.github.com/repos/stenzek/duckstation/releases?per_page=100";
-const PCSX2_RELEASES_API: &str =
-    "https://api.github.com/repos/PCSX2/pcsx2/releases?per_page=100";
+const PCSX2_RELEASES_API: &str = "https://api.github.com/repos/PCSX2/pcsx2/releases?per_page=100";
 // Dolphin publishes no GitHub releases and its own updater endpoints
 // are behind a bot challenge — Lacrima's EmuCR fallback is the same
 // chain: blog feed → post page → direct dl.dolphin-emu.org asset.
@@ -182,6 +181,47 @@ pub fn cemu_dir() -> Option<PathBuf> {
 /// EnsureDirectories.
 pub fn eden_dir() -> Option<PathBuf> {
     crate::settings::data_root().map(|d| d.join("Emulators").join("SWITCH").join("Eden"))
+}
+
+/// `<data>/Emulators/3DS/RetroArch` — the shared RetroArch frontend
+/// install (RetroArchEmulatorUpdateService's per-section emulator
+/// dir shape). Every RetroArch-backed section (3DS, N64) resolves
+/// this same frontend; only the Libretro core sets are
+/// section-specific — `Emulators/<SECTION>/Libretro`.
+pub fn retroarch_dir() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("3DS").join("RetroArch"))
+}
+
+/// Find `retroarch.exe` / `retroarch` under the managed install.
+/// Lacrima's ResolveLauncherPath walks the emulator dir for the
+/// launcher binary; macOS app bundles resolve their inner binary.
+/// The top level is checked first — the full walk runs ~10k files
+/// on a RetroArch install and callers poll it every frame.
+pub fn retroarch_exe() -> Option<PathBuf> {
+    let dir = retroarch_dir()?;
+    for want in ["retroarch.exe", "retroarch"] {
+        let p = dir.join(want);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut all = Vec::new();
+    walk(&dir, &mut all);
+    for want in ["retroarch.exe", "RetroArch.exe", "retroarch", "RetroArch"] {
+        if let Some(p) = all.iter().find(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.eq_ignore_ascii_case(want))
+        }) {
+            return Some(p.clone());
+        }
+    }
+    all.into_iter().find(|p| {
+        p.file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.to_lowercase().contains("retroarch") && !f.ends_with(".dmg"))
+            && p.is_file()
+    })
 }
 
 /// Find the installed `Cemu.exe` under the managed dir.
@@ -546,9 +586,7 @@ const EDEN_SPEC: EmuSpec = EmuSpec {
     // fail the amd64+zip pair on their own.
     asset_ok: |n| {
         let n = n.to_lowercase();
-        n.contains("windows")
-            && (n.contains("amd64") || n.contains("x64"))
-            && n.ends_with(".zip")
+        n.contains("windows") && (n.contains("amd64") || n.contains("x64")) && n.ends_with(".zip")
     },
     // ResolveLauncherPath — eden-cli.exe first, then the Qt gui.
     exe_names: &["eden-cli.exe", "eden.exe"],
@@ -559,6 +597,134 @@ const EDEN_SPEC: EmuSpec = EmuSpec {
 
 pub fn download_eden() -> Shared {
     download_emu(&EDEN_SPEC)
+}
+
+/// Kick off the managed RetroArch install — the buildbot **stable**
+/// `RetroArch.7z` per platform. The nightly MinGW build is not used:
+/// its frontend segfaults under the citra-family cores on Windows.
+/// (macOS only ships a .dmg — no managed download there.)
+pub fn download_retroarch() -> Shared {
+    let dl: Shared = Arc::new(Mutex::new(DlProgress {
+        stage: "Starting RetroArch download…".into(),
+        ..Default::default()
+    }));
+    let shared = dl.clone();
+    std::thread::spawn(move || {
+        let res = work_retroarch(&shared);
+        let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
+        p.done = Some(res);
+    });
+    dl
+}
+
+const RETROARCH_STABLE_FALLBACK: &str = "1.22.2";
+
+/// Newest `X.Y.Z` dir in the buildbot stable listing — parse the
+/// h5ai index like Lacrima's nightly scraper, pick the max version
+/// tuple. Returns the pinned fallback when the listing is
+/// unreachable or holds no version dirs.
+fn retroarch_stable_version() -> String {
+    let Ok(html) = get_text("https://buildbot.libretro.com/stable/") else {
+        return RETROARCH_STABLE_FALLBACK.to_string();
+    };
+    best_stable_version(&html).unwrap_or_else(|| RETROARCH_STABLE_FALLBACK.to_string())
+}
+
+/// Max `X.Y.Z` dir among `href="/stable/<ver>/"` entries — a plain
+/// lexicographic max would rank 1.9.9 above 1.22.2, so compare
+/// version tuples.
+fn best_stable_version(html: &str) -> Option<String> {
+    let mut best = (0u64, 0u64, 0u64);
+    let mut rest = html;
+    while let Some(at) = rest.find("/stable/") {
+        rest = &rest[at + 8..];
+        let end = rest.find('/').unwrap_or(0);
+        let ver = &rest[..end];
+        let mut parts = ver.split('.');
+        if let (Some(a), Some(b), Some(c)) = (
+            parts.next().and_then(|p| p.parse().ok()),
+            parts.next().and_then(|p| p.parse().ok()),
+            parts.next().and_then(|p| p.parse().ok()),
+        ) {
+            best = best.max((a, b, c));
+        }
+        rest = &rest[end..];
+    }
+    (best != (0, 0, 0)).then(|| format!("{}.{}.{}", best.0, best.1, best.2))
+}
+
+/// The platform's RetroArch stable main-emulator archive for
+/// `version`. macOS only ships a .dmg, which our extractor can't
+/// open — the user installs it and browses instead.
+fn retroarch_stable_url(version: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Some(format!(
+            "https://buildbot.libretro.com/stable/{version}/windows/x86_64/RetroArch.7z"
+        ));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some(format!(
+            "https://buildbot.libretro.com/stable/{version}/linux/x86_64/RetroArch.7z"
+        ));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some(format!(
+            "https://buildbot.libretro.com/stable/{version}/linux/aarch64/RetroArch.7z"
+        ));
+    }
+    #[allow(unreachable_code)]
+    let _ = version;
+    None
+}
+
+fn work_retroarch(dl: &Shared) -> Result<String, String> {
+    let Some(emu_dir) = retroarch_dir() else {
+        return Err("Could not resolve the emulators directory".into());
+    };
+    set(dl, "Checking RetroArch releases…", 0.0);
+    let version = retroarch_stable_version();
+    let url = retroarch_stable_url(&version).ok_or_else(|| {
+        "No managed RetroArch build for this platform — install RetroArch and Browse to it"
+            .to_string()
+    })?;
+    let update_dir = emu_dir.join("Emu_Update");
+    std::fs::create_dir_all(&update_dir).map_err(|e| format!("Emu dir not writable: {e}"))?;
+
+    let asset_name = url.rsplit('/').next().unwrap_or("RetroArch.7z");
+    let zip_path = update_dir.join(asset_name);
+    download(
+        dl,
+        &format!("Downloading RetroArch {version}…"),
+        &url,
+        &zip_path,
+    )?;
+
+    set(dl, "Extracting RetroArch…", 0.0);
+    let extracted = update_dir.join("extracted");
+    let _ = std::fs::remove_dir_all(&extracted);
+    std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
+    extract_archive(&zip_path, &extracted)?;
+    let root = normalize_root(&extracted);
+    copy_dir_contents(&root, &emu_dir, "Emu_Update")?;
+
+    let _ = std::fs::write(emu_dir.join("retroarch_version.txt"), &version);
+    let _ = std::fs::remove_dir_all(&update_dir);
+    let _ = std::fs::create_dir_all(&update_dir);
+
+    set(dl, "Done", 1.0);
+    let exe = retroarch_exe()
+        .ok_or_else(|| "retroarch executable not found after install".to_string())?;
+    // Extracted binaries lose the exec bit (Lacrima's
+    // TryMarkRetroArchLinuxBinaryExecutable).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(exe.to_string_lossy().into_owned())
 }
 
 /// Lacrima's DolphinEmulatorUpdateService EmuCR fallback:
@@ -720,8 +886,7 @@ fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
     let mut releases: Vec<&serde_json::Value> = releases
         .iter()
         .filter(|r| {
-            spec.allow_prerelease
-                || r.get("prerelease").and_then(|p| p.as_bool()) != Some(true)
+            spec.allow_prerelease || r.get("prerelease").and_then(|p| p.as_bool()) != Some(true)
         })
         .collect();
     releases.sort_by(|a, b| {
@@ -995,6 +1160,21 @@ mod tests {
             "https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z"
         );
         assert!(emucr_dolphin_asset("<a href=\"https://example.com/x\">", &DOLPHIN_SPEC).is_none());
+    }
+
+    /// RetroArch stable channel — the newest `X.Y.Z` dir wins, with
+    /// tuple (not lexicographic) ordering and the fallback on junk.
+    #[test]
+    fn retroarch_stable_version_prefers_newest_tuple() {
+        let html = r#"
+            <a href="/stable/1.9.9/">1.9.9</a>
+            <a href="/stable/1.22.2/">1.22.2</a>
+            <a href="/stable/1.22.1/">1.22.1</a>
+            <a href="/stable/altstore.json">altstore.json</a>
+            <a href="/nightly/">nightly</a>
+        "#;
+        assert_eq!(best_stable_version(html).as_deref(), Some("1.22.2"));
+        assert_eq!(best_stable_version("<a href=\"/stable/x\">"), None);
     }
 
     /// SelectAssetForPlatform — Cemu ships windows/macos/linux per

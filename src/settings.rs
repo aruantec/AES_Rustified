@@ -385,6 +385,14 @@ pub struct Emulation {
     /// `EmulationSectionConfiguration.DefaultHandlerId`) — which
     /// configured handler launches games for that console.
     pub default_handlers: std::collections::BTreeMap<String, String>,
+    /// Selected 3DS Libretro core id — handed to RetroArch via `-L`.
+    /// Empty means the first installed core by display name is the
+    /// default.
+    pub selected_3ds_core: String,
+    /// Same for the N64 section — `Emulators/N64/Libretro` cores.
+    pub selected_n64_core: String,
+    /// Same for the NES section — `Emulators/NES/Libretro` cores.
+    pub selected_nes_core: String,
     /// Per-section capture/render options (Lacrima's RenderOptions
     /// overlay, "Rendering" tab) — keyed by section key.
     pub render: std::collections::BTreeMap<String, RenderOpts>,
@@ -466,6 +474,9 @@ impl Default for Emulation {
             games: Default::default(),
             section_order: Default::default(),
             default_handlers: Default::default(),
+            selected_3ds_core: String::new(),
+            selected_n64_core: String::new(),
+            selected_nes_core: String::new(),
             render: Default::default(),
         }
     }
@@ -519,11 +530,7 @@ impl Default for Settings {
 }
 
 pub fn path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| {
-        d.join(APP_DIR)
-            .join("Settings")
-            .join("Settings.json")
-    })
+    dirs::data_local_dir().map(|d| d.join(APP_DIR).join("Settings").join("Settings.json"))
 }
 
 /// `%LOCALAPPDATA%\AES_Rustified` — the app's data root (Settings/,
@@ -534,7 +541,9 @@ pub fn data_root() -> Option<PathBuf> {
 }
 
 pub fn load() -> Settings {
-    let Some(path) = path() else { return Settings::default() };
+    let Some(path) = path() else {
+        return Settings::default();
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Settings::default();
     };

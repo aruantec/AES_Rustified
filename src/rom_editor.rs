@@ -407,7 +407,11 @@ impl RomEditor {
                 })
                 .unwrap_or_default();
             let _ = tx.send(LoadedDoc {
-                ids: if x360 { emu_meta::x360_ids(&path) } else { None },
+                ids: if x360 {
+                    emu_meta::x360_ids(&path)
+                } else {
+                    None
+                },
                 cached_title: emu_meta::cached_title(&path),
                 cover: std::fs::read(emu_meta::cover_path(&path)).ok(),
                 doc,
@@ -472,8 +476,7 @@ impl RomEditor {
     fn push_image(&mut self, data: Vec<u8>, kind: ImgKind) {
         // Lacrima's AddFrontCoverCandidateImage: a second Cover pick
         // lands as a BoxArt alternate (Use as Cover promotes it).
-        let kind = if kind == ImgKind::Cover
-            && self.images.iter().any(|i| i.kind == ImgKind::Cover)
+        let kind = if kind == ImgKind::Cover && self.images.iter().any(|i| i.kind == ImgKind::Cover)
         {
             ImgKind::BoxArt
         } else {
@@ -546,6 +549,7 @@ impl RomEditor {
             x360_title_id: self.tid.clone(),
             x360_media_id: self.mid.clone(),
             wiiu_title_id: prev.wiiu_title_id.clone(),
+            nintendo3ds_title_id: prev.nintendo3ds_title_id.clone(),
             switch_title_id: prev.switch_title_id.clone(),
             user_edited: true,
             crop_left: prev.crop_left,
@@ -668,7 +672,11 @@ impl RomEditor {
                     .size(20.0 * s)
                     .color(egui::Color32::WHITE),
             );
-            ui.label(egui::RichText::new("Platform").size(20.0 * s).color(SUBTEXT));
+            ui.label(
+                egui::RichText::new("Platform")
+                    .size(20.0 * s)
+                    .color(SUBTEXT),
+            );
             ui.label(
                 egui::RichText::new(&self.platform)
                     .size(20.0 * s)
@@ -692,11 +700,29 @@ impl RomEditor {
             _ => return,
         };
         let changed = if ro {
-            T::text_box(ui, s, egui::Id::new(("romf", label)), &mut v.as_str(), wide, min_h, 14.0, "")
-                .changed()
+            T::text_box(
+                ui,
+                s,
+                egui::Id::new(("romf", label)),
+                &mut v.as_str(),
+                wide,
+                min_h,
+                14.0,
+                "",
+            )
+            .changed()
         } else {
-            T::text_box(ui, s, egui::Id::new(("romf", label)), v, wide, min_h, 16.0, "")
-                .changed()
+            T::text_box(
+                ui,
+                s,
+                egui::Id::new(("romf", label)),
+                v,
+                wide,
+                min_h,
+                16.0,
+                "",
+            )
+            .changed()
         };
         self.dirty |= changed && !ro;
         ui.add_space(6.0 * s);
@@ -738,7 +764,11 @@ impl RomEditor {
                 self.field(ui, s, "Genre", wide, 0.0, false);
                 self.field(ui, s, "Game Info", wide, 90.0 * s, false);
                 // File Path — read-only, wrapping.
-                ui.label(egui::RichText::new("File Path").size(14.0 * s).color(SUBTEXT));
+                ui.label(
+                    egui::RichText::new("File Path")
+                        .size(14.0 * s)
+                        .color(SUBTEXT),
+                );
                 let fp = self.path.to_string_lossy().to_string();
                 T::text_box(
                     ui,
@@ -792,7 +822,10 @@ impl RomEditor {
             .show_ui(ui, |ui| {
                 for k in ImgKind::ALL {
                     if ui
-                        .selectable_label(*kind == *k, egui::RichText::new(k.label()).size(14.0 * s))
+                        .selectable_label(
+                            *kind == *k,
+                            egui::RichText::new(k.label()).size(14.0 * s),
+                        )
                         .clicked()
                         && *kind != *k
                     {
@@ -953,8 +986,13 @@ impl RomEditor {
                     }
                 });
                 // Search Wallpaper & Bezels — full-width row.
-                if T::button(ui, "Search Wallpaper & Bezels", egui::vec2(ui.available_width(), 0.0), pad)
-                    .clicked()
+                if T::button(
+                    ui,
+                    "Search Wallpaper & Bezels",
+                    egui::vec2(ui.available_width(), 0.0),
+                    pad,
+                )
+                .clicked()
                 {
                     let q = format!("{} {} wallpaper", self.title, self.platform)
                         .split_whitespace()
@@ -1001,8 +1039,13 @@ impl RomEditor {
                                     ui.vertical(|ui| {
                                         ui.set_width(inner_w);
                                         ui.spacing_mut().item_spacing.y = 8.0 * s;
-                                        if Self::kind_combo(ui, s, ("rom_kind", i), inner_w, &mut img.kind)
-                                            && img.kind == ImgKind::Cover
+                                        if Self::kind_combo(
+                                            ui,
+                                            s,
+                                            ("rom_kind", i),
+                                            inner_w,
+                                            &mut img.kind,
+                                        ) && img.kind == ImgKind::Cover
                                         {
                                             front = Some(i);
                                         }
@@ -1191,8 +1234,7 @@ impl RomEditor {
                             .and_then(|d| image::load_from_memory(d).ok())
                         {
                             let url = s.hits.get(i).map(|h| h.url.as_str()).unwrap_or("");
-                            s.preview_kind =
-                                infer_wallpaper_kind(url, img.width(), img.height());
+                            s.preview_kind = infer_wallpaper_kind(url, img.width(), img.height());
                             let rgba = img.to_rgba8();
                             let (w, h) = rgba.dimensions();
                             s.preview_tex = Some(ctx.load_texture(
@@ -1307,10 +1349,7 @@ impl RomEditor {
                 let (res_rect, pv_rect) = if wallpaper {
                     let w = inner.width() * 0.6 - 9.0 * s;
                     (
-                        Rect::from_min_max(
-                            inner.min,
-                            egui::pos2(inner.min.x + w, inner.max.y),
-                        ),
+                        Rect::from_min_max(inner.min, egui::pos2(inner.min.x + w, inner.max.y)),
                         Rect::from_min_max(
                             egui::pos2(inner.min.x + w + 18.0 * s, inner.min.y),
                             inner.max,
@@ -1341,10 +1380,8 @@ impl RomEditor {
                     self.search_preview_pane(ui, pv_rect, s);
                 }
                 // Footer: status + Close.
-                let foot = Rect::from_min_max(
-                    egui::pos2(area.min.x, area.max.y - 36.0 * s),
-                    area.max,
-                );
+                let foot =
+                    Rect::from_min_max(egui::pos2(area.min.x, area.max.y - 36.0 * s), area.max);
                 let mut close = false;
                 ui.scope_builder(
                     UiBuilder::new()
@@ -1687,7 +1724,13 @@ mod tests {
             ImgKind::Wallpaper
         );
         // Ambiguous aspect + no tokens → back cover (bezel default).
-        assert_eq!(infer_wallpaper_kind("https://x/img.png", 4, 3), ImgKind::BackCover);
-        assert_eq!(infer_wallpaper_kind("https://x/img.png", 0, 0), ImgKind::BackCover);
+        assert_eq!(
+            infer_wallpaper_kind("https://x/img.png", 4, 3),
+            ImgKind::BackCover
+        );
+        assert_eq!(
+            infer_wallpaper_kind("https://x/img.png", 0, 0),
+            ImgKind::BackCover
+        );
     }
 }

@@ -23,9 +23,12 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows::Win32::System::Console::{
+    AttachConsole, FreeConsole, GetConsoleWindow, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -46,6 +49,36 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use eframe::egui;
 
 use crate::wgc;
+
+/// Launch/session diagnostics — one timestamped line per event to
+/// `<data_root>/session.log` (truncated at 256KB). The failure modes
+/// a dead relaunch can hide in — launch() early-returns, spawn
+/// errors, worker transitions — leave no trace otherwise.
+pub fn session_log(msg: &str) {
+    let Some(root) = crate::settings::data_root() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&root);
+    let p = root.join("session.log");
+    if std::fs::metadata(&p)
+        .map(|m| m.len() > 256 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&p);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[{secs}] {msg}");
+    }
+}
 
 // Lacrima's PauseEmulator/ResumeEmulator — the ntdll suspend pair
 // (OpenProcess + NtSuspendProcess / NtResumeProcess).
@@ -109,7 +142,7 @@ impl Drop for JobGuard {
 }
 
 /// Session lifecycle shared with the UI thread.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Status {
     /// Searching the process tree for the render window.
     Resolving,
@@ -129,7 +162,7 @@ struct Shared {
 /// window-resolution heuristics (Xenia's render surface is a
 /// `temp_d3d_window` child; Flycast/xemu's is the main SDL window;
 /// RPCS3's is the Qt `gs_frame` window).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Xenia,
     Flycast,
@@ -141,6 +174,7 @@ pub enum Kind {
     Dolphin,
     Cemu,
     Eden,
+    RetroArch,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -180,16 +214,20 @@ impl Session {
     /// `profile_xuid` (Xenia only) is passed as
     /// `--logged_profile_slot_0_xuid` so a provisioned profile signs
     /// in without the (unclickable through capture) NoProfileDialog.
+    /// `retroarch_core` (RetroArch kind only) is the selected
+    /// Libretro core library RetroArch loads via `-L`.
     pub fn start(
         exe: &str,
         game: &Path,
         low_latency: bool,
         profile_xuid: Option<u64>,
         kind: Kind,
+        retroarch_core: Option<PathBuf>,
     ) -> Result<Self, String> {
-        // EdenHandler.BuildStartInfo — a configured eden.exe boots
-        // its eden-cli sibling for capture when present (the cli
-        // frontend logs "RenderReady" and has no shell window).
+        session_log(&format!(
+            "Session::start kind={kind:?} exe={exe} game={}",
+            game.display()
+        ));
         let exe_path = eden_cli_sibling(exe, kind);
         let work_dir = exe_path
             .parent()
@@ -340,6 +378,41 @@ impl Session {
                 }
                 cmd.arg("-g").arg(game);
             }
+            // RetroArch (RetroArchHandler.BuildRetroArchStartInfo):
+            // --appendconfig <focus overrides> -L <core> <rom>. The
+            // core is the managed 3DS Libretro download the user
+            // picked; no --fullscreen — the window is hidden/cloaked
+            // like the other launches.
+            Kind::RetroArch => {
+                let core = retroarch_core.as_ref().ok_or_else(|| {
+                    "No 3DS core installed — press Download all cores in Settings → Emulation"
+                        .to_string()
+                })?;
+                if let Some(cfg_path) = retroarch_append_config(retroarch_core.as_deref()) {
+                    cmd.arg("--appendconfig").arg(cfg_path);
+                }
+                if let Some(log_path) = retroarch_log_path(retroarch_core.as_deref()) {
+                    cmd.arg("--verbose").arg("--log-file").arg(&log_path);
+                    // The worker's resolve-failure read pulls the
+                    // last [ERROR] line from this file — per-section,
+                    // like the cores themselves.
+                    transcript = Some(log_path);
+                }
+                cmd.arg("-L").arg(core).arg(game);
+                // Never inherit our std handles — after the
+                // watchdog's AttachConsole/FreeConsole cycle ours
+                // can be dangling, and CreateProcess fails the spawn
+                // outright with ERROR_INVALID_HANDLE (os error 6).
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                // Lacrima's CreateNoWindow — "hides the console log
+                // window". --verbose makes RA AllocConsole() when the
+                // parent has none; the flag keeps that console
+                // invisible instead of flashing a cmd window.
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
             // xemu mounts disc images via -dvd_path (XemuHandler's
             // BuildStartInfo); other file types pass bare.
             Kind::Xemu
@@ -371,7 +444,9 @@ impl Session {
         let child = cmd
             .current_dir(work_dir)
             .spawn()
-            .map_err(|e| format!("failed to start emulator: {e}"))?;
+            .map_err(|e| format!("failed to start emulator: {e}"))
+            .inspect_err(|e| session_log(&format!("spawn failed: {e}")))?;
+        session_log(&format!("spawned kind={kind:?} pid={}", child.id()));
 
         // Kill-on-close job FIRST — if anything below panics the
         // guard unwinds and the OS reaps the emulator for us.
@@ -577,8 +652,19 @@ impl Session {
     /// True once the emulator process is gone (UI can drop the
     /// session — Drop reaps the child and detaches the worker).
     pub fn finished(&mut self) -> bool {
-        matches!(self.status(), Status::Exited) || matches!(self.child.try_wait(), Ok(Some(_)))
+        // Failed counts as finished too — a dead capture with the
+        // emulator still running must end the session (Lacrima tears
+        // the emulator down on capture failure); otherwise the game
+        // runs forever, hidden and uncaptured.
+        status_finished(&self.status()) || matches!(self.child.try_wait(), Ok(Some(_)))
     }
+}
+
+/// Session-status → session-over predicate (UI drops the session —
+/// Drop reaps the child). `Failed` counts: a capture that can never
+/// attach leaves the emulator running hidden/uncaptured otherwise.
+fn status_finished(status: &Status) -> bool {
+    matches!(status, Status::Exited | Status::Failed(_))
 }
 
 impl Drop for Session {
@@ -903,10 +989,7 @@ fn ensure_eden_setup() {
         ("pause_on_focus_loss", "false"),
     ];
     let Ok(existing) = std::fs::read_to_string(&path) else {
-        let body: String = desired
-            .iter()
-            .map(|(k, v)| format!("{k}={v}\n"))
-            .collect();
+        let body: String = desired.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
         let _ = std::fs::write(&path, body);
         return;
     };
@@ -918,7 +1001,10 @@ fn ensure_eden_setup() {
             continue;
         }
         let key = t.splitn(2, '=').next().unwrap_or("").trim();
-        if let Some(pos) = desired.iter().position(|(k, _)| k.eq_ignore_ascii_case(key)) {
+        if let Some(pos) = desired
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(key))
+        {
             let (_, v) = desired.remove(pos);
             let new_line = format!("{key}={v}");
             if t != new_line {
@@ -936,6 +1022,76 @@ fn ensure_eden_setup() {
     if updated {
         let _ = std::fs::write(&path, lines.join("\n") + "\n");
     }
+}
+
+/// `<data>/Emulators/3DS` — the section dir shared by the managed
+/// RetroArch install (`RetroArch/`) and the Libretro cores
+/// (`Libretro/`).
+fn three_ds_root() -> Option<PathBuf> {
+    crate::settings::data_root().map(|d| d.join("Emulators").join("3DS"))
+}
+
+/// The section root a RetroArch launch belongs to — the managed
+/// core path is `<root>/Libretro/cores/<id>/<lib>`, so its
+/// `Libretro` ancestor's parent IS the section dir (3DS, N64).
+/// User-configured core paths outside the managed tree fall back
+/// to the 3DS section.
+fn retroarch_root(core: Option<&Path>) -> Option<PathBuf> {
+    core.and_then(|c| {
+        c.ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n == "Libretro"))
+            .and_then(|a| a.parent().map(|p| p.to_path_buf()))
+    })
+    .or_else(three_ds_root)
+}
+
+/// RetroArchHandler's focus-override appendconfig — a hidden window
+/// never has focus, so pause_nonactive stays off and game-focus
+/// hotkey grabs are disabled. RA runs plain windowed (the parked
+/// window is the capture surface); video_threaded is off so the
+/// core's retro_run stays on the main thread — azahar's threaded
+/// video path faulted inside amdvlk under capture. The 3DS
+/// system/save/state dirs point at the managed Libretro tree so core
+/// data survives regardless of which retroarch.exe the handler
+/// resolves to. Written under the AES data dir (always writable — a
+/// user-installed RetroArch may sit in Program Files).
+fn retroarch_append_config(core: Option<&Path>) -> Option<PathBuf> {
+    let root = retroarch_root(core)?;
+    let libretro = root.join("Libretro");
+    let path = root.join("retroarch-aes.cfg");
+    let lines = [
+        "pause_nonactive = \"false\"".to_string(),
+        "input_auto_game_focus = \"0\"".to_string(),
+        "video_fullscreen = \"false\"".to_string(),
+        "video_threaded = \"false\"".to_string(),
+        format!(
+            "system_directory = \"{}\"",
+            libretro.join("system").display()
+        ),
+        format!(
+            "savefile_directory = \"{}\"",
+            libretro.join("saves").display()
+        ),
+        format!(
+            "savestate_directory = \"{}\"",
+            libretro.join("states").display()
+        ),
+    ];
+    let body = lines.join("\n") + "\n";
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
+        std::fs::create_dir_all(&root).ok()?;
+        std::fs::write(&path, body).ok()?;
+    }
+    Some(path)
+}
+
+/// The `--verbose --log-file` target — retroarch-launch.log under
+/// the section dir (RetroArchHandler's GetRetroArchLogFilePath
+/// shape). The launch-failure path reads its last error line.
+fn retroarch_log_path(core: Option<&Path>) -> Option<PathBuf> {
+    let root = retroarch_root(core)?;
+    let _ = std::fs::create_dir_all(&root);
+    Some(root.join("retroarch-launch.log"))
 }
 
 /// EdenHandler's WaitForRenderReadyOutputAsync — eden-cli logs
@@ -989,8 +1145,7 @@ fn set_ini_key(path: &Path, section: &str, key: &str, value: &str) {
         }
         if in_section
             && line.contains('=')
-            && t
-                .get(..key.len())
+            && t.get(..key.len())
                 .is_some_and(|p| p.eq_ignore_ascii_case(key))
         {
             found = true;
@@ -1057,6 +1212,7 @@ fn worker_main(
     transcript: Option<PathBuf>,
 ) {
     let set_status = |s: Status| {
+        session_log(&format!("pid={pid} status -> {s:?}"));
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
     };
 
@@ -1113,8 +1269,10 @@ fn worker_main(
         // through several windows before the render surface exists.
         Kind::Dolphin => 1800,
         // CemuHandler.CaptureStartupDelayMs = 250; Eden's is 250
-        // too (EdenHandler.CaptureStartupDelayMs).
+        // too (EdenHandler.CaptureStartupDelayMs). RetroArch's is
+        // 200 (RetroArchHandler.CaptureStartupDelayMs).
         Kind::Cemu | Kind::Eden => 250,
+        Kind::RetroArch => 200,
         _ => 0,
     };
     let poll = if matches!(
@@ -1126,6 +1284,7 @@ fn worker_main(
             | Kind::Dolphin
             | Kind::Cemu
             | Kind::Eden
+            | Kind::RetroArch
     ) {
         25
     } else {
@@ -1486,13 +1645,32 @@ fn worker_main(
     }
 
     if hwnd.is_invalid() {
-        set_status(if stop.load(Ordering::Relaxed) {
+        let failure = if stop.load(Ordering::Relaxed) {
             Status::Exited
         } else if !alive(proc) {
-            Status::Exited
+            if kind == Kind::RetroArch {
+                let reason = transcript
+                    .as_ref()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|s| {
+                        s.lines()
+                            .filter(|l| {
+                                let l = l.to_lowercase();
+                                l.contains("[error]") || l.contains("fatal")
+                            })
+                            .last()
+                            .map(|l| l.trim().to_string())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "RetroArch exited before creating its window".into());
+                Status::Failed(reason)
+            } else {
+                Status::Exited
+            }
         } else {
             Status::Failed("no render window found".into())
-        });
+        };
+        set_status(failure);
         if !proc.is_invalid() {
             unsafe {
                 let _ = TerminateProcess(proc, 0);
@@ -1509,18 +1687,16 @@ fn worker_main(
     //    visible). A target already parked by the sweep keeps its
     //    ORIGINAL saved state — re-preparing would snapshot the
     //    stripped/hidden style and break the failure-path restore.
-    let saved = hidden
-        .remove(&(hwnd.0 as usize))
-        .unwrap_or_else(|| {
-            // PrepareWindowForCapture is a no-op for Eden — an
-            // unswept target just gets state-snapshotted, never
-            // restyled mid-boot (same reason Lacrima no-ops it).
-            if kind == Kind::Eden {
-                snapshot_window(hwnd)
-            } else {
-                prepare_window_for_capture(hwnd)
-            }
-        });
+    let saved = hidden.remove(&(hwnd.0 as usize)).unwrap_or_else(|| {
+        // PrepareWindowForCapture is a no-op for Eden — an
+        // unswept target just gets state-snapshotted, never
+        // restyled mid-boot (same reason Lacrima no-ops it).
+        if matches!(kind, Kind::Eden | Kind::RetroArch) {
+            snapshot_window(hwnd)
+        } else {
+            prepare_window_for_capture(hwnd)
+        }
+    });
     if matches!(kind, Kind::Dolphin | Kind::Cemu | Kind::Eden) {
         // hide_window's WS_EX_LAYERED + 0-alpha can stall Vulkan/
         // OpenGL presentation (why Lacrima no-ops Dolphin's and
@@ -1542,8 +1718,7 @@ fn worker_main(
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i64;
-            let new_ex =
-                (ex | WS_EX_TOOLWINDOW.0 as i64) & !(WS_EX_APPWINDOW.0 as i64);
+            let new_ex = (ex | WS_EX_TOOLWINDOW.0 as i64) & !(WS_EX_APPWINDOW.0 as i64);
             if new_ex != ex {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
                 let _ = SetWindowPos(
@@ -1558,22 +1733,53 @@ fn worker_main(
             }
         }
         set_cloaked(hwnd, true);
-    } else {
+    } else if kind != Kind::RetroArch {
         hide_window(hwnd);
     }
     // Cemu: never send into the wx UI thread (SetMenu blocks while
     // it's busy) — the menubar goes away under RemoveWindow-
-    // Decorations + the game render anyway.
-    if kind != Kind::Cemu {
+    // Decorations + the game render anyway. RetroArch has no HMENU;
+    // sending SetMenu/DrawMenuBar into its busy window thread mid-
+    // boot is the same blocking hazard.
+    if !matches!(kind, Kind::Cemu | Kind::RetroArch) {
         strip_menu(hwnd);
     }
     // Catch anything that appeared since the last poll.
     sweep_hide(pid, hwnd, &mut hidden, kind);
 
+    if kind == Kind::RetroArch {
+        // The sweep has had the whole process cloaked since spawn —
+        // move the target to the corner BEFORE uncloaking so nothing
+        // ever flashes on-screen. Lacrima's WgcCaptureControl runs
+        // Win32API.RestoreWindow (ShowWindow SW_RESTORE) right before
+        // StartCapture: RA creates its window WITHOUT WS_VISIBLE and
+        // shows it a beat later — attach during the hidden window
+        // fails CreateForWindow with E_INVALIDARG and leaves the game
+        // running uncaptured. SW_RESTORE forces it visible.
+        park_retroarch_window(hwnd);
+        set_cloaked(hwnd, false);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
     // 3. Attach WGC — frames land in the shared slots (CPU mirror +
     //    zero-copy GPU ring).
-    let _capture = wgc::Capture::start(hwnd, frames.clone(), gpu, render, low_latency);
+    let mut capture = wgc::Capture::start(
+        hwnd,
+        frames.clone(),
+        gpu.clone(),
+        render.clone(),
+        low_latency,
+    );
     set_status(Status::Capturing);
+    if kind == Kind::RetroArch {
+        // RetroArchHandler: Prepare*ForCapture are no-ops so the
+        // Vulkan window renders until the capture exists; the window
+        // handler then runs Win32API.MoveAway — a bare SetWindowPos to
+        // the virtual-screen corner and NOTHING else.
+        undecorate_retroarch_window(hwnd);
+        park_retroarch_window(hwnd);
+    }
 
     // 4. Monitor: stop request, process exit, or capture failure.
     //    The sweep keeps parking late windows (dialogs, consoles) the
@@ -1586,11 +1792,23 @@ fn worker_main(
             break;
         }
         sweep_hide(pid, hwnd, &mut hidden, kind);
+        if kind == Kind::RetroArch {
+            retroarch_watchdog(
+                pid,
+                &mut hwnd,
+                &mut capture,
+                &frames,
+                &gpu,
+                &render,
+                low_latency,
+                &hwnd_out,
+            );
+        }
         // The capture target isn't swept — strip its menu too so a
         // late-attached menu bar can't leak into the captured frame.
-        // (Skipped for Cemu — SetMenu/DrawMenuBar can block on wx's
-        // busy UI thread.)
-        if kind != Kind::Cemu {
+        // (Skipped for Cemu and RetroArch — SetMenu/DrawMenuBar can
+        // block on their busy window threads.)
+        if !matches!(kind, Kind::Cemu | Kind::RetroArch) {
             strip_menu(hwnd);
         }
         if let Some(err) = frames.lock().unwrap_or_else(|p| p.into_inner()).err.clone() {
@@ -1600,12 +1818,24 @@ fn worker_main(
         std::thread::sleep(Duration::from_millis(120));
     }
 
-    drop(_capture);
+    drop(capture);
 
     if let Some(err) = capture_err {
         // Capture died but the game may still run — put the windows
-        // back so the user can interact with/close it.
-        restore_window(hwnd, &saved);
+        // back so the user can interact with/close it. RetroArch is
+        // the exception: its window was only snapshotted, never
+        // mutated — writing the saved style back can clobber the
+        // WS_VISIBLE RA sets itself after our snapshot (leaving the
+        // window permanently hidden and uncapturable).
+        if kind != Kind::RetroArch {
+            restore_window(hwnd, &saved);
+        } else {
+            // RA's windows were cloaked since spawn — uncloak them
+            // all so the user can see and close the emulator.
+            for w in process_windows_of(&win_pids(pid, kind), true) {
+                set_cloaked(w, false);
+            }
+        }
         for (h, s) in hidden {
             restore_window(HWND(h as *mut _), &s);
         }
@@ -2492,6 +2722,65 @@ fn is_likely_eden_window(hwnd: HWND, main: HWND) -> bool {
     !has_caption || !has_thick
 }
 
+/// RetroArch renders into its own win32 window — class "RetroArch",
+/// title "RetroArch <version> — <core>" once a core is running.
+/// RetroArchHandler.IsLikelyRetroArchRenderWindow — menu-ish titles
+/// lose, then frontend/emulator title and class hints, then the
+/// process-main-window fallback. No size floor: RA's window can be
+/// small before the core's first SET_GEOMETRY resize.
+fn is_likely_retroarch_window(hwnd: HWND, main: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    // Aux windows first — they report the OWNER's pid (console
+    // windows do on Win11), so Panda3DS's "Log Console" would win
+    // the `hwnd == main` fallback and we'd capture the console
+    // instead of the game.
+    let class = class_name(hwnd).to_lowercase();
+    if class.contains("console")
+        || class.contains("ime")
+        || class.starts_with("temp_d3d_window")
+        || class == "diemwin"
+    {
+        return false;
+    }
+    let title = window_title(hwnd);
+    let t = title.trim().to_lowercase();
+    if !t.is_empty() {
+        for bad in [
+            "menu",
+            "settings",
+            "audio",
+            "video",
+            "input",
+            "controller",
+            "cheat",
+            "shader",
+            "playlist",
+            "load content",
+            "options",
+            "config",
+        ] {
+            if t.contains(bad) {
+                return false;
+            }
+        }
+        if t.contains("retroarch") || t.contains("citra") || t.contains("3ds") {
+            return true;
+        }
+    }
+    if !class.is_empty()
+        && (class.contains("retroarch")
+            || class.contains("sdl")
+            || class.contains("glfw")
+            || class.contains("azahar")
+            || class.contains("citra"))
+    {
+        return true;
+    }
+    hwnd == main
+}
+
 /// IsLikelyXeniaRenderWindow — heuristic for top-level candidates
 /// when no dedicated render child exists.
 fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
@@ -2505,6 +2794,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::Dolphin => return is_likely_dolphin_window(hwnd, main),
         Kind::Cemu => return is_likely_cemu_window(hwnd, main),
         Kind::Eden => return is_likely_eden_window(hwnd, main),
+        Kind::RetroArch => return is_likely_retroarch_window(hwnd, main),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -2581,7 +2871,9 @@ fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
     }
     // Flycast/xemu require a real client area before assign
     // (IsStableCaptureCandidate — the UI settles at ≥640×360).
-    if kind != Kind::Xenia && (w < 640 || h < 360) {
+    // RetroArch has no size floor — its predicate accepts the
+    // process's main window at any size.
+    if !matches!(kind, Kind::Xenia | Kind::RetroArch) && (w < 640 || h < 360) {
         return i64::MIN;
     }
     let mut score = w as i64 * h as i64 * 10;
@@ -2935,6 +3227,179 @@ fn hide_window(hwnd: HWND) {
     }
 }
 
+/// Hide a console window. DWMWA_CLOAK is unreliable on
+/// ConsoleWindowClass (conhost-drawn, not a normal DWM surface) —
+/// SW_HIDE is the reliable console hide. Cloak anyway as a fallback
+/// for pseudo-console hosts that do compose.
+fn hide_console_window(hwnd: HWND) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    set_cloaked(hwnd, true);
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+/// Strip the frame off RA's render window so only the game surface
+/// shows even when a core re-centers it on-screen. Removing
+/// WS_CAPTION drops the title bar but NOT the HMENU — a menu-less
+/// window just redraws the band over the client area, so SetMenu is
+/// still required. Idempotent: re-applied by
+/// the watchdog whenever the style creeps back or the hwnd is
+/// retargeted. Runs only after the capture exists so the style
+/// change can't stall boot-time rendering.
+fn undecorate_retroarch_window(hwnd: HWND) {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as i64;
+        let frame = WS_CAPTION.0 as i64
+            | WS_THICKFRAME.0 as i64
+            | WS_SYSMENU.0 as i64
+            | WS_MINIMIZEBOX.0 as i64
+            | WS_MAXIMIZEBOX.0 as i64;
+        let new = (style & !frame) | WS_POPUP.0 as i64;
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i64;
+        // WS_EX_TOOLWINDOW drops the taskbar/Alt-Tab entry; removing
+        // WS_EX_APPWINDOW keeps it out even after a core restyles.
+        let new_ex = (ex | WS_EX_TOOLWINDOW.0 as i64) & !(WS_EX_APPWINDOW.0 as i64);
+        if new != style || new_ex != ex {
+            if new != style {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, new as isize);
+            }
+            if new_ex != ex {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        // Removing WS_CAPTION doesn't detach the HMENU — Windows
+        // redraws the menu band inside the client area and WGC
+        // captures it. SetMenu(NULL) is required to actually drop it.
+        // Post-attach only, so the send can't stall boot.
+        if !GetMenu(hwnd).is_invalid() {
+            let _ = SetMenu(hwnd, None);
+            let _ = DrawMenuBar(hwnd);
+        }
+    }
+}
+
+/// Win32API.MoveAway — a bare SetWindowPos to the virtual-screen
+/// corner and NOTHING else. No toolwindow restyle: SWP_FRAMECHANGED →
+/// WM_STYLECHANGED lands in RA's window proc while a core's emu
+/// thread is mid-frame. No-op when the window already sits there.
+fn park_retroarch_window(hwnd: HWND) {
+    unsafe {
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let want_x = vx + (vw - 100).max(0);
+        let want_y = vy + (vh - 100).max(0);
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        if r.left == want_x && r.top == want_y {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            want_x,
+            want_y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// RetroArch needs a re-target decision when its render window was
+/// recreated — the capture hangs off the destroyed hwnd and gets zero
+/// frames otherwise (Lacrima's OnTargetHwndChanged re-attach).
+fn retroarch_needs_retarget(captured: HWND, resolved: HWND) -> bool {
+    !resolved.is_invalid() && resolved != captured
+}
+
+/// Lacrima's WindowHandler equivalent for RetroArch, run once per
+/// monitor pass:
+/// - re-park the capture window — cores re-center/resize it on
+///   geometry changes (Panda3DS put it back mid-screen), and a
+///   one-shot park visibly pops back on the desktop;
+/// - re-attach capture when the render hwnd was destroyed and
+///   recreated (fullscreen toggles, driver re-init);
+/// - cloak the core's console — Panda3DS AllocConsoles a "Log
+///   Console" window inside retroarch.exe. Consoles are conhost-
+///   owned, outside the pid sweep; AttachConsole→GetConsoleWindow is
+///   the only reliable way to reach one we don't own.
+fn retroarch_watchdog(
+    pid: u32,
+    hwnd: &mut HWND,
+    capture: &mut wgc::Capture,
+    frames: &Arc<Mutex<wgc::FrameSlot>>,
+    gpu: &Arc<wgc::GpuState>,
+    render: &Arc<wgc::RenderShared>,
+    low_latency: bool,
+    hwnd_out: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    unsafe {
+        // No-op when RA has no console, and skipped entirely when
+        // this process already owns one (test harnesses).
+        if AttachConsole(pid).is_ok() {
+            let w = GetConsoleWindow();
+            let _ = FreeConsole();
+            // FreeConsole closes the console handles Windows just
+            // associated with our process — our std handles are left
+            // DANGLING, and the next Command::spawn dies in
+            // CreateProcess with ERROR_INVALID_HANDLE ("Das Handle
+            // ist ungültig", os error 6). A GUI app's std handles
+            // should be NULL — restore that so handle-inheritance
+            // survives into the next launch.
+            for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let _ = SetStdHandle(h, HANDLE::default());
+            }
+            hide_console_window(w);
+        }
+        if !IsWindow(Some(*hwnd)).as_bool() {
+            let new = resolve_capture_target(pid, Kind::RetroArch);
+            if retroarch_needs_retarget(*hwnd, new) {
+                // Same order as the initial attach — park before
+                // uncloak so a retargeted window can't flash either.
+                park_retroarch_window(new);
+                set_cloaked(new, false);
+                let _ = ShowWindow(new, SW_RESTORE);
+                *capture = wgc::Capture::start(
+                    new,
+                    frames.clone(),
+                    gpu.clone(),
+                    render.clone(),
+                    low_latency,
+                );
+                // The dead window's capture may have posted an err —
+                // clear it so the monitor doesn't kill the fresh
+                // attach on the new hwnd.
+                frames.lock().unwrap_or_else(|p| p.into_inner()).err = None;
+                *hwnd = new;
+                hwnd_out.store(new.0 as usize, Ordering::Relaxed);
+                undecorate_retroarch_window(new);
+            }
+            return;
+        }
+    }
+    undecorate_retroarch_window(*hwnd);
+    park_retroarch_window(*hwnd);
+}
+
 /// Undo prepare+hide — used when capture attach fails so the user can
 /// still see/close the emulator window.
 fn restore_window(hwnd: HWND, saved: &SavedWindow) {
@@ -2995,6 +3460,31 @@ fn sweep_hide(
     hidden: &mut std::collections::HashMap<usize, SavedWindow>,
     kind: Kind,
 ) {
+    // RetroArchHandler.PrepareProcessForCapture is a NO-OP:
+    // "RetroArch uses Vulkan/DX and can fail to render if its window
+    // is hidden before capture." That refers to SW_HIDE/ShowWindow
+    // hides — DWM cloaking is different: it clears no styles and the
+    // window still believes it is visible, so swapchain presents
+    // keep flowing. Cloak is therefore safe to apply from spawn —
+    // it kills the boot flash entirely; the resolved target is
+    // uncloaked right before attach (and only after it is already
+    // parked at the corner, so nothing ever flashes on-screen).
+    // Cores like Panda3DS AllocConsole a "Log Console" (console
+    // windows report the owner's pid on Win11) — those get SW_HIDE,
+    // the reliable console hide.
+    if kind == Kind::RetroArch {
+        for hwnd in process_windows_of(&win_pids(pid, kind), false) {
+            if hwnd == skip || hwnd.is_invalid() {
+                continue;
+            }
+            if class_name(hwnd).to_lowercase().contains("console") {
+                hide_console_window(hwnd);
+            } else {
+                set_cloaked(hwnd, true);
+            }
+        }
+        return;
+    }
     for hwnd in process_windows_of(&win_pids(pid, kind), false) {
         if hwnd == skip || hwnd.is_invalid() {
             continue;
@@ -3200,6 +3690,14 @@ pub fn launch_setup(exe: &str, kind: Option<Kind>) -> Result<(), String> {
         Some(Kind::Eden) => {
             ensure_eden_setup();
         }
+        // Bare retroarch.exe opens the menu — append the same focus/
+        // directory overrides a game launch uses so core settings the
+        // user changes land consistently.
+        Some(Kind::RetroArch) => {
+            if let Some(cfg) = retroarch_append_config(None) {
+                cmd.arg("--appendconfig").arg(cfg);
+            }
+        }
         _ => {}
     }
     let child = cmd
@@ -3304,4 +3802,81 @@ pub fn sync_mods(session: &Session, m: &egui::Modifiers, cur: &mut u8) {
         }
     }
     *cur = want;
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression: a recreated render window must trigger re-attach —
+    /// capturing a destroyed hwnd yields zero frames ("game runs but
+    /// never gets captured").
+    #[test]
+    fn retroarch_retarget_on_recreated_window() {
+        use super::HWND;
+        let dead = HWND(0x1000usize as _);
+        let alive = HWND(0x2000usize as _);
+        assert!(super::retroarch_needs_retarget(dead, alive));
+        assert!(!super::retroarch_needs_retarget(alive, alive));
+        assert!(!super::retroarch_needs_retarget(dead, HWND::default()));
+    }
+
+    /// Regression: a Failed capture must end the session — otherwise
+    /// the emulator keeps running hidden and uncaptured ("game is
+    /// running though"), which is exactly the zombie state a failed
+    /// CreateForWindow left RetroArch in.
+    #[test]
+    fn failed_status_counts_as_finished() {
+        assert!(super::status_finished(&super::Status::Exited));
+        assert!(super::status_finished(&super::Status::Failed("x".into())));
+        assert!(!super::status_finished(&super::Status::Resolving));
+        assert!(!super::status_finished(&super::Status::Capturing));
+    }
+
+    /// Repro driver for the live RetroArch capture path — run with
+    /// `cargo test retroarch_session -- --ignored` and env:
+    ///   RA_EXE, RA_CORE, RA_GAME (full paths).
+    ///   RA_ROUNDS=N runs N back-to-back sessions (relaunch repro).
+    #[test]
+    #[ignore]
+    fn retroarch_session_repro() {
+        let exe = std::env::var("RA_EXE").expect("RA_EXE");
+        let core = std::path::PathBuf::from(std::env::var("RA_CORE").expect("RA_CORE"));
+        let game = std::path::PathBuf::from(std::env::var("RA_GAME").expect("RA_GAME"));
+        let ll = std::env::var("RA_LL").map(|v| v == "1").unwrap_or(true);
+        let rounds: u32 = std::env::var("RA_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for round in 0..rounds {
+            let mut s = super::Session::start(
+                &exe,
+                &game,
+                ll,
+                None,
+                super::Kind::RetroArch,
+                Some(core.clone()),
+            )
+            .expect("session start");
+            for i in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let st = s.status();
+                let st_txt = match &st {
+                    super::Status::Resolving => "Resolving".to_string(),
+                    super::Status::Capturing => "Capturing".to_string(),
+                    super::Status::Exited => "Exited".to_string(),
+                    super::Status::Failed(e) => format!("Failed({e})"),
+                };
+                eprintln!(
+                    "round={round} t={}ms status={st_txt} finished={}",
+                    i * 250,
+                    s.finished()
+                );
+                if matches!(st, super::Status::Exited | super::Status::Failed(_)) || s.finished() {
+                    break;
+                }
+            }
+            s.stop();
+            drop(s);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+    }
 }

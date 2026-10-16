@@ -1457,9 +1457,8 @@ fn dolphin_disc_title(path: &Path) -> Option<String> {
         .filter(|b| b.is_ascii_alphanumeric())
         .map(|b| *b as char)
         .collect();
-    let magic_ok =
-        u32::from_be_bytes(hdr[0x18..0x1C].try_into().ok()?) == WII_DISC_MAGIC
-            || u32::from_be_bytes(hdr[0x1C..0x20].try_into().ok()?) == GC_DISC_MAGIC;
+    let magic_ok = u32::from_be_bytes(hdr[0x18..0x1C].try_into().ok()?) == WII_DISC_MAGIC
+        || u32::from_be_bytes(hdr[0x1C..0x20].try_into().ok()?) == GC_DISC_MAGIC;
     if !magic_ok && game_id.len() < 6 {
         return None;
     }
@@ -1548,7 +1547,9 @@ fn wiiu_tag(xml: &str, key: &str) -> Option<String> {
             continue;
         }
         let body = &rest[tag_end + 1..];
-        let Some(end) = body.find(&close) else { return None };
+        let Some(end) = body.find(&close) else {
+            return None;
+        };
         let v = body[..end].trim();
         if !v.is_empty() {
             return Some(v.replace(['\r', '\n'], " ").trim().to_string());
@@ -1614,8 +1615,7 @@ fn wiiu_title(path: &Path) -> Option<String> {
     let mut last_space = false;
     for w in stem.split([' ', '_', '-', '[', ']', '(', ')']) {
         let hex = w.len() >= 16 && w.chars().all(|c| c.is_ascii_hexdigit())
-            || w.len() == 17
-                && w.chars().filter(|c| c.is_ascii_hexdigit()).count() == 16;
+            || w.len() == 17 && w.chars().filter(|c| c.is_ascii_hexdigit()).count() == 16;
         if w.is_empty() || hex {
             continue;
         }
@@ -1714,6 +1714,313 @@ fn wiiu_title_id_in(text: &str) -> Option<String> {
 // LibHac/NCA-decrypt path needs prod.keys and yields nothing without
 // them, same as Lacrima on a keyless machine)
 // ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Nintendo 3DS (RomInspector.TryExtract3dsMetadata): NCSD/CCI/3DS and
+// raw NCCH/CXI title ids, decrypted ExeFS icon SMDH titles, plus CIA
+// TMD title ids and meta-region SMDH titles.
+// ------------------------------------------------------------------
+const N3DS_CIA_HEADER_SIZE: usize = 0x2020;
+const N3DS_SMDH_SIZE: usize = 0x36C0;
+const N3DS_SMDH_TITLE_ENTRY_SIZE: usize = 0x200;
+const N3DS_SMDH_SHORT_DESCRIPTION_SIZE: usize = 0x80;
+
+fn n3ds_read_at(f: &mut std::fs::File, off: u64, buf: &mut [u8]) -> Option<()> {
+    let len = f.metadata().ok()?.len();
+    if off.checked_add(buf.len() as u64)? > len {
+        return None;
+    }
+    f.seek(SeekFrom::Start(off)).ok()?;
+    f.read_exact(buf).ok()
+}
+
+fn n3ds_tag(buf: &[u8], off: usize, tag: &[u8]) -> bool {
+    buf.get(off..off + tag.len()) == Some(tag)
+}
+
+fn n3ds_tid_le(buf: &[u8], off: usize) -> Option<String> {
+    let tid = u64::from_le_bytes(buf.get(off..off + 8)?.try_into().ok()?);
+    (tid != 0).then(|| format!("{tid:016X}"))
+}
+
+fn n3ds_tid_be(buf: &[u8]) -> Option<String> {
+    let tid = u64::from_be_bytes(buf.get(..8)?.try_into().ok()?);
+    (tid != 0).then(|| format!("{tid:016X}"))
+}
+
+/// RomInspector.CleanAsciiText + IsValidTitle — the SMDH decoder is
+/// UTF-16, but Lacrima's display title still accepts only printable
+/// ASCII and rejects symbol-heavy garbage.
+fn n3ds_clean_title(raw: &str) -> Option<String> {
+    let mut cleaned = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c == '\t' || c == '\n' || c == '\r' || (' '..='~').contains(&c) {
+            cleaned.push(c);
+        } else {
+            cleaned.push(' ');
+        }
+    }
+    let cleaned = cleaned
+        .replace('\r', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = cleaned.trim();
+    let alpha_num = title.chars().filter(|c| c.is_alphanumeric()).count();
+    (title.len() >= 3 && alpha_num >= 2 && alpha_num * 10 >= title.len() * 3)
+        .then(|| title.to_string())
+}
+
+fn n3ds_smdh_title(smdh: &[u8]) -> Option<String> {
+    if !n3ds_tag(smdh, 0, b"SMDH") {
+        return None;
+    }
+    // The SMDH title array starts at 0x08; entry 1 is English and its
+    // 0x80-byte short description is UTF-16LE.
+    let off = 0x08 + N3DS_SMDH_TITLE_ENTRY_SIZE;
+    let bytes = smdh.get(off..off + N3DS_SMDH_SHORT_DESCRIPTION_SIZE)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let raw = String::from_utf16_lossy(&units);
+    n3ds_clean_title(raw.trim_end_matches(['\0', ' ', '\n', '\r', '\t']))
+}
+
+fn n3ds_media_unit(header: &[u8]) -> u64 {
+    let shift = header.get(0x188 + 6).copied().unwrap_or(0);
+    0x200u64 << u32::from(if shift > 16 { 0 } else { shift })
+}
+
+/// Locates the `icon` file inside a decrypted NCCH's ExeFS and reads
+/// the English SMDH title. Encrypted dumps leave the filename fallback.
+fn n3ds_exefs_title(
+    f: &mut std::fs::File,
+    ncch_header: &[u8],
+    ncch_offset: u64,
+    file_len: u64,
+) -> Option<String> {
+    if ncch_header.len() < 0x1A8 {
+        return None;
+    }
+    let media_unit = n3ds_media_unit(ncch_header);
+    let exe_fs_units = u64::from(le32(ncch_header, 0x1A0)?);
+    let exe_fs_size_units = u64::from(le32(ncch_header, 0x1A4)?);
+    if exe_fs_units == 0 || exe_fs_size_units == 0 {
+        return None;
+    }
+    let exe_fs_offset = ncch_offset.checked_add(exe_fs_units.checked_mul(media_unit)?)?;
+    let exe_fs_size = exe_fs_size_units.checked_mul(media_unit)?;
+    if exe_fs_offset == 0 || exe_fs_offset.checked_add(0x200)? > file_len {
+        return None;
+    }
+
+    let mut header = [0u8; 0x200];
+    n3ds_read_at(f, exe_fs_offset, &mut header)?;
+    for i in 0..10 {
+        let entry = i * 0x10;
+        let name = std::str::from_utf8(&header[entry..entry + 8])
+            .unwrap_or("")
+            .trim_end_matches(['\0', ' ']);
+        if name != "icon" {
+            continue;
+        }
+        let icon_off = u64::from(le32(&header, entry + 8)?);
+        let icon_size = u64::from(le32(&header, entry + 12)?);
+        if icon_size < N3DS_SMDH_SIZE as u64 {
+            return None;
+        }
+        let icon_abs = exe_fs_offset.checked_add(0x200)?.checked_add(icon_off)?;
+        if icon_abs.checked_add(N3DS_SMDH_SIZE as u64)? > file_len
+            || icon_abs.checked_add(N3DS_SMDH_SIZE as u64)?
+                > exe_fs_offset.checked_add(exe_fs_size)?
+        {
+            return None;
+        }
+        let mut smdh = vec![0u8; N3DS_SMDH_SIZE];
+        n3ds_read_at(f, icon_abs, &mut smdh)?;
+        return n3ds_smdh_title(&smdh);
+    }
+    None
+}
+
+fn n3ds_ncch(
+    f: &mut std::fs::File,
+    ncch_header: &[u8],
+    ncch_offset: u64,
+    file_len: u64,
+) -> (Option<String>, Option<String>) {
+    let tid = n3ds_tid_le(ncch_header, 0x118);
+    let unencrypted = ncch_header
+        .get(0x188 + 7)
+        .is_some_and(|flags| flags & 0x04 != 0);
+    let title = unencrypted
+        .then(|| n3ds_exefs_title(f, ncch_header, ncch_offset, file_len))
+        .flatten();
+    (tid, title)
+}
+
+fn n3ds_ncsd(
+    f: &mut std::fs::File,
+    header: &[u8],
+    file_len: u64,
+) -> Option<(String, Option<String>)> {
+    let ncsd_tid = n3ds_tid_le(header, 0x108)?;
+    let media_unit = n3ds_media_unit(header);
+    let first_partition = u64::from(le32(header, 0x120)?);
+    if first_partition == 0 {
+        return Some((ncsd_tid, None));
+    }
+    let ncch_offset = first_partition.checked_mul(media_unit)?;
+    if ncch_offset.checked_add(0x200)? > file_len {
+        return Some((ncsd_tid, None));
+    }
+    let mut ncch_header = [0u8; 0x200];
+    n3ds_read_at(f, ncch_offset, &mut ncch_header)?;
+    if !n3ds_tag(&ncch_header, 0x100, b"NCCH") {
+        return Some((ncsd_tid, None));
+    }
+    let (_ncch_tid, title) = n3ds_ncch(f, &ncch_header, ncch_offset, file_len);
+    Some((ncsd_tid, title))
+}
+
+fn n3ds_signed_body_offset(sig_type: u32) -> Option<u64> {
+    match sig_type {
+        0x0001_0000 | 0x0001_0003 => Some(0x240),
+        0x0001_0001 | 0x0001_0004 => Some(0x140),
+        0x0001_0002 | 0x0001_0005 => Some(0x80),
+        _ => None,
+    }
+}
+
+fn n3ds_cia(f: &mut std::fs::File, file_len: u64) -> Option<(String, Option<String>)> {
+    let mut header = [0u8; N3DS_CIA_HEADER_SIZE];
+    n3ds_read_at(f, 0, &mut header)?;
+    if le32(&header, 0)? as usize != N3DS_CIA_HEADER_SIZE {
+        return None;
+    }
+    let cert_size = u64::from(le32(&header, 0x08)?);
+    let ticket_size = u64::from(le32(&header, 0x0C)?);
+    let tmd_size = u64::from(le32(&header, 0x10)?);
+    let meta_size = u64::from(le32(&header, 0x14)?);
+    let content_size = u64::from_le_bytes(header.get(0x18..0x20)?.try_into().ok()?);
+    let align64 = |v: u64| -> Option<u64> { Some(v.checked_add(63)? & !63) };
+
+    let tmd_offset = align64(N3DS_CIA_HEADER_SIZE as u64)?
+        .checked_add(align64(cert_size)?)?
+        .checked_add(align64(ticket_size)?)?;
+    if tmd_offset.checked_add(0x1DC)? > file_len {
+        return None;
+    }
+    let mut sig = [0u8; 4];
+    n3ds_read_at(f, tmd_offset, &mut sig)?;
+    let body = n3ds_signed_body_offset(u32::from_be_bytes(sig))?;
+    let tid_offset = tmd_offset.checked_add(body)?.checked_add(0x4C)?;
+    let mut tid_bytes = [0u8; 8];
+    n3ds_read_at(f, tid_offset, &mut tid_bytes)?;
+    let tid = n3ds_tid_be(&tid_bytes)?;
+
+    let mut title = None;
+    if meta_size >= N3DS_SMDH_SIZE as u64 {
+        let meta_offset = tmd_offset
+            .checked_add(align64(tmd_size)?)?
+            .checked_add(align64(content_size)?)?;
+        // Meta layout: 0x180 dependencies + 0x180 reserved + 0x4 core
+        // version + 0xFC reserved, then the SMDH at +0x400.
+        let smdh_offset = meta_offset.checked_add(0x400)?;
+        if smdh_offset.checked_add(N3DS_SMDH_SIZE as u64)? <= file_len {
+            let mut smdh = vec![0u8; N3DS_SMDH_SIZE];
+            if n3ds_read_at(f, smdh_offset, &mut smdh).is_some() {
+                title = n3ds_smdh_title(&smdh);
+            }
+        }
+    }
+    Some((tid, title))
+}
+
+/// TryExtract3dsMetadata → (title_id, internal_title). `.3dsx` stays a
+/// filename fallback just as in Lacrima (it is not one of its parsed
+/// 3DS extensions).
+fn three_ds_read(path: &Path) -> (Option<String>, Option<String>) {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, None),
+    };
+    let file_len = f.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    if file_len < 0x200 {
+        return (None, None);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    if ext.as_deref() == Some("cia") {
+        return n3ds_cia(&mut f, file_len)
+            .map(|(tid, title)| (Some(tid), title))
+            .unwrap_or((None, None));
+    }
+    let mut header = [0u8; 0x200];
+    if n3ds_read_at(&mut f, 0, &mut header).is_none() {
+        return (None, None);
+    }
+    if n3ds_tag(&header, 0x100, b"NCSD") {
+        return n3ds_ncsd(&mut f, &header, file_len)
+            .map(|(tid, title)| (Some(tid), title))
+            .unwrap_or((None, None));
+    }
+    if n3ds_tag(&header, 0x100, b"NCCH") {
+        let (tid, title) = n3ds_ncch(&mut f, &header, 0, file_len);
+        return (tid, title);
+    }
+    (None, None)
+}
+
+/// Lacrima's `LooksLike3dsProductCode` — CTR/KTR/TWL product codes
+/// cached as titles by older scans must never survive as the display
+/// title; they're re-inspected and replaced.
+pub(crate) fn looks_like_3ds_product_code(title: &str) -> bool {
+    let t = title.trim();
+    (8..=16).contains(&t.len())
+        && ["CTR-", "KTR-", "TWL-"]
+            .iter()
+            .any(|p| t.get(..4).is_some_and(|h| h.eq_ignore_ascii_case(p)))
+}
+
+/// resolve_one's 3DS arm — Lacrima's `ResolveNintendo3dsTitle`: the
+/// SMDH title wins, the binary title id is cached, a stale
+/// product-code title self-heals to the SMDH title (or, when the
+/// dump is encrypted, to the normalized filename).
+fn three_ds_title(path: &Path) -> Option<String> {
+    let (tid, title) = three_ds_read(path);
+    let mut doc = load_meta(path).unwrap_or_default();
+    let mut dirty = false;
+    if let Some(tid) = tid {
+        if doc.nintendo3ds_title_id.trim().is_empty() {
+            doc.nintendo3ds_title_id = tid;
+            dirty = true;
+        }
+    }
+    if let Some(t) = &title {
+        if !doc.user_edited
+            && (doc.title.trim().is_empty() || looks_like_3ds_product_code(&doc.title))
+            && doc.title.trim() != t.trim()
+        {
+            doc.title = t.clone();
+            dirty = true;
+        }
+    }
+    if dirty {
+        let _ = save_meta(path, &doc);
+    }
+    title.or_else(|| {
+        // Self-heal tail: with no SMDH title (encrypted dump) and a
+        // stale product-code cache, return the normalized filename so
+        // the caller's save replaces the bad value.
+        cached_title(path)
+            .filter(|t| looks_like_3ds_product_code(t))
+            .and_then(|_| path.file_stem()?.to_str().map(display_title))
+    })
+}
+
 const NCA_HEADER_START: u64 = 0x200;
 const NCA_TITLE_ID: u64 = 0x210;
 const NCA_CONTENT_TYPE: u64 = 0x205;
@@ -1763,10 +2070,7 @@ fn switch_tid_valid(tid: &str) -> bool {
 /// magic, fileCount, stringTableSize, then per-entry
 /// (offset,size,nameOff) triples; names are NUL-terminated ASCII in
 /// the string table. Returns (name, data_offset, size).
-fn switch_partition(
-    f: &mut std::fs::File,
-    base: u64,
-) -> Option<Vec<(String, u64, u64)>> {
+fn switch_partition(f: &mut std::fs::File, base: u64) -> Option<Vec<(String, u64, u64)>> {
     let mut head = [0u8; 0x10];
     switch_read_at(f, base, &mut head)?;
     let magic = u32::from_le_bytes(head[0..4].try_into().ok()?);
@@ -2059,8 +2363,7 @@ fn switch_read_installed_dir(dir: &Path) -> (Option<String>, Option<String>) {
             .and_then(|n| n.to_str())
             .and_then(switch_tid_in)
             .or_else(|| {
-                nacp
-                    .file_name()
+                nacp.file_name()
                     .and_then(|n| n.to_str())
                     .and_then(switch_tid_in)
             });
@@ -3158,33 +3461,38 @@ fn resolve_one(
     use std::sync::atomic::Ordering::Relaxed;
     let ok = || !cancel.load(Relaxed);
     let cached = cover_path(path);
-    // Title: sidecar → database/binary → stem.
-    let title = cached_title(path).or_else(|| {
-        let t = match section_key {
-            "X360" => x360_title(path),
-            "DC" => dc_title(path),
-            "PSX" => psx_title(path),
-            "PS2" => ps2_title(path),
-            // GC + Wii share Dolphin's volume-header reader — the
-            // disc magic picks the console, not the section.
-            "GCN" | "WII" => dolphin_disc_title(path),
-            // Wii U installed folders carry meta.xml; bare files
-            // resolve via their package dir or stem.
-            "WIIU" => wiiu_title(path),
-            "SWITCH" => switch_title(path),
-            "PS3" => ps3_title(path),
-            "PS4" => ps4_title(path),
-            _ => None,
-        };
-        if let Some(t) = &t {
-            // A canceled worker (Clear Section Cache) must not write
-            // sidecars over the fresh refetch.
-            if ok() {
-                save_cached_title(path, t);
+    // Title: sidecar → database/binary → stem. A cached 3DS product
+    // code (CTR-/KTR-/TWL-) is a stale scan artifact — bypass it so
+    // the binary inspection replaces it (Lacrima's self-heal).
+    let title = cached_title(path)
+        .filter(|t| section_key != "3DS" || !looks_like_3ds_product_code(t))
+        .or_else(|| {
+            let t = match section_key {
+                "X360" => x360_title(path),
+                "DC" => dc_title(path),
+                "PSX" => psx_title(path),
+                "PS2" => ps2_title(path),
+                // GC + Wii share Dolphin's volume-header reader — the
+                // disc magic picks the console, not the section.
+                "GCN" | "WII" => dolphin_disc_title(path),
+                // Wii U installed folders carry meta.xml; bare files
+                // resolve via their package dir or stem.
+                "WIIU" => wiiu_title(path),
+                "SWITCH" => switch_title(path),
+                "3DS" => three_ds_title(path),
+                "PS3" => ps3_title(path),
+                "PS4" => ps4_title(path),
+                _ => None,
+            };
+            if let Some(t) = &t {
+                // A canceled worker (Clear Section Cache) must not write
+                // sidecars over the fresh refetch.
+                if ok() {
+                    save_cached_title(path, t);
+                }
             }
-        }
-        t
-    });
+            t
+        });
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -3404,6 +3712,10 @@ pub struct RomMetaDoc {
     /// `metadata.WiiUTitleId` cache field the graphic-packs overlay
     /// reads before re-extracting from meta.xml.
     pub wiiu_title_id: String,
+    /// Nintendo 3DS title id (16 hex) — Lacrima's
+    /// `metadata.Nintendo3dsTitleId`, filled by the NCSD/NCCH/CIA
+    /// readers so future scans don't need to reopen the container.
+    pub nintendo3ds_title_id: String,
     /// Switch title id (16 hex, `01…`) — Lacrima's
     /// `metadata.SwitchTitleId` cache, filled by the NCA/partition
     /// reader so the container walk doesn't re-run.
@@ -3437,8 +3749,7 @@ pub fn meta_doc_path(rom: &Path) -> PathBuf {
 pub fn back_cover_path(rom: &Path) -> Option<PathBuf> {
     let doc = load_meta(rom)?;
     for (i, r) in doc.images.iter().enumerate() {
-        if !r.kind.eq_ignore_ascii_case("Back Cover") && !r.kind.eq_ignore_ascii_case("BackCover")
-        {
+        if !r.kind.eq_ignore_ascii_case("Back Cover") && !r.kind.eq_ignore_ascii_case("BackCover") {
             continue;
         }
         let p = cache_dir().join(&r.file);
@@ -3850,7 +4161,10 @@ mod tests {
             ps_disc_serial(&iso).map(|s| ps_serial_key(&s)).as_deref(),
             Some("SLUS00594")
         );
-        assert_eq!(psx_title(&iso).as_deref(), Some("Metal Gear Solid (Disc 1)"));
+        assert_eq!(
+            psx_title(&iso).as_deref(),
+            Some("Metal Gear Solid (Disc 1)")
+        );
         let _ = std::fs::remove_dir_all(&dir_p);
     }
 
@@ -3877,10 +4191,7 @@ mod tests {
         img[0x20..0x60].fill(0);
         img[0x20..0x20 + 14].copy_from_slice(b"Mario Kart Wii");
         std::fs::write(&iso, &img).unwrap();
-        assert_eq!(
-            dolphin_disc_title(&iso).as_deref(),
-            Some("Mario Kart Wii")
-        );
+        assert_eq!(dolphin_disc_title(&iso).as_deref(), Some("Mario Kart Wii"));
         // Garbage → no title (the stem fallback wins).
         img.fill(0xAB);
         std::fs::write(&iso, &img).unwrap();
@@ -3899,7 +4210,7 @@ mod tests {
         img[8] = 6; // hd sector shift → 64
         img[9] = 15; // wbfs sector shift → 32768
         img[12] = 1; // disc count
-        // wlba table at hd_size(64)+256=320; wlba[0]=1 → cluster @32768.
+                     // wlba table at hd_size(64)+256=320; wlba[0]=1 → cluster @32768.
         img[320..322].copy_from_slice(&1u16.to_be_bytes());
         let h = 32768usize;
         img[h..h + 6].copy_from_slice(b"GALE01");
@@ -3965,10 +4276,7 @@ mod tests {
         img[h + 0x20..h + 0x20 + 14].copy_from_slice(b"Mario Kart Wii");
         let ciso = dir.join("mkwii.ciso");
         std::fs::write(&ciso, &img).unwrap();
-        assert_eq!(
-            dolphin_disc_title(&ciso).as_deref(),
-            Some("Mario Kart Wii")
-        );
+        assert_eq!(dolphin_disc_title(&ciso).as_deref(), Some("Mario Kart Wii"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4041,27 +4349,18 @@ mod tests {
         .unwrap();
         // Package dir itself.
         assert_eq!(wiiu_title(&pkg).as_deref(), Some("Test Quest"));
-        assert_eq!(
-            wiiu_title_id(&pkg).as_deref(),
-            Some("00050000-10101A00")
-        );
+        assert_eq!(wiiu_title_id(&pkg).as_deref(), Some("00050000-10101A00"));
         // The .rpx inside code/ resolves via the grandparent walk.
         let rpx = pkg.join("code").join("game.rpx");
         std::fs::write(&rpx, b"bin").unwrap();
         assert_eq!(wiiu_title(&rpx).as_deref(), Some("Test Quest"));
-        assert_eq!(
-            wiiu_title_id(&rpx).as_deref(),
-            Some("00050000-10101A00")
-        );
+        assert_eq!(wiiu_title_id(&rpx).as_deref(), Some("00050000-10101A00"));
         // A bare .wud outside a package → cleaned stem.
         let wud = dir.join("Great Game 00050000101ABC00.wud");
         std::fs::write(&wud, b"bin").unwrap();
         assert_eq!(wiiu_title(&wud).as_deref(), Some("Great Game"));
         // …and its title id comes from the filename token.
-        assert_eq!(
-            wiiu_title_id(&wud).as_deref(),
-            Some("00050000-101ABC00")
-        );
+        assert_eq!(wiiu_title_id(&wud).as_deref(), Some("00050000-101ABC00"));
         // Hex noise under 16 digits is not a title id.
         let plain = dir.join("No Id Here.wud");
         std::fs::write(&plain, b"bin").unwrap();
@@ -4070,6 +4369,160 @@ mod tests {
     }
 
     // ----------------------------------------------------------
+    // Nintendo 3DS (RomInspector.TryExtract3dsMetadata port)
+    // ----------------------------------------------------------
+
+    fn n3ds_smdh(title: &str) -> Vec<u8> {
+        let mut out = vec![0u8; N3DS_SMDH_SIZE];
+        out[..4].copy_from_slice(b"SMDH");
+        let off = 0x08 + N3DS_SMDH_TITLE_ENTRY_SIZE;
+        for (i, unit) in title.encode_utf16().take(0x40).enumerate() {
+            out[off + i * 2..off + i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    fn n3ds_ncch_payload(tid: u64, title: &str, encrypted: bool) -> Vec<u8> {
+        let smdh = n3ds_smdh(title);
+        let mut out = vec![0u8; 0x200];
+        out[0x100..0x104].copy_from_slice(b"NCCH");
+        out[0x118..0x120].copy_from_slice(&tid.to_le_bytes());
+        if !encrypted {
+            out[0x188 + 7] |= 0x04;
+            out[0x1A0..0x1A4].copy_from_slice(&1u32.to_le_bytes());
+            let exe_fs_size = 0x200 + smdh.len();
+            out[0x1A4..0x1A8]
+                .copy_from_slice(&((exe_fs_size + 0x1FF) as u32 / 0x200).to_le_bytes());
+        }
+        let mut exe_fs = vec![0u8; 0x200];
+        exe_fs[..4].copy_from_slice(b"icon");
+        exe_fs[0x0C..0x10].copy_from_slice(&(smdh.len() as u32).to_le_bytes());
+        out.extend_from_slice(&exe_fs);
+        if !encrypted {
+            out.extend_from_slice(&smdh);
+        }
+        out
+    }
+
+    #[test]
+    fn n3ds_ncsd_and_cxi_read_smdh_title() {
+        let dir = std::env::temp_dir().join(format!("aes_test_3ds_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ncch = n3ds_ncch_payload(0x00040000000F5200, "Test Quest 3D", false);
+
+        // NCSD's own title id wins (RomInspector applies it before the
+        // first partition's NCCH header).
+        let mut cci = vec![0u8; 0x200];
+        cci[0x100..0x104].copy_from_slice(b"NCSD");
+        cci[0x108..0x110].copy_from_slice(&0x00040000000ABC00u64.to_le_bytes());
+        cci[0x120..0x124].copy_from_slice(&1u32.to_le_bytes());
+        cci.extend_from_slice(&ncch);
+        let rom = dir.join("dump.cci");
+        std::fs::write(&rom, &cci).unwrap();
+        let (tid, title) = three_ds_read(&rom);
+        assert_eq!(tid.as_deref(), Some("00040000000ABC00"));
+        assert_eq!(title.as_deref(), Some("Test Quest 3D"));
+
+        // Raw NCCH/CXI reads the same ExeFS icon at offset zero.
+        let cxi = dir.join("dump.cxi");
+        std::fs::write(&cxi, &ncch).unwrap();
+        let (tid, title) = three_ds_read(&cxi);
+        assert_eq!(tid.as_deref(), Some("00040000000F5200"));
+        assert_eq!(title.as_deref(), Some("Test Quest 3D"));
+
+        // Encrypted payloads still yield the title id, but no fake
+        // product-code/internal title — the filename fallback wins.
+        let mut encrypted = n3ds_ncch_payload(0x00040000000F5300, "Ignored", true);
+        encrypted.truncate(0x200);
+        let enc = dir.join("encrypted.3ds");
+        std::fs::write(&enc, &encrypted).unwrap();
+        let (tid, title) = three_ds_read(&enc);
+        assert_eq!(tid.as_deref(), Some("00040000000F5300"));
+        assert_eq!(title, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn n3ds_cia_reads_tmd_id_and_meta_title() {
+        let dir = std::env::temp_dir().join(format!("aes_test_3ds_cia_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tid = 0x00040000000F5400u64;
+        let tmd_size = 0xC40u64;
+        let meta_size = 0x400 + N3DS_SMDH_SIZE as u64;
+        let tmd_offset = 0x2040usize;
+        let meta_offset = tmd_offset + tmd_size as usize;
+        let mut cia = vec![0u8; N3DS_CIA_HEADER_SIZE];
+        cia[0x00..0x04].copy_from_slice(&(N3DS_CIA_HEADER_SIZE as u32).to_le_bytes());
+        cia[0x10..0x14].copy_from_slice(&(tmd_size as u32).to_le_bytes());
+        cia[0x14..0x18].copy_from_slice(&(meta_size as u32).to_le_bytes());
+        cia.resize(tmd_offset, 0);
+        cia.extend_from_slice(&0x0001_0001u32.to_be_bytes()); // RSA-2048 body at +0x140
+        cia.resize(tmd_offset + 0x140 + 0x4C, 0);
+        cia.extend_from_slice(&tid.to_be_bytes());
+        cia.resize(meta_offset + 0x400, 0);
+        cia.extend_from_slice(&n3ds_smdh("CIA Title"));
+        let rom = dir.join("dump.cia");
+        std::fs::write(&rom, &cia).unwrap();
+
+        let (read_tid, title) = three_ds_read(&rom);
+        assert_eq!(read_tid.as_deref(), Some("00040000000F5400"));
+        assert_eq!(title.as_deref(), Some("CIA Title"));
+        assert_eq!(three_ds_title(&rom).as_deref(), Some("CIA Title"));
+        assert_eq!(
+            load_meta(&rom).unwrap().nintendo3ds_title_id.as_str(),
+            "00040000000F5400"
+        );
+        let _ = std::fs::remove_file(meta_doc_path(&rom));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn n3ds_stale_product_code_title_self_heals() {
+        let dir = std::env::temp_dir().join(format!("aes_test_3ds_heal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Decrypted dump + a stale CTR- title sidecar → the SMDH title
+        // comes back and the meta doc records it with the title id.
+        let mut cci = vec![0u8; 0x200];
+        cci[0x100..0x104].copy_from_slice(b"NCSD");
+        cci[0x108..0x110].copy_from_slice(&0x00040000000AAA00u64.to_le_bytes());
+        cci[0x120..0x124].copy_from_slice(&1u32.to_le_bytes());
+        cci.extend_from_slice(&n3ds_ncch_payload(0, "Real Title", false));
+        let rom = dir.join("stale.cci");
+        std::fs::write(&rom, &cci).unwrap();
+        std::fs::create_dir_all(meta_path(&rom).parent().unwrap()).unwrap();
+        std::fs::write(meta_path(&rom), "CTR-P-AQEE").unwrap();
+        assert_eq!(three_ds_title(&rom).as_deref(), Some("Real Title"));
+        let doc = load_meta(&rom).unwrap();
+        assert_eq!(doc.nintendo3ds_title_id, "00040000000AAA00");
+        assert_eq!(doc.title, "Real Title");
+
+        // Encrypted dump + stale KTR- sidecar → normalized filename
+        // fallback replaces the product code.
+        let mut encrypted = n3ds_ncch_payload(0x00040000000BBB00, "x", true);
+        encrypted.truncate(0x200);
+        let enc = dir.join("My Great Game (USA).cxi");
+        std::fs::write(&enc, &encrypted).unwrap();
+        std::fs::write(meta_path(&enc), "KTR-P-BBBB").unwrap();
+        assert_eq!(
+            three_ds_title(&enc).as_deref(),
+            Some(display_title("My Great Game (USA)").as_str())
+        );
+
+        // A non-product-code cached title is not flagged stale.
+        assert!(!looks_like_3ds_product_code("Ocarina of Time 3D"));
+        assert!(looks_like_3ds_product_code("CTR-P-AQEE"));
+        assert!(looks_like_3ds_product_code("twl-p-abcd"));
+        let _ = std::fs::remove_file(meta_path(&rom));
+        let _ = std::fs::remove_file(meta_doc_path(&rom));
+        let _ = std::fs::remove_file(meta_path(&enc));
+        let _ = std::fs::remove_file(meta_doc_path(&enc));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------------------------------------------
+    // Nintendo Switch (SwitchRomMetadataReader port)
+    // ----------------------------------------------------------    // ----------------------------------------------------------
     // Nintendo Switch (SwitchRomMetadataReader port)
     // ----------------------------------------------------------
 
@@ -4144,8 +4597,7 @@ mod tests {
             Some("Super Mario Odyssey")
         );
         assert_eq!(
-            switch_clean_title("Zelda.TOTK.0100A00000000000", Some("0100A00000000000"))
-                .as_deref(),
+            switch_clean_title("Zelda.TOTK.0100A00000000000", Some("0100A00000000000")).as_deref(),
             Some("Zelda TOTK")
         );
         // No id → separators still collapse.
@@ -4163,10 +4615,7 @@ mod tests {
         // win regardless of entry order (TryReadFromPartitionEntries).
         let meta = nca_bytes(0x0100BBBB00000002, NCA_CT_META);
         let prog = nca_bytes(0x0100AAAA00000001, NCA_CT_PROGRAM);
-        let nsp = pfs0_bytes(&[
-            ("pack.cnmt.nca", &meta),
-            ("main.program.nca", &prog),
-        ]);
+        let nsp = pfs0_bytes(&[("pack.cnmt.nca", &meta), ("main.program.nca", &prog)]);
         let rom = dir.join("garbage_name.nsp");
         std::fs::write(&rom, &nsp).unwrap();
         let (tid, title) = switch_read(&rom);
