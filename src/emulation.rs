@@ -567,6 +567,32 @@ pub struct EmuView {
     /// Set by open_section when the prompt should fire once `view()`
     /// runs (open needs a Context for the fade seed).
     prof_want: bool,
+    /// Section-entry update check — spawned the first time a section
+    /// with a managed handler is entered (section key + shared
+    /// result), polled in `view()`.
+    upd_check: Option<(String, emu_dl::VerShared)>,
+    /// Handler ids already checked this run — one check per handler
+    /// so the shared RetroArch/Dolphin installs don't prompt from
+    /// every backed section or spawn duplicate downloads.
+    upd_checked: HashSet<String>,
+    /// Sections whose update prompt was skipped — the band shows an
+    /// update icon while one is active so it stays reachable. Maps
+    /// the section key to the subtitle its prompt showed.
+    upd_skipped: HashMap<String, String>,
+    /// The "update available" prompt — same confirm dialog the
+    /// fullscreen-exit and delete prompts use.
+    upd_open: bool,
+    /// Painted fade (trails `upd_open`) + focused button — mirrors
+    /// main.rs's FsExitPrompt fields.
+    upd_vis: f32,
+    upd_sel: usize,
+    /// Dialog text for the open prompt — the section key it belongs
+    /// to, "installed → latest" for the subtitle.
+    upd_key: String,
+    upd_subtitle: String,
+    /// The running update job — `Some` turns the prompt into its
+    /// progress/status view until the worker reports done.
+    upd_job: Option<emu_dl::Shared>,
     /// Launch pipeline — config prep + Session::start run on a
     /// worker; the result lands here (Lacrima's LaunchEmulatorAsync
     /// Task.Run shape so template downloads never stall the UI).
@@ -734,6 +760,15 @@ impl EmuView {
             cemu_packs: cemu_overlay::CemuGraphicPacksOverlay::new(),
             prof_prompt: xenia_overlay::ProfilePrompt::new(),
             prof_want: false,
+            upd_check: None,
+            upd_checked: HashSet::new(),
+            upd_skipped: HashMap::new(),
+            upd_open: false,
+            upd_vis: 0.0,
+            upd_sel: 0,
+            upd_key: String::new(),
+            upd_subtitle: String::new(),
+            upd_job: None,
             launch_rx: None,
             scan_rx: None,
             settings_dirty: false,
@@ -869,6 +904,26 @@ impl EmuView {
             && self.active_handler(cfg).as_deref() == Some(XENIA_HANDLER)
             && !self.prof_prompt.is_open()
             && xenia_storage(cfg).is_some_and(|r| xenia_profile::find_xuids(&r).is_empty());
+        // First entry this run: with the section's handler installed,
+        // check for an upstream update in the background — `view()`
+        // opens the prompt if the versions differ. Keyed by handler
+        // (RetroArch covers nine sections, Dolphin two) so a shared
+        // install only prompts once and can't queue parallel
+        // downloads of itself; skipped while a check is in flight so
+        // its result can't be silently overwritten.
+        if self.upd_check.is_none() {
+            if let Some(spec) = handler_spec(&key) {
+                let installed = cfg
+                    .emulators
+                    .get(spec.handler)
+                    .is_some_and(|p| !p.trim().is_empty())
+                    || (spec.installed_exe)().is_some();
+                if installed && self.upd_checked.insert(spec.handler.to_string()) {
+                    self.upd_check =
+                        Some((key.clone(), emu_dl::update_check(spec.handler)));
+                }
+            }
+        }
         // Per-section render options (Lacrima's SectionSettings) —
         // the panel edits this live copy.
         self.render = cfg.render.get(&key).cloned().unwrap_or_default();
@@ -1331,13 +1386,42 @@ pub fn view(
         && !emu.shad_patches.is_open()
         && !emu.shad_cheats.is_open()
         && !emu.cemu_packs.is_open()
-        && !emu.prof_prompt.is_open();
+        && !emu.prof_prompt.is_open()
+        && !emu.upd_open;
 
     // open_section flagged a missing Xenia profile — open the prompt
     // (deferred to here because open() seeds the fade on the ctx).
     if emu.prof_want {
         emu.prof_want = false;
         emu.prof_prompt.open(ui.ctx());
+    }
+
+    // The section-entry update check — resolves on a worker; a real
+    // version bump opens the same confirm dialog the fullscreen-exit
+    // prompt uses. A failed/ambiguous lookup quietly drops the check.
+    if let Some((key, check)) = &emu.upd_check {
+        let done = check.lock().unwrap_or_else(|e| e.into_inner()).done.clone();
+        if let Some((installed, latest)) = done {
+            let key = key.clone();
+            emu.upd_check = None;
+            if let Some(spec) = handler_spec(&key) {
+                if let Some(latest) = latest {
+                    if installed.as_deref() != Some(latest.as_str()) {
+                        emu.upd_key = key;
+                        emu.upd_subtitle = format!(
+                            "{}: {} installed → {} available",
+                            spec.name,
+                            installed.unwrap_or_else(|| "unknown".into()),
+                            latest
+                        );
+                        emu.upd_sel = 0;
+                        emu.upd_open = true;
+                    }
+                }
+            }
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     // Async launch — the worker merged the custom config and spawned
@@ -1839,9 +1923,17 @@ pub fn view(
                 f32::NAN
             }
         };
+        // The skipped-update icon takes a slot when the active
+        // section's handler has a pending update the user parked.
+        let upd_key = emu
+            .active
+            .and_then(|i| emu.sections.get(i))
+            .map(|s| section_key(s));
+        let upd_sub = upd_key.as_ref().and_then(|k| emu.upd_skipped.get(k));
         let pw_x = slot(emu.session.is_some());
         let tun_x = slot(emu.session.is_some());
         let sliders_x = slot(emu.session.is_some());
+        let upd_x = slot(upd_sub.is_some() && !emu.upd_open);
         let setup_x = rx;
         let layout_x = rx - 110.0 * s;
 
@@ -1893,6 +1985,31 @@ pub fn view(
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
             transport::icon_pointer(&painter, tb, emu.input_tun, alpha);
+        }
+
+        // Skipped-update icon — reopens the parked update prompt for
+        // the active section (its stored subtitle still describes the
+        // found version bump).
+        if !upd_x.is_nan() {
+            let ub = Rect::from_center_size(Pos2::new(upd_x, cy), Vec2::splat(60.0 * s));
+            let r = if interactive {
+                ui.interact(ub, ui.id().with("emu-update"), Sense::click())
+            } else {
+                ui.interact(ub, ui.id().with("emu-update"), Sense::hover())
+            }
+            .on_hover_text(upd_sub.cloned().unwrap_or_else(|| "Update available".into()));
+            if r.clicked() {
+                if let (Some(k), Some(sub)) = (upd_key.clone(), upd_sub.cloned()) {
+                    emu.upd_key = k;
+                    emu.upd_subtitle = sub;
+                    emu.upd_sel = 0;
+                    emu.upd_open = true;
+                }
+            }
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            transport::icon_update(&painter, ub, alpha);
         }
 
         // Handler-setup launch (LaunchCurrentSectionHandlerSetup) —
@@ -2227,6 +2344,213 @@ pub fn view(
             });
         }
     }
+
+    // Update-available prompt — the same confirm dialog the
+    // fullscreen-exit/delete prompts use. Update swaps it into a
+    // progress/status view that stays up until the worker finishes;
+    // Skip parks an update icon in the band for the section.
+    if emu.upd_open || emu.upd_vis > 0.001 {
+        let dt = ui.ctx().input(|i| i.stable_dt);
+        emu.upd_vis = (emu.upd_vis + dt / if emu.upd_open { 0.18 } else { -0.14 })
+            .clamp(0.0, 1.0);
+        let (upd_key, upd_subtitle) = (emu.upd_key.clone(), emu.upd_subtitle.clone());
+        if emu.upd_job.is_none() {
+            match crate::confirm_overlay(
+                ui,
+                content,
+                "Update available",
+                &upd_subtitle,
+                "Update",
+                "Skip",
+                &mut emu.upd_sel,
+                s,
+                emu.upd_vis,
+                emu.upd_open,
+                "emu-upd",
+            ) {
+                crate::DialogAction::Confirm => {
+                    emu.upd_skipped.remove(&upd_key);
+                    if let Some(spec) = handler_spec(&upd_key) {
+                        // A shared handler (RetroArch, Dolphin) may
+                        // already be downloading under a sibling
+                        // section's key — never run two installs of
+                        // the same emulator into the same directory.
+                        if !emu.dl.values().any(|j| j.handler == spec.handler) {
+                            let shared = (spec.download)();
+                            emu.upd_job = Some(shared.clone());
+                            emu.dl.insert(
+                                upd_key.clone(),
+                                DlJob {
+                                    handler: spec.handler,
+                                    name: spec.name,
+                                    cores: None,
+                                    shared,
+                                },
+                            );
+                            emu.dl_msg.remove(&upd_key);
+                        } else {
+                            emu.upd_open = false;
+                        }
+                    }
+                }
+                crate::DialogAction::Cancel => {
+                    emu.upd_open = false;
+                    emu.upd_skipped.insert(upd_key, upd_subtitle);
+                }
+                crate::DialogAction::None => {}
+            }
+        } else {
+            // Running phase — same veil/dialog dressing, but a
+            // progress bar + status line; closes itself on success,
+            // shows the error + Close on failure.
+            let (stage, frac, done) = emu
+                .upd_job
+                .as_ref()
+                .map(|j| {
+                    let p = j.lock().unwrap_or_else(|e| e.into_inner());
+                    (p.stage.clone(), p.frac, p.done.clone())
+                })
+                .unwrap_or_default();
+            let name = handler_spec(&upd_key).map(|sp| sp.name).unwrap_or(upd_key.as_str());
+            match upd_progress_overlay(
+                ui,
+                content,
+                &format!("Updating {name}"),
+                &stage,
+                frac,
+                done.as_ref().is_some_and(|d| d.is_ok()),
+                done.as_ref().and_then(|d| d.as_ref().err().map(|e| e.as_str())),
+                s,
+                emu.upd_vis,
+            ) {
+                UpdPhase::Running => {}
+                UpdPhase::Closed => {
+                    // Success — fade out; a failure's Close lands here
+                    // too, keeping the band icon so it can be retried.
+                    let failed = done.as_ref().is_some_and(|d| d.is_err());
+                    emu.upd_open = false;
+                    emu.upd_job = None;
+                    if failed {
+                        emu.upd_skipped.insert(upd_key, upd_subtitle);
+                    }
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+        ui.ctx().request_repaint();
+    }
+}
+
+/// The update prompt's running phase.
+enum UpdPhase {
+    /// Still downloading/installing — keep the dialog up.
+    Running,
+    /// Finished and acknowledged (auto on success, Close on error).
+    Closed,
+}
+
+/// Progress view for a running emulator update — same veil + scaled
+/// dialog dressing as `confirm_overlay`, but a status line and a
+/// progress bar instead of buttons. Success closes on its own; a
+/// failure swaps the bar for the error + a Close button.
+fn upd_progress_overlay(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    title: &str,
+    stage: &str,
+    frac: f32,
+    succeeded: bool,
+    err: Option<&str>,
+    s: f32,
+    vis: f32,
+) -> UpdPhase {
+    let painter = ui.painter().clone();
+    painter.rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        Color32::from_black_alpha((170.0 * vis) as u8),
+    );
+    let pop = 0.94 + 0.06 * vis;
+    let dlg = Rect::from_center_size(rect.center(), Vec2::new(420.0 * s, 170.0 * s) * pop);
+    let dr = CornerRadius::same((14.0 * s).round() as u8);
+    painter.rect_filled(dlg, dr, Color32::from_black_alpha((240.0 * vis) as u8));
+    painter.rect_stroke(
+        dlg,
+        dr,
+        Stroke::new(1.0, Color32::from_white_alpha((70.0 * vis) as u8)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        Pos2::new(dlg.center().x, dlg.min.y + 36.0 * s * pop),
+        Align2::CENTER_CENTER,
+        title,
+        FontId::proportional(20.0 * s),
+        Color32::WHITE.gamma_multiply(vis),
+    );
+    painter.text(
+        Pos2::new(dlg.center().x, dlg.min.y + 66.0 * s * pop),
+        Align2::CENTER_CENTER,
+        if err.is_some() { "Update failed" } else { stage },
+        FontId::proportional(13.0 * s),
+        Color32::from_gray(190).gamma_multiply(vis),
+    );
+    if let Some(err) = err {
+        // Failure — clipped error line above a centered Close button.
+        let clip = Rect::from_min_max(
+            Pos2::new(dlg.min.x + 20.0 * s, dlg.min.y + 82.0 * s),
+            Pos2::new(dlg.max.x - 20.0 * s, dlg.min.y + 104.0 * s),
+        );
+        painter.with_clip_rect(clip).text(
+            clip.center(),
+            Align2::CENTER_CENTER,
+            err,
+            FontId::proportional(11.0 * s),
+            Color32::from_rgb(0xE0, 0x70, 0x70).gamma_multiply(vis),
+        );
+        let b = Rect::from_center_size(
+            Pos2::new(dlg.center().x, dlg.min.y + 126.0 * s * pop),
+            Vec2::new(140.0 * s, 38.0 * s),
+        );
+        let resp = ui.interact(b, ui.id().with("emu-upd-close"), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let br = CornerRadius::same((8.0 * s).round() as u8);
+        painter.rect_filled(
+            b,
+            br,
+            Color32::from_gray(if resp.hovered() { 70 } else { 50 }).gamma_multiply(vis),
+        );
+        painter.rect_stroke(
+            b,
+            br,
+            Stroke::new(1.0, Color32::from_white_alpha((120.0 * vis) as u8)),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            b.center(),
+            Align2::CENTER_CENTER,
+            "Close",
+            FontId::proportional(15.0 * s),
+            Color32::WHITE.gamma_multiply(vis),
+        );
+        return if resp.clicked() { UpdPhase::Closed } else { UpdPhase::Running };
+    }
+    if succeeded {
+        return UpdPhase::Closed;
+    }
+    // Progress bar — same track/fill styling as the settings card's.
+    let track = Rect::from_min_size(
+        Pos2::new(dlg.min.x + 40.0 * s, dlg.min.y + 118.0 * s * pop),
+        Vec2::new(dlg.width() - 80.0 * s, 8.0 * s),
+    );
+    painter.rect_filled(track, CornerRadius::same(4), Color32::from_gray(50).gamma_multiply(vis));
+    painter.rect_filled(
+        Rect::from_min_size(track.min, Vec2::new(track.width() * frac.clamp(0.0, 1.0), track.height())),
+        CornerRadius::same(4),
+        Color32::from_rgb(0x1E, 0x6B, 0x3A).gamma_multiply(vis),
+    );
+    UpdPhase::Running
 }
 
 /// Overlay header title — the resolved/custom title when present,
@@ -4289,8 +4613,11 @@ pub fn settings_tab(
                 }
 
                 // Right-aligned button row — Lacrima's
-                // Set default | Browse | Clear | Download.
-                let downloading = emu.dl.contains_key(key);
+                // Set default | Browse | Clear | Download. A job
+                // under a sibling section's key counts too — shared
+                // handlers (RetroArch, Dolphin) install into one
+                // directory, so only one can run at a time.
+                let downloading = emu.dl.values().any(|j| j.handler == spec.handler);
                 let is_default = cfg
                     .default_handlers
                     .get(spec.section)
@@ -4311,13 +4638,21 @@ pub fn settings_tab(
                 let by = ry + if core_select { 96.0 } else { 68.0 } * s;
                 let mut bx = inner.max.x - m;
 
-                // Download (green #1E6B3A).
-                let w = measure(&painter, "Download");
+                // Download (green #1E6B3A) — reads "Update" once a
+                // managed install exists; the worker path is the same
+                // (fetch newest release → overwrite the managed dir).
+                let dl_label =
+                    if emu.installed_hint.get(spec.handler).is_some_and(|(_, p)| p.is_some()) {
+                        "Update"
+                    } else {
+                        "Download"
+                    };
+                let w = measure(&painter, dl_label);
                 bx -= w;
                 let (dl_clicked, _) = crate::flat_button(
                     &mut cui,
                     Pos2::new(bx, by),
-                    "Download",
+                    dl_label,
                     s,
                     !downloading,
                     Color32::from_rgb(0x1E, 0x6B, 0x3A),

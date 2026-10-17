@@ -102,7 +102,7 @@ impl Default for Effects {
             show_lacrima: true,
             lacrima_cover_color: false,
             lacrima_count: 100,
-            show_edge_border: true,
+            show_edge_border: false,
             animate_title: true,
             show_shadertoy: true,
             // EnsureDefaultSelectedShaderToy prefers this name.
@@ -474,7 +474,7 @@ impl Default for RenderOpts {
 impl Default for Emulation {
     fn default() -> Self {
         Self {
-            use_first_item_cover: false,
+            use_first_item_cover: true,
             gameplay_autoplay: false,
             back_cover_letterbox_fill: false,
             // Lacrima: MyVideos/AES_Lacrima, else DataRoot/Recordings.

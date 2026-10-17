@@ -1093,6 +1093,114 @@ fn emucr_dolphin_asset(html: &str, spec: &EmuSpec) -> Option<(String, String)> {
     None
 }
 
+/// The newest non-prerelease release object for a spec (same
+/// fetch + sort the install path uses). The update-check worker and
+/// `work` share this so "latest" always means the same thing.
+fn fetch_latest_release(spec: &EmuSpec) -> Result<serde_json::Value, String> {
+    let mut resp = agent()
+        .get(spec.releases_api)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("Release lookup failed: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Release lookup failed: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Bad release json: {e}"))?;
+    let releases = json.as_array().cloned().unwrap_or_default();
+    let mut releases: Vec<serde_json::Value> = releases
+        .into_iter()
+        .filter(|r| {
+            spec.allow_prerelease || r.get("prerelease").and_then(|p| p.as_bool()) != Some(true)
+        })
+        .collect();
+    releases.sort_by(|a, b| {
+        let pa = a.get("published_at").and_then(|p| p.as_str()).unwrap_or("");
+        let pb = b.get("published_at").and_then(|p| p.as_str()).unwrap_or("");
+        pb.cmp(pa)
+    });
+    releases
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("No {} releases found", spec.name))
+}
+
+// ======================================================================
+// Update check — Emulation view's section-entry prompt
+// ======================================================================
+
+/// Result of a background update check — the section prompt polls
+/// `done` each frame. `installed` is the managed-install marker,
+/// `latest` the newest upstream tag; `None` where a side couldn't
+/// be determined (no marker / lookup failed / no checkable source).
+#[derive(Default)]
+pub struct VerCheck {
+    pub done: Option<(Option<String>, Option<String>)>,
+}
+
+pub type VerShared = Arc<Mutex<VerCheck>>;
+
+/// The managed install's version marker contents, if present.
+fn marker_version(dir: Option<PathBuf>, marker: &str) -> Option<String> {
+    let v = std::fs::read_to_string(dir?.join(marker)).ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Handler id → its spec (update checks key off the same ids the
+/// settings cards do). Dolphin has no managed release feed and
+/// RetroArch checks a buildbot listing instead of a releases API.
+fn spec_for_handler(handler: &str) -> Option<&'static EmuSpec> {
+    Some(match handler {
+        "xenia" => &XENIA_SPEC,
+        "flycast" => &FLYCAST_SPEC,
+        "xemu" => &XEMU_SPEC,
+        "rpcs3" => &RPCS3_SPEC,
+        "shadps4" => &SHADPS4_SPEC,
+        "duckstation" => &DUCKSTATION_SPEC,
+        "pcsx2" => &PCSX2_SPEC,
+        "cemu" => &CEMU_SPEC,
+        "eden" => &EDEN_SPEC,
+        _ => return None,
+    })
+}
+
+/// The installed version string for a handler — the marker file the
+/// download worker writes into the managed emu dir.
+pub fn installed_version(handler: &str) -> Option<String> {
+    if handler == "retroarch" {
+        return marker_version(retroarch_dir(), "retroarch_version.txt");
+    }
+    let spec = spec_for_handler(handler)?;
+    marker_version((spec.dir)(), spec.version_marker)
+}
+
+/// Spawn a worker that resolves (installed, latest) for a handler —
+/// cheap metadata only, no download. Handlers without a checkable
+/// source (Dolphin's EmuCR chain, flatpak) report `latest: None`.
+pub fn update_check(handler: &str) -> VerShared {
+    let shared: VerShared = Arc::new(Mutex::new(VerCheck::default()));
+    let worker = shared.clone();
+    let handler = handler.to_string();
+    std::thread::spawn(move || {
+        let installed = installed_version(&handler);
+        let latest = if handler == "retroarch" {
+            Some(retroarch_stable_version())
+        } else {
+            spec_for_handler(&handler)
+                .and_then(|spec| {
+                    fetch_latest_release(spec).ok().and_then(|r| {
+                        r.get("tag_name").and_then(|t| t.as_str()).map(str::to_string)
+                    })
+                })
+        };
+        worker.lock().unwrap_or_else(|e| e.into_inner()).done = Some((installed, latest));
+    });
+    shared
+}
+
 fn download_emu(spec: &'static EmuSpec) -> Shared {
     let dl: Shared = Arc::new(Mutex::new(DlProgress {
         stage: format!("Starting {} download…", spec.name),
@@ -1116,33 +1224,7 @@ fn work(dl: &Shared, spec: &EmuSpec) -> Result<String, String> {
 
     // Fetch releases — newest non-prerelease first.
     set(dl, &format!("Fetching {} releases…", spec.name), 0.0);
-    let mut resp = agent()
-        .get(spec.releases_api)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| format!("Release lookup failed: {e}"))?;
-    let text = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Release lookup failed: {e}"))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("Bad release json: {e}"))?;
-    let releases = json.as_array().cloned().unwrap_or_default();
-    let mut releases: Vec<&serde_json::Value> = releases
-        .iter()
-        .filter(|r| {
-            spec.allow_prerelease || r.get("prerelease").and_then(|p| p.as_bool()) != Some(true)
-        })
-        .collect();
-    releases.sort_by(|a, b| {
-        let pa = a.get("published_at").and_then(|p| p.as_str()).unwrap_or("");
-        let pb = b.get("published_at").and_then(|p| p.as_str()).unwrap_or("");
-        pb.cmp(pa)
-    });
-    let release = releases
-        .first()
-        .ok_or_else(|| format!("No {} releases found", spec.name))?;
+    let release = fetch_latest_release(spec)?;
     let tag = release
         .get("tag_name")
         .and_then(|t| t.as_str())

@@ -812,6 +812,82 @@ pub(crate) fn icon_power(painter: &egui::Painter, rect: Rect, alpha: f32) {
     painter.add(egui::Shape::line(pts, stroke));
 }
 
+/// Emulator-update glyph: a filled gear ringed by two circular
+/// arrows — the classic sync mark, here meaning a pending upstream
+/// update.
+pub(crate) fn icon_update(painter: &egui::Painter, rect: Rect, alpha: f32) {
+    let c = WHITE.gamma_multiply(alpha);
+    let k = rect.height() / 100.0;
+    let center = cv(rect, 100.0, 50.0, 50.0);
+
+    // Filled cog with a real hole — pair each toothed-boundary vertex
+    // with a same-angle inner vertex and triangulate the ring between
+    // them, so the hub is genuinely transparent.
+    const TEETH: usize = 8;
+    let step = std::f32::consts::TAU / TEETH as f32;
+    let (root_r, tip_r, hole_r) = (15.0 * k, 21.0 * k, 8.0 * k);
+    let (half_tooth, half_gap) = (step * 0.18, step * 0.40);
+    let mut boundary: Vec<(f32, f32)> = Vec::with_capacity(TEETH * 4);
+    for i in 0..TEETH {
+        let a = i as f32 * step;
+        for (r, da) in [
+            (root_r, -half_gap),
+            (tip_r, -half_tooth),
+            (tip_r, half_tooth),
+            (root_r, half_gap),
+        ] {
+            boundary.push((a + da, r));
+        }
+    }
+    let n = boundary.len();
+    let mut mesh = egui::Mesh::default();
+    for &(ang, r) in &boundary {
+        mesh.colored_vertex(center + Vec2::new(ang.cos() * r, ang.sin() * r), c);
+        mesh.colored_vertex(
+            center + Vec2::new(ang.cos() * hole_r, ang.sin() * hole_r),
+            c,
+        );
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (oi, ii) = (2 * i as u32, 2 * i as u32 + 1);
+        let (oj, ij) = (2 * j as u32, 2 * j as u32 + 1);
+        mesh.indices
+            .extend_from_slice(&[oi, oj, ij, oi, ij, ii]);
+    }
+    painter.add(Shape::Mesh(std::sync::Arc::new(mesh)));
+
+    // Sync ring — two ~140° arcs; each arrowhead sits ON the ring a
+    // few degrees past its arc's end (gap, not a tangent runaway),
+    // pointing along the direction of travel: upper-right clockwise,
+    // lower-left counter. (0° = right, 90° = down.)
+    let r = 37.0 * k;
+    let stroke = Stroke::new(7.0 * k, c);
+    for (start, end) in [(135.0f32, 275.0f32), (315.0f32, 455.0f32)] {
+        let pts: Vec<Pos2> = ((start as i32)..=(end as i32))
+            .step_by(8)
+            .map(|deg| {
+                let rad = (deg as f32).to_radians();
+                center + Vec2::new(rad.cos() * r, rad.sin() * r)
+            })
+            .collect();
+        painter.add(Shape::line(pts, stroke));
+        let a = (end + 8.0).to_radians();
+        let pos = center + Vec2::new(a.cos() * r, a.sin() * r);
+        let dir = Vec2::new(a.sin(), -a.cos());
+        let perp = Vec2::new(-dir.y, dir.x);
+        painter.add(Shape::convex_polygon(
+            vec![
+                pos + dir * 10.0 * k,
+                pos - dir * 6.0 * k + perp * 8.0 * k,
+                pos - dir * 6.0 * k - perp * 8.0 * k,
+            ],
+            c,
+            Stroke::NONE,
+        ));
+    }
+}
+
 /// Input-tunnel toggle (the emulator-control button): a classic
 /// pointer-cursor arrow, lit while clicks/keys forward into the
 /// captured emulator window.
