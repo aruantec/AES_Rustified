@@ -88,3 +88,19 @@ downloads it into `%LOCALAPPDATA%\AES_Rustified\Tools` automatically (no PATH ne
 
 App data (settings, metadata/cover caches, stream cache, tools) lives under
 `%LOCALAPPDATA%\AES_Rustified`.
+
+## Disclaimer
+
+This software is a personal research project made for **research and learning purposes
+only**. It is not intended for production use or any commercial purpose.
+
+This software is provided **"as is"**, without warranty of any kind, express or implied,
+including but not limited to the warranties of merchantability, fitness for a particular
+purpose and noninfringement. In no event shall the author be liable for any claim, damages
+or other liability — whether in an action of contract, tort or otherwise — arising from,
+out of or in connection with the software or the use or other dealings in the software.
+
+**You, the user, are solely responsible for how you use this software** and for any
+consequences of that use, including any damage caused directly or indirectly by the
+software, and for ensuring your use complies with the laws and terms of service applicable
+to you (media downloads, emulator and ROM usage, third-party APIs, and so on).

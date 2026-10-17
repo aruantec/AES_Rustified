@@ -240,6 +240,10 @@ pub struct Carousel {
     /// Scrollbar auto-fade, matching the album row's behavior.
     sb_opacity: f32,
     sb_visible_until: Instant,
+    /// Last rendered scrollbar geometry + hot state — the horizontal
+    /// bar docks at the bottom edge where the spectrum paints AFTER
+    /// this view, so `repaint_scrollbar` redraws it on top.
+    last_sb: Option<(SbGeo, bool)>,
     /// Playing-item pulse phase (3.1 rad/s while a track plays).
     pulse: f32,
     /// Pill slider drag/hover preview.
@@ -320,6 +324,7 @@ impl Carousel {
             sb_drag: None,
             sb_opacity: 0.0,
             sb_visible_until: Instant::now(),
+            last_sb: None,
             pulse: 0.0,
             preview: None,
             pending_reveal: None,
@@ -2171,11 +2176,14 @@ impl Carousel {
             s,
         );
         if mode != Mode::Carousel {
+            self.last_sb = sb.map(|b| (b, sb_hot));
             if let Some(b) = &sb {
                 if self.sb_opacity > 0.01 {
                     Self::paint_scrollbar(ui.painter(), b, sb_hot, self.sb_opacity);
                 }
             }
+        } else {
+            self.last_sb = None;
         }
 
         // Tab focus-in flash — a soft border around the view that
@@ -2222,6 +2230,19 @@ impl Carousel {
     // ================================================================
     // GRID SCROLLBAR
     // ================================================================
+
+    /// Repaint the horizontal scrollbar after the spectrum — its
+    /// track docks at the bottom edge of the cover view, exactly
+    /// where `music_view` paints the spectrum strip *after* this
+    /// view, so without this pass the spectrum covers the bar.
+    /// Vertical bars live on the right edge and are never touched.
+    pub fn repaint_scrollbar(&self, painter: &egui::Painter) {
+        if let Some((b, hot)) = self.last_sb {
+            if b.horizontal && self.sb_opacity > 0.01 {
+                Self::paint_scrollbar(painter, &b, hot, self.sb_opacity);
+            }
+        }
+    }
 
     /// Pill scrollbar like the album row's — a soft halo under a bright
     /// core, brighter while hot (hovered/dragged).
@@ -3387,6 +3408,7 @@ impl GridGeo {
 }
 
 /// Grid scrollbar geometry (see `GridGeo::scrollbar`).
+#[derive(Clone, Copy)]
 struct SbGeo {
     track: Rect,
     thumb: Rect,

@@ -4167,6 +4167,16 @@ fn music_view(
     // Compact + horizontal grid: the compact bar ate a card-height of
     // cover area — floor the grid at 2 rows (cards shrink to fit).
     carousel.h_min_rows = if transport.compact() { 2 } else { 1 };
+    // The spectrum parks at the bottom of `upper` (above the
+    // transport band) and paints over the cover area in every
+    // layout — the horizontal grid keeps its full height like the
+    // vertical grid (Lacrima hides it there entirely:
+    // IsMusicSpectrumVisible).
+    let spec_h = if spec_cfg.show {
+        (spec_cfg.height * s).min(upper.height())
+    } else {
+        0.0
+    };
     // Grid modes lay out against the pre-lift area: when the drawers
     // raise the transport band, the grid keeps its rows and the band
     // simply covers whatever slides under it (painted earlier).
@@ -4435,9 +4445,10 @@ fn music_view(
     // band (MusicView's GlSpectrumControl, Height=SpectrumHeight,
     // VerticalAlignment=Bottom, IsHitTestVisible=False). Cover-derived
     // colors override the configured gradient when enabled and a cover
-    // was extracted (GetDominantColorGradient). Hidden in the
-    // horizontal grid layout (Lacrima's IsMusicSpectrumVisible).
-    if spec_cfg.show && cover_mode != carousel::Mode::HorizontalGrid {
+    // was extracted (GetDominantColorGradient). Visible in every
+    // cover layout — it overlays the horizontal grid's cards like the
+    // vertical grid (Lacrima hides it there instead).
+    if spec_h > 0.0 {
         let manual = spec_cfg
             .gradient
             .map(|c| Color32::from_rgb(c[0], c[1], c[2]));
@@ -4446,10 +4457,20 @@ fn music_view(
         } else {
             &manual
         };
-        let spec_h = (spec_cfg.height * s).min(upper.height());
         let spec_rect =
             Rect::from_min_max(Pos2::new(content.min.x, upper.max.y - spec_h), upper.max);
-        spectrum.paint(&painter, spec_rect, spec_cfg, colors, alpha);
+        // Compact + cards: fade the spectrum to 50% opacity so the
+        // bars sit behind the card text (lerped on cct — no pop).
+        let spec_alpha = if cover_mode != carousel::Mode::Carousel {
+            alpha * (1.0 - 0.5 * cct)
+        } else {
+            alpha
+        };
+        spectrum.paint(&painter, spec_rect, spec_cfg, colors, spec_alpha);
+        // The horizontal grid scrollbar docks at the same bottom edge
+        // — repaint it over the spectrum (it was painted inside
+        // carousel.ui, before this strip).
+        carousel.repaint_scrollbar(&painter);
     }
     let (position, duration) = player
         .map(|p| (p.position().as_secs_f64(), p.duration().as_secs_f64()))
