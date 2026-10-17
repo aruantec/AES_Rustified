@@ -14,7 +14,7 @@
 use std::{
     ffi::OsString,
     os::unix::{fs::MetadataExt, io::OwnedFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
@@ -58,13 +58,14 @@ use smithay::{
         calloop::{
             channel::{channel, Event as ChannelEvent, Sender as ChannelSender},
             generic::Generic,
-            EventLoop, Interest, LoopSignal, Mode as SourceMode, PostAction,
+            timer::{TimeoutAction, Timer},
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode as SourceMode, PostAction,
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::{wl_buffer, wl_output, wl_seat::WlSeat, wl_surface::WlSurface},
-            Client, Display, DisplayHandle, Dispatch, GlobalDispatch, ListeningSocket,
+            Client, Display, DisplayHandle, Dispatch, GlobalDispatch, ListeningSocket, Resource,
         },
     },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER},
@@ -129,7 +130,8 @@ mod wl_drm_proto {
 use wl_drm_proto::wl_drm::WlDrm;
 
 /// Input events forwarded from the UI into the nested seat. Coordinates
-/// are in the captured frame's logical space (0,0 = surface top-left).
+/// are in the published frame's space (0,0 = the crop's top-left; the
+/// compositor adds the scene origin back to get global coords).
 pub enum WlInput {
     /// Absolute pointer position inside the captured surface.
     PointerMotion { x: f64, y: f64 },
@@ -256,6 +258,59 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// Rank a DRM render node for GPU preference — dedicated VRAM wins,
+/// which picks the discrete card over an APU's small stolen-memory
+/// carveout. NVIDIA's proprietary driver doesn't expose
+/// `mem_info_vram_total`, so its vendor id counts as discrete.
+fn render_node_rank(device_dir: &std::path::Path) -> u64 {
+    let vendor = std::fs::read_to_string(device_dir.join("vendor"))
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    let vram = std::fs::read_to_string(device_dir.join("mem_info_vram_total"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    vram + if vendor == 0x10de { 1u64 << 62 } else { 0 }
+}
+
+/// `vendor:device` of the strongest render node — for
+/// `MESA_VK_DEVICE_SELECT`, which reorders RADV's physical-device
+/// list. Without it Vulkan clients on iGPU+dGPU desktops (Ryzen APU +
+/// big Radeon) enumerate the 2-CU iGPU first and `gpu=any`-style
+/// pickers land on it. `None` when there's nothing to disambiguate.
+pub(crate) fn vulkan_device_select() -> Option<String> {
+    let mut nodes: Vec<(u64, u32, u32)> = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/drm").ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("renderD") {
+            continue;
+        }
+        let dir = entry.path().join("device");
+        let read_hex = |f: &str| {
+            std::fs::read_to_string(dir.join(f))
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        };
+        let (Some(vendor), Some(device)) = (read_hex("vendor"), read_hex("device")) else {
+            continue;
+        };
+        nodes.push((render_node_rank(&dir), vendor, device));
+    }
+    if nodes.len() < 2 {
+        return None;
+    }
+    nodes.sort_by_key(|&(rank, vendor, device)| (rank, vendor, device));
+    let (_, vendor, device) = *nodes.last().unwrap();
+    Some(format!("{vendor:04x}:{device:04x}"))
+}
+
 /// The compositor. All state lives here; the calloop callbacks borrow
 /// it mutably so nothing needs locking. Several `*State` fields are
 /// never touched by us directly — they only need to exist for the
@@ -297,9 +352,27 @@ struct Comp {
     pointer: PointerHandle<Comp>,
     /// Last pointer position the UI tunnel sent — drawn into the
     /// published frame so the user has a visible cursor reference.
+    /// Frame-space (the published crop), not compositor space.
     pointer_loc: Option<Point<f64, Logical>>,
+    /// Origin of the last published scene crop. Input arrives in
+    /// frame space (the cropped readback), so protocol dispatch adds
+    /// this back to get compositor-global coordinates.
+    scene_loc: Point<f64, Logical>,
+    /// Where each toplevel was last rendered — the surface's
+    /// global-space origin, needed for pointer focus so clients get
+    /// correct surface-local coordinates.
+    toplevel_locs: std::collections::HashMap<ObjectId, Point<f64, Logical>>,
     output: Output,
     start: Instant,
+    /// Render+readback on every commit is a synchronous GPU
+    /// round-trip — a client committing faster than the capture rate
+    /// would serialize the whole pipeline. Publishes are coalesced to
+    /// ~120 Hz; a skipped commit arms a short timer to flush the
+    /// pending frame.
+    last_publish: Instant,
+    pending_publish: bool,
+    publish_timer_set: bool,
+    loop_handle: Option<LoopHandle<'static, Comp>>,
 
     /// Every mapped toplevel, oldest first — the emulator's main
     /// window is the first; dialogs (Qt messages, CSD menus) stack on
@@ -371,11 +444,21 @@ fn run(
     output.set_preferred(mode);
 
     // Headless GLES context on a render node — needed to import client
-    // dmabufs (Vulkan/GL emulators never hand us shm buffers). EGLDevice
-    // enumeration finds /dev/dri/renderD*; the first working one wins.
+    // dmabufs (Vulkan/GL emulators never hand us shm buffers). Devices
+    // are tried strongest-first: on iGPU+dGPU desktops enumeration
+    // order lands on the APU's render node, which makes the
+    // compositor's render+readback (and XWayland's glamor, via wl_drm)
+    // share the weakest GPU with the game.
     let renderer = (|| -> Option<(GlesRenderer, PathBuf)> {
-        let devices = EGLDevice::enumerate().ok()?;
-        for device in devices {
+        let mut devices: Vec<EGLDevice> = EGLDevice::enumerate().ok()?.collect();
+        devices.sort_by_key(|d| {
+            d.render_device_path()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_os_string()))
+                .map(|n| render_node_rank(&Path::new("/sys/class/drm").join(n).join("device")))
+                .unwrap_or(0)
+        });
+        for device in devices.into_iter().rev() {
             let Ok(path) = device.render_device_path() else {
                 continue;
             };
@@ -478,8 +561,14 @@ fn run(
         keyboard,
         pointer,
         pointer_loc: None,
+        scene_loc: Point::from((0.0, 0.0)),
+        toplevel_locs: std::collections::HashMap::new(),
         output,
         start: Instant::now(),
+        last_publish: Instant::now(),
+        pending_publish: false,
+        publish_timer_set: false,
+        loop_handle: None,
         toplevels: Vec::new(),
         renderer,
         target: None,
@@ -502,6 +591,7 @@ fn run(
 
     let mut event_loop = EventLoop::<Comp>::try_new().map_err(|e| format!("calloop: {e}"))?;
     let handle = event_loop.handle();
+    state.loop_handle = Some(handle.clone());
 
     // XWayland for X11-only emulators (Xenia's Linux build has no
     // wayland Vulkan surface — it presents through xcb). XWayland
@@ -622,6 +712,23 @@ impl Comp {
             .or_else(|| self.toplevels.last().map(|t| t.wl_surface().clone()))
     }
 
+    /// Where `surface` lives in compositor-global space — its origin
+    /// is the second half of the pointer focus tuple (clients get
+    /// `location - origin` as their surface-local coords). X11
+    /// windows sit at their configured geometry; toplevels at the
+    /// position publish() last rendered them.
+    fn surface_origin(&self, surface: &WlSurface) -> Point<f64, Logical> {
+        for w in self.x11_surfaces.iter().rev() {
+            if w.wl_surface().as_ref() == Some(surface) {
+                return w.geometry().loc.to_f64();
+            }
+        }
+        self.toplevel_locs
+            .get(&surface.id())
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Milliseconds since compositor start — protocol timestamp base.
     fn time(&self) -> u32 {
         self.start.elapsed().as_millis() as u32
@@ -636,9 +743,25 @@ impl Comp {
         let keyboard = self.keyboard.clone();
         match ev {
             WlInput::PointerMotion { x, y } => {
-                let loc = Point::<f64, Logical>::from((x, y));
-                self.pointer_loc = Some(loc);
-                let focus = self.active_surface().map(|s| (s, loc));
+                // (x, y) is in frame space — the published crop of the
+                // scene. The cursor overlay draws in that same space;
+                // protocol coords translate back to compositor space.
+                let frame_pos = Point::<f64, Logical>::from((x, y));
+                let delta = self
+                    .pointer_loc
+                    .map(|p| Point::from((frame_pos.x - p.x, frame_pos.y - p.y)))
+                    .unwrap_or_default();
+                self.pointer_loc = Some(frame_pos);
+                let loc = Point::<f64, Logical>::from((
+                    frame_pos.x + self.scene_loc.x,
+                    frame_pos.y + self.scene_loc.y,
+                ));
+                // Focus's second element is the surface's global
+                // origin, NOT the pointer position — smithay derives
+                // surface-local coords as `location - origin`.
+                let focus = self
+                    .active_surface()
+                    .map(|s| (s.clone(), self.surface_origin(&s)));
                 pointer.motion(
                     self,
                     focus.clone(),
@@ -654,8 +777,8 @@ impl Comp {
                     self,
                     focus,
                     &RelativeMotionEvent {
-                        delta: loc,
-                        delta_unaccel: loc,
+                        delta,
+                        delta_unaccel: delta,
                         utime: self.time() as u64 * 1000,
                     },
                 );
@@ -737,6 +860,9 @@ impl Comp {
         // regions skip re-import. Non-fullscreen toplevels (dialogs)
         // are centered over the output instead of hugging 0,0.
         self.publishes += 1;
+        self.last_publish = Instant::now();
+        self.pending_publish = false;
+        self.toplevel_locs.clear();
         let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
         for toplevel in &self.toplevels {
             let surface = toplevel.wl_surface();
@@ -766,6 +892,10 @@ impl Comp {
             } else {
                 (0, 0)
             };
+            self.toplevel_locs.insert(
+                surface.id(),
+                Point::<f64, Logical>::from((loc.0 as f64, loc.1 as f64)),
+            );
             elements.extend(render_elements_from_surface_tree(
                 renderer,
                 surface,
@@ -816,6 +946,7 @@ impl Comp {
         if scene.size.w <= 0 || scene.size.h <= 0 {
             return;
         }
+        self.scene_loc = Point::<f64, Logical>::from((scene.loc.x as f64, scene.loc.y as f64));
         let extent = scene.loc + scene.size;
         let frame_size: Size<i32, Physical> = Size::from((extent.x, extent.y));
         let buf_size = frame_size.to_logical(1).to_buffer(1, Transform::Normal);
@@ -978,9 +1109,36 @@ impl CompositorHandler for Comp {
                 self.empty_publishes
             ));
         }
-        // Republish on every commit — any surface in any toplevel's
-        // tree (subsurfaces commit independently of their parent).
-        self.publish();
+        // Republish on commits — but render+readback is a synchronous
+        // GPU round-trip, so coalesce to ~120 Hz. Clients committing
+        // faster than that (XWayland damage bursts, unlocked framerate)
+        // would otherwise stall the shared GPU pipe on every commit.
+        // Skipped commits arm a one-shot timer so the latest state is
+        // always published promptly even if the client goes quiet.
+        const MIN_PUBLISH: Duration = Duration::from_millis(8);
+        if self.last_publish.elapsed() >= MIN_PUBLISH {
+            self.publish();
+        } else {
+            self.pending_publish = true;
+            if !self.publish_timer_set {
+                if let Some(handle) = self.loop_handle.clone() {
+                    self.publish_timer_set = true;
+                    let delay = MIN_PUBLISH - self.last_publish.elapsed();
+                    if handle
+                        .insert_source(Timer::from_duration(delay), |_, _, state| {
+                            state.publish_timer_set = false;
+                            if std::mem::take(&mut state.pending_publish) {
+                                state.publish();
+                            }
+                            TimeoutAction::Drop
+                        })
+                        .is_err()
+                    {
+                        self.publish_timer_set = false;
+                    }
+                }
+            }
+        }
     }
 }
 

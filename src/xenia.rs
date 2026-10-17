@@ -613,6 +613,14 @@ impl Session {
                         cmd.env_remove("DISPLAY");
                     }
                 }
+                // iGPU+dGPU desktops: Vulkan enumerates in PCI order
+                // and `gpu=any`-style clients grab the APU's 2-CU iGPU
+                // (xenia picked RAPHAEL_MENDOCINO over NAVI31). RADV
+                // honors MESA_VK_DEVICE_SELECT to reorder its physical
+                // device list toward the discrete card.
+                if let Some(sel) = wlcomp::vulkan_device_select() {
+                    cmd.env("MESA_VK_DEVICE_SELECT", sel);
+                }
                 Some(c)
             }
             Err(e) => {
