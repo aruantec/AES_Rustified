@@ -22,12 +22,24 @@ const BTN: f32 = 60.0;
 const PLAY_BTN: f32 = 100.0;
 const KNOB_D: f32 = 100.0;
 
-/// Edge-to-edge span of the full row (base px): left cluster
-/// (list + search slot) + center cluster + right cluster
-/// (layout + eq + knob). Below it the clusters collide and the band
-/// collapses to the compact strip.
-const FULL_SPAN: f32 =
-    SIDE_MARGIN * 2.0 + BTN * 8.0 + PLAY_BTN + KNOB_D + RIGHT_SPACING * 3.0 + CENTER_SPACING * 4.0;
+/// Left-cluster extent (base px): margin + list + gap + search slot.
+const LEFT_EXTENT: f32 = SIDE_MARGIN + BTN + RIGHT_SPACING + BTN;
+/// Half the centered transport cluster (stop/prev/play/next/repeat
+/// plus the four gaps) — each side of the band center must fit this
+/// plus its side cluster's extent. Pub so the caller can bound the
+/// expanding search pill at the cluster's left edge.
+pub(crate) const CENTER_HALF: f32 = (BTN * 4.0 + PLAY_BTN + CENTER_SPACING * 4.0) * 0.5;
+/// Right-cluster extent (base px): margin + knob + gap + eq +
+/// gap + layout — the wider of the two side clusters.
+const RIGHT_EXTENT: f32 = SIDE_MARGIN + KNOB_D + (RIGHT_SPACING + BTN) * 2.0;
+/// Edge-to-edge span the full row really needs (base px): the
+/// centered cluster must clear the wider side cluster, so
+/// `w/2 >= CENTER_HALF + max(side extents)` — below it icons
+/// overlap and the band collapses to the compact strip. Derived
+/// from the layout constants so the threshold is the exact
+/// collision boundary, not an estimate.
+const FULL_SPAN: f32 = 2.0
+    * (CENTER_HALF + if LEFT_EXTENT > RIGHT_EXTENT { LEFT_EXTENT } else { RIGHT_EXTENT });
 /// Full<->compact crossfade.
 const COMPACT_SECS: f32 = 0.22;
 /// Compact strip side margin (the 50px SIDE_MARGIN is a luxury of
@@ -117,6 +129,11 @@ pub struct Transport {
     /// Ctrl+F opened the drawer — focus the filter field once the
     /// reveal lands.
     want_filter_focus: bool,
+    /// The drawer filter pill's collapsed/open state — a right-docked
+    /// circle that grows leftward on hover, like the top-right
+    /// SearchPill (`expand: hover || focus || has text`).
+    filter_expanded: bool,
+    filter_focused: bool,
 }
 
 impl Transport {
@@ -376,8 +393,7 @@ impl Transport {
             + BTN * 2.0
             + BTN * 2.0
             + PLAY_BTN
-            + CENTER_SPACING * 2.0
-            + 8.0
+            + CENTER_SPACING * 3.0
             + KNOB_D)
             * s;
         let cs = s * (rect.width() / need).min(1.0);
@@ -403,10 +419,10 @@ impl Transport {
         let ic = scaled(kebab, self.press_scale(ui, &r));
         icon_more(ui.painter(), ic, alpha);
 
-        // Album-list toggle docks right beside the kebab (a snug 8px
-        // gap — CENTER_SPACING would read as a hole).
+        // Album-list toggle docks right of the kebab at the
+        // center-cluster spacing.
         let list = Rect::from_center_size(
-            Pos2::new(kebab.max.x + 8.0 * cs + BTN * 0.5 * cs, cy),
+            Pos2::new(kebab.max.x + CENTER_SPACING * cs + BTN * 0.5 * cs, cy),
             Vec2::splat(BTN * cs),
         );
         let r = hit(list, "t-clist", "Album List");
@@ -505,13 +521,12 @@ impl Transport {
         // strip slides through it at full height.
         let cp = ui.painter().with_clip_rect(clip);
 
-        // Centered row: stop | repeat | layout | eq | filter field —
-        // the album-list toggle lives on the compact strip itself.
+        // Buttons left-aligned so the first one sits vertically under
+        // the kebab (same C_PAD inset); the filter field right-aligns
+        // at the same margin — the album-list toggle lives on the
+        // compact strip itself.
         let sp = RIGHT_SPACING * s;
-        let field_w = 200.0 * s;
-        let field_h = 44.0 * s;
-        let total = BTN * s * 4.0 + field_w + sp * 4.0;
-        let mut x = rect.center().x - total * 0.5;
+        let mut x = rect.min.x + C_PAD * s;
         let btn_at = |x: &mut f32| {
             let r = Rect::from_center_size(
                 Pos2::new(*x + BTN * 0.5 * s, cy),
@@ -524,65 +539,129 @@ impl Transport {
         let repeat = btn_at(&mut x);
         let layout = btn_at(&mut x);
         let eq = btn_at(&mut x);
-        let field = Rect::from_center_size(
-            Pos2::new(x + field_w * 0.5, cy),
-            Vec2::new(field_w, field_h),
+        // Album filter pill — a right-docked magnifier circle that
+        // grows LEFTWARD on hover/focus like the top-right SearchPill
+        // (PILL spec behavior, BAND metrics), bounded left by the
+        // buttons row. `x` still points just past the last button.
+        let pill_id = ui.id().with("ovf-filter");
+        let open_t = ease_out_cubic(ui.ctx().animate_bool_with_time(
+            pill_id.with("open"),
+            self.filter_expanded,
+            0.35,
+        ));
+        let pill_right = rect.max.x - C_PAD * s;
+        let pill_w = ((50.0 + 250.0 * open_t) * s).min((pill_right - x).max(50.0 * s));
+        let pill_h = 50.0 * s;
+        let field = Rect::from_min_max(
+            Pos2::new(pill_right - pill_w, cy - pill_h * 0.5),
+            Pos2::new(pill_right, cy + pill_h * 0.5),
         );
-
-        // Album filter field — bordered box, magnifier left, TextEdit
-        // bound to the band pill's text so it filters the same way.
-        let rr = CornerRadius::same((field_h * 0.5).round() as u8);
+        // The pointer test runs on the pre-growth rect — the inner
+        // TextEdit claims hover for itself once open (SearchPill's
+        // track_expand). Open while hovered / focused / Ctrl+F
+        // pending / holding text.
+        let pill_hover = ui
+            .ctx()
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|p| field.intersect(clip).contains(p));
+        self.filter_expanded = interactive
+            && (pill_hover
+                || self.filter_focused
+                || self.want_filter_focus
+                || !search_text.is_empty());
+        if pill_hover && !self.filter_expanded {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let rr = CornerRadius::same((pill_h * 0.5).round() as u8);
         cp.rect_filled(
             field,
             rr,
-            Color32::from_black_alpha((140.0 * alpha).min(255.0) as u8),
+            Color32::from_black_alpha((140.0 * open_t * alpha).min(255.0) as u8),
         );
+        // Collapsed face sits dimmed — brightening as the box opens
+        // (SearchPill's grow_left border treatment).
+        let dim = 0.5 + 0.5 * open_t;
         cp.rect_stroke(
             field,
             rr,
             Stroke::new(
-                2.0 * s,
-                Color32::from_white_alpha((0x60 as f32 * alpha) as u8),
+                (2.5 - 1.5 * open_t) * s,
+                Color32::from_white_alpha(
+                    ((0xB0 as f32 - (0xB0 - 0x44) as f32 * open_t) * alpha * dim) as u8,
+                ),
             ),
             StrokeKind::Inside,
         );
+        // The magnifier rides the box's left edge, travelling left as
+        // the pill opens — same anchoring as the top-right pill.
         magnifier_icon(
             &cp,
-            Pos2::new(field.min.x + 22.0 * s, cy),
-            field_h / 46.0,
-            Color32::from_white_alpha((0xCC as f32 * alpha) as u8),
+            Pos2::new(field.min.x + 25.0 * s, cy),
+            25.0 * s / 24.0,
+            Color32::from_white_alpha((0xCC as f32 * alpha * dim) as u8),
         );
-        let edit_id = ui.id().with("t-ovf-filter");
-        if self.want_filter_focus {
-            ui.ctx().memory_mut(|m| m.request_focus(edit_id));
-            self.want_filter_focus = false;
-        }
-        // The scope rect itself is text-height and centered on the
-        // strip (the search_pill pattern) — a taller rect relies on
-        // cross-axis centering that TextEdit doesn't honor.
-        let line_h = 15.0 * s * 1.4;
-        let edit_rect = Rect::from_min_max(
-            Pos2::new(field.min.x + 40.0 * s, cy - line_h * 0.5),
-            Pos2::new(field.max.x - 10.0 * s, cy + line_h * 0.5),
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(edit_rect.intersect(clip)),
-            |ui| {
-                ui.style_mut()
-                    .text_styles
-                    .insert(egui::TextStyle::Body, FontId::proportional(15.0 * s));
-                ui.add(
-                    egui::TextEdit::singleline(search_text)
-                        .id(edit_id)
-                        .desired_width(f32::INFINITY)
-                        .font(FontId::proportional(15.0 * s))
-                        .text_color(Color32::WHITE.gamma_multiply(alpha))
-                        .hint_text("Filter albums")
-                        .interactive(interactive)
-                        .frame(egui::Frame::NONE),
+        if open_t > 0.05 {
+            // The scope rect itself is text-height and centered on
+            // the strip (the search_pill pattern) — a taller rect
+            // relies on cross-axis centering TextEdit doesn't honor.
+            let line_h = 15.0 * s * 1.4;
+            let clear = !search_text.is_empty();
+            let edit_rect = Rect::from_min_max(
+                Pos2::new(field.min.x + 49.0 * s, cy - line_h * 0.5),
+                Pos2::new(
+                    field.max.x - if clear { 30.0 } else { 8.0 } * s,
+                    cy + line_h * 0.5,
+                ),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(edit_rect.intersect(clip)),
+                |ui| {
+                    ui.style_mut()
+                        .text_styles
+                        .insert(egui::TextStyle::Body, FontId::proportional(15.0 * s));
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(search_text)
+                            .id(pill_id.with("edit"))
+                            .desired_width(f32::INFINITY)
+                            .font(FontId::proportional(15.0 * s))
+                            .text_color(Color32::WHITE.gamma_multiply(alpha))
+                            .hint_text("Filter albums")
+                            .interactive(interactive)
+                            .frame(egui::Frame::NONE),
+                    );
+                    if self.want_filter_focus {
+                        ui.ctx().memory_mut(|m| m.request_focus(edit.id));
+                        self.want_filter_focus = false;
+                    }
+                    self.filter_focused = edit.has_focus();
+                },
+            );
+            if clear && open_t > 0.6 {
+                let cr = Rect::from_center_size(
+                    Pos2::new(field.max.x - 15.0 * s, cy),
+                    Vec2::splat(16.0 * s),
                 );
-            },
-        );
+                let c = Color32::from_white_alpha((0xAA as f32 * alpha) as u8);
+                let g = 3.5 * s;
+                cp.line_segment(
+                    [cr.min + Vec2::splat(g), cr.max - Vec2::splat(g)],
+                    Stroke::new(1.6 * s, c),
+                );
+                cp.line_segment(
+                    [
+                        Pos2::new(cr.max.x - g, cr.min.y + g),
+                        Pos2::new(cr.min.x + g, cr.max.y - g),
+                    ],
+                    Stroke::new(1.6 * s, c),
+                );
+                let clr = hit(ui, cr, "t-ofilter-clr", "Clear");
+                if clr.clicked() {
+                    search_text.clear();
+                }
+            }
+        } else {
+            self.filter_focused = false;
+        }
 
         let r = hit(ui, stop, "t-ostop", "Stop");
         if r.clicked() {
@@ -1367,5 +1446,18 @@ mod tests {
         // The threshold is in design units — UI scale shifts it.
         assert!(!compact_needed(FULL_SPAN * 0.6, 0.5));
         assert!(compact_needed(FULL_SPAN * 0.4, 0.5));
+        // The span is the real layout's collision boundary: at s=1
+        // the centered cluster's right edge sits exactly where the
+        // right cluster begins — one design px less and they
+        // overlap, which is precisely when the transition must run.
+        assert!(!compact_needed(1200.0, 1.0));
+        assert!(compact_needed(1199.0, 1.0));
+        assert_eq!(FULL_SPAN, 1200.0);
     }
+}
+
+/// CubicEaseOut (Lacrima's width transition) — the drawer filter
+/// pill's open animation.
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
 }

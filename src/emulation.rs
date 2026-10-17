@@ -396,6 +396,76 @@ const ART: &[(&str, &[u8])] = &[
 
 /// Extract the embedded console art into `<data>/Assets/Consoles/`
 /// (only missing/stale files are rewritten) — returns the dir.
+/// Right-cluster slot packing for the emulation control band: `rx`
+/// walks left from the band's right edge in 110s steps. A slot whose
+/// 60s button would reach into the centered pause button's zone — or
+/// land on an already-placed icon (`taken` centers) — parks at
+/// `left_next` instead: the gap between the left toggles and the
+/// pause, while room remains. `force_park` unconditionally parks the
+/// slot (the balance split picks the innermost icons this way).
+/// Returns NaN for absent slots (`cond == false`); keeps the packed
+/// position when no spot is free (degenerate ultra-narrow fallback).
+fn band_slot(
+    cond: bool,
+    force_park: bool,
+    rx: &mut f32,
+    left_next: &mut f32,
+    taken: &mut Vec<f32>,
+    pause: Rect,
+    s: f32,
+) -> f32 {
+    if !cond {
+        return f32::NAN;
+    }
+    let mut x = *rx;
+    *rx -= 110.0 * s;
+    let gap = 10.0 * s;
+    let blocked = |p: f32| taken.iter().any(|&t| (p - t).abs() < 70.0 * s);
+    let intrudes = x - 30.0 * s < pause.max.x + gap && x + 30.0 * s > pause.min.x - gap;
+    if force_park || intrudes || blocked(x) {
+        let cand = *left_next;
+        if cand + 30.0 * s <= pause.min.x - gap && !blocked(cand) {
+            x = cand;
+            *left_next = cand + 110.0 * s;
+        }
+    }
+    taken.push(x);
+    x
+}
+
+/// Where a carousel Play action goes (Lacrima's PlayCommand →
+/// RequestEmulatorLaunch shape): the running game only un-dismisses
+/// the capture viewport; a different game while a session runs
+/// queues a pending launch and closes the emulator first; no
+/// session launches straight away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayRoute {
+    UnDismiss,
+    QueuePending,
+    Launch,
+}
+
+fn play_route(session_on: bool, running_same: bool) -> PlayRoute {
+    if running_same {
+        PlayRoute::UnDismiss
+    } else if session_on {
+        PlayRoute::QueuePending
+    } else {
+        PlayRoute::Launch
+    }
+}
+
+/// Balance split for the emulation band: returns the present-icon
+/// ordinal at which slots should start parking left, so the band
+/// reads symmetric around the centered pause (`n_left` icons already
+/// occupy the left side). The right side keeps `ceil(total/2)` icons
+/// when the room allows it, bounded by `right_cap`; the overflow —
+/// at most `left_cap` — parks left.
+fn band_spill_from(n_left: usize, n_right: usize, right_cap: usize, left_cap: usize) -> usize {
+    let right_target = ((n_left + n_right + 1) / 2).min(right_cap).min(n_right);
+    n_right - (n_right - right_target).min(left_cap)
+}
+
 fn extract_art() -> Option<PathBuf> {
     let dir = settings::data_root()?.join("Assets").join("Consoles");
     std::fs::create_dir_all(&dir).ok()?;
@@ -664,6 +734,11 @@ pub struct EmuView {
     /// "Reboot" context-menu request — relaunches the running game at
     /// the view level where `cfg` is in scope.
     reboot: bool,
+    /// Lacrima's `_pendingEmulatorLaunchRequest` — a double-click on
+    /// another game while a session runs stores the request here and
+    /// closes the running emulator; it fires once the old session is
+    /// fully gone (TryLaunchPendingEmulatorRequest).
+    pending_launch: Option<PathBuf>,
     /// Whether the saved aspect_key was applied to this session's
     /// window (the HWND resolves asynchronously after launch).
     aspect_applied: bool,
@@ -799,6 +874,7 @@ impl EmuView {
             pillar_prog: 1.0,
             pillar_lock: None,
             reboot: false,
+            pending_launch: None,
             aspect_applied: false,
             input_tun: false,
             tun_map: None,
@@ -1517,6 +1593,11 @@ pub fn view(
         emu.viewport_dismissed = false;
         emu.game_fs = false;
         emu.input_tun = false;
+        // TryLaunchPendingEmulatorRequest — the queued double-click
+        // fires only once the replaced session is fully reaped.
+        if let Some(game) = emu.pending_launch.take() {
+            emu.launch(cfg, &game);
+        }
     }
 
     // The opaque capture layer fades in/out over the carousel —
@@ -1913,16 +1994,23 @@ pub fn view(
         // the outer slots: [layout][setup][sliders][tun][power], shrinking
         // to [layout][setup] while no capture runs (the capture-settings
         // and input-tunnel toggles only exist while a game is captured).
-        let mut rx = band.max.x - 50.0 * s - 30.0 * s;
-        let mut slot = |cond: bool| -> f32 {
-            let x = rx;
-            if cond {
-                rx -= 110.0 * s;
-                x
-            } else {
-                f32::NAN
-            }
-        };
+        // Narrow bands: a slot that would reach into the centered pause
+        // button parks in the left gap instead — there's room there.
+        let pause = Rect::from_center_size(band.center(), Vec2::splat(80.0 * s));
+        let gap = 10.0 * s;
+        let session_on = emu.session.is_some();
+        // The viewport toggle lives at min+190 — clamp it left of the
+        // pause zone so a narrow band can't overlap the button either.
+        let vp_cx = (band.min.x + 190.0 * s)
+            .min(pause.min.x - gap - 30.0 * s)
+            .max(band.min.x + 140.0 * s);
+        // Occupied lane centers — the left toggles first; parked and
+        // packed slots append so a late slot can't land on them.
+        let mut taken = vec![band.min.x + 80.0 * s];
+        if session_on {
+            taken.push(vp_cx);
+        }
+        let mut left_next = *taken.last().unwrap() + 110.0 * s;
         // The skipped-update icon takes a slot when the active
         // section's handler has a pending update the user parked.
         let upd_key = emu
@@ -1930,12 +2018,49 @@ pub fn view(
             .and_then(|i| emu.sections.get(i))
             .map(|s| section_key(s));
         let upd_sub = upd_key.as_ref().and_then(|k| emu.upd_skipped.get(k));
-        let pw_x = slot(emu.session.is_some());
-        let tun_x = slot(emu.session.is_some());
-        let sliders_x = slot(emu.session.is_some());
-        let upd_x = slot(upd_sub.is_some() && !emu.upd_open);
-        let setup_x = rx;
-        let layout_x = rx - 110.0 * s;
+        // Balance split: when the free lane left and right of the
+        // pause fits the same icon count, the innermost right-cluster
+        // slots park left so both sides read equal (3 | pause | 3).
+        let upd_on = upd_sub.is_some() && !emu.upd_open;
+        let setup_on = !session_on && emu.launch_rx.is_none();
+        let n_right = [session_on, session_on, session_on, upd_on, setup_on, true]
+            .iter()
+            .filter(|&&c| c)
+            .count();
+        let rx0 = band.max.x - 50.0 * s - 30.0 * s;
+        let mut rx_probe = rx0;
+        let mut right_cap = 0usize;
+        while rx_probe - 30.0 * s >= pause.max.x + gap {
+            right_cap += 1;
+            rx_probe -= 110.0 * s;
+        }
+        let mut left_cap = 0usize;
+        let mut lx = left_next;
+        while lx + 30.0 * s <= pause.min.x - gap {
+            left_cap += 1;
+            lx += 110.0 * s;
+        }
+        let spill_from = band_spill_from(taken.len(), n_right, right_cap, left_cap);
+        let mut rx = rx0;
+        let mut present = 0usize;
+        let mut slot = |cond: bool| -> f32 {
+            let force = if cond {
+                let i = present;
+                present += 1;
+                i >= spill_from
+            } else {
+                false
+            };
+            band_slot(cond, force, &mut rx, &mut left_next, &mut taken, pause, s)
+        };
+        let pw_x = slot(session_on);
+        let tun_x = slot(session_on);
+        let sliders_x = slot(session_on);
+        let upd_x = slot(upd_on);
+        // The setup tile hides while a game captures or launches —
+        // the dimmed app icon reads as noise over the band.
+        let setup_x = slot(setup_on);
+        let layout_x = slot(true);
 
         // Capture-settings toggle (Lacrima's ToggleRenderOptions) — the
         // sliders glyph; only exists while a session captures.
@@ -2017,32 +2142,12 @@ pub fn view(
         // reach its own settings. Disabled while a session runs or a
         // launch is in flight (Lacrima's CanLaunch… guard).
         let setup_exe = emu.setup_exe(cfg);
-        let setup_ok = setup_exe.is_some() && emu.session.is_none() && emu.launch_rx.is_none();
-        let sb = Rect::from_center_size(Pos2::new(setup_x, cy), Vec2::splat(60.0 * s));
-        let r = if interactive && setup_ok {
-            ui.interact(sb, ui.id().with("emu-setup"), Sense::click())
-        } else {
-            ui.interact(sb, ui.id().with("emu-setup"), Sense::hover())
-        }
-        .on_hover_text(if setup_ok {
-            "Open Emulator Settings".to_string()
-        } else {
-            "Open Emulator Settings — unavailable while a game runs".to_string()
-        });
-        if r.clicked() {
-            if let Some(exe) = &setup_exe {
-                let kind = handler_kind(emu.active_handler(cfg).as_deref());
-                if let Err(e) = xenia::launch_setup(&exe.to_string_lossy(), kind) {
-                    emu.notice = Some(e);
-                }
-            }
-        }
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
+        let setup_ok = setup_exe.is_some() && !setup_x.is_nan();
         // The handler's own exe icon (ExtractIconEx → 48px) inside a
-        // rounded-rect button like Lacrima's setup tile — dimmed while
-        // unavailable, a gear glyph when extraction fails.
+        // rounded-rect button like Lacrima's setup tile — hidden
+        // entirely while a game captures/launches (`setup_x` is NaN),
+        // dimmed otherwise when unavailable. The texture stays warm
+        // so the tile pops back fully rendered.
         if let Some(p) = &setup_exe {
             let key = p.to_string_lossy().into_owned();
             if emu.handler_icon_key.as_deref() != Some(key.as_str()) {
@@ -2053,46 +2158,70 @@ pub fn view(
                 });
             }
         }
-        let icon_a = alpha * if setup_ok { 1.0 } else { 0.45 };
-        let bgr = sb.shrink(4.0 * s);
-        painter.rect_filled(
-            bgr,
-            CornerRadius::same((9.0 * s) as u8),
-            Color32::from_rgb(0x2D, 0x2D, 0x2D).gamma_multiply(icon_a),
-        );
-        painter.rect_stroke(
-            bgr,
-            CornerRadius::same((9.0 * s) as u8),
-            Stroke::new(s.max(1.0), Color32::from_white_alpha((40.0 * icon_a) as u8)),
-            StrokeKind::Inside,
-        );
-        // The icon fills most of the button — Lacrima's setup tile is
-        // icon-dominant, not a chip in a big button.
-        let ir = bgr.shrink(6.0 * s);
-        if let Some(tex) = &emu.handler_icon {
-            painter.image(
-                tex.id(),
-                ir,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE.gamma_multiply(icon_a),
+        if !setup_x.is_nan() {
+            let sb = Rect::from_center_size(Pos2::new(setup_x, cy), Vec2::splat(60.0 * s));
+            let r = if interactive && setup_ok {
+                ui.interact(sb, ui.id().with("emu-setup"), Sense::click())
+            } else {
+                ui.interact(sb, ui.id().with("emu-setup"), Sense::hover())
+            }
+            .on_hover_text(if setup_ok {
+                "Open Emulator Settings".to_string()
+            } else {
+                "Open Emulator Settings — no emulator configured".to_string()
+            });
+            if r.clicked() {
+                if let Some(exe) = &setup_exe {
+                    let kind = handler_kind(emu.active_handler(cfg).as_deref());
+                    if let Err(e) = xenia::launch_setup(&exe.to_string_lossy(), kind) {
+                        emu.notice = Some(e);
+                    }
+                }
+            }
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            let icon_a = alpha * if setup_ok { 1.0 } else { 0.45 };
+            let bgr = sb.shrink(4.0 * s);
+            painter.rect_filled(
+                bgr,
+                CornerRadius::same((9.0 * s) as u8),
+                Color32::from_rgb(0x2D, 0x2D, 0x2D).gamma_multiply(icon_a),
             );
-        } else {
-            // Fallback — a gear: hub circle + eight spokes, line-art style.
-            let c = Color32::from_gray(170).gamma_multiply(icon_a);
-            let stroke = Stroke::new(2.4 * s, c);
-            let ctr = ir.center();
-            let r_out = ir.height() * 0.42;
-            let r_in = ir.height() * 0.28;
-            painter.circle_stroke(ctr, ir.height() * 0.16, stroke);
-            for i in 0..8 {
-                let a = i as f32 * std::f32::consts::FRAC_PI_4;
-                painter.add(Shape::line_segment(
-                    [
-                        ctr + Vec2::new(a.cos() * r_in, a.sin() * r_in),
-                        ctr + Vec2::new(a.cos() * r_out, a.sin() * r_out),
-                    ],
-                    stroke,
-                ));
+            painter.rect_stroke(
+                bgr,
+                CornerRadius::same((9.0 * s) as u8),
+                Stroke::new(s.max(1.0), Color32::from_white_alpha((40.0 * icon_a) as u8)),
+                StrokeKind::Inside,
+            );
+            // The icon fills most of the button — Lacrima's setup tile is
+            // icon-dominant, not a chip in a big button.
+            let ir = bgr.shrink(6.0 * s);
+            if let Some(tex) = &emu.handler_icon {
+                painter.image(
+                    tex.id(),
+                    ir,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE.gamma_multiply(icon_a),
+                );
+            } else {
+                // Fallback — a gear: hub circle + eight spokes, line-art style.
+                let c = Color32::from_gray(170).gamma_multiply(icon_a);
+                let stroke = Stroke::new(2.4 * s, c);
+                let ctr = ir.center();
+                let r_out = ir.height() * 0.42;
+                let r_in = ir.height() * 0.28;
+                painter.circle_stroke(ctr, ir.height() * 0.16, stroke);
+                for i in 0..8 {
+                    let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                    painter.add(Shape::line_segment(
+                        [
+                            ctr + Vec2::new(a.cos() * r_in, a.sin() * r_in),
+                            ctr + Vec2::new(a.cos() * r_out, a.sin() * r_out),
+                        ],
+                        stroke,
+                    ));
+                }
             }
         }
 
@@ -2105,11 +2234,9 @@ pub fn view(
         let mut close_emu = false;
         if let Some(session) = &emu.session {
             // Viewport toggle — directly right of the albums toggle
-            // (same 110px button spacing the right cluster uses).
-            let vp = Rect::from_center_size(
-                Pos2::new(band.min.x + 190.0 * s, cy),
-                Vec2::splat(60.0 * s),
-            );
+            // (same 110px button spacing the right cluster uses),
+            // clamped off the pause zone above.
+            let vp = Rect::from_center_size(Pos2::new(vp_cx, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
                 ui.interact(vp, ui.id().with("emu-viewport"), Sense::click())
             } else {
@@ -2128,7 +2255,7 @@ pub fn view(
 
             // Center pause/play — NtSuspendProcess/NtResumeProcess, the
             // glyph is Lacrima's circled bars/triangle.
-            let pp = Rect::from_center_size(band.center(), Vec2::splat(80.0 * s));
+            let pp = pause;
             let r = if interactive {
                 ui.interact(pp, ui.id().with("emu-pause"), Sense::click())
             } else {
@@ -3895,13 +4022,20 @@ fn draw_items(
         );
     }
     match action {
-        // One session at a time — Play while a game runs in the
-        // background just brings the capture viewport back.
+        // One session at a time. Play on the RUNNING game just brings
+        // the capture viewport back; Play on a different game is
+        // Lacrima's RequestEmulatorLaunch — queue the request and
+        // close the running emulator first, the new launch fires
+        // once the old session reports finished.
         carousel::Action::Play(p) => {
-            if emu.session.is_some() {
-                emu.viewport_dismissed = false;
-            } else {
-                emu.launch(cfg, &p);
+            let running_same = emu.session.as_ref().is_some_and(|s| s.game == p);
+            match play_route(emu.session.is_some(), running_same) {
+                PlayRoute::UnDismiss => emu.viewport_dismissed = false,
+                PlayRoute::QueuePending => {
+                    emu.pending_launch = Some(p);
+                    emu.stop_session();
+                }
+                PlayRoute::Launch => emu.launch(cfg, &p),
             }
         }
         // "Edit Metadata" — the EmulationMetadataOverlay port.
@@ -5286,5 +5420,90 @@ mod tests {
         assert!(found.contains(&nested.join("deep.pkg")));
         assert!(!found.contains(&dump.join("patch.pkg")));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Narrow band: right-cluster slots that would reach into the
+    /// centered pause button park in the left gap instead of
+    /// overlapping it. Wide bands pack normally from the right.
+    #[test]
+    fn band_slots_relocate_around_pause() {
+        let pause = Rect::from_center_size(Pos2::new(400.0, 70.0), Vec2::splat(80.0));
+        // pause = 360..440, gap 10 -> intruding centers in (320, 480).
+        // Wide band, left toggles at 80/190: nothing intrudes.
+        let mut taken = vec![80.0, 190.0];
+        let mut left = 300.0;
+        let mut rx = 700.0;
+        assert_eq!(band_slot(true, false, &mut rx, &mut left, &mut taken, pause, 1.0), 700.0);
+        assert_eq!(band_slot(true, false, &mut rx, &mut left, &mut taken, pause, 1.0), 590.0);
+        assert_eq!(left, 300.0);
+        // Narrower band: 480 stays (its left edge is exactly at the
+        // zone's end), 370 intrudes -> parks at left_next=300. The
+        // next packed position 260 is clear of the zone but blocks
+        // the parked 300; the left gap is full by then, so it keeps
+        // its packed spot (degenerate ultra-narrow fallback).
+        let mut taken = vec![80.0, 190.0];
+        let mut left = 300.0;
+        let mut rx = 480.0;
+        assert_eq!(band_slot(true, false, &mut rx, &mut left, &mut taken, pause, 1.0), 480.0);
+        assert_eq!(band_slot(true, false, &mut rx, &mut left, &mut taken, pause, 1.0), 300.0);
+        assert_eq!(left, 410.0);
+        assert_eq!(band_slot(true, false, &mut rx, &mut left, &mut taken, pause, 1.0), 260.0);
+        // Absent slots never consume a position.
+        assert!(band_slot(false, false, &mut rx, &mut left, &mut taken, pause, 1.0).is_nan());
+        assert_eq!(rx, 150.0);
+        // A slot landing on a left toggle relocates into the free gap:
+        // pause at 450 -> zone 400..500, 490 intrudes -> parks at 300.
+        let pause2 = Rect::from_center_size(Pos2::new(450.0, 70.0), Vec2::splat(80.0));
+        let mut taken2 = vec![80.0, 190.0];
+        let mut left2 = 300.0;
+        let mut rx2 = 600.0;
+        assert_eq!(band_slot(true, false, &mut rx2, &mut left2, &mut taken2, pause2, 1.0), 600.0);
+        assert_eq!(band_slot(true, false, &mut rx2, &mut left2, &mut taken2, pause2, 1.0), 300.0);
+        assert_eq!(left2, 410.0);
+        // force_park relocates even a slot that would not intrude.
+        let mut taken3 = vec![80.0, 190.0];
+        let mut left3 = 300.0;
+        let mut rx3 = 700.0;
+        assert_eq!(
+            band_slot(true, true, &mut rx3, &mut left3, &mut taken3, pause, 1.0),
+            300.0
+        );
+    }
+
+    /// The balance split: when the lanes flanking the pause hold the
+    /// same icon count, the innermost right-cluster slots park left
+    /// so the band reads symmetric (`spill_from` is the present-icon
+    /// ordinal where spilling begins).
+    #[test]
+    fn band_spill_balances_icons_around_pause() {
+        // 2 left (list + viewport) vs 4 right (power/tun/sliders/
+        // layout, setup hidden by the session): with left room for
+        // one, the innermost spills -> 3 left / 3 right.
+        assert_eq!(band_spill_from(2, 4, 3, 1), 3);
+        // More left room does not spill extra icons past the balance.
+        assert_eq!(band_spill_from(2, 4, 3, 2), 3);
+        // No left room at all: nothing spills.
+        assert_eq!(band_spill_from(2, 4, 3, 0), 4);
+        // 8 icons, two free left lanes: 4 / 4.
+        assert_eq!(band_spill_from(2, 6, 4, 2), 4);
+        // Right side already the smaller one: untouched.
+        assert_eq!(band_spill_from(3, 2, 5, 3), 2);
+        // Right lane capped by the pause zone: the excess spills.
+        assert_eq!(band_spill_from(1, 4, 2, 3), 2);
+        // No left room -> the capped right lane just overflows-packed
+        // (degenerate, same as before balancing existed).
+        assert_eq!(band_spill_from(1, 4, 2, 0), 4);
+    }
+
+    /// Play routing: the running game un-dismisses the viewport, a
+    /// different game while a session runs queues the pending
+    /// launch + close, and with no session Play launches directly —
+    /// a double-click during capture must never just re-show the
+    /// running game's viewport when the target differs.
+    #[test]
+    fn play_routes_pending_launch_for_another_game() {
+        assert_eq!(play_route(true, true), PlayRoute::UnDismiss);
+        assert_eq!(play_route(true, false), PlayRoute::QueuePending);
+        assert_eq!(play_route(false, false), PlayRoute::Launch);
     }
 }

@@ -4164,6 +4164,9 @@ fn music_view(
         2 => carousel::Mode::HorizontalGrid,
         _ => carousel::Mode::Carousel,
     };
+    // Compact + horizontal grid: the compact bar ate a card-height of
+    // cover area — floor the grid at 2 rows (cards shrink to fit).
+    carousel.h_min_rows = if transport.compact() { 2 } else { 1 };
     // Grid modes lay out against the pre-lift area: when the drawers
     // raise the transport band, the grid keeps its rows and the band
     // simply covers whatever slides under it (painted earlier).
@@ -4320,6 +4323,10 @@ fn music_view(
     album_search.ui_band(
         ui,
         transport.search_icon,
+        // The expanded box must stop short of the centered transport
+        // cluster — below FULL_SPAN the band is already compacting,
+        // but a hovering pill could still reach into it.
+        band.center().x - transport::CENTER_HALF * s - 8.0 * s,
         "Filter Albums",
         // Compact mode moves the album filter into the transport's
         // overflow panel — the pill fades out here.

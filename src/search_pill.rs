@@ -145,11 +145,15 @@ impl SearchPill {
     /// collapsed magnifier sits (centered on its slot). The box grows
     /// rightward from there — icon fades out as a slightly bigger one
     /// fades in with the box; on close the icon fades back.
+    /// `max_right` bounds the expansion (the centered transport
+    /// cluster's left edge) so a hovering pill can't swallow buttons
+    /// on narrow bands.
     #[allow(clippy::too_many_arguments)]
     pub fn ui_band(
         &mut self,
         ui: &mut egui::Ui,
         icon_center: Pos2,
+        max_right: f32,
         hint: &str,
         active: bool,
         forced_open: bool,
@@ -169,10 +173,12 @@ impl SearchPill {
         }
         let alpha = alpha * avail;
         let t = self.open_t(ui, id);
-        let w = (spec.w_min + (spec.w_max - spec.w_min) * t) * s;
         // Left anchor: the icon slot's left edge, so the icon stays
-        // put while the box grows to its right.
+        // put while the box grows to its right. `max_right` caps the
+        // expansion on narrow bands — never past w_min.
         let left = icon_center.x - (spec.icon_left + spec.icon_d * 0.5) * s;
+        let w = ((spec.w_min + (spec.w_max - spec.w_min) * t) * s)
+            .min((max_right - left).max(spec.w_min * s));
         let rect = Rect::from_min_max(
             Pos2::new(left, icon_center.y - spec.h * 0.5 * s),
             Pos2::new(left + w, icon_center.y + spec.h * 0.5 * s),

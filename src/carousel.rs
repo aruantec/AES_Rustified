@@ -295,6 +295,10 @@ pub struct Carousel {
     /// ROM mode + cemu handler — shows the "Graphic Packs" entry
     /// (ShowCurrentSectionCemuGraphicPacksMenuItem).
     pub cemu_menu: bool,
+    /// Row floor for the horizontal card grid — compact transport
+    /// mode sets 2 so the shrunken cover area still shows two rows
+    /// (cards shrink to fit); normal layouts leave it at 1.
+    pub h_min_rows: usize,
 }
 
 impl Carousel {
@@ -336,6 +340,7 @@ impl Carousel {
             rpcs3_menu: false,
             shadps4_menu: false,
             cemu_menu: false,
+            h_min_rows: 1,
         }
     }
 
@@ -1655,7 +1660,9 @@ impl Carousel {
         let geo = match mode {
             Mode::Carousel => None,
             Mode::VerticalGrid => Some(GridGeo::vertical(grid_area, n, cfg, s)),
-            Mode::HorizontalGrid => Some(GridGeo::horizontal(grid_area, n, cfg, s)),
+            Mode::HorizontalGrid => {
+                Some(GridGeo::horizontal(grid_area, n, cfg, s, self.h_min_rows))
+            }
         };
         self.nav_geo = geo.clone().map(|g| (g, rect));
         // Queued reveal — the playing item owns the selection marker;
@@ -2278,7 +2285,7 @@ impl Carousel {
             _ => {
                 let mut geo = match mode {
                     Mode::VerticalGrid => GridGeo::vertical(rect, visible.len(), cfg, s),
-                    _ => GridGeo::horizontal(rect, visible.len(), cfg, s),
+                    _ => GridGeo::horizontal(rect, visible.len(), cfg, s, self.h_min_rows),
                 };
                 geo.origin.y += drift_y;
                 self.paint_grid(
@@ -3250,13 +3257,27 @@ impl GridGeo {
     }
 
     /// Horizontal card grid — same fixed-size model, rows collapse
-    /// only when a card no longer fits vertically.
-    fn horizontal(rect: Rect, count: usize, cfg: &settings::Carousel, s: f32) -> Self {
+    /// only when a card no longer fits vertically. `min_rows` floors
+    /// the count (compact transport wants ≥2 visible): when it
+    /// exceeds what the configured size fits, cards shrink so the
+    /// rows are actually visible.
+    fn horizontal(
+        rect: Rect,
+        count: usize,
+        cfg: &settings::Carousel,
+        s: f32,
+        min_rows: usize,
+    ) -> Self {
         let spacing = cfg.card_spacing.max(4.0) * s;
         let avail_h = (rect.height() - GRID_TOP * s - GRID_BOTTOM * s - SB_ZONE * s).max(120.0);
-        let card_h = (cfg.card_size * CARD_RATIO * s).min(avail_h);
+        let mut card_h = (cfg.card_size * CARD_RATIO * s).min(avail_h);
+        let fit = ((avail_h + spacing) / (card_h + spacing)) as usize;
+        let rows = fit.clamp(min_rows.clamp(1, count.max(1)), count.max(1));
+        if rows > fit {
+            card_h = ((avail_h - rows.saturating_sub(1) as f32 * spacing) / rows as f32)
+                .max(24.0 * s);
+        }
         let card_w = card_h / CARD_RATIO;
-        let rows = (((avail_h + spacing) / (card_h + spacing)) as usize).clamp(1, count.max(1));
         let content_h = rows as f32 * card_h + (rows.saturating_sub(1)) as f32 * spacing;
         let pad_top = GRID_TOP * s + (avail_h - content_h).max(0.0) * 0.5;
         let columns = count.max(1).div_ceil(rows);
@@ -3483,4 +3504,34 @@ fn capsule_mesh(rect: Rect, r: f32, top: Color32, bot: Color32) -> Mesh {
         mesh.indices.extend_from_slice(&[0, i as u32, i as u32 + 1]);
     }
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compact transport floors the horizontal grid at 2 rows: when
+    /// the configured card size only fits one, cards shrink until
+    /// the required rows are actually visible (the compact bar
+    /// shaved a card-height off the cover area).
+    #[test]
+    fn horizontal_grid_min_rows_shrinks_cards() {
+        let cfg = settings::Carousel::default();
+        // avail_h = 700 - (20+28+14) = 638; full card_h = 376*1.36 =
+        // 511.36 -> one row fits naturally.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0));
+        let one = GridGeo::horizontal(rect, 6, &cfg, 1.0, 1);
+        assert_eq!(one.columns, 6);
+        let two = GridGeo::horizontal(rect, 6, &cfg, 1.0, 2);
+        assert_eq!(two.columns, 3);
+        assert!(two.card_h < one.card_h);
+        assert!(two.card_h * 2.0 + two.spacing <= 638.0 + 1e-4);
+        // Plenty of room: the floor changes nothing.
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 1200.0));
+        let t = GridGeo::horizontal(tall, 6, &cfg, 1.0, 2);
+        assert!((t.card_h - one.card_h).abs() < 1e-4);
+        // A lone item never splits into phantom rows.
+        let single = GridGeo::horizontal(rect, 1, &cfg, 1.0, 2);
+        assert_eq!(single.columns, 1);
+    }
 }
