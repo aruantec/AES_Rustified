@@ -22,6 +22,22 @@ const BTN: f32 = 60.0;
 const PLAY_BTN: f32 = 100.0;
 const KNOB_D: f32 = 100.0;
 
+/// Edge-to-edge span of the full row (base px): left cluster
+/// (list + search slot) + center cluster + right cluster
+/// (layout + eq + knob). Below it the clusters collide and the band
+/// collapses to the compact strip.
+const FULL_SPAN: f32 =
+    SIDE_MARGIN * 2.0 + BTN * 8.0 + PLAY_BTN + KNOB_D + RIGHT_SPACING * 3.0 + CENTER_SPACING * 4.0;
+/// Full<->compact crossfade.
+const COMPACT_SECS: f32 = 0.22;
+/// Compact strip side margin (the 50px SIDE_MARGIN is a luxury of
+/// the full layout).
+const C_PAD: f32 = 16.0;
+
+/// The kebab's reveal drawer height (base px) — a full button row
+/// plus breathing room, laid out like the EQ drawer.
+pub const OVF_H: f32 = 96.0;
+
 const WHITE: Color32 = Color32::WHITE;
 const LIT: Color32 = Color32::from_rgb(0xF0, 0xF0, 0xF0);
 const DIM: Color32 = Color32::from_rgb(0x69, 0x69, 0x69);
@@ -92,6 +108,15 @@ pub struct Transport {
     /// Volume captured when muted by a cap click — restored on the
     /// next click. `Some` doubles as the muted flag for drawing.
     muted_vol: Option<f32>,
+    /// Full<->compact crossfade position: 0 = full row, 1 = compact
+    /// strip (kebab + prev/play/next + knob).
+    compact_t: f32,
+    /// Overflow drawer open — the compact strip's kebab toggles it;
+    /// the app-level Esc chain or leaving compact mode closes it.
+    pub overflow_open: bool,
+    /// Ctrl+F opened the drawer — focus the filter field once the
+    /// reveal lands.
+    want_filter_focus: bool,
 }
 
 impl Transport {
@@ -102,7 +127,82 @@ impl Transport {
         }
     }
 
+    /// The compact strip is (or is becoming) the dominant layout —
+    /// callers gate the band search pill on this and route its
+    /// Ctrl+F into the overflow menu.
+    pub fn compact(&self) -> bool {
+        self.compact_t > 0.5
+    }
+
+    /// Raw crossfade position (0 = full, 1 = compact) — sibling
+    /// elements (the centered overlay text, the top info bar) ride
+    /// the same fade.
+    pub fn compact_mix(&self) -> f32 {
+        self.compact_t
+    }
+
+    /// Ctrl+F into the album filter — opens the overflow drawer and
+    /// focuses its field once it exists.
+    pub fn open_filter(&mut self) {
+        self.overflow_open = true;
+        self.want_filter_focus = true;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        player: Option<&AudioPlayer>,
+        alpha: f32,
+        interactive: bool,
+        accent: Color32,
+        s: f32,
+    ) -> Step {
+        let mut step = Step::None;
+        // Below the edge-to-edge span the three clusters collide —
+        // crossfade the full row into the compact strip.
+        let compact = compact_needed(rect.width(), s);
+        let ct = ui
+            .ctx()
+            .animate_bool_with_time(ui.id().with("t-compact"), compact, COMPACT_SECS);
+        self.compact_t = ct;
+        if !compact {
+            self.overflow_open = false;
+        }
+        if ct < 0.999 {
+            step = self.row_full(
+                ui,
+                rect,
+                player,
+                alpha * (1.0 - ct),
+                interactive && ct < 0.5,
+                accent,
+                s,
+            );
+        }
+        if ct > 0.001 {
+            let st = self.row_compact(
+                ui,
+                rect,
+                player,
+                alpha * ct,
+                interactive && ct >= 0.5,
+                accent,
+                s,
+            );
+            if step == Step::None {
+                step = st;
+            }
+        }
+        step
+    }
+
+    /// Lacrima's full-width layout: album-list + search slot at the
+    /// left, stop/prev/play/next/repeat centered, layout + eq +
+    /// volume at the right.
+    #[allow(clippy::too_many_arguments)]
+    fn row_full(
         &mut self,
         ui: &mut egui::Ui,
         rect: Rect,
@@ -249,8 +349,278 @@ impl Transport {
         let ic = scaled(eq, self.press_scale(ui, &r));
         icon_eq(ui.painter(), ic, self.equalizer_open, alpha);
 
-        self.volume(ui, vol_rect, player, alpha, interactive, accent, s);
+        self.volume(ui, vol_rect, player, alpha, interactive, accent, s, "t-vol");
         step
+    }
+
+    /// Compact strip for narrow windows: kebab (overflow drawer) at
+    /// the left, prev/play/next centered, volume at the right — the
+    /// rest of the band's controls live in the kebab's reveal drawer
+    /// (`overflow_strip`, drawn by the caller under the band).
+    #[allow(clippy::too_many_arguments)]
+    fn row_compact(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        player: Option<&AudioPlayer>,
+        alpha: f32,
+        interactive: bool,
+        accent: Color32,
+        s: f32,
+    ) -> Step {
+        let mut step = Step::None;
+        let cy = rect.center().y;
+        // Ultra-narrow fallback: shrink the strip itself rather than
+        // spill over the edges.
+        let need = (C_PAD * 2.0
+            + BTN * 2.0
+            + BTN * 2.0
+            + PLAY_BTN
+            + CENTER_SPACING * 2.0
+            + 8.0
+            + KNOB_D)
+            * s;
+        let cs = s * (rect.width() / need).min(1.0);
+        let hit = |r: Rect, id: &str, tip: &str| {
+            if interactive {
+                ui.interact(r, ui.id().with(id), Sense::click())
+            } else {
+                ui.interact(r, ui.id().with(id), Sense::hover())
+            }
+            .on_hover_text(tip)
+        };
+
+        // --- Left: kebab -> overflow panel --------------------------
+        let kebab = Rect::from_center_size(
+            Pos2::new(rect.min.x + C_PAD * cs + BTN * 0.5 * cs, cy),
+            Vec2::splat(BTN * cs),
+        );
+        let r = hit(kebab, "t-more", "More");
+        if r.clicked() {
+            self.overflow_open = !self.overflow_open;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(kebab, self.press_scale(ui, &r));
+        icon_more(ui.painter(), ic, alpha);
+
+        // Album-list toggle docks right beside the kebab (a snug 8px
+        // gap — CENTER_SPACING would read as a hole).
+        let list = Rect::from_center_size(
+            Pos2::new(kebab.max.x + 8.0 * cs + BTN * 0.5 * cs, cy),
+            Vec2::splat(BTN * cs),
+        );
+        let r = hit(list, "t-clist", "Album List");
+        if r.clicked() {
+            self.album_list_open = !self.album_list_open;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(list, self.press_scale(ui, &r));
+        icon_album_list(ui.painter(), ic, self.album_list_open, alpha);
+
+        // --- Center: prev / play / next -----------------------------
+        let widths = [BTN, PLAY_BTN, BTN];
+        let total = widths.iter().sum::<f32>() * cs + CENTER_SPACING * cs * 2.0;
+        let mut x = rect.center().x - total * 0.5;
+        let at = |i: usize, x: &mut f32| {
+            let w = widths[i] * cs;
+            let r = Rect::from_min_size(Pos2::new(*x, cy - w * 0.5), Vec2::splat(w));
+            *x += w + CENTER_SPACING * cs;
+            r
+        };
+        let prev = at(0, &mut x);
+        let play = at(1, &mut x);
+        let next = at(2, &mut x);
+        let playing = matches!(player.map(|p| p.state()), Some(PlayerState::Playing));
+
+        // `c`-prefixed ids: during the crossfade both rows are drawn
+        // and two interacts under one id would alias.
+        let r = hit(prev, "t-cprev", "Previous Track");
+        if r.clicked() {
+            step = Step::Prev;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(prev, self.press_scale(ui, &r));
+        icon_prev(ui.painter(), ic, alpha);
+
+        let r = hit(play, "t-cplay", "Play / Pause");
+        if r.clicked() {
+            if let Some(p) = player {
+                p.toggle();
+            }
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(play, self.press_scale(ui, &r));
+        icon_play(ui.painter(), ic, playing, alpha);
+
+        let r = hit(next, "t-cnext", "Next Track");
+        if r.clicked() {
+            step = Step::Next;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(next, self.press_scale(ui, &r));
+        icon_next(ui.painter(), ic, alpha);
+
+        // --- Right: volume -------------------------------------------
+        let vol_rect = Rect::from_min_size(
+            Pos2::new(rect.max.x - C_PAD * cs - KNOB_D * cs, cy - KNOB_D * 0.5 * cs),
+            Vec2::new(KNOB_D * cs, KNOB_D * cs),
+        );
+        self.volume(ui, vol_rect, player, alpha, interactive, accent, cs, "t-cvol");
+        step
+    }
+
+    /// The kebab's reveal drawer (compact strip): the full row's
+    /// hidden controls laid out horizontally — the album filter
+    /// field, stop, repeat, layout, eq — same glyphs and
+    /// tooltips as the full band. `rect` is the FULL-height strip;
+    /// `clip` is the revealed window — the caller slides `rect` down
+    /// through `clip`'s bottom edge as the drawer closes, so the
+    /// icons translate at fixed size instead of being squashed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn overflow_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        clip: Rect,
+        player: Option<&AudioPlayer>,
+        alpha: f32,
+        interactive: bool,
+        s: f32,
+        search_text: &mut String,
+    ) {
+        let cy = rect.center().y;
+        // `ui` is passed per-call — capturing it here would hold the
+        // borrow across `scope_builder` below. Controls only sense on
+        // their visible part (intersected with `clip`).
+        let hit = |ui: &egui::Ui, r: Rect, id: &str, tip: &str| {
+            let r = r.intersect(clip);
+            if interactive {
+                ui.interact(r, ui.id().with(id), Sense::click())
+            } else {
+                ui.interact(r, ui.id().with(id), Sense::hover())
+            }
+            .on_hover_text(tip)
+        };
+        // Painted content is clipped to the revealed window — the
+        // strip slides through it at full height.
+        let cp = ui.painter().with_clip_rect(clip);
+
+        // Centered row: stop | repeat | layout | eq | filter field —
+        // the album-list toggle lives on the compact strip itself.
+        let sp = RIGHT_SPACING * s;
+        let field_w = 200.0 * s;
+        let field_h = 44.0 * s;
+        let total = BTN * s * 4.0 + field_w + sp * 4.0;
+        let mut x = rect.center().x - total * 0.5;
+        let btn_at = |x: &mut f32| {
+            let r = Rect::from_center_size(
+                Pos2::new(*x + BTN * 0.5 * s, cy),
+                Vec2::splat(BTN * s),
+            );
+            *x += BTN * s + sp;
+            r
+        };
+        let stop = btn_at(&mut x);
+        let repeat = btn_at(&mut x);
+        let layout = btn_at(&mut x);
+        let eq = btn_at(&mut x);
+        let field = Rect::from_center_size(
+            Pos2::new(x + field_w * 0.5, cy),
+            Vec2::new(field_w, field_h),
+        );
+
+        // Album filter field — bordered box, magnifier left, TextEdit
+        // bound to the band pill's text so it filters the same way.
+        let rr = CornerRadius::same((field_h * 0.5).round() as u8);
+        cp.rect_filled(
+            field,
+            rr,
+            Color32::from_black_alpha((140.0 * alpha).min(255.0) as u8),
+        );
+        cp.rect_stroke(
+            field,
+            rr,
+            Stroke::new(
+                2.0 * s,
+                Color32::from_white_alpha((0x60 as f32 * alpha) as u8),
+            ),
+            StrokeKind::Inside,
+        );
+        magnifier_icon(
+            &cp,
+            Pos2::new(field.min.x + 22.0 * s, cy),
+            field_h / 46.0,
+            Color32::from_white_alpha((0xCC as f32 * alpha) as u8),
+        );
+        let edit_id = ui.id().with("t-ovf-filter");
+        if self.want_filter_focus {
+            ui.ctx().memory_mut(|m| m.request_focus(edit_id));
+            self.want_filter_focus = false;
+        }
+        // The scope rect itself is text-height and centered on the
+        // strip (the search_pill pattern) — a taller rect relies on
+        // cross-axis centering that TextEdit doesn't honor.
+        let line_h = 15.0 * s * 1.4;
+        let edit_rect = Rect::from_min_max(
+            Pos2::new(field.min.x + 40.0 * s, cy - line_h * 0.5),
+            Pos2::new(field.max.x - 10.0 * s, cy + line_h * 0.5),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(edit_rect.intersect(clip)),
+            |ui| {
+                ui.style_mut()
+                    .text_styles
+                    .insert(egui::TextStyle::Body, FontId::proportional(15.0 * s));
+                ui.add(
+                    egui::TextEdit::singleline(search_text)
+                        .id(edit_id)
+                        .desired_width(f32::INFINITY)
+                        .font(FontId::proportional(15.0 * s))
+                        .text_color(Color32::WHITE.gamma_multiply(alpha))
+                        .hint_text("Filter albums")
+                        .interactive(interactive)
+                        .frame(egui::Frame::NONE),
+                );
+            },
+        );
+
+        let r = hit(ui, stop, "t-ostop", "Stop");
+        if r.clicked() {
+            if let Some(p) = player {
+                p.stop();
+            }
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(stop, self.press_scale(ui, &r));
+        icon_stop(&cp, ic, alpha);
+
+        let r = hit(ui, repeat, "t-orepeat", "Repeat: Off / All / One");
+        if r.clicked() {
+            self.repeat = match self.repeat {
+                RepeatMode::Off => RepeatMode::All,
+                RepeatMode::All => RepeatMode::One,
+                RepeatMode::One => RepeatMode::Off,
+            };
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(repeat, self.press_scale(ui, &r));
+        icon_repeat(&cp, ic, self.repeat, alpha);
+
+        let r = hit(ui, layout, "t-olayout", "Cover Layout");
+        if r.clicked() {
+            self.cover_layout = (self.cover_layout + 1) % 3;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(layout, self.press_scale(ui, &r));
+        icon_layout(&cp, ic, self.cover_layout, alpha);
+
+        let r = hit(ui, eq, "t-oeq", "Equalizer");
+        if r.clicked() {
+            self.equalizer_open = !self.equalizer_open;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(eq, self.press_scale(ui, &r));
+        icon_eq(ui.painter(), ic, self.equalizer_open, alpha);
     }
 
     /// Deflate/inflate press feedback: on the press-down edge record a
@@ -284,7 +654,10 @@ impl Transport {
     /// Rotary volume knob: dark ring with a cyan level arc sweeping
     /// 270° (dead zone at the bottom), a conical metal cap built as a
     /// vertex-shaded fan, and a cyan pip marking the position. Drag
-    /// rotates to the pointer angle; wheel nudges by 5%.
+    /// rotates to the pointer angle; wheel nudges by 5%. `id` is the
+    /// interact salt — the two layouts must not share one during the
+    /// crossfade.
+    #[allow(clippy::too_many_arguments)]
     fn volume(
         &mut self,
         ui: &mut egui::Ui,
@@ -294,6 +667,7 @@ impl Transport {
         interactive: bool,
         accent: Color32,
         s: f32,
+        id: &str,
     ) {
         // Slow breathing pulse on the level arc — ~4.5s cycle. The
         // core stays near-full while the halo swings wide, so the
@@ -308,7 +682,7 @@ impl Transport {
         let mut vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
         if interactive {
             let resp = ui
-                .interact(rect, ui.id().with("t-vol"), Sense::click_and_drag())
+                .interact(rect, ui.id().with(id), Sense::click_and_drag())
                 .on_hover_text("Volume — drag to adjust, click the cap to mute");
             // Cap press/release edges handled manually: egui's
             // clicked() dies the moment drag_started fires (a couple
@@ -665,6 +1039,36 @@ fn icon_next(painter: &egui::Painter, rect: Rect, alpha: f32) {
 }
 
 /// Two counter-curving arrows on a 120x120 canvas; "1" for RepeatOne.
+/// Kebab: three vertically stacked dots — the compact strip's
+/// overflow-menu button. Lit ring while the panel is open.
+fn icon_more(painter: &egui::Painter, rect: Rect, alpha: f32) {
+    let k = rect.height() / 100.0;
+    for &y in &[22.0f32, 50.0, 78.0] {
+        painter.circle_filled(
+            cv(rect, 100.0, 50.0, y),
+            7.5 * k,
+            WHITE.gamma_multiply(alpha),
+        );
+    }
+}
+
+/// Small magnifier glyph — the overflow panel's filter-field icon
+/// (`k` = size/26 scale).
+fn magnifier_icon(painter: &egui::Painter, center: Pos2, k: f32, c: Color32) {
+    painter.circle_stroke(
+        center + Vec2::new(-2.0 * k, -2.0 * k),
+        6.0 * k,
+        Stroke::new(2.0 * k, c),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(3.0 * k, 3.0 * k),
+            center + Vec2::new(7.5 * k, 7.5 * k),
+        ],
+        Stroke::new(2.2 * k, c),
+    );
+}
+
 fn icon_repeat(painter: &egui::Painter, rect: Rect, mode: RepeatMode, alpha: f32) {
     let c = (if mode == RepeatMode::Off { DIM } else { LIT }).gamma_multiply(alpha);
     let canvas = 120.0;
@@ -943,5 +1347,25 @@ fn icon_eq(painter: &egui::Painter, rect: Rect, open: bool, alpha: f32) {
             CornerRadius::same((2.0 * k) as u8),
             c,
         );
+    }
+}
+
+/// Below the edge-to-edge cluster span the full row collides — the
+/// band switches to the compact strip.
+fn compact_needed(width: f32, s: f32) -> bool {
+    width < FULL_SPAN * s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_only_below_cluster_span() {
+        assert!(!compact_needed(FULL_SPAN * 1.01, 1.0));
+        assert!(compact_needed(FULL_SPAN * 0.99, 1.0));
+        // The threshold is in design units — UI scale shifts it.
+        assert!(!compact_needed(FULL_SPAN * 0.6, 0.5));
+        assert!(compact_needed(FULL_SPAN * 0.4, 0.5));
     }
 }

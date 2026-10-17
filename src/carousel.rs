@@ -2715,15 +2715,22 @@ impl Carousel {
         cx: f32,
         cy: f32,
         idx: usize,
+        avail_w: f32,
         alpha: f32,
         s: f32,
     ) {
         let item = &self.items[idx];
         let mut y = cy - 52.0 * s;
+        let title = crate::ellipsize(
+            painter,
+            &item.title,
+            &FontId::proportional(28.0 * s),
+            avail_w,
+        );
         painter.text(
             Pos2::new(cx, y),
             Align2::CENTER_CENTER,
-            &item.title,
+            title,
             FontId::proportional(28.0 * s),
             Color32::WHITE.gamma_multiply(alpha),
         );
@@ -2732,7 +2739,7 @@ impl Carousel {
             painter.text(
                 Pos2::new(cx, y),
                 Align2::CENTER_CENTER,
-                &item.artist,
+                crate::ellipsize(painter, &item.artist, &FontId::proportional(19.0 * s), avail_w),
                 FontId::proportional(19.0 * s),
                 Color32::WHITE.gamma_multiply(0.8 * alpha),
             );
@@ -2742,7 +2749,7 @@ impl Carousel {
             painter.text(
                 Pos2::new(cx, y),
                 Align2::CENTER_CENTER,
-                &item.album,
+                crate::ellipsize(painter, &item.album, &FontId::proportional(16.0 * s), avail_w),
                 FontId::proportional(16.0 * s),
                 Color32::WHITE.gamma_multiply(0.6 * alpha),
             );
@@ -2769,7 +2776,17 @@ impl Carousel {
         let cy = rect.center().y + 190.0 * s;
         let painter = ui.painter().with_clip_rect(rect);
         if let Some(idx) = self.overlay_index(visible) {
-            self.overlay_text(&painter, rect.center().x, cy, idx, alpha, s);
+            // Keep real margins on both sides — long titles ellipsis
+            // rather than touching the cover area's edges.
+            self.overlay_text(
+                &painter,
+                rect.center().x,
+                cy,
+                idx,
+                rect.width() - 48.0 * s,
+                alpha,
+                s,
+            );
         }
 
         // Pill slider: 520x28, track 16 (Margin 0,12,0,0 below text).

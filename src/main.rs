@@ -2330,11 +2330,22 @@ impl eframe::App for AesRustApp {
                 {
                     match nav.target() {
                         View::Music => match *sel_owner {
-                            SelOwner::Albums => album_search.open(),
+                            // Compact band: the album filter lives in
+                            // the transport's overflow drawer — Ctrl+F
+                            // opens it and focuses the field.
+                            SelOwner::Albums => {
+                                if transport.compact() {
+                                    transport.open_filter();
+                                } else {
+                                    album_search.open()
+                                }
+                            }
                             SelOwner::Cards => search.open(),
                             SelOwner::None => {
                                 if carousel.has_items() {
                                     search.open()
+                                } else if transport.compact() {
+                                    transport.open_filter();
                                 } else {
                                     album_search.open()
                                 }
@@ -2360,6 +2371,10 @@ impl eframe::App for AesRustApp {
                             fs_exit.open = false;
                         } else if del_prompt.open {
                             del_prompt.dismiss();
+                        } else if transport.overflow_open {
+                            // The compact transport's overflow panel
+                            // dismisses before any navigation.
+                            transport.overflow_open = false;
                         } else if search.is_open() {
                             search.close(ui.ctx());
                         } else if album_search.is_open() {
@@ -4001,6 +4016,8 @@ fn main_menu(
 /// (#FF000000) wraps the 266px strip. Each boundary gets a 1px
 /// Separator (Fluent's ~20% white).
 const TRANSPORT_BAND_H: f32 = 140.0;
+/// Compact mode's now-playing bar at the top of the cover area.
+const COMPACT_BAR_H: f32 = 52.0;
 const WAVEFORM_BAR_H: f32 = 60.0;
 const WAVEFORM_ROW_H: f32 = 75.0; // 60 + 5 top + 10 bottom margins
 const BAND_BG: Color32 = Color32::from_black_alpha(247);
@@ -4082,9 +4099,34 @@ fn music_view(
         t
     };
     let eq_top = wave_top - equalizer::PANEL_H * s * eq_t;
-    let band_top = (eq_top - TRANSPORT_BAND_H * s).max(content.min.y);
+    // The compact strip's overflow drawer reveals between the band
+    // and the EQ drawer — same damped lift as the EQ panel.
+    let ovf_t = {
+        let id = ui.id().with("ovf-drawer");
+        let mut t = ui.ctx().data_mut(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+        let target = if transport.overflow_open { 1.0 } else { 0.0 };
+        let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+        t += (target - t) * (1.0 - (-dt * 8.0).exp());
+        if (target - t).abs() < 0.0015 {
+            t = target;
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(id, t));
+        if t != target {
+            ui.ctx().request_repaint();
+        }
+        t
+    };
+    let ovf_top = eq_top - transport::OVF_H * s * ovf_t;
+    // Compact mode: the cover area clears the now-playing top bar.
+    let cct = transport.compact_mix();
+    let upper_top = content.min.y + COMPACT_BAR_H * s * cct;
+    let band_top = (ovf_top - TRANSPORT_BAND_H * s).max(upper_top);
     let band = Rect::from_min_max(
         Pos2::new(content.min.x, band_top),
+        Pos2::new(content.max.x, ovf_top),
+    );
+    let ovf_rect = Rect::from_min_max(
+        Pos2::new(content.min.x, ovf_top),
         Pos2::new(content.max.x, eq_top),
     );
     let eq_rect = Rect::from_min_max(
@@ -4103,11 +4145,16 @@ fn music_view(
     // overflow). Its interact widget registers before the pill/buttons
     // so they always win their own hit areas. The top-right search
     // pill's text filters the items (AlbumSearch -> CoverItems).
-    let upper = Rect::from_min_max(content.min, Pos2::new(content.max.x, band.min.y));
+    let upper = Rect::from_min_max(
+        Pos2::new(content.min.x, upper_top),
+        Pos2::new(content.max.x, band.min.y),
+    );
     // MusicView's row-spanning Border paints the content row with
-    // CardGridBackgroundColor in every mode, behind the cover view.
+    // CardGridBackgroundColor in every mode, behind the cover view —
+    // from `content.min` so the compact title strip isn't raw window
+    // black while `upper` itself is pushed down.
     ui.painter().rect_filled(
-        upper,
+        Rect::from_min_max(Pos2::new(content.min.x, content.min.y), upper.max),
         0,
         Color32::from_rgb(car_cfg.grid_bg[0], car_cfg.grid_bg[1], car_cfg.grid_bg[2])
             .gamma_multiply(alpha),
@@ -4117,12 +4164,15 @@ fn music_view(
         2 => carousel::Mode::HorizontalGrid,
         _ => carousel::Mode::Carousel,
     };
-    // Grid modes lay out against the pre-lift area: when the EQ drawer
-    // raises the transport band, the grid keeps its rows and the band
+    // Grid modes lay out against the pre-lift area: when the drawers
+    // raise the transport band, the grid keeps its rows and the band
     // simply covers whatever slides under it (painted earlier).
     let grid_area = Rect::from_min_max(
         upper.min,
-        Pos2::new(upper.max.x, upper.max.y + equalizer::PANEL_H * s * eq_t),
+        Pos2::new(
+            upper.max.x,
+            upper.max.y + (equalizer::PANEL_H * eq_t + transport::OVF_H * ovf_t) * s,
+        ),
     );
     let carousel_action = carousel.ui(
         ui,
@@ -4147,6 +4197,9 @@ fn music_view(
         // lifted unit; the separators mark both its edges.
         painter.rect_filled(eq_rect, 0.0, BAND_BG.gamma_multiply(alpha));
     }
+    if ovf_t > 0.001 {
+        painter.rect_filled(ovf_rect, 0.0, BAND_BG.gamma_multiply(alpha));
+    }
     painter.rect_filled(wave_row, 0.0, GRID_BG.gamma_multiply(alpha));
     if list_t > 0.001 {
         painter.rect_filled(
@@ -4168,6 +4221,9 @@ fn music_view(
     }
     if eq_t > 0.001 {
         painter.hline(content.min.x..=content.max.x, eq_rect.min.y, line);
+    }
+    if ovf_t > 0.001 {
+        painter.hline(content.min.x..=content.max.x, ovf_rect.min.y, line);
     }
 
     let mut step = transport.ui(ui, band, player, alpha, interactive, accent, s);
@@ -4220,13 +4276,37 @@ fn music_view(
             }
         }
     }
+    // The compact strip's overflow drawer — the kebab toggles it;
+    // input unlocks once the reveal settles, like the EQ panel. The
+    // strip keeps a FIXED height and slides vertically through the
+    // `ovf_rect` window (settings-overlay idiom, rotated 90°): pinned
+    // at the gap's top edge, it sinks behind the EQ boundary as the
+    // gap closes instead of squashing its icons.
+    if ovf_t > 0.001 {
+        let strip = Rect::from_min_max(
+            ovf_rect.min,
+            Pos2::new(ovf_rect.max.x, ovf_rect.min.y + transport::OVF_H * s),
+        );
+        transport.overflow_strip(
+            ui,
+            strip,
+            ovf_rect,
+            player,
+            alpha,
+            interactive && ovf_t > 0.95,
+            s,
+            &mut album_search.text,
+        );
+    }
 
     // Expanding search pill docked top-right (MusicView's AlbumSearch,
     // Margin 0,15,30,0) — filters the cover view when it exists.
+    // In compact mode the bar's time takes the top-right corner, so
+    // the pill drops just below the bar's bottom-right edge.
     search.ui(
         ui,
         content.max.x - 30.0 * s,
-        content.min.y + 26.0 * s,
+        content.min.y + (26.0 + (COMPACT_BAR_H + 8.0 - 26.0) * cct) * s,
         "Search",
         true,
         false,
@@ -4241,7 +4321,9 @@ fn music_view(
         ui,
         transport.search_icon,
         "Filter Albums",
-        true,
+        // Compact mode moves the album filter into the transport's
+        // overflow panel — the pill fades out here.
+        !transport.compact(),
         false,
         alpha,
         interactive,
@@ -4254,16 +4336,17 @@ fn music_view(
     );
     // Now-playing track info, top-left (MusicView's Metadata
     // StackPanel, Margin 25,20 — fades in with HasCurrentMediaLoaded).
+    // In compact mode it gives way to the narrow top bar below.
     let meta_t =
         ui.ctx()
             .animate_bool_with_time(ui.id().with("trackinfo"), playing_track.is_some(), 0.6);
-    if meta_t > 0.001 {
+    if meta_t > 0.001 && cct < 0.999 {
         if let Some(tp) = playing_track {
             let (title, artist, album) = carousel.display_for(tp);
             let x = content.min.x + 25.0 * s + 2.0 * s;
             let mut y = content.min.y + 20.0 * s;
             let paint = ui.painter();
-            let a = alpha * meta_t;
+            let a = alpha * meta_t * (1.0 - cct);
             paint.text(
                 Pos2::new(x, y),
                 Align2::LEFT_TOP,
@@ -4296,6 +4379,47 @@ fn music_view(
                 Align2::LEFT_TOP,
                 format!("{} / {}", fmt_time(position), fmt_time(duration)),
                 FontId::proportional(33.0 * s),
+                Color32::WHITE.gamma_multiply(a),
+            );
+        }
+    }
+    // Compact mode's now-playing bar: a semi-transparent strip across
+    // the top of the cover area — title on the left (ellipsis when it
+    // would crowd the time), position/duration on the right.
+    if meta_t > 0.001 && cct > 0.001 {
+        if let Some(tp) = playing_track {
+            let (title, _, _) = carousel.display_for(tp);
+            let paint = ui.painter();
+            let a = alpha * meta_t * cct;
+            let bar = Rect::from_min_max(
+                content.min,
+                Pos2::new(content.max.x, content.min.y + COMPACT_BAR_H * s),
+            );
+            let cy = bar.center().y;
+            let (position, duration) = player
+                .map(|p| (p.position().as_secs_f64(), p.duration().as_secs_f64()))
+                .unwrap_or((0.0, 0.0));
+            let tfont = FontId::proportional(24.0 * s);
+            let time = format!("{} / {}", fmt_time(position), fmt_time(duration));
+            let tw = paint
+                .layout_no_wrap(time.clone(), tfont.clone(), Color32::WHITE)
+                .size()
+                .x;
+            paint.text(
+                Pos2::new(bar.max.x - 14.0 * s, cy),
+                Align2::RIGHT_CENTER,
+                time,
+                tfont,
+                Color32::WHITE.gamma_multiply(a),
+            );
+            let tx = bar.min.x + 14.0 * s;
+            let avail = bar.max.x - 14.0 * s - tw - 18.0 * s - tx;
+            let nfont = FontId::proportional(26.0 * s);
+            paint.text(
+                Pos2::new(tx, cy),
+                Align2::LEFT_CENTER,
+                ellipsize(paint, &title, &nfont, avail),
+                nfont,
                 Color32::WHITE.gamma_multiply(a),
             );
         }
@@ -4491,6 +4615,32 @@ fn fmt_time(secs: f64) -> String {
     } else {
         format!("{m}:{sec:02}")
     }
+}
+
+/// Longest `text` prefix that fits `max_w` followed by an ellipsis —
+/// painter-measured, binary-searched over char boundaries (the
+/// compact top bar's title).
+pub(crate) fn ellipsize(painter: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
+    let measure =
+        |s: String| painter.layout_no_wrap(s, font.clone(), Color32::WHITE).size().x;
+    if measure(text.to_owned()) <= max_w {
+        return text.to_owned();
+    }
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if measure(format!("{}…", &text[..bounds[mid]])) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    format!("{}…", &text[..bounds[lo]])
 }
 
 /// CubicEaseInOut (Lacrima's transition easing).
@@ -6703,5 +6853,25 @@ mod tests {
         assert!(!playback_keepalive(Some(Stopped), false));
         assert!(!playback_keepalive(Some(Paused), false));
         assert!(!playback_keepalive(None, false));
+    }
+
+    /// Compact top bar title: short text passes through untouched,
+    /// long text truncates to "…", and multibyte titles never split
+    /// a char (would panic on a non-boundary slice).
+    #[test]
+    fn ellipsize_truncates_on_boundaries() {
+        let ctx = egui::Context::default();
+        // Fonts only exist after the first frame; the output's
+        // texture deltas panic if dropped unhandled — clear them.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        let painter =
+            egui::Painter::new(ctx, egui::LayerId::background(), Rect::EVERYTHING);
+        let font = FontId::proportional(15.0);
+        assert_eq!(ellipsize(&painter, "short", &font, 10_000.0), "short");
+        let out = ellipsize(&painter, &"a".repeat(200), &font, 60.0);
+        assert!(out.ends_with('…') && out.len() < 200);
+        let out = ellipsize(&painter, &"ÿ𝄞".repeat(100), &font, 60.0);
+        assert!(out.ends_with('…'));
     }
 }
