@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -19,18 +20,26 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 
+use super::player::patch_media;
+use super::stream_cache::StreamCache;
+
 /// Peaks across the whole track (Lacrima's WaveformResolution 4000).
 pub const BUCKETS: usize = 4000;
 /// Peak slots per second before bucketing (20ms granularity).
 const SLOTS_PER_SEC: u32 = 50;
+/// Regeneration attempts when a decode stops short of the declared
+/// length — a stream that's still downloading or a file mid-write
+/// gets re-run until its waveform actually covers the song.
+const MAX_ATTEMPTS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Disk cache — `ApplicationPaths.CacheDirectory/Waveform/{hash}_{buckets}.json`.
-// Generated buckets persist between runs; a changed file (size/mtime) or a
-// bucket-count change invalidates the entry.
+// Generated buckets persist between runs; a changed file (size/mtime),
+// a bucket-count change, or a song whose real duration no longer
+// matches the stored one invalidates the entry.
 // ---------------------------------------------------------------------------
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -39,6 +48,11 @@ struct CacheEntry {
     buckets: usize,
     size: u64,
     modified: u64,
+    /// Header duration the buckets were generated against — a song
+    /// re-probing to a different length drops the entry so the
+    /// waveform is regenerated for the actual audio.
+    #[serde(default)]
+    dur_secs: f64,
     waveform: Vec<f32>,
 }
 
@@ -76,6 +90,32 @@ fn file_stamp(path: &Path) -> (u64, u64) {
     (m.len(), modified)
 }
 
+/// Header-only probe for the declared audio duration — cheap (no
+/// decode) so a cached waveform can be checked against the song's
+/// actual length on every load.
+fn probe_duration(media: Box<dyn MediaSource>) -> Option<f64> {
+    let mss = MediaSourceStream::new(media, Default::default());
+    let probed = get_probe()
+        .format(
+            &Hint::new(),
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
+        .and_then(|t| t.codec_params.n_frames.zip(t.codec_params.time_base))
+        .map(|(nf, tb)| {
+            let t = tb.calc_time(nf);
+            t.seconds as f64 + t.frac
+        })
+        .filter(|d| *d > 0.1)
+}
+
 fn load_cache(path: &Path) -> Option<Vec<f32>> {
     let p = cache_path(path)?;
     let text = std::fs::read_to_string(&p).ok()?;
@@ -87,6 +127,19 @@ fn load_cache(path: &Path) -> Option<Vec<f32>> {
         && entry.size == size
         && entry.modified == modified
     {
+        // The waveform must match the song's real length — an entry
+        // generated against a different duration is dropped so the
+        // next play regenerates it instead of serving a stale shape.
+        if entry.dur_secs > 0.0 {
+            if let Ok(f) = std::fs::File::open(path) {
+                if let Some(d) = probe_duration(patch_media(Box::new(f))) {
+                    if (entry.dur_secs - d).abs() > (0.05 * d).max(1.0) {
+                        let _ = std::fs::remove_file(&p);
+                        return None;
+                    }
+                }
+            }
+        }
         return Some(entry.waveform);
     }
     // Stale for a changed file or a different bucket count — drop it
@@ -95,7 +148,7 @@ fn load_cache(path: &Path) -> Option<Vec<f32>> {
     None
 }
 
-fn save_cache(path: &Path, waveform: &[f32]) {
+fn save_cache(path: &Path, g: &Gen, waveform: &[f32]) {
     let Some(p) = cache_path(path) else { return };
     let (size, modified) = file_stamp(path);
     let entry = CacheEntry {
@@ -103,6 +156,7 @@ fn save_cache(path: &Path, waveform: &[f32]) {
         buckets: BUCKETS,
         size,
         modified,
+        dur_secs: g.dur_secs.unwrap_or(0.0),
         waveform: waveform.to_vec(),
     };
     let Ok(json) = serde_json::to_string(&entry) else {
@@ -121,7 +175,8 @@ fn save_cache(path: &Path, waveform: &[f32]) {
 /// Decode `path` into peak buckets on a worker thread. The finished
 /// `BUCKETS`-long vector arrives on the receiver — served straight from
 /// the disk cache when available; nothing arrives if decoding fails or
-/// `cancel` flips.
+/// `cancel` flips. A decode that ends short of the song's declared
+/// length is retried so a file that was still being written fills in.
 pub fn spawn(path: PathBuf, cancel: Arc<AtomicBool>) -> mpsc::Receiver<Vec<f32>> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -131,11 +186,31 @@ pub fn spawn(path: PathBuf, cancel: Arc<AtomicBool>) -> mpsc::Receiver<Vec<f32>>
                 let _ = tx.send(w);
                 return;
             }
-            let w = std::fs::File::open(&path)
-                .ok()
-                .and_then(|f| generate(Box::new(f), &cancel, &tx));
-            if let Some(w) = w {
-                save_cache(&path, &w);
+            let mut g = Gen::default();
+            for attempt in 0..MAX_ATTEMPTS {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let ok = std::fs::File::open(&path)
+                    .ok()
+                    .map(|f| generate(patch_media(Box::new(f)), &cancel, &tx, &mut g))
+                    .unwrap_or(false);
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !ok || g.complete() || attempt + 1 >= MAX_ATTEMPTS {
+                    break;
+                }
+                // Short back-off — the file may still be filling in.
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            if let Some(w) = g.finish() {
+                // Only complete coverage is persisted — a truncated
+                // result must regenerate on the next play rather than
+                // cache the mismatch.
+                if g.complete() {
+                    save_cache(&path, &g, &w);
+                }
                 let _ = tx.send(w);
             }
         })
@@ -147,6 +222,12 @@ pub fn spawn(path: PathBuf, cancel: Arc<AtomicBool>) -> mpsc::Receiver<Vec<f32>>
 /// consumer of the shared stream cache — no second download, and the
 /// waveform fills at disk speed for already-fetched bytes, then at the
 /// live download rate. `key` is the stable item url.
+///
+/// When a pass ends before the song's declared length — the download
+/// stalled or the demuxer hit a gap — the worker waits for the shared
+/// cache to gain coverage and regenerates, merging peaks by absolute
+/// time so earlier passes' data is never lost (the waveform resumes
+/// where it left off rather than restarting visually).
 pub fn spawn_stream(
     url: String,
     key: String,
@@ -156,10 +237,27 @@ pub fn spawn_stream(
     std::thread::Builder::new()
         .name("aes-waveform".into())
         .spawn(move || {
-            let w = super::player::http_source(&url, &key, false)
-                .ok()
-                .and_then(|src| generate(src, &cancel, &tx));
-            if let Some(w) = w {
+            let cache = super::stream_cache::cache_for(&key);
+            let mut g = Gen::default();
+            for attempt in 0..MAX_ATTEMPTS {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let ok = super::player::http_source(&url, &key, false)
+                    .ok()
+                    .map(|s| generate(s, &cancel, &tx, &mut g))
+                    .unwrap_or(false);
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                if (ok && g.complete()) || attempt + 1 >= MAX_ATTEMPTS {
+                    break;
+                }
+                if !wait_for_more(&cache, &cancel) {
+                    break;
+                }
+            }
+            if let Some(w) = g.finish() {
                 let _ = tx.send(w);
             }
         })
@@ -167,27 +265,147 @@ pub fn spawn_stream(
     rx
 }
 
+/// Another generation pass only makes sense when new bytes can still
+/// arrive: an active feed, or coverage that grows during the grace
+/// window. Returns false when nothing more can come (dead feed and an
+/// incomplete cache) so the caller finalizes with what decoded.
+fn wait_for_more(cache: &Arc<StreamCache>, cancel: &AtomicBool) -> bool {
+    let start = cache.inner().ranges_total();
+    if matches!(cache.len(), Some(l) if start >= l) {
+        // Fully cached — an immediate re-run is cheap and may pass
+        // where a mid-download pass hit a gap.
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let inner = cache.inner();
+        let covered = inner.ranges_total();
+        if covered > start {
+            return true;
+        }
+        match inner.live() {
+            // Feed still running — data is (slowly) coming; keep
+            // waiting out the stall until the deadline.
+            Some((_, false, _)) => {
+                drop(inner);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            _ => return matches!(cache.len(), Some(l) if covered >= l),
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// Accumulated peaks across generation attempts. `slots` indexes
+/// absolute 20ms positions, so a restarted decode only adds the
+/// positions the earlier pass never reached — re-decoded audio lands
+/// on the same indices and merges by max.
+struct Gen {
+    /// Per-20ms mono peaks by absolute time index — kept in both
+    /// mapping modes so a short result can be re-scaled over its real
+    /// span at the end.
+    slots: Vec<f32>,
+    /// Buckets mapped by the declared duration (live-fill path).
+    buckets: Vec<f32>,
+    global_max: f32,
+    /// Header-declared song length — the reference a generated
+    /// waveform is checked against.
+    dur_secs: Option<f64>,
+    /// Longest decoded span across attempts, in seconds.
+    decoded_secs: f64,
+}
+
+impl Default for Gen {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            buckets: vec![0.0; BUCKETS],
+            global_max: 0.0,
+            dur_secs: None,
+            decoded_secs: 0.0,
+        }
+    }
+}
+
+impl Gen {
+    /// True when the decoded audio covers (essentially) the declared
+    /// song length — a waveform worth showing as final or caching.
+    fn complete(&self) -> bool {
+        match self.dur_secs {
+            Some(d) => self.decoded_secs + 1.0 >= d || self.decoded_secs >= d * 0.97,
+            None => !self.slots.is_empty(),
+        }
+    }
+
+    /// Fold the accumulated peaks into the final normalized buckets —
+    /// `buckets` when the declared-length mapping completed, else the
+    /// slots spread over their real decoded span so the waveform still
+    /// covers the bar end-to-end (a lying header or a permanently
+    /// short stream still gets a proper shape).
+    fn finish(&self) -> Option<Vec<f32>> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut buckets = if self.dur_secs.is_some() && self.complete() {
+            self.buckets.clone()
+        } else {
+            let n = self.slots.len();
+            let mut b = vec![0f32; BUCKETS];
+            for (i, &v) in self.slots.iter().enumerate() {
+                let k = (i * BUCKETS / n).min(BUCKETS - 1);
+                if v > b[k] {
+                    b[k] = v;
+                }
+            }
+            b
+        };
+        let g = if self.global_max > 0.0 {
+            self.global_max
+        } else {
+            1.0
+        };
+        for v in &mut buckets {
+            *v = ((*v / g) * 1.1).clamp(0.01, 1.0);
+        }
+        Some(buckets)
+    }
+}
+
+/// One decode pass over `media`, folding peaks into `g`. Returns false
+/// when probing/setup fails (a retry won't fix it); a pass that ran
+/// but ended short of the declared length leaves `g.complete()` false.
 fn generate(
     media: Box<dyn MediaSource>,
     cancel: &AtomicBool,
     progress: &mpsc::Sender<Vec<f32>>,
-) -> Option<Vec<f32>> {
+    g: &mut Gen,
+) -> bool {
     let mss = MediaSourceStream::new(media, Default::default());
-    let probed = get_probe()
-        .format(
-            &Hint::new(),
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .ok()?;
+    let Ok(probed) = get_probe().format(
+        &Hint::new(),
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    ) else {
+        return false;
+    };
     let mut format = probed.format;
-    let track = format
+    let Some(track) = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())?;
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
+    else {
+        return false;
+    };
     let track_id = track.id;
-    let src_rate = track.codec_params.sample_rate?;
+    let Some(src_rate) = track.codec_params.sample_rate else {
+        return false;
+    };
     // Total duration from the header maps decode time -> bucket 1:1,
     // so live snapshots fill left-to-right at their final positions
     // (Lacrima streams buckets the same way while ffmpeg decodes).
@@ -200,25 +418,58 @@ fn generate(
             t.seconds as f64 + t.frac
         })
         .filter(|d| *d > 0.1);
-    let mut decoder = get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .ok()?;
+    // A re-probed duration that moved means bucket positions computed
+    // against the old length are wrong — start the accumulation over.
+    if let (Some(old), Some(new)) = (g.dur_secs, dur_secs) {
+        if (old - new).abs() > 0.05 {
+            *g = Gen::default();
+        }
+    }
+    g.dur_secs = dur_secs;
+    let Ok(mut decoder) = get_codecs().make(&track.codec_params, &DecoderOptions::default())
+    else {
+        return false;
+    };
 
-    // Peak |mono| per fixed time slot, then fold into BUCKETS — slot
-    // rate is constant so slot -> bucket IS time -> bucket, no need
-    // to know the total frame count up front.
+    // Peak |mono| per fixed time slot; slots index absolute 20ms
+    // positions so re-runs merge rather than duplicate.
     let slot_frames = (src_rate / SLOTS_PER_SEC).max(1) as usize;
-    let mut slots: Vec<f32> = Vec::new();
-    let mut buckets = vec![0f32; BUCKETS];
     let mut slot_fill = 0usize;
     let mut slot_peak = 0f32;
     let mut slot_idx = 0usize;
-    let mut global_max = 0f32;
-    let mut last_send = std::time::Instant::now();
+    let mut last_send = Instant::now();
+
+    let mut close_slot = |g: &mut Gen, slot_peak: f32, slot_idx: usize| {
+        g.global_max = g.global_max.max(slot_peak);
+        if g.slots.len() <= slot_idx {
+            g.slots.resize(slot_idx + 1, 0.0);
+        }
+        if slot_peak > g.slots[slot_idx] {
+            g.slots[slot_idx] = slot_peak;
+        }
+        if let Some(dur) = g.dur_secs {
+            // Streaming mode: the bucket's position is final,
+            // so push throttled snapshots as peaks land.
+            let t = slot_idx as f64 / SLOTS_PER_SEC as f64;
+            let b = ((t / dur * BUCKETS as f64) as usize).min(BUCKETS - 1);
+            if slot_peak > g.buckets[b] {
+                g.buckets[b] = slot_peak;
+            }
+            if last_send.elapsed().as_millis() > 120 && g.global_max > 0.0 {
+                let snap: Vec<f32> = g
+                    .buckets
+                    .iter()
+                    .map(|&v| ((v / g.global_max) * 1.1).clamp(0.0, 1.0))
+                    .collect();
+                let _ = progress.send(snap);
+                last_send = Instant::now();
+            }
+        }
+    };
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return None;
+            break;
         }
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -248,26 +499,7 @@ fn generate(
             slot_peak = slot_peak.max(mono.abs());
             slot_fill += 1;
             if slot_fill >= slot_frames {
-                global_max = global_max.max(slot_peak);
-                if let Some(dur) = dur_secs {
-                    // Streaming mode: the bucket's position is final,
-                    // so push throttled snapshots as peaks land.
-                    let t = slot_idx as f64 / SLOTS_PER_SEC as f64;
-                    let b = ((t / dur * BUCKETS as f64) as usize).min(BUCKETS - 1);
-                    if slot_peak > buckets[b] {
-                        buckets[b] = slot_peak;
-                    }
-                    if last_send.elapsed().as_millis() > 120 && global_max > 0.0 {
-                        let snap: Vec<f32> = buckets
-                            .iter()
-                            .map(|&v| ((v / global_max) * 1.1).clamp(0.0, 1.0))
-                            .collect();
-                        let _ = progress.send(snap);
-                        last_send = std::time::Instant::now();
-                    }
-                } else {
-                    slots.push(slot_peak);
-                }
+                close_slot(g, slot_peak, slot_idx);
                 slot_peak = 0.0;
                 slot_fill = 0;
                 slot_idx += 1;
@@ -275,31 +507,11 @@ fn generate(
         }
     }
     if slot_fill > 0 {
-        global_max = global_max.max(slot_peak);
-        if let Some(dur) = dur_secs {
-            let t = slot_idx as f64 / SLOTS_PER_SEC as f64;
-            let b = ((t / dur * BUCKETS as f64) as usize).min(BUCKETS - 1);
-            if slot_peak > buckets[b] {
-                buckets[b] = slot_peak;
-            }
-        } else {
-            slots.push(slot_peak);
-        }
+        close_slot(g, slot_peak, slot_idx);
+        slot_idx += 1;
     }
-    if dur_secs.is_none() {
-        if slots.is_empty() {
-            return None;
-        }
-        for (i, &v) in slots.iter().enumerate() {
-            let b = (i * BUCKETS / slots.len()).min(BUCKETS - 1);
-            if v > buckets[b] {
-                buckets[b] = v;
-            }
-        }
-    }
-    let g = if global_max > 0.0 { global_max } else { 1.0 };
-    for v in &mut buckets {
-        *v = ((*v / g) * 1.1).clamp(0.01, 1.0);
-    }
-    Some(buckets)
+    g.decoded_secs = g
+        .decoded_secs
+        .max(slot_idx as f64 / SLOTS_PER_SEC as f64);
+    true
 }

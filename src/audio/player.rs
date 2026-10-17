@@ -630,7 +630,7 @@ fn run_decoder(
         Source::Stream { key, .. } => (None, Some(key.clone())),
     };
     let media: Box<dyn MediaSource> = match src {
-        Source::File(path) => Box::new(std::fs::File::open(path)?),
+        Source::File(path) => patch_media(Box::new(std::fs::File::open(path)?)),
         Source::Stream { url, key } => http_source(&url, &key, true)?,
     };
     let mss = MediaSourceStream::new(media, Default::default());
@@ -1060,6 +1060,7 @@ fn parse_gain_db(s: &str) -> Option<f64> {
 const FEED_LANES: usize = 4;
 const SEGMENT: u64 = 1024 * 1024;
 const FEED_CHUNK: usize = 64 * 1024;
+const HTTP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 struct HttpSource {
     url: String,
@@ -1099,7 +1100,171 @@ pub(crate) fn http_source(
     key: &str,
     feeder: bool,
 ) -> std::io::Result<Box<dyn MediaSource>> {
-    Ok(Box::new(HttpSource::open(url, key, feeder)?))
+    let src = HttpSource::open(url, key, feeder)?;
+    let patches = src.atom_patches();
+    if patches.is_empty() {
+        Ok(Box::new(src))
+    } else {
+        Ok(Box::new(PatchSource {
+            inner: Box::new(src),
+            pos: 0,
+            patches,
+        }))
+    }
+}
+
+// -------------------------------------------------------------------
+// Malformed-MP4 repair — some googlevideo muxes inject a `uuid` box
+// without shrinking `mdat`'s declared size, so the last root atom
+// overshoots the real stream length. symphonia's seekable mp4 probe
+// walks EVERY root atom (`AtomIterator::next` ignore_bytes-es to the
+// declared end before checking the length) and dies on EOF. Cached
+// bytes are left untouched; the size field is spliced into served
+// reads instead so every consumer sees a consistent container.
+// -------------------------------------------------------------------
+
+/// How much of the head is walked for atom headers — covers
+/// `ftyp`+`uuid`+`moov`+`mdat` for typical muxes.
+const PATCH_HEAD: u64 = 192 * 1024;
+
+/// A rewritten atom size field: `(field offset, corrected size, field
+/// width)` — width 4 for normal sizes, 8 for `size==1` extended sizes.
+struct AtomPatch {
+    off: u64,
+    value: u64,
+    width: u8,
+}
+
+/// Walk top-level ISO-BMFF atom headers; a box whose declared size
+/// runs past `len` gets its size field clamped to the stream end
+/// (it necessarily is the last box — nothing valid can follow it).
+/// Only scans when the data starts with an `ftyp` brand and every
+/// walked type looks like a fourcc — other containers are left alone.
+fn atom_patch_scan(head: &[u8], len: u64) -> Vec<AtomPatch> {
+    let mut out = Vec::new();
+    if head.len() < 8 || &head[4..8] != b"ftyp" {
+        return out;
+    }
+    let mut pos = 0u64;
+    while (pos as usize) + 8 <= head.len() && pos + 8 <= len {
+        let s = &head[pos as usize..];
+        let sz32 = u32::from_be_bytes(s[..4].try_into().unwrap());
+        if !s[4..8].iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+            break;
+        }
+        let (size, hdr, foff, width) = if sz32 == 1 {
+            if (pos as usize) + 16 > head.len() || pos + 16 > len {
+                break;
+            }
+            (
+                u64::from_be_bytes(s[8..16].try_into().unwrap()),
+                16u64,
+                pos + 8,
+                8u8,
+            )
+        } else if sz32 == 0 {
+            // Runs to EOF by definition — can never overshoot.
+            (len - pos, 8u64, pos, 4u8)
+        } else {
+            (sz32 as u64, 8u64, pos, 4u8)
+        };
+        if size < hdr {
+            break;
+        }
+        let end = pos.saturating_add(size);
+        if end > len {
+            out.push(AtomPatch {
+                off: foff,
+                value: len - pos,
+                width,
+            });
+            break;
+        }
+        pos = end;
+    }
+    out
+}
+
+/// Splice corrected size fields over the served range `[pos, pos+len)`.
+fn apply_patches(pos: u64, buf: &mut [u8], patches: &[AtomPatch]) {
+    let end = pos + buf.len() as u64;
+    for p in patches {
+        let lo = pos.max(p.off);
+        let hi = end.min(p.off + p.width as u64);
+        if lo >= hi {
+            continue;
+        }
+        let field = p.value.to_be_bytes();
+        let field = &field[8 - p.width as usize..];
+        buf[(lo - pos) as usize..(hi - pos) as usize]
+            .copy_from_slice(&field[(lo - p.off) as usize..(hi - p.off) as usize]);
+    }
+}
+
+/// MediaSource wrapper applying `AtomPatch`es to served reads — the
+/// inner source's bytes pass through untouched except for the fixed
+/// size fields.
+struct PatchSource {
+    inner: Box<dyn MediaSource>,
+    pos: u64,
+    patches: Vec<AtomPatch>,
+}
+
+impl std::io::Read for PatchSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        apply_patches(self.pos, &mut buf[..n], &self.patches);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for PatchSource {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.inner.seek(pos)?;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for PatchSource {
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+    fn byte_len(&self) -> Option<u64> {
+        self.inner.byte_len()
+    }
+}
+
+/// Repair pass for any seekable `MediaSource` — reads the head through
+/// the source itself, rewinds, and wraps it in `PatchSource` when an
+/// overshooting root atom was found. Local files get the same repair
+/// as streams (a downloaded malformed mp4 is just as unproble).
+pub(crate) fn patch_media(mut media: Box<dyn MediaSource>) -> Box<dyn MediaSource> {
+    let Some(len) = media.byte_len() else {
+        return media;
+    };
+    let want = PATCH_HEAD.min(len) as usize;
+    let mut head = vec![0u8; want];
+    let mut have = 0usize;
+    while have < want {
+        match media.read(&mut head[have..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => have += n,
+        }
+    }
+    if media.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return media;
+    }
+    let patches = atom_patch_scan(&head[..have], len);
+    if patches.is_empty() {
+        media
+    } else {
+        Box::new(PatchSource {
+            inner: media,
+            pos: 0,
+            patches,
+        })
+    }
 }
 
 /// A downloader: `FEED_LANES` workers claim disjoint `SEGMENT` ranges
@@ -1172,10 +1337,7 @@ impl Feed {
         let mut ok = true;
         let req = ureq::get(&self.url)
             .header("Range", &format!("bytes={}-{}", at, end - 1))
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            );
+            .header("User-Agent", HTTP_UA);
         match req.call() {
             Ok(resp) => {
                 let mut rd = resp.into_body().into_reader();
@@ -1280,16 +1442,46 @@ impl HttpSource {
         Ok(src)
     }
 
+    /// Scan the stream's head for a malformed root atom overshooting
+    /// the real length (see `atom_patch_scan`). Head bytes come from
+    /// the shared cache when already fetched, topped up by a single
+    /// ranged GET — the feed downloads the same region in parallel
+    /// anyway, so this costs at most one extra connection.
+    fn atom_patches(&self) -> Vec<AtomPatch> {
+        let Some(len) = self.cache.len() else {
+            return Vec::new();
+        };
+        let want = PATCH_HEAD.min(len);
+        let mut head = vec![0u8; want as usize];
+        let mut have = {
+            let mut inner = self.cache.inner();
+            inner.covered_read(0, &mut head).unwrap_or(0)
+        };
+        if (have as u64) < want {
+            let resp = ureq::get(&self.url)
+                .header("Range", &format!("bytes={}-{}", have, want - 1))
+                .header("User-Agent", HTTP_UA)
+                .call();
+            if let Ok(resp) = resp {
+                let mut rd = resp.into_body().into_reader();
+                while have < head.len() {
+                    match std::io::Read::read(&mut rd, &mut head[have..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => have += n,
+                    }
+                }
+            }
+        }
+        atom_patch_scan(&head[..have], len)
+    }
+
     /// Total length via a 1-byte GET (googlevideo honours Range and
     /// answers Content-Range without paying for a second connection —
     /// lane 0 opens the real download right after).
     fn head_len(url: &str) -> std::io::Result<Option<u64>> {
         let resp = ureq::get(url)
             .header("Range", "bytes=0-0")
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            .header("User-Agent", HTTP_UA)
             .call()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let len = resp
@@ -1347,6 +1539,11 @@ impl std::io::Read for HttpSource {
                 self.pos += n as u64;
                 self.fails = 0;
                 return Ok(n);
+            }
+            // Reads at or past the known stream end are EOF — no feed
+            // lane will ever produce them, so don't wait for one.
+            if matches!(inner.total_len(), Some(l) if self.pos >= l) {
+                return Ok(0);
             }
             if inner.live().is_some() {
                 self.saw_live = true;
@@ -1482,5 +1679,57 @@ impl MediaSource for HttpSource {
     }
     fn byte_len(&self) -> Option<u64> {
         self.cache.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Repro for a failing stream: AES_TEST_URL=<resolved media url>
+    /// AES_TEST_KEY=<item key> — opens the cached HTTP source exactly
+    /// like playback and runs symphonia's probe + first decodes.
+    #[test]
+    #[ignore]
+    fn stream_probe_repro() {
+        let media: Box<dyn MediaSource> = if let Ok(file) = std::env::var("AES_TEST_FILE") {
+            patch_media(Box::new(std::fs::File::open(&file).expect("open file")))
+        } else {
+            let url = std::env::var("AES_TEST_URL").expect("AES_TEST_URL");
+            let key = std::env::var("AES_TEST_KEY").unwrap_or_else(|_| url.clone());
+            http_source(&url, &key, true).expect("http_source")
+        };
+        let mss = MediaSourceStream::new(media, Default::default());
+        let probed = get_probe()
+            .format(
+                &Hint::new(),
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .expect("probe");
+        let mut format = probed.format;
+        let track = format
+            .tracks()
+            .iter()
+            .find(|t| {
+                t.codec_params.codec != CODEC_TYPE_NULL
+                    && t.codec_params.sample_rate.is_some()
+            })
+            .expect("audio track")
+            .clone();
+        eprintln!("track: {:?} rate={:?}", track.codec_params.codec, track.codec_params.sample_rate);
+        let mut dec = get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .expect("decoder");
+        for _ in 0..20 {
+            match format.next_packet() {
+                Ok(p) if p.track_id() == track.id => {
+                    dec.decode(&p).expect("decode");
+                }
+                Ok(_) => {}
+                Err(e) => panic!("packet read failed: {e}"),
+            }
+        }
     }
 }
