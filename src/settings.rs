@@ -267,11 +267,11 @@ impl Default for Carousel {
     fn default() -> Self {
         Self {
             layout_mode: 0,
-            spacing: 0.93,
-            scale: 1.88,
-            vertical_offset: -95.0,
-            side_translation: 73.0,
-            stack_spacing: 39.0,
+            spacing: 0.74,
+            scale: 2.0,
+            vertical_offset: -165.0,
+            side_translation: 198.0,
+            stack_spacing: 198.0,
             use_full_cover_size: true,
             card_size: 376.0,
             card_spacing: 16.0,
