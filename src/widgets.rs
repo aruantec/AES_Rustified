@@ -64,60 +64,6 @@ fn fit_inside(rect: Rect, bounds: Rect) -> Rect {
     Rect::from_min_size(Pos2::new(x, y), rect.size())
 }
 
-/// How one axis of a widget anchors as the window changes — the
-/// placement intent, captured once and re-evaluated each frame.
-/// `Min`/`Max` glue the rect to a CONTENT edge at an absolute gap
-/// (a corner widget stays in the corner; content min moves with the
-/// title bar); `Frac` keeps the CENTER at a fraction of the whole
-/// FRAME, so e.g. the turntable disc stays on the shadertoy render
-/// origin (frame center) through fullscreen.
-#[derive(Clone, Copy)]
-enum Anchor {
-    Frac(f32),
-    Min(f32),
-    Max(f32),
-}
-
-/// An edge gap below this is treated as glued.
-const EDGE_GLUE: f32 = 48.0;
-
-#[allow(clippy::too_many_arguments)]
-fn axis_anchor(
-    min: f32,
-    max: f32,
-    content_min: f32,
-    content_max: f32,
-    frame_min: f32,
-    frame_size: f32,
-) -> Anchor {
-    let dmin = min - content_min;
-    let dmax = content_max - max;
-    if dmin <= dmax && dmin < EDGE_GLUE {
-        Anchor::Min(dmin)
-    } else if dmax < dmin && dmax < EDGE_GLUE {
-        Anchor::Max(dmax)
-    } else {
-        Anchor::Frac(((min + max) * 0.5 - frame_min) / frame_size.max(1.0))
-    }
-}
-
-/// Evaluate an anchor to the axis' min coordinate for `size`.
-#[allow(clippy::too_many_arguments)]
-fn axis_pos(
-    a: Anchor,
-    size: f32,
-    content_min: f32,
-    content_max: f32,
-    frame_min: f32,
-    frame_size: f32,
-) -> f32 {
-    match a {
-        Anchor::Min(g) => content_min + g,
-        Anchor::Max(g) => content_max - g - size,
-        Anchor::Frac(f) => frame_min + f * frame_size - size * 0.5,
-    }
-}
-
 fn clamp_inside(rect: Rect, bounds: Rect) -> Rect {
     let mut r = rect;
     if r.width() > bounds.width() {
@@ -154,10 +100,16 @@ pub struct WidgetFrame {
     pub dragging: bool,
     saved_offset: Option<Vec2>,
     saved_size: Option<Vec2>,
-    /// Canonical placement — placement is recomputed from this every
-    /// frame, so transient window sizes (startup races, fullscreen
-    /// transitions) can never corrupt the position incrementally.
-    anchor: Option<[Anchor; 2]>,
+    /// Canonical placement — the widget's FOCUS point as a fraction
+    /// of the whole window, captured once and re-evaluated every
+    /// frame, so the layout always looks the same at any window size
+    /// and transient sizes can't corrupt the position incrementally.
+    anchor: Option<Vec2>,
+    /// The point the anchor tracks: rect center by default, but the
+    /// turntable's focus is its DISC center — the rect includes the
+    /// tonearm jutting right, so anchoring the rect center would
+    /// drift the disc off the window center as it widens.
+    focus: fn(Rect) -> Pos2,
     last_scale: f32,
     /// Rect at drag start — `drag_delta` applies to this snapshot, not
     /// the live rect (which would compound the delta every frame).
@@ -183,6 +135,7 @@ impl WidgetFrame {
         default_rect: fn(Rect, Rect, f32) -> Rect,
         min_size: Vec2,
         id: &'static str,
+        focus: fn(Rect) -> Pos2,
     ) -> Self {
         Self {
             rect: Rect::NOTHING,
@@ -191,6 +144,7 @@ impl WidgetFrame {
             saved_offset: saved.map(|s| s.0),
             saved_size: saved.map(|s| s.1),
             anchor: None,
+            focus,
             last_scale: 0.0,
             drag_from: None,
             default_rect,
@@ -202,20 +156,23 @@ impl WidgetFrame {
     pub fn reset(&mut self, content: Rect, frame: Rect, s: f32) {
         self.rect = (self.default_rect)(content, frame, s);
         let r = self.rect;
-        self.anchor = Some(self.anchor_of(r, content, frame));
+        self.anchor = Some(self.anchor_of(r, frame));
     }
 
-    /// Per-axis anchors for `r` — the placement intent captured once,
-    /// then re-evaluated against every new geometry.
-    fn anchor_of(&self, r: Rect, content: Rect, frame: Rect) -> [Anchor; 2] {
-        [
-            axis_anchor(
-                r.min.x, r.max.x, content.min.x, content.max.x, frame.min.x, frame.width(),
-            ),
-            axis_anchor(
-                r.min.y, r.max.y, content.min.y, content.max.y, frame.min.y, frame.height(),
-            ),
-        ]
+    /// The placement intent for `r`: its focus point as a fraction of
+    /// the whole window, captured once, then re-evaluated against
+    /// every new geometry so the widget keeps its relative spot
+    /// through any resize — centered stays centered.
+    fn anchor_of(&self, r: Rect, frame: Rect) -> Vec2 {
+        ((self.focus)(r) - frame.min) / frame.size()
+    }
+
+    /// The rect whose focus lands on `target` — `focus` is a pure
+    /// function of rect shape, so the offset inside a same-sized rect
+    /// is constant.
+    fn rect_at_focus(&self, target: Pos2, size: Vec2) -> Rect {
+        let f0 = (self.focus)(Rect::from_min_size(Pos2::ZERO, size));
+        Rect::from_min_size(target - f0.to_vec2(), size)
     }
 
     /// Initialize the rect (or restore it) and re-place it as the
@@ -230,17 +187,12 @@ impl WidgetFrame {
             // corner permanently (the random drift on fresh builds).
             let (rect, intent) = match (self.saved_offset, self.saved_size) {
                 (Some(off), Some(size)) => {
-                    // Offset is the widget CENTER as a fraction of the
+                    // Offset is the widget FOCUS as a fraction of the
                     // whole window, so a widget keeps its screen spot
                     // in any mode; size is absolute virtual units —
                     // fullscreen must not inflate widgets.
-                    let restored = Rect::from_center_size(
-                        Pos2::new(
-                            frame.min.x + off.x * frame.width(),
-                            frame.min.y + off.y * frame.height(),
-                        ),
-                        size,
-                    );
+                    let restored =
+                        self.rect_at_focus(frame.min + off * frame.size(), size);
                     (fit_inside(restored, content.shrink(EDIT_MARGIN)), restored)
                 }
                 _ => {
@@ -249,7 +201,7 @@ impl WidgetFrame {
                 }
             };
             self.rect = rect;
-            self.anchor = Some(self.anchor_of(intent, content, frame));
+            self.anchor = Some(self.anchor_of(intent, frame));
         }
         // The widget lives inside the ScalableDecorator: on a UI-scale
         // change the rect rescales once, then the anchor re-derives.
@@ -257,22 +209,19 @@ impl WidgetFrame {
             let k = s / self.last_scale;
             self.rect = Rect::from_center_size(self.rect.center(), self.rect.size() * k);
             let r = self.rect;
-            self.anchor = Some(self.anchor_of(r, content, frame));
+            self.anchor = Some(self.anchor_of(r, frame));
         }
         self.last_scale = s;
-        // Placement is a pure function of (anchor, content, frame) —
-        // recomputed every frame so any transient size converges back
-        // to the same spot instead of chaining off a stale rect.
-        // Skipped while dragging (chrome writes the rect; the anchor
+        // Placement is a pure function of (anchor, frame) — the center
+        // fraction re-projected through the live window size —
+        // recomputed every frame so transient sizes converge back to
+        // the same spot instead of chaining off a stale rect. Skipped
+        // while dragging (chrome writes the rect; the anchor
         // re-derives on release).
-        if let (Some(a), false) = (self.anchor, self.dragging) {
+        if let (Some(frac), false) = (self.anchor, self.dragging) {
             let size = self.rect.size();
-            let min = Pos2::new(
-                axis_pos(a[0], size.x, content.min.x, content.max.x, frame.min.x, frame.width()),
-                axis_pos(a[1], size.y, content.min.y, content.max.y, frame.min.y, frame.height()),
-            );
             self.rect = fit_inside(
-                Rect::from_min_size(min, size),
+                self.rect_at_focus(frame.min + frac * frame.size(), size),
                 content.shrink(EDIT_MARGIN),
             );
         }
@@ -326,7 +275,7 @@ impl WidgetFrame {
         if move_resp.drag_stopped() {
             self.drag_from = None;
             let r = self.rect;
-            self.anchor = Some(self.anchor_of(r, content, frame));
+            self.anchor = Some(self.anchor_of(r, frame));
         }
         let move_dragged = move_resp.dragged();
         out.ended = move_resp.drag_stopped();
@@ -359,7 +308,7 @@ impl WidgetFrame {
         if grip_resp.drag_stopped() {
             self.drag_from = None;
             let r = self.rect;
-            self.anchor = Some(self.anchor_of(r, content, frame));
+            self.anchor = Some(self.anchor_of(r, frame));
         }
         let grip_dragged = grip_resp.dragged();
         out.ended = out.ended || grip_resp.drag_stopped();
@@ -368,24 +317,13 @@ impl WidgetFrame {
         out
     }
 
-    /// The persistable position: the anchor's center as a fraction of
-    /// `frame` — evaluated from intent so a clamped or transient
-    /// display rect can't leak into the save.
-    pub fn anchor_offset(&self, content: Rect, frame: Rect) -> Vec2 {
-        if let Some([ax, ay]) = self.anchor {
-            let size = self.rect.size();
-            let cx = axis_pos(
-                ax, size.x, content.min.x, content.max.x, frame.min.x, frame.width(),
-            ) + size.x * 0.5;
-            let cy = axis_pos(
-                ay, size.y, content.min.y, content.max.y, frame.min.y, frame.height(),
-            ) + size.y * 0.5;
-            Vec2::new(
-                (cx - frame.min.x) / frame.width().max(1.0),
-                (cy - frame.min.y) / frame.height().max(1.0),
-            )
-        } else {
-            (self.rect.center() - frame.min) / frame.size()
+    /// The persistable position: the anchor itself — the widget's
+    /// center as a fraction of `frame`. Returned from intent so a
+    /// clamped or transient display rect can't leak into the save.
+    pub fn anchor_offset(&self, frame: Rect) -> Vec2 {
+        match self.anchor {
+            Some(f) => f,
+            None => ((self.focus)(self.rect) - frame.min) / frame.size(),
         }
     }
 }
@@ -413,7 +351,7 @@ impl ClockWidget {
     /// `offset` is relative to the content area's top-left corner.
     pub fn new(have_font: bool, saved: Option<(Vec2, Vec2, bool)>) -> Self {
         Self {
-            frame: WidgetFrame::new(saved, clock_default, CLOCK_MIN, "clock"),
+            frame: WidgetFrame::new(saved, clock_default, CLOCK_MIN, "clock", |r| r.center()),
             have_font,
         }
     }
@@ -440,6 +378,161 @@ impl ClockWidget {
             return WidgetOut::default();
         }
         self.frame.chrome(ui, content, frame, elapsed, s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Player info — Lacrima's `PlayerInfo` WidgetControl: a centered stack of
+// title / artist / album + "position / duration" docked above the main menu.
+// ---------------------------------------------------------------------------
+
+const PLAYER_INFO_MIN: Vec2 = Vec2::new(220.0, 60.0);
+
+/// `MainContentWidgetLayout.Apply` for the info strip: full container
+/// width, `PlayerInfoHeightRatio` (116.94/769, min 80) tall, bottom
+/// pinned `MainMenuHeight` (160) above the container bottom.
+fn player_info_default(content: Rect, _frame: Rect, s: f32) -> Rect {
+    let h_v = content.height() / s;
+    let ih = (h_v * 116.94 / 769.0).max(80.0);
+    let top = content.max.y - (160.0 + ih) * s;
+    Rect::from_min_size(Pos2::new(content.min.x, top), Vec2::new(content.width(), ih * s))
+}
+
+pub struct PlayerInfoWidget {
+    pub frame: WidgetFrame,
+}
+
+impl std::ops::Deref for PlayerInfoWidget {
+    type Target = WidgetFrame;
+    fn deref(&self) -> &WidgetFrame {
+        &self.frame
+    }
+}
+
+impl std::ops::DerefMut for PlayerInfoWidget {
+    fn deref_mut(&mut self) -> &mut WidgetFrame {
+        &mut self.frame
+    }
+}
+
+impl PlayerInfoWidget {
+    pub fn new(saved: Option<(Vec2, Vec2, bool)>) -> Self {
+        Self {
+            frame: WidgetFrame::new(
+                saved,
+                player_info_default,
+                PLAYER_INFO_MIN,
+                "player_info",
+                |r| r.center(),
+            ),
+        }
+    }
+
+    /// `track` is the active item's (title, artist, album); `position`/
+    /// `duration` are seconds — the time line hides when `duration`
+    /// is unknown (Lacrima: `IsVisible={Duration != null}`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        content: Rect,
+        frame: Rect,
+        edit_mode: bool,
+        elapsed: f32,
+        s: f32,
+        track: Option<(&str, &str, &str)>,
+        position: f64,
+        duration: f64,
+    ) -> WidgetOut {
+        if !self.frame.begin(content, frame, s) {
+            return WidgetOut::default();
+        }
+        if let Some((title, artist, album)) = track {
+            paint_player_info(
+                ui.painter(),
+                self.frame.rect,
+                s,
+                title,
+                artist,
+                album,
+                position,
+                duration,
+            );
+        }
+        if !edit_mode {
+            self.frame.dragging = false;
+            return WidgetOut::default();
+        }
+        self.frame.chrome(ui, content, frame, elapsed, s)
+    }
+}
+
+/// The PlayerInfo StackPanel: `Margin=22,0,20,0`, centered both axes;
+/// title 32 bold white, artist 24 white, album 24 DarkGray, then
+/// "position / duration" 40 white with a 10px top margin.
+fn paint_player_info(
+    painter: &egui::Painter,
+    rect: Rect,
+    s: f32,
+    title: &str,
+    artist: &str,
+    album: &str,
+    position: f64,
+    duration: f64,
+) {
+    let wrap = (rect.width() - 42.0 * s).max(1.0);
+    let mut lines: Vec<(std::sync::Arc<egui::Galley>, f32)> = Vec::with_capacity(4);
+    if !title.is_empty() {
+        lines.push((
+            painter.layout(
+                title.to_string(),
+                FontId::proportional(32.0 * s),
+                Color32::WHITE,
+                wrap,
+            ),
+            0.0,
+        ));
+    }
+    if !artist.is_empty() {
+        lines.push((
+            painter.layout(
+                artist.to_string(),
+                FontId::proportional(24.0 * s),
+                Color32::WHITE,
+                wrap,
+            ),
+            0.0,
+        ));
+    }
+    if !album.is_empty() {
+        lines.push((
+            painter.layout(
+                album.to_string(),
+                FontId::proportional(24.0 * s),
+                Color32::from_rgb(0xA9, 0xA9, 0xA9),
+                wrap,
+            ),
+            0.0,
+        ));
+    }
+    if duration > 0.0 {
+        lines.push((
+            painter.layout(
+                format!("{} / {}", crate::fmt_time(position), crate::fmt_time(duration)),
+                FontId::proportional(40.0 * s),
+                Color32::WHITE,
+                wrap,
+            ),
+            10.0 * s,
+        ));
+    }
+    let total_h: f32 = lines.iter().map(|(g, gap)| g.size().y + gap).sum();
+    let mut y = rect.center().y - total_h * 0.5;
+    for (g, gap) in lines {
+        y += gap;
+        let h = g.size().y;
+        painter.galley(Pos2::new(rect.center().x - g.size().x * 0.5, y), g, Color32::WHITE);
+        y += h;
     }
 }
 
@@ -624,7 +717,9 @@ pub struct PlayerOut {
 impl PlayerWidget {
     pub fn new(saved: Option<(Vec2, Vec2, bool)>) -> Self {
         Self {
-            frame: WidgetFrame::new(saved, player_default, PLAYER_MIN, "player"),
+            frame: WidgetFrame::new(saved, player_default, PLAYER_MIN, "player", |r| {
+                disc_layout(r).center
+            }),
             rotation_deg: 0.0,
             arm_deg: ARM_REST_DEG,
             last_anim: None,
@@ -1104,4 +1199,109 @@ fn paint_clock(painter: &egui::Painter, rect: Rect, have_font: bool) {
         date_galley,
         date_color,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixed_default(_content: Rect, _frame: Rect, _s: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0))
+    }
+
+    /// Widgets keep their RELATIVE spot through resizes — the center
+    /// stays at the same fraction of the window, so a centered widget
+    /// stays centered at any size. The old absolute `Left`/`Top` gap
+    /// (and the edge-glue Min/Max inference before it) let the player
+    /// drift out of proportion on a right-edge resize.
+    #[test]
+    fn widget_keeps_center_fraction_on_resize() {
+        let mut w = WidgetFrame::new(None, fixed_default, Vec2::splat(80.0), "t", |r| {
+            r.center()
+        });
+        let frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(1092.0, 769.0));
+        let content = Rect::from_min_max(Pos2::new(0.0, 70.0), Pos2::new(1092.0, 769.0));
+        w.begin(content, frame, 1.0);
+
+        // A centered drop captures the anchor (as at drag end).
+        w.rect = Rect::from_center_size(frame.center(), Vec2::splat(200.0));
+        w.anchor = Some(w.anchor_of(w.rect, frame));
+
+        // Right-edge resize: only the max side grows — the widget must
+        // re-center, not sit at its old absolute offset.
+        let wide_frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 769.0));
+        let wide_content =
+            Rect::from_min_max(Pos2::new(0.0, 70.0), Pos2::new(1600.0, 769.0));
+        w.begin(wide_content, wide_frame, 1.0);
+        assert_eq!(w.rect.center(), wide_frame.center());
+
+        // An off-center widget keeps the same fraction.
+        w.rect = Rect::from_center_size(Pos2::new(300.0, 200.0), Vec2::splat(200.0));
+        w.anchor = Some(w.anchor_of(w.rect, wide_frame));
+        w.begin(content, frame, 1.0);
+        let want = Pos2::new(300.0 / 1600.0 * 1092.0, 200.0 / 769.0 * 769.0);
+        assert!((w.rect.center().x - want.x).abs() < 0.01);
+        assert!((w.rect.center().y - want.y).abs() < 0.01);
+
+        // Shrinking past the widget clamps it on-screen, and growing
+        // back restores the same relative spot — the anchor never
+        // degrades through a transient size.
+        let tiny_frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 400.0));
+        let tiny_content =
+            Rect::from_min_max(Pos2::new(0.0, 70.0), Pos2::new(500.0, 400.0));
+        w.begin(tiny_content, tiny_frame, 1.0);
+        assert!(w.rect.max.x <= 500.0);
+        w.begin(wide_content, wide_frame, 1.0);
+        assert!((w.rect.center().x - 300.0).abs() < 0.01);
+    }
+
+    /// The turntable's rect isn't centered on the disc — the tonearm
+    /// juts right. Anchoring the RECT center let the disc drift off
+    /// the window center as it widened; the anchor must track the
+    /// widget's focus point (the disc) instead.
+    #[test]
+    fn widget_keeps_focus_fraction_on_resize() {
+        // Focus at 25% of the rect width — like the disc inside the
+        // player rect.
+        let mut w = WidgetFrame::new(None, fixed_default, Vec2::splat(80.0), "p", |r| {
+            Pos2::new(r.min.x + r.width() * 0.25, r.center().y)
+        });
+        let frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(1092.0, 769.0));
+        let content = Rect::from_min_max(Pos2::new(0.0, 70.0), Pos2::new(1092.0, 769.0));
+        w.begin(content, frame, 1.0);
+
+        // Drop so the focus sits dead-center on the window.
+        w.rect = w.rect_at_focus(frame.center(), Vec2::splat(200.0));
+        w.anchor = Some(w.anchor_of(w.rect, frame));
+
+        let wide_frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 769.0));
+        let wide_content =
+            Rect::from_min_max(Pos2::new(0.0, 70.0), Pos2::new(1600.0, 769.0));
+        w.begin(wide_content, wide_frame, 1.0);
+        // The focus stays centered — not the rect, which must sit
+        // left-of-center so the offset focus lands on the middle.
+        assert_eq!(w.rect.min.x + 50.0, wide_frame.center().x);
+        assert!((w.rect.center().x - wide_frame.center().x).abs() > 1.0);
+    }
+
+    /// `MainContentWidgetLayout.Apply` for the info strip: full
+    /// container width, 116.94/769 of the container height (min 80),
+    /// bottom edge pinned MainMenuHeight (160) above the container
+    /// bottom.
+    #[test]
+    fn player_info_default_docks_above_menu() {
+        let content = Rect::from_min_max(Pos2::new(0.0, 70.0), Pos2::new(1092.0, 769.0));
+        let frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(1092.0, 769.0));
+        let r = player_info_default(content, frame, 1.0);
+        let ih = 699.0 * 116.94 / 769.0;
+        assert!((r.min.x - content.min.x).abs() < 0.01);
+        assert!((r.width() - 1092.0).abs() < 0.01);
+        assert!((r.max.y - (769.0 - 160.0)).abs() < 0.01);
+        assert!((r.height() - ih).abs() < 0.01);
+
+        // The 80px height floor kicks in on a tiny container.
+        let tiny = Rect::from_min_max(Pos2::ZERO, Pos2::new(300.0, 200.0));
+        let rt = player_info_default(tiny, tiny, 1.0);
+        assert!((rt.height() - 80.0).abs() < 0.01);
+    }
 }

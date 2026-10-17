@@ -406,6 +406,9 @@ struct AesRustApp {
     /// The turntable widget (Lacrima's PlayerCompositionControl): spinning
     /// cover disc, circular seek ring, play/pause tonearm.
     player_widget: widgets::PlayerWidget,
+    /// Lacrima's PlayerInfo widget — title/artist/album + the
+    /// "position / duration" line, docked above the main menu.
+    player_info: widgets::PlayerInfoWidget,
     /// The playing track's cover as an egui texture — the vinyl label.
     playing_cover: Option<egui::TextureHandle>,
     widget_edit: bool,
@@ -842,6 +845,23 @@ impl AesRustApp {
             // Lacrima's default layout.
             player_widget: widgets::PlayerWidget::new({
                 let p = &settings.player;
+                (p.left >= 0.0
+                    && p.top >= -0.5
+                    && p.left <= 1.5
+                    && p.top <= 1.5
+                    && p.width > 4.0
+                    && p.height > 4.0)
+                    .then(|| {
+                        (
+                            Vec2::new(p.left, p.top),
+                            Vec2::new(p.width, p.height),
+                            p.visible,
+                        )
+                    })
+            }),
+            // The PlayerInfo strip restores the same way.
+            player_info: widgets::PlayerInfoWidget::new({
+                let p = &settings.player_info;
                 (p.left >= 0.0
                     && p.top >= -0.5
                     && p.left <= 1.5
@@ -1561,6 +1581,7 @@ impl eframe::App for AesRustApp {
             lacrima,
             clock,
             player_widget,
+            player_info,
             playing_cover,
             widget_edit,
             settings,
@@ -1842,6 +1863,7 @@ impl eframe::App for AesRustApp {
                                 ui,
                                 &mut clock.frame,
                                 &mut player_widget.frame,
+                                &mut player_info.frame,
                                 widget_edit,
                                 content,
                                 frame_rect,
@@ -1941,12 +1963,41 @@ impl eframe::App for AesRustApp {
                                 p.toggle();
                             }
                         }
-                        for r in [cout.menu_resp, pout.menu_resp].into_iter().flatten() {
+                        // PlayerInfo strip — the active item's
+                        // title/artist/album + "position / duration".
+                        let info_track = playing_track
+                            .as_deref()
+                            .map(|tp| carousel.display_for(tp));
+                        let iout = player_info.ui(
+                            ui,
+                            content,
+                            frame_rect,
+                            *widget_edit && view_interactive,
+                            elapsed,
+                            s,
+                            info_track
+                                .as_ref()
+                                .map(|(t, a, al)| (t.as_str(), a.as_str(), al.as_str())),
+                            player
+                                .as_ref()
+                                .map(|p| p.position().as_secs_f64())
+                                .unwrap_or(0.0),
+                            player
+                                .as_ref()
+                                .map(|p| p.duration().as_secs_f64())
+                                .unwrap_or(0.0),
+                        );
+                        ended = ended || iout.ended;
+                        for r in [cout.menu_resp, pout.menu_resp, iout.menu_resp]
+                            .into_iter()
+                            .flatten()
+                        {
                             r.context_menu(|ui| {
                                 widget_menu(
                                     ui,
                                     &mut clock.frame,
                                     &mut player_widget.frame,
+                                    &mut player_info.frame,
                                     widget_edit,
                                     content,
                                     frame_rect,
@@ -3267,7 +3318,7 @@ impl eframe::App for AesRustApp {
                 // anchor_offset evaluates the canonical intent — a
                 // clamped/transient display rect can't leak into the
                 // save (the source of the random shift on launches).
-                let off = clock.anchor_offset(content, frame_rect);
+                let off = clock.anchor_offset(frame_rect);
                 let wsize = clock.rect.size();
                 let differs = settings.clock.left != off.x
                     || settings.clock.top != off.y
@@ -3280,7 +3331,7 @@ impl eframe::App for AesRustApp {
                 settings.clock.height = wsize.y;
                 settings.clock.visible = clock.visible;
                 // The turntable widget persists the same way.
-                let poff = player_widget.anchor_offset(content, frame_rect);
+                let poff = player_widget.anchor_offset(frame_rect);
                 let psize = player_widget.rect.size();
                 let pdiffers = settings.player.left != poff.x
                     || settings.player.top != poff.y
@@ -3292,6 +3343,19 @@ impl eframe::App for AesRustApp {
                 settings.player.width = psize.x;
                 settings.player.height = psize.y;
                 settings.player.visible = player_widget.visible;
+                // The PlayerInfo strip persists the same way.
+                let ioff = player_info.anchor_offset(frame_rect);
+                let isize = player_info.rect.size();
+                let idiffers = settings.player_info.left != ioff.x
+                    || settings.player_info.top != ioff.y
+                    || settings.player_info.width != isize.x
+                    || settings.player_info.height != isize.y
+                    || settings.player_info.visible != player_info.visible;
+                settings.player_info.left = ioff.x;
+                settings.player_info.top = ioff.y;
+                settings.player_info.width = isize.x;
+                settings.player_info.height = isize.y;
+                settings.player_info.visible = player_info.visible;
                 // Resizing the window re-anchors the widget every frame, so
                 // rate-limit writes; drag ends and menu changes save at
                 // once. Defer while any pointer press is held — a
@@ -3302,7 +3366,8 @@ impl eframe::App for AesRustApp {
                     || (!held
                         && !clock.dragging
                         && !player_widget.dragging
-                        && (differs || pdiffers || fx_changed)
+                        && !player_info.dragging
+                        && (differs || pdiffers || idiffers || fx_changed)
                         && save_due)
                 {
                     settings::save(settings);
@@ -3437,6 +3502,7 @@ fn widget_menu(
     ui: &mut egui::Ui,
     clock: &mut widgets::WidgetFrame,
     player: &mut widgets::WidgetFrame,
+    player_info: &mut widgets::WidgetFrame,
     widget_edit: &mut bool,
     content: Rect,
     frame: Rect,
@@ -3464,10 +3530,22 @@ fn widget_menu(
         player.visible = !player.visible;
         ui.close();
     }
+    if ui
+        .button(if player_info.visible {
+            "Hide Player Info"
+        } else {
+            "Show Player Info"
+        })
+        .clicked()
+    {
+        player_info.visible = !player_info.visible;
+        ui.close();
+    }
     ui.checkbox(widget_edit, "Widget Edit Mode");
     if ui.button("Reset Widget Layout").clicked() {
         clock.reset(content, frame, s);
         player.reset(content, frame, s);
+        player_info.reset(content, frame, s);
         ui.close();
     }
 }
@@ -4664,7 +4742,7 @@ fn persist_url_items(
 }
 
 /// "m:ss" / "h:mm:ss" (the waveform bar's TimeSpanConverter format).
-fn fmt_time(secs: f64) -> String {
+pub(crate) fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
     if h > 0 {
@@ -4732,6 +4810,26 @@ const SETTINGS_TABS: [&str; 6] = [
     "Libraries",
 ];
 
+/// Greedy row-packing for the settings tab strip: tabs go into the
+/// current row until the next one would exceed `strip_w`, then a new
+/// row starts. A lone tab wider than the strip gets its own row.
+fn pack_tab_rows(widths: &[f32], gap: f32, strip_w: f32) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut row_w = 0.0;
+    for (i, &tw) in widths.iter().enumerate() {
+        if row_w > 0.0 && row_w + gap + tw > strip_w {
+            rows.push(Vec::new());
+            row_w = 0.0;
+        }
+        if row_w > 0.0 {
+            row_w += gap;
+        }
+        row_w += tw;
+        rows.last_mut().unwrap().push(i);
+    }
+    rows
+}
+
 /// Lacrima's `SettingsOverlay`: a dark panel that slides in from the right
 /// edge of the content area, with a tab strip and the app version pinned
 /// to the bottom-right.
@@ -4756,7 +4854,7 @@ fn settings_overlay(
     // edge while `panel.min.x` moves, so content anchored to it would
     // squash horizontally instead of sliding out rigidly (the way the UI
     // tab's fixed-size controls do).
-    let body_panel =
+    let mut body_panel =
         Rect::from_min_max(panel.min, Pos2::new(panel.min.x + w, panel.max.y));
     let painter = ui.painter().clone();
 
@@ -4787,47 +4885,70 @@ fn settings_overlay(
     );
 
     // Tab strip across the top (75px header band, tabs FontSize 30);
-    // selected tab is underlined.
-    let mut x = panel.min.x + 15.0 * scale;
-    let y = panel.min.y + 14.0 * scale;
+    // selected tab is underlined. On narrow (compact) windows the
+    // strip wraps into extra rows instead of clipping tabs past the
+    // panel edge; each extra row pushes the body down by one row.
     let font = FontId::proportional(30.0 * scale);
-    for (i, name) in SETTINGS_TABS.iter().enumerate() {
-        let text_w = painter
-            .layout_no_wrap(name.to_string(), font.clone(), Color32::WHITE)
-            .rect
-            .width();
-        let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(text_w, 44.0 * scale));
-        let resp = ui.interact(rect, ui.id().with(("settings-tab", i)), Sense::click());
-        let color = if i == *tab {
-            Color32::WHITE
-        } else if resp.hovered() {
-            Color32::from_gray(200)
-        } else {
-            Color32::from_gray(140)
-        };
-        painter.text(
-            rect.min,
-            Align2::LEFT_TOP,
-            *name,
-            font.clone(),
-            color.gamma_multiply(t),
-        );
-        if i == *tab {
-            painter.line_segment(
-                [
-                    Pos2::new(x, rect.max.y - 2.0 * scale),
-                    Pos2::new(x + text_w, rect.max.y - 2.0 * scale),
-                ],
-                Stroke::new(2.0 * scale, Color32::WHITE.gamma_multiply(t)),
+    let gap = 28.0 * scale;
+    let row_h = 44.0 * scale;
+    let pad = 15.0 * scale;
+    let widths: Vec<f32> = SETTINGS_TABS
+        .iter()
+        .map(|n| {
+            painter
+                .layout_no_wrap(n.to_string(), font.clone(), Color32::WHITE)
+                .rect
+                .width()
+        })
+        .collect();
+    let strip_w = body_panel.width() - 2.0 * pad;
+    let rows = pack_tab_rows(&widths, gap, strip_w);
+    for (r, row) in rows.iter().enumerate() {
+        let mut x = panel.min.x + pad;
+        let y = panel.min.y + 14.0 * scale + r as f32 * row_h;
+        for &i in row {
+            let text_w = widths[i];
+            let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(text_w, row_h));
+            let resp = ui.interact(rect, ui.id().with(("settings-tab", i)), Sense::click());
+            let color = if i == *tab {
+                Color32::WHITE
+            } else if resp.hovered() {
+                Color32::from_gray(200)
+            } else {
+                Color32::from_gray(140)
+            };
+            painter.text(
+                rect.min,
+                Align2::LEFT_TOP,
+                SETTINGS_TABS[i],
+                font.clone(),
+                color.gamma_multiply(t),
             );
+            if i == *tab {
+                painter.line_segment(
+                    [
+                        Pos2::new(x, rect.max.y - 2.0 * scale),
+                        Pos2::new(x + text_w, rect.max.y - 2.0 * scale),
+                    ],
+                    Stroke::new(2.0 * scale, Color32::WHITE.gamma_multiply(t)),
+                );
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                *tab = i;
+            }
+            x += text_w + gap;
         }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        if resp.clicked() {
-            *tab = i;
-        }
-        x += text_w + 28.0 * scale;
+    }
+    // Extra rows push the body down — the bottom-pinned footer stays.
+    if rows.len() > 1 {
+        let dy = (rows.len() - 1) as f32 * row_h;
+        body_panel = Rect::from_min_max(
+            Pos2::new(body_panel.min.x, body_panel.min.y + dy),
+            body_panel.max,
+        );
     }
 
     // Body content per tab.
@@ -6829,6 +6950,32 @@ mod tests {
             album_row::Action::Opened(2),
         );
         assert!(matches!(merged, album_row::Action::Opened(2)));
+    }
+
+    /// Settings tabs wrap into extra rows on narrow panels — before
+    /// the wrap they painted past the panel edge and compact-mode
+    /// windows lost Carousel/Libraries entirely.
+    #[test]
+    fn settings_tabs_wrap_on_narrow_panels() {
+        let widths = [40.0, 150.0, 120.0, 80.0, 125.0, 110.0];
+        // Wide: one row holds everything.
+        assert_eq!(pack_tab_rows(&widths, 28.0, 800.0).len(), 1);
+        // Compact panel (~440px): wraps, no tab lost, rows stay within
+        // the strip.
+        let rows = pack_tab_rows(&widths, 28.0, 440.0);
+        assert!(rows.len() > 1);
+        assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), widths.len());
+        for row in &rows {
+            let w: f32 = row
+                .iter()
+                .enumerate()
+                .map(|(j, &i)| widths[i] + if j > 0 { 28.0 } else { 0.0 })
+                .sum();
+            assert!(w <= 440.0 || row.len() == 1);
+        }
+        // Ultra-narrow: every tab on its own row rather than clipped.
+        let rows = pack_tab_rows(&widths, 28.0, 100.0);
+        assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), widths.len());
     }
 
     /// Same regression for item deletes: a `None` from the view must

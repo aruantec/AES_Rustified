@@ -13,6 +13,10 @@ pub struct Settings {
     pub window: Window,
     pub clock: Clock,
     pub player: Player,
+    /// The "Player Info" widget (Lacrima's WidgetSettingsKey=PlayerInfo)
+    /// — track/artist/album + "position / duration" strip above the
+    /// main menu. Same fractional-offset semantics as `Player`.
+    pub player_info: Player,
     pub effects: Effects,
     pub library: Library,
     pub spectrum: Spectrum,
@@ -537,6 +541,7 @@ impl Default for Settings {
             window: Window::default(),
             clock: Clock::default(),
             player: Player::default(),
+            player_info: Player::default(),
             effects: Effects::default(),
             library: Library::default(),
             spectrum: Spectrum::default(),
@@ -581,6 +586,7 @@ pub fn load() -> Settings {
                 section(&v, "Window", &mut s.window);
                 section(&v, "Clock", &mut s.clock);
                 section(&v, "Player", &mut s.player);
+                section(&v, "PlayerInfo", &mut s.player_info);
                 section(&v, "Effects", &mut s.effects);
                 section(&v, "Library", &mut s.library);
                 section(&v, "Spectrum", &mut s.spectrum);
