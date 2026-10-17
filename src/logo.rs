@@ -90,6 +90,13 @@ impl TitleLogo {
         }
     }
 
+    /// Whether a glitch burst is in progress — the caller must keep
+    /// repainting while this is true, otherwise the last scrambled
+    /// frame stays on screen forever (egui only repaints on demand).
+    pub fn glitching(&self) -> bool {
+        self.glitch_frames > 0
+    }
+
     /// Advance animation state. Call once per frame; `dt` in seconds.
     /// A burst is 5–9 discrete steps of ~40–110ms each — the glitch
     /// holds frozen inside a step and snaps to a new state at each
@@ -167,27 +174,44 @@ impl TitleLogo {
             self.display.as_str()
         };
 
-        let text_w = painter
-            .layout_no_wrap(display.to_owned(), font.clone(), Color32::WHITE)
-            .rect
-            .width();
+        let galley = painter.layout_no_wrap(display.to_owned(), font.clone(), Color32::WHITE);
+        let text_w = galley.rect.width();
+        // The title has no descenders, so centering the galley (which
+        // reserves descender space in its line height) leaves it
+        // visibly high. Center the caps instead: baseline - half cap
+        // height is the visual middle.
+        let baseline = galley
+            .rows
+            .first()
+            .and_then(|r| r.glyphs.first())
+            .map(|g| g.pos.y)
+            .unwrap_or(galley.rect.height() * 0.8);
+        let cap_h = text_size * 0.72;
+        let cap_dy = galley.rect.height() * 0.5 - baseline + cap_h * 0.5;
 
         // Burst offset only applies while animated — a static title
         // must stay put even if the burst state machine keeps running.
         let (cx, cy) = if animate {
-            (rect.center().x + self.offset.x, rect.center().y + self.offset.y)
+            (rect.center().x + self.offset.x, rect.center().y + self.offset.y + cap_dy)
         } else {
-            (rect.center().x, rect.center().y)
+            (rect.center().x, rect.center().y + cap_dy)
         };
 
-        let shadow = Color32::from_black_alpha(150);
-        let cyan = Color32::from_rgba_unmultiplied(0, 245, 255, (110.0 * pulse) as u8);
-        let magenta = Color32::from_rgba_unmultiplied(255, 0, 180, (90.0 * pulse) as u8);
+        // The whole title renders at 30% opacity.
+        const TITLE_OPACITY: f32 = 0.3;
+        let shadow = Color32::from_black_alpha(150).gamma_multiply(TITLE_OPACITY);
+        let cyan =
+            Color32::from_rgba_unmultiplied(0, 245, 255, (110.0 * pulse) as u8)
+                .gamma_multiply(TITLE_OPACITY);
+        let magenta =
+            Color32::from_rgba_unmultiplied(255, 0, 180, (90.0 * pulse) as u8)
+                .gamma_multiply(TITLE_OPACITY);
         let main = Color32::from_rgb(
             (225.0 + 30.0 * pulse) as u8,
             (245.0 + 10.0 * pulse) as u8,
             255,
-        );
+        )
+        .gamma_multiply(TITLE_OPACITY);
 
         painter.text(
             Pos2::new(cx + 1.0, cy + 1.0),
@@ -203,7 +227,7 @@ impl TitleLogo {
                 Align2::CENTER_CENTER,
                 title,
                 font,
-                Color32::from_rgb(245, 250, 255),
+                Color32::from_rgb(245, 250, 255).gamma_multiply(TITLE_OPACITY),
             );
             return;
         }
@@ -242,7 +266,8 @@ impl TitleLogo {
                 Color32::from_rgba_unmultiplied(0, 240, 255, 38)
             } else {
                 Color32::from_rgba_unmultiplied(255, 0, 170, 34)
-            };
+            }
+            .gamma_multiply(TITLE_OPACITY);
             painter.rect_filled(flash_rect, CornerRadius::ZERO, color);
         }
 
@@ -359,4 +384,36 @@ fn corrupt(title: &str, count: u32, rng: &mut Rng) -> String {
         }
     }
     chars.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A burst must always play out and restore the real title —
+    /// if repaints stop mid-burst the scrambled frame would freeze
+    /// on screen forever (the "garbled logo" report).
+    #[test]
+    fn glitch_burst_always_terminates() {
+        let title = "AES Lacrima [Rust]";
+        let mut logo = TitleLogo::new(false);
+        // 60s at 60fps: whenever a burst is active it must finish
+        // within 2s of steady frames (5-9 steps of ≤110ms each) and
+        // restore the clean title — a frozen burst leaves scrambled
+        // text on screen when repaints stop.
+        let mut saw_burst = false;
+        for _ in 0..60 * 60 {
+            logo.advance(1.0 / 60.0, title);
+            if !logo.glitching() {
+                continue;
+            }
+            saw_burst = true;
+            for _ in 0..120 {
+                logo.advance(1.0 / 60.0, title);
+            }
+            assert!(!logo.glitching(), "burst never terminated");
+            assert_eq!(logo.display, title);
+        }
+        assert!(saw_burst, "no burst fired in 60s");
+    }
 }

@@ -689,63 +689,86 @@ fn export_playlists(
     }
 }
 
-impl AesRustApp {
-    fn new(cc: &eframe::CreationContext<'_>, settings: settings::Settings) -> Self {
-        // Lacrima renders its title in Consolas Bold and widgets in Segoe UI
-        // Light; load both from the OS and fall back to built-in fonts if
-        // unavailable.
-        let mut defs = egui::FontDefinitions::default();
-        let mut load_font = |name: &str, path: &str, family: &str| {
-            std::fs::read(path)
-                .map(|data| {
-                    defs.font_data.insert(
-                        name.to_owned(),
-                        std::sync::Arc::new(egui::FontData::from_owned(data)),
-                    );
-                    defs.families
-                        .insert(egui::FontFamily::Name(family.into()), vec![name.to_owned()]);
-                })
-                .is_ok()
-        };
-        let have_font = load_font(
-            "consolas-bold",
-            r"C:\Windows\Fonts\consolab.ttf",
-            logo::CONSOLAS_BOLD_FAMILY,
+/// System fonts appended to the egui font families as per-character
+/// fallbacks. egui's built-in fonts lack CJK, Hangul, Arabic, the
+/// Mathematical Alphanumeric block (YouTube "𝗕𝗢𝗟𝗗" titles) and
+/// emoji — missing glyphs render as tofu boxes. The first face whose
+/// charmap covers a char wins, so the CJK fonts are ordered by
+/// quality and the symbol/emoji fonts come last.
+/// Note: egui has no bidi/shaping — Arabic renders LTR with unjoined
+/// forms; legible, but not properly shaped.
+#[cfg(windows)]
+const FONT_FALLBACKS: &[(&str, &str)] = &[
+    ("malgun-gothic", r"C:\Windows\Fonts\malgun.ttf"), // Korean: Hangul + hanja
+    ("ms-yahei", r"C:\Windows\Fonts\msyh.ttc"),        // Simplified Chinese + kana
+    ("yu-gothic", r"C:\Windows\Fonts\YuGothR.ttc"),    // Japanese: kana + kanji
+    ("ms-gothic", r"C:\Windows\Fonts\msgothic.ttc"),   // Japanese fallback
+    ("ms-jhenghei", r"C:\Windows\Fonts\msjh.ttc"),     // Traditional Chinese
+    ("simsun", r"C:\Windows\Fonts\simsun.ttc"),        // Chinese fallback
+    ("segoe-ui", r"C:\Windows\Fonts\segoeui.ttf"),
+    ("tahoma", r"C:\Windows\Fonts\tahoma.ttf"),        // Arabic/Hebrew/Thai
+    ("segoe-symbol", r"C:\Windows\Fonts\seguisym.ttf"), // math-alphanumeric, symbols
+    ("segoe-emoji", r"C:\Windows\Fonts\seguiemj.ttf"), // emoji (monochrome outlines)
+];
+
+/// Font definitions for the app: Lacrima's Consolas Bold logo and
+/// Segoe UI Light widgets loaded from the OS, plus the script
+/// fallback chain above on every family so any text path (track
+/// titles, clock, logo) can render non-Latin glyphs.
+fn app_font_definitions() -> egui::FontDefinitions {
+    let mut defs = egui::FontDefinitions::default();
+    let load_font = |defs: &mut egui::FontDefinitions, name: &str, path: &str| {
+        if let Ok(data) = std::fs::read(path) {
+            defs.font_data.insert(
+                name.to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            return true;
+        }
+        false
+    };
+    if load_font(&mut defs, "consolas-bold", r"C:\Windows\Fonts\consolab.ttf") {
+        defs.families.insert(
+            egui::FontFamily::Name(logo::CONSOLAS_BOLD_FAMILY.into()),
+            vec!["consolas-bold".to_owned()],
         );
-        let have_light_font = load_font(
-            "segoe-light",
-            r"C:\Windows\Fonts\segoeuil.ttf",
-            widgets::SEGOE_LIGHT_FAMILY,
+    }
+    if load_font(&mut defs, "segoe-light", r"C:\Windows\Fonts\segoeuil.ttf") {
+        defs.families.insert(
+            egui::FontFamily::Name(widgets::SEGOE_LIGHT_FAMILY.into()),
+            vec!["segoe-light".to_owned()],
         );
-        // Glyph fallback: egui's built-in fonts lack Hangul/Kanji/Kana
-        // and Arabic, so those track titles draw as boxes. Appending
-        // Windows fonts to the Proportional family makes missing
-        // glyphs fall through per-character (system font fallback).
-        // Note: egui has no bidi/shaping — Arabic renders LTR with
-        // unjoined forms; legible, but not properly shaped.
-        let mut have_cjk = false;
-        for (name, path) in [
-            ("malgun-gothic", r"C:\Windows\Fonts\malgun.ttf"),
-            ("ms-yahei", r"C:\Windows\Fonts\msyh.ttc"),
-            ("yu-gothic", r"C:\Windows\Fonts\YuGothR.ttc"),
-            ("segoe-ui", r"C:\Windows\Fonts\segoeui.ttf"),
-            ("tahoma", r"C:\Windows\Fonts\tahoma.ttf"),
-        ] {
-            if let Ok(data) = std::fs::read(path) {
-                defs.font_data.insert(
-                    name.to_owned(),
-                    std::sync::Arc::new(egui::FontData::from_owned(data)),
+    }
+    #[cfg(windows)]
+    for (name, path) in FONT_FALLBACKS {
+        if load_font(&mut defs, name, path) {
+            // Every family gets the fallback chain — named families
+            // (SegoeLight clock, ConsolasBold logo) would otherwise be
+            // single-font families where any non-covered char is tofu.
+            // `Proportional`/`Monospace` already exist in the defaults.
+            for family in defs.families.values_mut() {
+                family.push(name.to_string());
+            }
+            if !defs
+                .families
+                .contains_key(&egui::FontFamily::Proportional)
+            {
+                defs.families.insert(
+                    egui::FontFamily::Proportional,
+                    vec![name.to_string()],
                 );
-                defs.families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .push(name.to_owned());
-                have_cjk = true;
             }
         }
-        if have_font || have_light_font || have_cjk {
-            cc.egui_ctx.set_fonts(defs);
-        }
+    }
+    defs
+}
+
+impl AesRustApp {
+    fn new(cc: &eframe::CreationContext<'_>, settings: settings::Settings) -> Self {
+        let defs = app_font_definitions();
+        let have_font = defs.font_data.contains_key("consolas-bold");
+        let have_light_font = defs.font_data.contains_key("segoe-light");
+        cc.egui_ctx.set_fonts(defs);
         boot_mark("fonts loaded");
         let mut transport = transport::Transport::new();
         transport.cover_layout = settings.carousel.layout_mode.min(2);
@@ -1321,6 +1344,11 @@ impl eframe::App for AesRustApp {
             ui.ctx().request_repaint();
         }
         self.logo.advance(dt, "AES Lacrima [Rust]");
+        // A glitch burst freezes mid-scramble if repaints stop —
+        // keep frames coming until it plays out.
+        if self.logo.glitching() {
+            ui.ctx().request_repaint();
+        }
 
         let radius = if maximized || is_fullscreen {
             0
@@ -3609,9 +3637,9 @@ fn lacrima_window_frame(
             // Panel clip (not app_rect): the bar reaches past the
             // frame-stroke inset to the window edge.
             let painter = ui.painter().clone().with_clip_rect(panel_rect);
-            // Mostly-opaque charcoal bar at the back button's face
-            // tone (Lacrima's Black@0.8 bar, tinted to the corner
-            // button's perceived #12 so the two read as one surface).
+            // The bar matches the back button's resting face (~#20)
+            // so the corner button reads as part of one surface —
+            // hover/press still tint the button for feedback.
             painter.rect_filled(
                 title_bar_rect,
                 CornerRadius {
@@ -3620,7 +3648,7 @@ fn lacrima_window_frame(
                     se: 0,
                     sw: 0,
                 },
-                Color32::from_rgba_unmultiplied(0x12, 0x12, 0x12, 204),
+                Color32::from_rgb(0x20, 0x20, 0x20),
             );
 
             logo.paint(&painter, title_bar_rect, elapsed, title, animate_title);
@@ -3656,32 +3684,19 @@ fn lacrima_window_frame(
                     sw: 0,
                     se: 0,
                 };
-                let (fill, line) = if press > 0.5 {
-                    (
-                        Color32::from_white_alpha((14.0 * back_alpha) as u8),
-                        Color32::from_white_alpha((45.0 * back_alpha) as u8),
-                    )
+                // No border — the button only tints on hover/press so
+                // at rest it's indistinguishable from the bar.
+                let fill = if press > 0.5 {
+                    Color32::from_white_alpha((14.0 * back_alpha) as u8)
                 } else if back_resp.hovered() {
-                    (
-                        Color32::from_white_alpha((30.0 * back_alpha) as u8),
-                        Color32::from_white_alpha((80.0 * back_alpha) as u8),
-                    )
+                    Color32::from_white_alpha((30.0 * back_alpha) as u8)
                 } else {
-                    (
-                        Color32::from_white_alpha((18.0 * back_alpha) as u8),
-                        Color32::from_white_alpha((60.0 * back_alpha) as u8),
-                    )
+                    Color32::TRANSPARENT
                 };
                 // The face reaches past `app_rect`'s clip (it covers the
                 // frame-stroke inset), so paint it with the panel clip.
                 let btn_painter = ui.painter().clone().with_clip_rect(panel_rect);
-                btn_painter.rect(
-                    face,
-                    face_cr,
-                    fill,
-                    Stroke::new((1.0 * scale).max(1.0), line),
-                    StrokeKind::Inside,
-                );
+                btn_painter.rect_filled(face, face_cr, fill);
                 // Arrow fills ~58% of the face and scales with it.
                 btn_painter.image(
                     back_icon,
@@ -3717,9 +3732,9 @@ fn lacrima_window_frame(
             ui.scope_builder(UiBuilder::new().max_rect(title_bar_rect), |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Buttons carry Margin=10 in a Spacing=5 StackPanel:
-                    // 10px right edge, 25px between buttons.
+                    // right edge padding, 25px between buttons.
                     ui.spacing_mut().item_spacing.x = 25.0 * scale;
-                    ui.add_space(10.0 * scale);
+                    ui.add_space(20.0 * scale);
                     if title_button(ui, TitleButton::Close, scale).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
@@ -4178,6 +4193,9 @@ fn music_view(
     // Compact + horizontal grid: the compact bar ate a card-height of
     // cover area — floor the grid at 2 rows (cards shrink to fit).
     carousel.h_min_rows = if transport.compact() { 2 } else { 1 };
+    // Compact title lane is narrow — overflowed titles marquee
+    // instead of ellipsizing.
+    carousel.marquee_title = transport.compact();
     // The spectrum parks at the bottom of `upper` (above the
     // transport band) and paints over the cover area in every
     // layout — the horizontal grid keeps its full height like the
@@ -6425,6 +6443,15 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton, scale: f32) -> egui::Respo
         ui.allocate_exact_size(Vec2::new(35.0 * scale, 30.0 * scale), Sense::click());
     let painter = ui.painter();
     let hovered = response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    response.clone().on_hover_text(match kind {
+        TitleButton::Minimize => "Minimize",
+        TitleButton::Fullscreen => "Fullscreen",
+        TitleButton::FullscreenExit => "Exit Fullscreen",
+        TitleButton::Close => "Close",
+    });
 
     if hovered {
         let fill = match kind {
@@ -6744,6 +6771,53 @@ mod tests {
             merged,
             album_row::Action::DeleteAlbum(d) if d == ["d:/games"]
         ));
+    }
+
+    /// The Proportional fallback chain must cover the scripts that
+    /// show up in streamed/YouTube titles — CJK kana/kanji, Hangul,
+    /// fullwidth forms, and the Mathematical Alphanumeric block
+    /// ("𝗕𝗔𝗖𝗞 𝗧𝗢 𝟭𝟵𝟵𝟬𝘀" — the actual title that rendered as tofu
+    /// boxes because no chain font covered U+1D400+). Checks the real
+    /// `app_font_definitions` data through skrifa charmaps; egui's
+    /// `has_glyph` can't be used here (a face that also owns the
+    /// family's replacement char reports false for every glyph).
+    #[cfg(windows)]
+    #[test]
+    fn fallback_fonts_cover_streamed_title_ranges() {
+        use skrifa::MetadataProvider;
+        let defs = app_font_definitions();
+        let names = defs
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .expect("Proportional family must exist");
+        // Machines without the Windows fonts (CI/other OS) skip.
+        if !names.iter().any(|n| n == "yu-gothic") {
+            return;
+        }
+        let covers = |c: char| {
+            names.iter().any(|name| {
+                defs.font_data.get(name).is_some_and(|d| {
+                    skrifa::FontRef::from_index(d.font.as_ref(), d.index).is_ok_and(|f| {
+                        f.charmap().map(c).is_some_and(|g| g != skrifa::GlyphId::NOTDEF)
+                    })
+                })
+            })
+        };
+        for (c, label) in [
+            ('あ', "hiragana"),
+            ('ア', "katakana"),
+            ('日', "kanji"),
+            ('한', "hangul"),
+            ('中', "chinese"),
+            ('Ａ', "fullwidth latin"),
+            ('･', "halfwidth katakana"),
+            ('𝗕', "math sans-serif bold"),
+            ('𝟭', "math sans-serif bold digit"),
+            ('🎵', "emoji"),
+            ('♪', "music note"),
+        ] {
+            assert!(covers(c), "no fallback font covers {label} U+{:04X}", c as u32);
+        }
     }
 
     /// A real action from the current frame still wins over a pending

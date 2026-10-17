@@ -178,6 +178,7 @@ dependencies = [
  "sevenz-rust2",
  "sha1",
  "sha2 0.10.9",
+ "skrifa",
  "smithay",
  "symphonia",
  "ureq",

@@ -324,6 +324,14 @@ pub struct Carousel {
     /// mode sets 2 so the shrunken cover area still shows two rows
     /// (cards shrink to fit); normal layouts leave it at 1.
     pub h_min_rows: usize,
+    /// Marquee the overlay title when it overflows (compact mode).
+    /// Lacrima's MarqueeBehavior: scrolls left at 40px/s, re-entering
+    /// from off the right edge (+40% text-width pad) after a 0.3s
+    /// wrap pause.
+    pub marquee_title: bool,
+    marquee_off: f32,
+    marquee_text: String,
+    marquee_pause: Instant,
 }
 
 impl Carousel {
@@ -368,6 +376,10 @@ impl Carousel {
             shadps4_menu: false,
             cemu_menu: false,
             h_min_rows: 1,
+            marquee_title: false,
+            marquee_off: 0.0,
+            marquee_text: String::new(),
+            marquee_pause: Instant::now(),
         }
     }
 
@@ -2789,11 +2801,50 @@ impl Carousel {
         None
     }
 
+    /// Title marquee state (Lacrima's `MarqueeBehavior`, adjusted per
+    /// user request): only runs when `marquee_title` (compact mode)
+    /// and the text overflows the lane. A NEW title shows in place
+    /// immediately — offset 0 — holds 2s, then scrolls left at
+    /// 40px/s; on wrap it re-enters from off the right edge (+40% of
+    /// text width) after a 0.3s pause, like Lacrima's re-entry.
+    /// Returns true while the marquee is active (caller repaints).
+    /// `now` is a parameter so tests can drive the hold/wrap timing.
+    fn marquee_step(
+        &mut self,
+        title: &str,
+        tw: f32,
+        avail_w: f32,
+        s: f32,
+        dt: f32,
+        now: Instant,
+    ) -> bool {
+        if !self.marquee_title || tw <= avail_w || avail_w <= 0.0 {
+            self.marquee_text.clear();
+            return false;
+        }
+        if self.marquee_text != title {
+            self.marquee_text = title.to_owned();
+            self.marquee_off = 0.0;
+            self.marquee_pause = now + std::time::Duration::from_millis(2000);
+        }
+        if now >= self.marquee_pause {
+            self.marquee_off -= 40.0 * s * dt;
+            if self.marquee_off <= -tw {
+                self.marquee_off = avail_w + tw * 0.4;
+                self.marquee_pause = now + std::time::Duration::from_millis(300);
+            }
+        }
+        true
+    }
+
     /// One item's overlay text block — title, artist, album — drawn
     /// centered at `cx`, stacked upward from `cy`.
+    #[allow(clippy::too_many_arguments)]
     fn overlay_text(
-        &self,
+        &mut self,
         painter: &egui::Painter,
+        ctx: &egui::Context,
+        dt: f32,
         cx: f32,
         cy: f32,
         idx: usize,
@@ -2802,36 +2853,54 @@ impl Carousel {
         s: f32,
     ) {
         let item = &self.items[idx];
+        let (title, artist, album) =
+            (item.title.clone(), item.artist.clone(), item.album.clone());
         let mut y = cy - 52.0 * s;
-        let title = crate::ellipsize(
-            painter,
-            &item.title,
-            &FontId::proportional(28.0 * s),
-            avail_w,
-        );
-        painter.text(
-            Pos2::new(cx, y),
-            Align2::CENTER_CENTER,
-            title,
-            FontId::proportional(28.0 * s),
-            Color32::WHITE.gamma_multiply(alpha),
-        );
-        y += 34.0 * s;
-        if !item.artist.is_empty() {
+        let font = FontId::proportional(28.0 * s);
+        let color = Color32::WHITE.gamma_multiply(alpha);
+        // Title marquee: fitting titles stay centered; overflowing
+        // ones show in place, hold, then scroll (see marquee_step).
+        let galley = painter.layout_no_wrap(title.clone(), font.clone(), color);
+        let tw = galley.rect.width();
+        if self.marquee_step(&title, tw, avail_w, s, dt, Instant::now()) {
+            ctx.request_repaint();
+            let lane = Rect::from_center_size(
+                Pos2::new(cx, y),
+                Vec2::new(avail_w, galley.rect.height() * 1.2),
+            );
+            painter.with_clip_rect(lane).galley(
+                Pos2::new(
+                    lane.min.x + self.marquee_off,
+                    lane.center().y - galley.rect.height() * 0.5,
+                ),
+                galley,
+                color,
+            );
+        } else {
             painter.text(
                 Pos2::new(cx, y),
                 Align2::CENTER_CENTER,
-                crate::ellipsize(painter, &item.artist, &FontId::proportional(19.0 * s), avail_w),
+                crate::ellipsize(painter, &title, &font, avail_w),
+                font,
+                color,
+            );
+        }
+        y += 34.0 * s;
+        if !artist.is_empty() {
+            painter.text(
+                Pos2::new(cx, y),
+                Align2::CENTER_CENTER,
+                crate::ellipsize(painter, &artist, &FontId::proportional(19.0 * s), avail_w),
                 FontId::proportional(19.0 * s),
                 Color32::WHITE.gamma_multiply(0.8 * alpha),
             );
             y += 26.0 * s;
         }
-        if !item.album.is_empty() {
+        if !album.is_empty() {
             painter.text(
                 Pos2::new(cx, y),
                 Align2::CENTER_CENTER,
-                crate::ellipsize(painter, &item.album, &FontId::proportional(16.0 * s), avail_w),
+                crate::ellipsize(painter, &album, &FontId::proportional(16.0 * s), avail_w),
                 FontId::proportional(16.0 * s),
                 Color32::WHITE.gamma_multiply(0.6 * alpha),
             );
@@ -2859,9 +2928,14 @@ impl Carousel {
         let painter = ui.painter().with_clip_rect(rect);
         if let Some(idx) = self.overlay_index(visible) {
             // Keep real margins on both sides — long titles ellipsis
-            // rather than touching the cover area's edges.
+            // rather than touching the cover area's edges (compact
+            // mode marquees them instead).
+            let ctx = ui.ctx().clone();
+            let dt = ctx.input(|i| i.stable_dt).min(0.1);
             self.overlay_text(
                 &painter,
+                &ctx,
+                dt,
                 rect.center().x,
                 cy,
                 idx,
@@ -3647,5 +3721,49 @@ mod tests {
         c.select_vi(0, egui::Modifiers::CTRL, &visible);
         assert!(!c.sel_set.contains(&0));
         assert!(c.sel_touched);
+    }
+
+    /// Marquee UX: a new title must be VISIBLE immediately (offset 0),
+    /// hold before scrolling, then scroll left and re-enter from the
+    /// right edge after a wrap — the previous behavior started the
+    /// text off-screen so it slid in late.
+    #[test]
+    fn marquee_shows_new_title_then_scrolls() {
+        use std::time::Duration;
+        let mut c = Carousel::new();
+        c.marquee_title = true;
+        let t0 = Instant::now();
+        let (tw, avail, s) = (400.0, 200.0, 1.0);
+
+        // New title: visible in place, not off-screen.
+        assert!(c.marquee_step("long title", tw, avail, s, 0.016, t0));
+        assert_eq!(c.marquee_off, 0.0);
+
+        // During the 2s hold the offset stays put.
+        assert!(c.marquee_step("long title", tw, avail, s, 0.016, t0 + Duration::from_secs(1)));
+        assert_eq!(c.marquee_off, 0.0);
+
+        // After the hold it scrolls left.
+        assert!(c.marquee_step("long title", tw, avail, s, 0.5, t0 + Duration::from_secs(3)));
+        assert!(c.marquee_off < 0.0);
+
+        // Past the tail it wraps to off-screen-right and pauses.
+        let mut now = t0 + Duration::from_secs(3);
+        for _ in 0..1000 {
+            now += Duration::from_millis(16);
+            c.marquee_step("long title", tw, avail, s, 0.016, now);
+            if c.marquee_off > avail {
+                break;
+            }
+        }
+        assert!(c.marquee_off > avail, "never re-entered from the right");
+        // During the wrap pause the offset holds.
+        let off = c.marquee_off;
+        assert!(c.marquee_step("long title", tw, avail, s, 0.016, now + Duration::from_millis(100)));
+        assert_eq!(c.marquee_off, off);
+
+        // A fitting title never engages and clears the state.
+        assert!(!c.marquee_step("short", 100.0, avail, s, 0.016, now));
+        assert!(c.marquee_text.is_empty());
     }
 }

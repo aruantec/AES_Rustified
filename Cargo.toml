@@ -114,3 +114,7 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
+
+# Font-coverage diagnostics in tests only (the app loads fonts via egui).
+[target.'cfg(windows)'.dev-dependencies]
+skrifa = "0.44"
