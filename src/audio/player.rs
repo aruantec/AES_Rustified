@@ -1551,13 +1551,31 @@ impl std::io::Read for HttpSource {
             match inner.live() {
                 // The live feed is at or ahead of us — wait for data.
                 // (pos == base is the steady case; pos inside a gap a
-                // lane is still filling also lands here.) A read-only
-                // consumer bails when the feed stops making progress.
+                // lane is still filling also lands here.)
                 Some((base, false, _)) if self.pos >= base => {
                     let total = inner.ranges_total();
                     drop(inner);
-                    if !self.feeder && self.stalled(total) {
-                        return Ok(0);
+                    if self.stalled(total) {
+                        // A "live" feed that produced nothing for ~15s
+                        // is a hung connection — ureq sets no read
+                        // deadline by default, so its lanes block
+                        // forever and the live entry never turns done.
+                        // A read-only consumer bails to EOF; the
+                        // playback feeder restarts the lanes (bounded
+                        // by MAX_FAILS), then EOFs too — a dead stream
+                        // must still end the track so the queue can
+                        // advance instead of buffering forever.
+                        if !self.feeder || self.fails >= MAX_FAILS {
+                            return Ok(0);
+                        }
+                        self.fails += 1;
+                        // The restarted feed needs its own stall
+                        // window — the covered total is unchanged, so
+                        // without resetting the clock the next wait
+                        // instantly re-detects the same stall and
+                        // burns every retry inside one read call.
+                        self.progress_at = std::time::Instant::now();
+                        self.start_feed(self.pos);
                     }
                     let cache = self.cache.clone();
                     let g = cache.inner();
@@ -1731,5 +1749,46 @@ mod tests {
                 Err(e) => panic!("packet read failed: {e}"),
             }
         }
+    }
+
+    /// A "live" feed that produces nothing is a hung socket (ureq
+    /// sets no read deadline by default, so its lanes can block
+    /// forever and the live entry never turns done). The playback
+    /// feeder used to wait on it unconditionally — the decoder never
+    /// saw EOF, the track never flagged Finished and the queue
+    /// stalled mid-album. Now a stall restarts the lanes a bounded
+    /// number of times, then reports EOF/error so the track still
+    /// ends and auto-advance can fire.
+    #[test]
+    fn feeder_stall_ends_instead_of_hanging() {
+        let cache = stream_cache::cache_for("aes-test-feeder-stall");
+        // Registered live, never producing — exactly the hung state.
+        cache.live_begin(stream_cache::next_live_id(), 0, FEED_LANES);
+        let mut src = HttpSource {
+            // Instantly refused — restarted lanes die fast instead of
+            // downloading real data mid-test.
+            url: "http://127.0.0.1:1/unreachable".to_string(),
+            pos: 0,
+            cache: cache.clone(),
+            feed: None,
+            feeder: true,
+            fails: 0,
+            saw_live: true,
+            live_grace: None,
+            last_covered: 0,
+            progress_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = tx.send(std::io::Read::read(&mut src, &mut buf));
+        });
+        // Without the stall restart this never returns — a few
+        // bounded retries against a refused port finish in seconds.
+        // Ok(0) (EOF) and Err both end the track; only a hang loses.
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("feeder read hung on a stalled live feed");
+        assert!(matches!(res, Ok(0) | Err(_)), "unexpected: {res:?}");
     }
 }

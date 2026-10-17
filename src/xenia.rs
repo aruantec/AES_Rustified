@@ -742,6 +742,15 @@ impl Session {
         self.compositor.is_some()
     }
 
+    /// Windows sessions are always embedded — the emulator window is
+    /// captured/hidden by definition, never an external desktop
+    /// window. Exists so cross-platform call sites can gate on
+    /// `embedded()` without cfg soup of their own.
+    #[cfg(windows)]
+    pub fn embedded(&self) -> bool {
+        true
+    }
+
     /// Forward a UI-originated input event into the nested seat —
     /// no-op when the session runs in an external window.
     #[cfg(not(windows))]

@@ -481,6 +481,11 @@ struct AesRustApp {
     /// Path currently loaded in the player — drives the playing-item
     /// glow and the top-left track info overlay.
     playing_track: Option<std::path::PathBuf>,
+    /// Tracks queued to start — ui() pushes user-initiated plays here
+    /// and `tick_playback` (App::logic) drains + starts them so the
+    /// same machinery runs while the window is minimized, where ui()
+    /// never executes.
+    pending_play: Vec<std::path::PathBuf>,
     /// Which view owns the current selection — the albums strip or
     /// the loaded album's cards. The Delete key routes here only, so
     /// a stale highlight in the other view can never delete
@@ -874,6 +879,7 @@ impl AesRustApp {
             playing_cover_rx: None,
             album_cover_rx: None,
             playing_track: None,
+            pending_play: Vec::new(),
             sel_owner: SelOwner::None,
             alt_down: false,
             alt_clean: false,
@@ -898,6 +904,314 @@ impl AesRustApp {
         boot_mark("app::new done");
         app
     }
+
+    /// Playback bookkeeping that must keep running while the window is
+    /// minimized or hidden: eframe calls `App::logic` before every
+    /// ui() pass, and for a hidden root viewport whenever a repaint is
+    /// pending — ui() itself never runs there. Track-end advance, the
+    /// stream-resolve handoff and queued plays all live here; the
+    /// keepalive re-arms the next logic tick while anything
+    /// playback-related is in flight, which is what keeps auto-advance
+    /// working when nothing else schedules a repaint (minimized, or a
+    /// view with no per-frame animation).
+    fn tick_playback(&mut self, ctx: &egui::Context) {
+        // URL-item stream resolved — open the direct stream url
+        // (Lacrima: OpenMediaItemAsync -> ResolveMediaSourceAsync ->
+        // PlayFile; the worker already tried bestaudio then best).
+        // Stale results for an item that stopped being current drop.
+        if let Some(rx) = self.resolve_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((path, Ok(stream))) => {
+                    if self.playing_track.as_ref() == Some(&path) {
+                        if self.player.is_none() {
+                            self.player = audio::AudioPlayer::new().ok();
+                            // A lazily created player starts at unity —
+                            // apply the persisted EQ curve.
+                            if let Some(p) = self.player.as_ref() {
+                                for (i, &db) in
+                                    self.settings.equalizer.bands.iter().enumerate()
+                                {
+                                    p.set_band_gain(i, db);
+                                }
+                                p.apply_audio(&self.settings.audio);
+                            }
+                        }
+                        // The item's page url keys the persistent
+                        // stream cache — shared by playback and the
+                        // waveform worker, surviving restarts.
+                        let key = path.to_string_lossy().into_owned();
+                        if let Some(p) = self.player.as_ref() {
+                            let _ = p.open_stream(&stream, &key);
+                        }
+                        // Stream waveform: read-only consumer of that
+                        // same cache — no second download; buckets fill
+                        // at disk speed for fetched bytes, then at the
+                        // live download rate.
+                        if let Some(c) = self.waveform_cancel.take() {
+                            c.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let cancel =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.waveform_rx = Some(audio::waveform::spawn_stream(
+                            stream,
+                            key,
+                            cancel.clone(),
+                        ));
+                        self.waveform_cancel = Some(cancel);
+                    } else {
+                        self.waveform_loading = false;
+                    }
+                    self.resolve_rx = None;
+                }
+                Ok((_, Err(_))) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.waveform_loading = false;
+                    self.resolve_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // Stream end -> RepeatMode: One replays the track, All
+        // auto-advances through the loaded album (wrapping), Off
+        // advances without wrapping and stops at the last item.
+        // User-queued plays win — same precedence `play_path` had.
+        // CRITICAL: while a play is queued or a stream resolve is in
+        // flight, Finished is the PREVIOUS track's latch — url items
+        // only leave Finished when open_stream runs after the worker
+        // lands. Evaluating it during that window re-fires the
+        // advance every tick and cascades to the end of the list.
+        if end_check_open(self.resolve_rx.is_some(), !self.pending_play.is_empty()) {
+            if let (Some(p), Some(cur)) =
+                (self.player.as_ref(), self.playing_track.as_ref())
+            {
+                let mut end_hit = p.state() == audio::PlayerState::Finished;
+                // Lacrima's OnTimeChangedForSilence: once the
+                // position enters the waveform-measured
+                // trailing-silence region, wait
+                // SilenceAdvanceDelayMs then end the track
+                // early. Repeat-One is exempt — its loop
+                // replays the tail instead of advancing.
+                if !end_hit
+                    && self.trailing_silence_s > 0.0
+                    && self.transport.repeat != transport::RepeatMode::One
+                    && p.state() == audio::PlayerState::Playing
+                {
+                    let in_tail = p.position().as_secs_f64()
+                        >= p.duration().as_secs_f64() - self.trailing_silence_s;
+                    if in_tail {
+                        let t0 = self
+                            .silence_entered
+                            .get_or_insert_with(std::time::Instant::now);
+                        if t0.elapsed().as_millis() as u64
+                            >= self.settings.audio.silence_advance_delay_ms as u64
+                        {
+                            end_hit = true;
+                        }
+                    } else {
+                        // Seeked back out before the delay
+                        // elapsed — re-arm the trigger.
+                        self.silence_entered = None;
+                    }
+                }
+                if end_hit {
+                    match end_advance(self.transport.repeat, &self.carousel, cur) {
+                        EndAdvance::Rewind => p.seek(0.0),
+                        EndAdvance::Next(next) => self.pending_play.push(next),
+                        // Queue end (or the playing item left the
+                        // carousel): leaving Finished latched would
+                        // spin the keepalive forever — the transport
+                        // truly stopped.
+                        EndAdvance::Stop => p.stop(),
+                    }
+                }
+            }
+            // A finished player with no current item can never
+            // advance — unlatch it so the keepalive can't spin.
+            if let (Some(p), None) = (self.player.as_ref(), self.playing_track.as_ref()) {
+                if p.state() == audio::PlayerState::Finished {
+                    p.stop();
+                }
+            }
+        }
+        for track in std::mem::take(&mut self.pending_play) {
+            self.start_track(ctx, track);
+        }
+        // eframe only calls logic() while a repaint is pending, and a
+        // minimized window gets no OS wakeups — re-arm the chain while
+        // playback still has pending work or the decoder's Finished
+        // edge could sit unobserved until the window is restored
+        // ("next track only plays once un-minimized").
+        if playback_keepalive(
+            self.player.as_ref().map(|p| p.state()),
+            self.resolve_rx.is_some(),
+        ) {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Begin playing `track` — double-click, transport step and queue
+    /// advance all funnel here (Lacrima's OpenSelectedItem). URL items
+    /// resolve their stream on a worker; local files open directly.
+    fn start_track(&mut self, ctx: &egui::Context, track: std::path::PathBuf) {
+        // The new playing item owns the selection and gets scrolled
+        // into view (transport steps land here too).
+        self.carousel.reveal(&track);
+        // The gradient follows the track's own art.
+        if library::is_url(&track) {
+            // Online item: resolve the direct stream url
+            // with yt-dlp on a worker — Lacrima's
+            // ResolveMediaSourceAsync (bestaudio first,
+            // muxed `best` fallback). Playback starts when
+            // resolve_rx lands.
+            let url = track.to_string_lossy().into_owned();
+            let item = track.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("aes-stream-resolve".into())
+                .spawn(move || {
+                    let one = |sel: &str| {
+                        ytdlp::stream_urls(&url, sel, ytdlp::ExtractorProfile::Default)
+                            .ok()
+                            .and_then(|v| v.into_iter().next())
+                    };
+                    // Symphonia has no Opus decoder, so
+                    // `bestaudio` (YT's webm/opus) is
+                    // useless to us — prefer m4a/AAC, then
+                    // any non-opus direct-progressive
+                    // stream (protocol^=http also excludes
+                    // HLS/DASH manifests symphonia can't
+                    // parse). `best` muxed last resort.
+                    let sel = "ba[ext=m4a][protocol^=http]/ba[acodec!=opus][protocol^=http]/b[protocol^=http]";
+                    let _ = tx.send((
+                        item,
+                        one(sel)
+                            .or_else(|| one("b"))
+                            .ok_or_else(|| "no playable stream".to_string()),
+                    ));
+                })
+                .ok();
+            self.resolve_rx = Some(rx);
+            // Remote cover fetch+decode off the UI thread.
+            if let Some(src) = self.carousel.cover_for(&track) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let t = track.clone();
+                std::thread::Builder::new()
+                    .name("aes-cover-fetch".into())
+                    .spawn(move || {
+                        let _ = tx.send((t, library::decode_cover(&src)));
+                    })
+                    .ok();
+                self.playing_cover_rx = Some(rx);
+            }
+            self.playing_track = Some(track.clone());
+            if let Some(c) = self.waveform_cancel.take() {
+                c.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.waveform.clear();
+            self.waveform_shown.clear();
+            self.trailing_silence_s = 0.0;
+            self.silence_entered = None;
+            // Spinner until the stream url resolves and the
+            // decoder is actually running (the waveform row
+            // has no local file to generate from).
+            self.waveform_loading = true;
+            self.waveform_rx = None;
+        } else {
+            let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
+            self.spectrum_colors = img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
+            if let (Some(toy), Some(img)) = (self.shadertoy.as_mut(), img.as_ref()) {
+                toy.set_cover_image(img);
+                if let Some(c) = self.spectrum_colors.as_deref() {
+                    toy.set_palette(c);
+                }
+            }
+            // The turntable's vinyl label
+            // (PlaybackCoordinator.ActiveCoverBitmap).
+            if let Some(img) = &img {
+                self.playing_cover = Some(ctx.load_texture(
+                    "player-cover",
+                    img.clone(),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            if self.player.is_none() {
+                self.player = audio::AudioPlayer::new().ok();
+                // A lazily created player starts at unity —
+                // apply the persisted EQ curve.
+                if let Some(p) = self.player.as_ref() {
+                    for (i, &db) in self.settings.equalizer.bands.iter().enumerate() {
+                        p.set_band_gain(i, db);
+                    }
+                    p.apply_audio(&self.settings.audio);
+                }
+            }
+            if let Some(p) = self.player.as_ref() {
+                let _ = p.open(&track);
+            }
+            self.playing_track = Some(track.clone());
+            if let Some(c) = self.waveform_cancel.take() {
+                c.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.waveform.clear();
+            self.waveform_shown.clear();
+            self.trailing_silence_s = 0.0;
+            self.silence_entered = None;
+            self.waveform_loading = true;
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.waveform_rx = Some(audio::waveform::spawn(track, cancel.clone()));
+            self.waveform_cancel = Some(cancel);
+        }
+    }
+}
+
+/// Transport decision when a track reaches its end (decoder Finished,
+/// or the trailing-silence cut): Repeat-One rewinds in place, All
+/// steps to the next carousel item wrapping, Off steps without
+/// wrapping — and a queue with no next item stops the transport
+/// instead of latching Finished forever.
+enum EndAdvance {
+    Rewind,
+    Next(std::path::PathBuf),
+    Stop,
+}
+
+fn end_advance(
+    repeat: transport::RepeatMode,
+    carousel: &carousel::Carousel,
+    cur: &std::path::Path,
+) -> EndAdvance {
+    match repeat {
+        transport::RepeatMode::One => EndAdvance::Rewind,
+        r => match carousel.step_path(cur, 1, matches!(r, transport::RepeatMode::All)) {
+            Some(next) => EndAdvance::Next(next),
+            None => EndAdvance::Stop,
+        },
+    }
+}
+
+/// Whether the end-of-track check may run this tick. While a play is
+/// queued or a stream resolve is in flight, the player's Finished is
+/// the PREVIOUS track's latch — url items only leave it when
+/// `open_stream` runs after the resolve lands (file opens set Playing
+/// synchronously, so only stream lists cascaded). Evaluating it then
+/// re-fired the advance every tick and the queue walked to the last
+/// item before a single resolve could finish.
+fn end_check_open(resolve_pending: bool, queued: bool) -> bool {
+    !resolve_pending && !queued
+}
+
+/// Whether playback still has work that can only progress inside
+/// logic(): the decoder's Finished edge must be observed (advance or
+/// stop), and a pending stream resolve must be consumed to start the
+/// track. eframe only calls logic() while a repaint is pending — a
+/// chain that ever breaks means the state sits unobserved until the
+/// next OS event, which is why a finished track used to stall until
+/// the window was restored.
+fn playback_keepalive(state: Option<audio::PlayerState>, resolve_pending: bool) -> bool {
+    resolve_pending
+        || matches!(
+            state,
+            Some(audio::PlayerState::Playing | audio::PlayerState::Finished)
+        )
 }
 
 impl eframe::App for AesRustApp {
@@ -912,6 +1226,14 @@ impl eframe::App for AesRustApp {
         } else {
             egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
         }
+    }
+
+    /// Runs before every ui() pass AND for a minimized/occluded
+    /// window whenever a repaint is pending — the only place
+    /// auto-advance, stream resolves and queued plays can run that
+    /// still works while hidden.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_playback(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1222,14 +1544,9 @@ impl eframe::App for AesRustApp {
             album_row,
             album_rx,
             player,
-            waveform,
             waveform_shown,
-            waveform_rx,
-            waveform_cancel,
             waveform_loading,
             waveform_bar,
-            trailing_silence_s,
-            silence_entered,
             transport,
             spectrum,
             spectrum_colors,
@@ -1247,6 +1564,7 @@ impl eframe::App for AesRustApp {
             album_cover_rx,
             scan_seen,
             playing_track,
+            pending_play,
             sel_owner,
             alt_down,
             alt_clean,
@@ -1260,53 +1578,6 @@ impl eframe::App for AesRustApp {
         // Libraries tab).
         if ytdlp.pump() {
             ui.ctx().request_repaint();
-        }
-        // URL-item stream resolved — open the direct stream url
-        // (Lacrima: OpenMediaItemAsync -> ResolveMediaSourceAsync ->
-        // PlayFile; the worker already tried bestaudio then best).
-        // Stale results for an item that stopped being current drop.
-        if let Some(rx) = resolve_rx.as_ref() {
-            match rx.try_recv() {
-                Ok((path, Ok(stream))) => {
-                    if playing_track.as_ref() == Some(&path) {
-                        if player.is_none() {
-                            *player = audio::AudioPlayer::new().ok();
-                            if let Some(p) = player {
-                                for (i, &db) in settings.equalizer.bands.iter().enumerate() {
-                                    p.set_band_gain(i, db);
-                                }
-                                p.apply_audio(&settings.audio);
-                            }
-                        }
-                        // The item's page url keys the persistent
-                        // stream cache — shared by playback and the
-                        // waveform worker, surviving restarts.
-                        let key = path.to_string_lossy().into_owned();
-                        if let Some(p) = player {
-                            let _ = p.open_stream(&stream, &key);
-                        }
-                        // Stream waveform: read-only consumer of that
-                        // same cache — no second download; buckets fill
-                        // at disk speed for fetched bytes, then at the
-                        // live download rate.
-                        if let Some(c) = waveform_cancel.take() {
-                            c.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        *waveform_rx =
-                            Some(audio::waveform::spawn_stream(stream, key, cancel.clone()));
-                        *waveform_cancel = Some(cancel);
-                    } else {
-                        *waveform_loading = false;
-                    }
-                    *resolve_rx = None;
-                }
-                Ok((_, Err(_))) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    *waveform_loading = false;
-                    *resolve_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
         }
         // Playlist expansion landed — add every member (deduped) and
         // fetch their metadata (Lacrima's AddPlaylistAsync batch).
@@ -2580,171 +2851,13 @@ impl eframe::App for AesRustApp {
                     }
                     album_row::Action::Selected(_) | album_row::Action::None => {}
                 }
-                // Stream end -> RepeatMode: One replays the track, All
-                // auto-advances through the loaded album (wrapping), Off
-                // advances without wrapping and stops at the last item.
-                if play_path.is_none() {
-                    if let (Some(p), Some(cur)) = (player.as_ref(), playing_track.as_ref()) {
-                        let mut end_hit = p.state() == audio::PlayerState::Finished;
-                        // Lacrima's OnTimeChangedForSilence: once the
-                        // position enters the waveform-measured
-                        // trailing-silence region, wait
-                        // SilenceAdvanceDelayMs then end the track
-                        // early. Repeat-One is exempt — its loop
-                        // replays the tail instead of advancing.
-                        if !end_hit
-                            && *trailing_silence_s > 0.0
-                            && transport.repeat != transport::RepeatMode::One
-                            && p.state() == audio::PlayerState::Playing
-                        {
-                            let in_tail = p.position().as_secs_f64()
-                                >= p.duration().as_secs_f64() - *trailing_silence_s;
-                            if in_tail {
-                                let t0 =
-                                    silence_entered.get_or_insert_with(std::time::Instant::now);
-                                if t0.elapsed().as_millis() as u64
-                                    >= settings.audio.silence_advance_delay_ms as u64
-                                {
-                                    end_hit = true;
-                                }
-                            } else {
-                                // Seeked back out before the delay
-                                // elapsed — re-arm the trigger.
-                                *silence_entered = None;
-                            }
-                        }
-                        if end_hit {
-                            match transport.repeat {
-                                transport::RepeatMode::One => p.seek(0.0),
-                                transport::RepeatMode::All => {
-                                    play_path = carousel.step_path(cur, 1, true);
-                                }
-                                transport::RepeatMode::Off => {
-                                    play_path = carousel.step_path(cur, 1, false);
-                                }
-                            }
-                        }
-                    }
-                }
+                // Track-end detection, the resolve handoff and the
+                // start itself live in `tick_playback` (App::logic) —
+                // they must also run while the window is minimized,
+                // where ui() never executes. ui() only queues the
+                // request; logic() drains it next pass (~16ms).
                 if let Some(track) = play_path {
-                    // The new playing item owns the selection and gets
-                    // scrolled into view (transport steps land here too).
-                    carousel.reveal(&track);
-                    // Double-clicked a cover item — play that track
-                    // (Lacrima's ItemDoubleClickedCommand ->
-                    // OpenSelectedItem). The gradient follows the
-                    // track's own art.
-                    if library::is_url(&track) {
-                        // Online item: resolve the direct stream url
-                        // with yt-dlp on a worker — Lacrima's
-                        // ResolveMediaSourceAsync (bestaudio first,
-                        // muxed `best` fallback). Playback starts when
-                        // resolve_rx lands.
-                        let url = track.to_string_lossy().into_owned();
-                        let item = track.clone();
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::Builder::new()
-                            .name("aes-stream-resolve".into())
-                            .spawn(move || {
-                                let one = |sel: &str| {
-                                    ytdlp::stream_urls(
-                                        &url,
-                                        sel,
-                                        ytdlp::ExtractorProfile::Default,
-                                    )
-                                    .ok()
-                                    .and_then(|v| v.into_iter().next())
-                                };
-                                // Symphonia has no Opus decoder, so
-                                // `bestaudio` (YT's webm/opus) is
-                                // useless to us — prefer m4a/AAC, then
-                                // any non-opus direct-progressive
-                                // stream (protocol^=http also excludes
-                                // HLS/DASH manifests symphonia can't
-                                // parse). `best` muxed last resort.
-                                let sel = "ba[ext=m4a][protocol^=http]/ba[acodec!=opus][protocol^=http]/b[protocol^=http]";
-                                let _ = tx.send((
-                                    item,
-                                    one(sel)
-                                        .or_else(|| one("b"))
-                                        .ok_or_else(|| {
-                                            "no playable stream".to_string()
-                                        }),
-                                ));
-                            })
-                            .ok();
-                        *resolve_rx = Some(rx);
-                        // Remote cover fetch+decode off the UI thread.
-                        if let Some(src) = carousel.cover_for(&track) {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            let t = track.clone();
-                            std::thread::Builder::new()
-                                .name("aes-cover-fetch".into())
-                                .spawn(move || {
-                                    let _ = tx.send((t, library::decode_cover(&src)));
-                                })
-                                .ok();
-                            *playing_cover_rx = Some(rx);
-                        }
-                        *playing_track = Some(track.clone());
-                        if let Some(c) = waveform_cancel.take() {
-                            c.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        waveform.clear();
-                        waveform_shown.clear();
-                        *trailing_silence_s = 0.0;
-                        *silence_entered = None;
-                        // Spinner until the stream url resolves and the
-                        // decoder is actually running (the waveform row
-                        // has no local file to generate from).
-                        *waveform_loading = true;
-                        *waveform_rx = None;
-                    } else {
-                        let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
-                        *spectrum_colors =
-                            img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
-                        if let (Some(toy), Some(img)) = (shadertoy.as_mut(), img.as_ref()) {
-                            toy.set_cover_image(img);
-                            if let Some(c) = spectrum_colors.as_deref() {
-                                toy.set_palette(c);
-                            }
-                        }
-                        // The turntable's vinyl label
-                        // (PlaybackCoordinator.ActiveCoverBitmap).
-                        if let Some(img) = &img {
-                            *playing_cover = Some(ui.ctx().load_texture(
-                                "player-cover",
-                                img.clone(),
-                                egui::TextureOptions::LINEAR,
-                            ));
-                        }
-                        if player.is_none() {
-                            *player = audio::AudioPlayer::new().ok();
-                            // A lazily created player starts at unity —
-                            // apply the persisted EQ curve.
-                            if let Some(p) = player {
-                                for (i, &db) in settings.equalizer.bands.iter().enumerate() {
-                                    p.set_band_gain(i, db);
-                                }
-                                p.apply_audio(&settings.audio);
-                            }
-                        }
-                        if let Some(p) = player {
-                            let _ = p.open(&track);
-                        }
-                        *playing_track = Some(track.clone());
-                        if let Some(c) = waveform_cancel.take() {
-                            c.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        waveform.clear();
-                        waveform_shown.clear();
-                        *trailing_silence_s = 0.0;
-                        *silence_entered = None;
-                        *waveform_loading = true;
-                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        *waveform_rx = Some(audio::waveform::spawn(track, cancel.clone()));
-                        *waveform_cancel = Some(cancel);
-                    }
+                    pending_play.push(track);
                 }
                 // The Add Url / Add Playlist prompts (Lacrima's
                 // IsAddUrlPopupOpen overlays on the cover view).
@@ -6527,5 +6640,68 @@ mod tests {
         ];
         assert_eq!(exportable_dirs(&albums), ["apl://Mix", "apl://Chill"]);
         assert!(exportable_dirs(&[]).is_empty());
+    }
+
+    /// Track-end decision: Repeat-One rewinds, All wraps the queue,
+    /// Off stops at the last item, and a playing item that left the
+    /// carousel stops rather than latching Finished forever (a latched
+    /// Finished with no advance would spin the playback keepalive
+    /// while accomplishing nothing).
+    #[test]
+    fn end_advance_repeats_wraps_and_stops() {
+        let mut c = carousel::Carousel::new();
+        for u in ["https://a/1", "https://a/2", "https://a/3"] {
+            assert!(c.add_url(u));
+        }
+        let p = |s: &str| std::path::PathBuf::from(s);
+        assert!(matches!(
+            end_advance(transport::RepeatMode::One, &c, &p("https://a/2")),
+            EndAdvance::Rewind
+        ));
+        match end_advance(transport::RepeatMode::Off, &c, &p("https://a/1")) {
+            EndAdvance::Next(n) => assert_eq!(n, p("https://a/2")),
+            _ => panic!("expected next item"),
+        }
+        assert!(matches!(
+            end_advance(transport::RepeatMode::Off, &c, &p("https://a/3")),
+            EndAdvance::Stop
+        ));
+        match end_advance(transport::RepeatMode::All, &c, &p("https://a/3")) {
+            EndAdvance::Next(n) => assert_eq!(n, p("https://a/1")),
+            _ => panic!("expected wrap to first"),
+        }
+        assert!(matches!(
+            end_advance(transport::RepeatMode::Off, &c, &p("https://gone")),
+            EndAdvance::Stop
+        ));
+    }
+
+    /// The end-check must stay closed while a stream resolve is in
+    /// flight or a play is queued — during that window the player's
+    /// Finished belongs to the PREVIOUS track, and re-firing it every
+    /// tick cascaded the queue to the last item (the Smtve bug).
+    #[test]
+    fn end_check_stays_closed_during_resolve() {
+        assert!(end_check_open(false, false));
+        assert!(!end_check_open(true, false));
+        assert!(!end_check_open(false, true));
+        assert!(!end_check_open(true, true));
+    }
+
+    /// The keepalive is what keeps logic() ticking while nothing else
+    /// schedules repaints (minimized window / view with no per-frame
+    /// animation): Playing and Finished must re-arm — Finished
+    /// included so the end edge is observed even when it lands
+    /// mid-tick; Stopped/Paused/idle must not burn repaints.
+    #[test]
+    fn playback_keepalive_covers_pending_states() {
+        use audio::PlayerState::*;
+        assert!(playback_keepalive(Some(Playing), false));
+        assert!(playback_keepalive(Some(Finished), false));
+        assert!(playback_keepalive(Some(Stopped), true));
+        assert!(playback_keepalive(None, true));
+        assert!(!playback_keepalive(Some(Stopped), false));
+        assert!(!playback_keepalive(Some(Paused), false));
+        assert!(!playback_keepalive(None, false));
     }
 }

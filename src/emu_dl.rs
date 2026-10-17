@@ -1412,6 +1412,7 @@ fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), Stri
 /// Unix tarballs go through the system `tar` (GNU tar auto-detects
 /// gz/xz/zst/bz2 by content).
 fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    #[cfg(unix)]
     let name = archive
         .file_name()
         .and_then(|f| f.to_str())
@@ -1676,18 +1677,24 @@ mod tests {
             ] {
                 assert!(arch_ok(good), "{good} should pass");
             }
-            // The DuckStation predicate specifically — this is the
+            // The DuckStation/xemu predicates specifically — these
+            // exercise the LINUX asset_ok branches, so they only hold
+            // off-Windows (the Windows branch rightly rejects
+            // AppImages). The DuckStation armhf rejection is the
             // exact bug the user hit.
-            assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-armhf.AppImage"));
-            assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-arm64.AppImage"));
-            assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-x64-SSE2.AppImage"));
-            assert!((DUCKSTATION_SPEC.asset_ok)("DuckStation-x64.AppImage"));
-            // xemu dropped the "ubuntu"/"linux" marker from asset
-            // names — the Linux build is now xemu-<ver>-x86_64.AppImage.
-            assert!((XEMU_SPEC.asset_ok)("xemu-0.8.137-x86_64.AppImage"));
-            assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-aarch64.AppImage"));
-            assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-dbg-x86_64.AppImage"));
-            assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-windows-x86_64.zip"));
+            #[cfg(unix)]
+            {
+                assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-armhf.AppImage"));
+                assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-arm64.AppImage"));
+                assert!(!(DUCKSTATION_SPEC.asset_ok)("DuckStation-x64-SSE2.AppImage"));
+                assert!((DUCKSTATION_SPEC.asset_ok)("DuckStation-x64.AppImage"));
+                // xemu dropped the "ubuntu"/"linux" marker from asset
+                // names — the Linux build is now xemu-<ver>-x86_64.AppImage.
+                assert!((XEMU_SPEC.asset_ok)("xemu-0.8.137-x86_64.AppImage"));
+                assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-aarch64.AppImage"));
+                assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-dbg-x86_64.AppImage"));
+                assert!(!(XEMU_SPEC.asset_ok)("xemu-0.8.137-windows-x86_64.zip"));
+            }
         }
     }
 }
