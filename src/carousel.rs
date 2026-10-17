@@ -171,6 +171,24 @@ struct Press {
     item: Option<usize>,
 }
 
+/// Tracks the screen rect across frames. A window resize re-maps
+/// every pointer coordinate — an in-flight press/drag is stale, and
+/// a press caught while the OS resize grip is active must never arm
+/// a card lift or a scroll.
+#[derive(Default)]
+struct ResizeWatch {
+    last: Option<Rect>,
+}
+
+impl ResizeWatch {
+    /// True while the screen rect is changing (each resize frame).
+    fn update(&mut self, screen: Rect) -> bool {
+        let changed = self.last.map(|r| r != screen).unwrap_or(false);
+        self.last = Some(screen);
+        changed
+    }
+}
+
 /// In-flight item reorder: the card floated off its slot and follows
 /// the pointer while neighbors slide aside. Committing applies the
 /// actual `items` move — `display_slot` is exactly the post-move
@@ -244,6 +262,9 @@ pub struct Carousel {
     /// bar docks at the bottom edge where the spectrum paints AFTER
     /// this view, so `repaint_scrollbar` redraws it on top.
     last_sb: Option<(SbGeo, bool)>,
+    /// Screen-rect watch — a resize drops in-flight press/drag state
+    /// and blocks new presses while coordinates re-map.
+    resize: ResizeWatch,
     /// Playing-item pulse phase (3.1 rad/s while a track plays).
     pulse: f32,
     /// Pill slider drag/hover preview.
@@ -325,6 +346,7 @@ impl Carousel {
             sb_opacity: 0.0,
             sb_visible_until: Instant::now(),
             last_sb: None,
+            resize: ResizeWatch::default(),
             pulse: 0.0,
             preview: None,
             pending_reveal: None,
@@ -914,6 +936,34 @@ impl Carousel {
     /// double-click.
     pub fn primary_path(&self) -> Option<PathBuf> {
         self.items.get(self.sel).map(|i| i.path.clone())
+    }
+
+    /// Select-on-press (Explorer/ListBox semantics): the selection
+    /// lands on mouse-down, not on release — gating it on `clicked()`
+    /// made every selection feel delayed. Shift extends a range from
+    /// the anchor, Ctrl toggles the item, plain press singles it.
+    /// Ranges run over *visible* items — filtered-out tracks never
+    /// get silently selected.
+    fn select_vi(&mut self, vi: usize, mods: egui::Modifiers, visible: &[usize]) {
+        let idx = visible[vi];
+        self.sel = idx;
+        if mods.shift {
+            let anchor_vi = visible
+                .iter()
+                .position(|&i| i == self.sel_anchor)
+                .unwrap_or(vi);
+            let (a, b) = (anchor_vi.min(vi), anchor_vi.max(vi));
+            self.sel_set = visible[a..=b].iter().copied().collect();
+        } else if mods.ctrl || mods.command {
+            if !self.sel_set.remove(&idx) {
+                self.sel_set.insert(idx);
+            }
+            self.sel_anchor = idx;
+        } else {
+            self.sel_set = BTreeSet::from([idx]);
+            self.sel_anchor = idx;
+        }
+        self.sel_touched = true;
     }
 
     /// Selected items' paths (the Delete key payload).
@@ -1535,6 +1585,20 @@ impl Carousel {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         let painter = ui.painter().clone();
 
+        // Window resize: every pointer coordinate re-maps, so any
+        // press/drag in flight is stale (the resize-grip press used to
+        // pop a card into drag mode as the window moved under it).
+        // New presses are blocked while the screen rect keeps changing.
+        let screen = ctx
+            .input(|i| i.viewport().inner_rect)
+            .unwrap_or(Rect::NOTHING);
+        let resizing = self.resize.update(screen);
+        if resizing {
+            self.press = None;
+            self.item_drag = None;
+            self.sb_drag = None;
+        }
+
         // Layout-mode switch: the outgoing view stays painted as a
         // fading ghost while the new one fades in (see the paint
         // dispatch below). `mode_t` drives the crossfade.
@@ -1799,10 +1863,21 @@ impl Carousel {
 
         // Manual press tracking — raw input can't be stolen by widget
         // routing (same approach as the album row's scrollbar).
-        if interactive && ctx.input(|i| i.pointer.primary_pressed()) {
+        if interactive && !resizing && ctx.input(|i| i.pointer.primary_pressed()) {
             if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
+                // A press that armed a window-resize grip belongs to
+                // the OS resize — the root stamps the CURRENT frame
+                // number when BeginResize fires (`insert_temp` is
+                // session-lifetime, so a bare bool would stick and
+                // block every later press).
+                let grip_press = ctx
+                    .data(|d| {
+                        d.get_temp::<u64>(egui::Id::new("resize_grip_press"))
+                    })
+                    .map(|f| f == ctx.cumulative_frame_nr())
+                    .unwrap_or(false);
                 let over_slider = slider_rect.map(|r| r.contains(p)).unwrap_or(false);
-                if rect.contains(p) && !over_slider {
+                if rect.contains(p) && !over_slider && !grip_press {
                     // Press inside the scrollbar's grab zone owns the
                     // drag — store the offset within the thumb (or the
                     // whole thumb when grabbing the track) so it never
@@ -1817,20 +1892,21 @@ impl Carousel {
                         };
                         self.sb_drag = Some(t.clamp(0.0, len));
                     } else {
-                        // Item under the press — the hold-to-lift
-                        // candidate. Only resolved when reordering is
-                        // possible (unfiltered); the hit test projects
-                        // quads, so skip it otherwise.
-                        let item = if reorderable {
-                            match mode {
-                                Mode::Carousel => {
-                                    self.hit_carousel(p, grid_area, &visible, row, &ctx, cfg, s)
-                                }
-                                _ => self.hit_grid(p, &visible, geo.as_ref().unwrap()),
+                        // Item under the press — needed for
+                        // select-on-press in every mode; it doubles as
+                        // the hold-to-lift candidate only when
+                        // reordering is possible (unfiltered).
+                        let hit = match mode {
+                            Mode::Carousel => {
+                                self.hit_carousel(p, grid_area, &visible, row, &ctx, cfg, s)
                             }
-                        } else {
-                            None
+                            _ => self.hit_grid(p, &visible, geo.as_ref().unwrap()),
                         };
+                        if let Some(vi) = hit {
+                            let mods = ctx.input(|i| i.modifiers);
+                            self.select_vi(vi, mods, &visible);
+                        }
+                        let item = if reorderable { hit } else { None };
                         self.press = Some(Press {
                             start: p,
                             last: p,
@@ -2096,30 +2172,8 @@ impl Carousel {
                     };
                     if let Some(vi) = hit {
                         let idx = visible[vi];
-                        self.sel = idx;
-                        // Multi-selection (SelectionMode=Multiple):
-                        // Shift extends a range from the anchor, Ctrl
-                        // toggles the item, plain click singles it.
-                        // Ranges run over *visible* items — filtered-
-                        // out tracks never get silently selected.
-                        let mods = ctx.input(|i| i.modifiers);
-                        if mods.shift {
-                            let anchor_vi = visible
-                                .iter()
-                                .position(|&i| i == self.sel_anchor)
-                                .unwrap_or(vi);
-                            let (a, b) = (anchor_vi.min(vi), anchor_vi.max(vi));
-                            self.sel_set = visible[a..=b].iter().copied().collect();
-                        } else if mods.ctrl || mods.command {
-                            if !self.sel_set.remove(&idx) {
-                                self.sel_set.insert(idx);
-                            }
-                            self.sel_anchor = idx;
-                        } else {
-                            self.sel_set = BTreeSet::from([idx]);
-                            self.sel_anchor = idx;
-                        }
-                        self.sel_touched = true;
+                        // Selection already landed on press — the
+                        // release only navigates / plays.
                         if resp.double_clicked() {
                             // Snap to the item and play it.
                             if mode == Mode::Carousel {
@@ -3555,5 +3609,43 @@ mod tests {
         // A lone item never splits into phantom rows.
         let single = GridGeo::horizontal(rect, 1, &cfg, 1.0, 2);
         assert_eq!(single.columns, 1);
+    }
+
+    /// Regression: the resize-grip drag used to pop a card into
+    /// reorder mode — the window moved under a held pointer and the
+    /// re-mapped coords read as a drag gesture. The watch must flag
+    /// every frame the screen rect changes (press/drag is dropped and
+    /// new presses blocked) and settle when it stops.
+    #[test]
+    fn resize_watch_flags_screen_changes() {
+        let mut w = ResizeWatch::default();
+        let a = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let b = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        assert!(!w.update(a)); // first frame: baseline, not a resize
+        assert!(!w.update(a)); // stable: no resize
+        assert!(w.update(b)); // resize starts
+        assert!(w.update(a)); // still dragging — keep blocking
+        assert!(!w.update(a)); // settled
+    }
+
+    /// Select-on-press semantics: plain press singles, Shift extends
+    /// from the anchor, Ctrl toggles — all applied on mouse-down.
+    #[test]
+    fn select_vi_covers_plain_shift_ctrl() {
+        let mut c = Carousel::new();
+        let visible: Vec<usize> = (0..6).collect();
+        // Plain press singles.
+        c.select_vi(2, egui::Modifiers::NONE, &visible);
+        assert_eq!(c.sel, 2);
+        assert_eq!(c.sel_set, BTreeSet::from([2]));
+        // Shift extends a range from the anchor.
+        c.select_vi(4, egui::Modifiers::SHIFT, &visible);
+        assert_eq!(c.sel_set, BTreeSet::from([2, 3, 4]));
+        // Ctrl toggles one item on/off.
+        c.select_vi(0, egui::Modifiers::CTRL, &visible);
+        assert!(c.sel_set.contains(&0));
+        c.select_vi(0, egui::Modifiers::CTRL, &visible);
+        assert!(!c.sel_set.contains(&0));
+        assert!(c.sel_touched);
     }
 }

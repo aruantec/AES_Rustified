@@ -12,11 +12,6 @@ This port focuses on the multimedia side: a cover-flow carousel and card grids f
 library, local folder scanning, online media playback (YouTube and friends via yt-dlp), playlist
 import/export, a metadata editor, an equalizer, and the spectrum-driven shader backgrounds.
 
-Supports Plasma6 Wallpaper (Shadertoy/Fragment) Shaders in the same loose uniform convention as
-Lacrima (`iResolution`, `iTime`, `iChannel0` spectrum, `iChannel1` cover) — GLSL is translated to
-WGSL at runtime via naga. The bundled collection lives in `shaders/shadertoys`.
-<br />[https://github.com/y4my4my4m/kde-shader-wallpaper](https://github.com/y4my4my4m/kde-shader-wallpaper/tree/master/package/contents/ui/Shaders)<br />
-
 Some of the included shaders react to the music by using the player's spectrum data (`iChannel0`
 is fed a 512-wide spectrum texture every frame).
 
@@ -103,4 +98,4 @@ out of or in connection with the software or the use or other dealings in the so
 **You, the user, are solely responsible for how you use this software** and for any
 consequences of that use, including any damage caused directly or indirectly by the
 software, and for ensuring your use complies with the laws and terms of service applicable
-to you (media downloads, emulator and ROM usage, third-party APIs, and so on).
+to you.

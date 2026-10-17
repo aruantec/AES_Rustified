@@ -3518,6 +3518,17 @@ fn lacrima_window_frame(
                 if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
                     boot_mark(&format!("resize grip {dir:?}"));
                     ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+                    // This press belongs to the OS resize — flag it so
+                    // the cover view (and any press-tracked view under
+                    // the grip) never registers it. `insert_temp` lives
+                    // for the session, so the value is a frame stamp:
+                    // readers match it against the CURRENT frame.
+                    // The stamp is read OUTSIDE data_mut — a ctx read
+                    // inside the write lock deadlocks.
+                    let frame = ctx.cumulative_frame_nr();
+                    ctx.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("resize_grip_press"), frame)
+                    });
                 }
             }
 
