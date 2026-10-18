@@ -134,6 +134,11 @@ pub struct Transport {
     /// SearchPill (`expand: hover || focus || has text`).
     filter_expanded: bool,
     filter_focused: bool,
+    /// Play pressed while the player couldn't toggle (no player yet,
+    /// or Stopped/Finished — `toggle()` only maps Playing/Paused).
+    /// The app consumes it via `take_play_request` and picks what to
+    /// start instead.
+    play_request: bool,
 }
 
 impl Transport {
@@ -156,6 +161,19 @@ impl Transport {
     /// the same fade.
     pub fn compact_mix(&self) -> f32 {
         self.compact_t
+    }
+
+    /// Surface a play intent the band can't serve itself — used by the
+    /// other play surfaces (turntable arm, media key) so every "play"
+    /// lands on the same fallback ladder.
+    pub fn request_play(&mut self) {
+        self.play_request = true;
+    }
+
+    /// A play click arrived while nothing could toggle — the app
+    /// decides what to start (selection → loaded album → first album).
+    pub fn take_play_request(&mut self) -> bool {
+        std::mem::take(&mut self.play_request)
     }
 
     /// Ctrl+F into the album filter — opens the overflow drawer and
@@ -304,8 +322,20 @@ impl Transport {
 
         let r = hit(play, "t-play", "Play / Pause");
         if r.clicked() {
-            if let Some(p) = player {
-                p.toggle();
+            match player {
+                // Playing/Paused toggle in place — anything else (no
+                // player yet, Stopped, Finished) asks the app to
+                // start something (Lacrima's TogglePlay falls back to
+                // the selected item).
+                Some(p)
+                    if matches!(
+                        p.state(),
+                        PlayerState::Playing | PlayerState::Paused
+                    ) =>
+                {
+                    p.toggle()
+                }
+                _ => self.play_request = true,
             }
         }
         hover_cursor(ui, &r);
@@ -460,8 +490,16 @@ impl Transport {
 
         let r = hit(play, "t-cplay", "Play / Pause");
         if r.clicked() {
-            if let Some(p) = player {
-                p.toggle();
+            match player {
+                Some(p)
+                    if matches!(
+                        p.state(),
+                        PlayerState::Playing | PlayerState::Paused
+                    ) =>
+                {
+                    p.toggle()
+                }
+                _ => self.play_request = true,
             }
         }
         hover_cursor(ui, &r);

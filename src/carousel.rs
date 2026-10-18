@@ -950,6 +950,13 @@ impl Carousel {
         self.items.get(self.sel).map(|i| i.path.clone())
     }
 
+    /// The first item's path — the transport play button's fallback
+    /// when no card is selected (Lacrima's TogglePlay →
+    /// SelectedMediaItem; an opened album selects index 0 anyway).
+    pub fn first_path(&self) -> Option<PathBuf> {
+        self.items.first().map(|i| i.path.clone())
+    }
+
     /// Select-on-press (Explorer/ListBox semantics): the selection
     /// lands on mouse-down, not on release — gating it on `clicked()`
     /// made every selection feel delayed. Shift extends a range from

@@ -692,6 +692,75 @@ fn export_playlists(
     }
 }
 
+/// Load an album into the cover view — the strip's Opened action and
+/// the transport play-fallback share this. The top cover feeds the
+/// spectrum gradient + shadertoy palette, decoded on a worker (a Web
+/// source is a network fetch — seconds — which used to freeze the
+/// whole view); persisted url items append after the file tracks
+/// (Lacrima's album Children contain both kinds).
+fn open_album(
+    album: &library::Album,
+    settings: &settings::Settings,
+    carousel: &mut carousel::Carousel,
+    album_cover_rx: &mut Option<
+        std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
+    >,
+    url_info_rx: &mut Option<
+        std::sync::mpsc::Receiver<Vec<(std::path::PathBuf, library::TrackInfo)>>,
+    >,
+) {
+    if let Some(src) = album.covers.last().cloned() {
+        let dir = album.dir.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("aes-album-cover".into())
+            .spawn(move || {
+                let _ = tx.send((dir, library::decode_cover(&src)));
+            })
+            .ok();
+        *album_cover_rx = Some(rx);
+    } else {
+        *album_cover_rx = None;
+    }
+    let urls = settings
+        .library
+        .url_items
+        .get(&album.dir.to_string_lossy().into_owned())
+        .cloned()
+        .unwrap_or_default();
+    let (tracks, title) = carousel.open(album, &urls);
+    *url_info_rx = Some(library::spawn_url_info(tracks, title));
+}
+
+/// What the transport play button should start when the player can't
+/// just toggle (no player yet, Stopped, Finished).
+enum PlayFallback {
+    /// Queue this track for `pending_play`.
+    Track(std::path::PathBuf),
+    /// Open this album (index into `albums`), then queue its first
+    /// item.
+    OpenAlbum(usize),
+}
+
+/// Lacrima's TogglePlay falls back to the selected media item when
+/// nothing is loaded; the ladder extends it: selected card → first
+/// item of the loaded album → the strip-selected album → the first
+/// album in the library.
+fn play_fallback(
+    carousel: &carousel::Carousel,
+    row: &album_row::AlbumRow,
+    albums: &[library::Album],
+) -> Option<PlayFallback> {
+    if let Some(t) = carousel.primary_path().or_else(|| carousel.first_path()) {
+        return Some(PlayFallback::Track(t));
+    }
+    let i = row
+        .selected_dir()
+        .and_then(|d| albums.iter().position(|a| a.dir.to_string_lossy() == d))
+        .or_else(|| (!albums.is_empty()).then_some(0))?;
+    Some(PlayFallback::OpenAlbum(i))
+}
+
 /// System fonts appended to the egui font families as per-character
 /// fallbacks. egui's built-in fonts lack CJK, Hangul, Arabic, the
 /// Mathematical Alphanumeric block (YouTube "𝗕𝗢𝗟𝗗" titles) and
@@ -1959,8 +2028,17 @@ impl eframe::App for AesRustApp {
                             }
                         }
                         if pout.toggle_play {
-                            if let Some(p) = player.as_ref() {
-                                p.toggle();
+                            match player.as_ref() {
+                                Some(p)
+                                    if matches!(
+                                        p.state(),
+                                        audio::PlayerState::Playing
+                                            | audio::PlayerState::Paused
+                                    ) =>
+                                {
+                                    p.toggle()
+                                }
+                                _ => transport.request_play(),
                             }
                         }
                         // PlayerInfo strip — the active item's
@@ -2916,35 +2994,13 @@ impl eframe::App for AesRustApp {
                         // wrong album.
                         let i = albums.iter().position(|a| a.dir.to_string_lossy() == dir);
                         if let Some(album) = i.and_then(|i| albums.get(i)) {
-                            // The top cover feeds the spectrum gradient +
-                            // shadertoy palette — decode it off the UI
-                            // thread: a Web source is a network fetch
-                            // (seconds), which used to freeze the whole
-                            // view (and stall track-end advance).
-                            if let Some(src) = album.covers.last().cloned() {
-                                let dir = album.dir.to_string_lossy().into_owned();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                std::thread::Builder::new()
-                                    .name("aes-album-cover".into())
-                                    .spawn(move || {
-                                        let _ = tx.send((dir, library::decode_cover(&src)));
-                                    })
-                                    .ok();
-                                *album_cover_rx = Some(rx);
-                            } else {
-                                *album_cover_rx = None;
-                            }
-                            // The album's persisted url items append
-                            // after its file tracks (Lacrima's album
-                            // Children contain both kinds).
-                            let urls = settings
-                                .library
-                                .url_items
-                                .get(&album.dir.to_string_lossy().into_owned())
-                                .cloned()
-                                .unwrap_or_default();
-                            let (tracks, title) = carousel.open(album, &urls);
-                            *url_info_rx = Some(library::spawn_url_info(tracks, title));
+                            open_album(
+                                album,
+                                settings,
+                                carousel,
+                                album_cover_rx,
+                                url_info_rx,
+                            );
                         }
                     }
                     album_row::Action::Selected(_) | album_row::Action::None => {}
@@ -2954,6 +3010,27 @@ impl eframe::App for AesRustApp {
                 // they must also run while the window is minimized,
                 // where ui() never executes. ui() only queues the
                 // request; logic() drains it next pass (~16ms).
+                // The play button / turntable arm / media key landed
+                // while nothing could toggle — run the fallback
+                // ladder (an explicit card action still wins).
+                if transport.take_play_request() && play_path.is_none() {
+                    match play_fallback(carousel, album_row, albums) {
+                        Some(PlayFallback::Track(t)) => pending_play.push(t),
+                        Some(PlayFallback::OpenAlbum(i)) => {
+                            open_album(
+                                &albums[i],
+                                settings,
+                                carousel,
+                                album_cover_rx,
+                                url_info_rx,
+                            );
+                            if let Some(t) = carousel.first_path() {
+                                pending_play.push(t);
+                            }
+                        }
+                        None => {}
+                    }
+                }
                 if let Some(track) = play_path {
                     pending_play.push(track);
                 }
@@ -4356,8 +4433,16 @@ fn music_view(
     if ui.ctx().input(|i| i.viewport().focused.unwrap_or(false)) {
         media_key_events(|k| match k {
             MediaKey::PlayPause => {
-                if let Some(p) = player {
-                    p.toggle();
+                match player {
+                    Some(p)
+                        if matches!(
+                            p.state(),
+                            audio::PlayerState::Playing | audio::PlayerState::Paused
+                        ) =>
+                    {
+                        p.toggle()
+                    }
+                    _ => transport.request_play(),
                 }
             }
             MediaKey::Stop => {
@@ -6958,6 +7043,37 @@ mod tests {
             album_row::Action::Opened("b".into()),
         );
         assert!(matches!(merged, album_row::Action::Opened(ref d) if d == "b"));
+    }
+
+    /// The dead play button regression: with no player (or a stopped
+    /// one) the button must start something — the loaded album's
+    /// first item when one is open, else the first album opens.
+    #[test]
+    fn play_fallback_ladder() {
+        let mut car = carousel::Carousel::new();
+        let row = album_row::AlbumRow::new();
+        let albums = vec![
+            library::Album::placeholder("a"),
+            library::Album::placeholder("b"),
+        ];
+        // Nothing loaded -> open the first album.
+        assert!(matches!(
+            play_fallback(&car, &row, &albums),
+            Some(PlayFallback::OpenAlbum(0))
+        ));
+        // Empty library -> nothing to do.
+        assert!(matches!(play_fallback(&car, &row, &[]), None));
+        // An album is open -> its first item plays directly.
+        let mut a = library::Album::placeholder("x");
+        a.tracks = vec![
+            std::path::PathBuf::from("x/t1.mp3"),
+            std::path::PathBuf::from("x/t2.mp3"),
+        ];
+        car.open(&a, &[]);
+        assert!(matches!(
+            play_fallback(&car, &row, &albums),
+            Some(PlayFallback::Track(t)) if t == std::path::PathBuf::from("x/t1.mp3")
+        ));
     }
 
     /// Settings tabs wrap into extra rows on narrow panels — before
