@@ -175,11 +175,14 @@ impl TagEditor {
                     self.album = tag.album().unwrap_or_default().to_string();
                     self.artist = tag.artist().unwrap_or_default().to_string();
                     self.track = tag.track().map(|t| t.to_string()).unwrap_or_default();
-                    self.year = tag.year().map(|y| y.to_string()).unwrap_or_default();
+                    self.year = tag
+                        .get_string(lofty::tag::ItemKey::Year)
+                        .unwrap_or_default()
+                        .to_string();
                     self.genres = tag.genre().unwrap_or_default().to_string();
                     self.comment = tag.comment().unwrap_or_default().to_string();
                     self.lyrics = tag
-                        .get_string(&lofty::tag::ItemKey::Lyrics)
+                        .get_string(lofty::tag::ItemKey::Lyrics)
                         .unwrap_or_default()
                         .to_string();
                     self.images = tag
@@ -283,7 +286,7 @@ impl TagEditor {
             let mut set = |key: lofty::tag::ItemKey, val: &str| {
                 let val = val.trim();
                 if val.is_empty() {
-                    tag.remove_key(&key);
+                    tag.remove_key(key);
                 } else {
                     tag.insert_text(key, val.to_string());
                 }
@@ -301,23 +304,22 @@ impl TagEditor {
             }
             let y = self.year.trim();
             match y.parse::<u32>() {
-                Ok(n) if !y.is_empty() => tag.set_year(n),
-                _ => tag.remove_year(),
+                Ok(n) if !y.is_empty() => {
+                    tag.insert_text(lofty::tag::ItemKey::Year, n.to_string());
+                }
+                _ => tag.remove_key(lofty::tag::ItemKey::Year),
             }
             while tag.picture_count() > 0 {
                 tag.remove_picture(0);
             }
             for img in &self.images {
-                tag.push_picture(Picture::new_unchecked(
-                    img.kind,
-                    Some(sniff_mime(&img.data)),
-                    if img.desc.is_empty() {
-                        None
-                    } else {
-                        Some(img.desc.clone())
-                    },
-                    img.data.clone(),
-                ));
+                let mut pic = Picture::unchecked(img.data.clone())
+                    .pic_type(img.kind)
+                    .mime_type(sniff_mime(&img.data));
+                if !img.desc.is_empty() {
+                    pic = pic.description(img.desc.clone());
+                }
+                tag.push_picture(pic.build());
             }
         }
         tagged

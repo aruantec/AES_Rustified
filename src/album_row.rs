@@ -1287,6 +1287,14 @@ impl AlbumRow {
             self.current_scroll = self.target_scroll;
             self.spring_velocity = 0.0;
         }
+        // The app is event-driven — an unsettled scroll spring must
+        // keep asking for frames. Without this a keyboard reveal
+        // (scroll_tile_into_view) or the rubber-band relax only moved
+        // while other input/events happened to arrive, which read as
+        // laggy stepped scrolling.
+        if !self.scroll_settled(m.max_scroll) {
+            ui.ctx().request_repaint();
+        }
 
         // Fan spread + hover lift — near-critical springs so hover has
         // inertia and a gentle settle without visible bounce (the old
@@ -1779,6 +1787,16 @@ impl AlbumRow {
             };
             self.target_scroll = target.clamp(0.0, m.max_scroll);
         }
+    }
+
+    /// Whether the scroll spring has nothing left to do — at its
+    /// target, no velocity, and the target itself inside the
+    /// rubber-band range. Feeds the repaint keepalive in `ui()`.
+    fn scroll_settled(&self, max_scroll: f32) -> bool {
+        self.current_scroll == self.target_scroll
+            && self.spring_velocity == 0.0
+            && self.target_scroll >= 0.0
+            && self.target_scroll <= max_scroll
     }
 
     /// Ctrl+A — every shown album selected (keyed by dir, like the
@@ -2276,5 +2294,33 @@ mod tests {
         }
         assert!(row.title_fade.values().all(|&v| v > 0.99));
         assert!(!row.title_fade_step(0.016)); // settled -> no repaint
+    }
+
+    /// The scroll spring's keepalive predicate: a moved target, live
+    /// velocity, or an out-of-bounds (rubber-banding) target all mean
+    /// "still moving" — only a snapped-in-range rest state is settled.
+    /// Without it keyboard reveals froze mid-glide between input
+    /// events.
+    #[test]
+    fn scroll_spring_reports_unsettled_until_rest() {
+        let mut row = AlbumRow::new();
+        assert!(row.scroll_settled(100.0));
+        // A reveal moved the target — spring still has to travel.
+        row.target_scroll = 50.0;
+        assert!(!row.scroll_settled(100.0));
+        // Arrived but still carrying velocity — not settled yet.
+        row.current_scroll = 50.0;
+        row.spring_velocity = 3.0;
+        assert!(!row.scroll_settled(100.0));
+        // Snapped at rest.
+        row.spring_velocity = 0.0;
+        assert!(row.scroll_settled(100.0));
+        // Overshot rubber-band target — the relax pass needs frames.
+        row.target_scroll = 140.0;
+        row.current_scroll = 140.0;
+        assert!(!row.scroll_settled(100.0));
+        row.target_scroll = -10.0;
+        row.current_scroll = -10.0;
+        assert!(!row.scroll_settled(100.0));
     }
 }

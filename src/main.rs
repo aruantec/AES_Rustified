@@ -297,7 +297,7 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         wgpu_options,
         viewport: egui::ViewportBuilder::default()
-            .with_title("AES Lacrima [Rust]")
+            .with_title("AES Oxide")
             // Taskbar/alt-tab icon (the file icon comes from app.rc).
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/AES.png"))
@@ -312,7 +312,7 @@ fn main() -> eframe::Result<()> {
 
     boot_mark("run_native enter");
     eframe::run_native(
-        "AES Lacrima [Rust]",
+        "AES Oxide",
         native_options,
         Box::new(move |cc| {
             boot_mark("creation ctx (window+wgpu device ready)");
@@ -390,7 +390,7 @@ fn work_area_rect(ctx: &egui::Context) -> Option<Rect> {
 /// so one rides along as a companion — sent AFTER Fullscreen so it sees
 /// the new state (`window.fullscreen()` flips synchronously). The window
 /// is already borderless, so `Decorations(false)` itself changes nothing.
-fn set_fullscreen(ctx: &egui::Context, on: bool) {
+pub(crate) fn set_fullscreen(ctx: &egui::Context, on: bool) {
     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(on));
     ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
 }
@@ -494,6 +494,9 @@ struct AesRustApp {
     /// a stale highlight in the other view can never delete
     /// (Lacrima's per-ListBox selection scope).
     sel_owner: SelOwner,
+    /// Same owner routing for the Emulation view — `Albums` is the
+    /// console-section strip, `Cards` the loaded section's games.
+    emu_sel_owner: SelOwner,
     /// Alt-tap detection for the cover-layout cycle — Alt is a
     /// modifier, not a Key event, so the handler watches its edge
     /// and requires a clean press→release (no other key, window
@@ -505,6 +508,10 @@ struct AesRustApp {
     fs_exit: FsExitPrompt,
     /// Item/album delete confirmation — same dialog style.
     del_prompt: DeletePrompt,
+    /// "Close emulator?" confirmation — same dialog again.
+    emu_close: EmuClosePrompt,
+    /// "Exit application?" confirmation — the main menu's Esc.
+    app_exit: AppExitPrompt,
     /// Emulation view state — section strip, item search, active
     /// section (prototype; ROM items land later).
     emu: emulation::EmuView,
@@ -513,11 +520,48 @@ struct AesRustApp {
 
 /// Selection owner for Delete-key routing — set by whichever view
 /// last saw a user selection gesture.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SelOwner {
     None,
     Albums,
     Cards,
+}
+
+/// Resolves which emulation surface owns the keyboard this frame —
+/// the requested owner clamped by what's actually navigable: a
+/// collapsed section strip can't take keys, an empty card view falls
+/// back to the strip, and with nothing touched yet a loaded section's
+/// cards win (the same default as the audio view's arrow routing).
+fn emu_key_owner(sel: SelOwner, list_open: bool, has_items: bool) -> SelOwner {
+    match sel {
+        SelOwner::Albums => {
+            if list_open {
+                SelOwner::Albums
+            } else if has_items {
+                SelOwner::Cards
+            } else {
+                SelOwner::None
+            }
+        }
+        SelOwner::Cards => {
+            if has_items {
+                SelOwner::Cards
+            } else if list_open {
+                SelOwner::Albums
+            } else {
+                SelOwner::None
+            }
+        }
+        SelOwner::None => {
+            if has_items {
+                SelOwner::Cards
+            } else if list_open {
+                SelOwner::Albums
+            } else {
+                SelOwner::None
+            }
+        }
+    }
 }
 
 /// The Switch-style exit-fullscreen confirmation: a translucent veil
@@ -538,6 +582,55 @@ struct FsExitPrompt {
 impl FsExitPrompt {
     fn begin(&mut self, ctx: &egui::Context) {
         self.sel = 0;
+        self.open = true;
+        self.pending_exit = false;
+        ctx.request_repaint();
+    }
+}
+
+/// The same Switch-style confirmation for closing a running emulator
+/// — Ctrl+Q, Esc's session branch, the band's power button and the
+/// capture menu's "Close Emulator" all land here instead of stopping
+/// directly. Unlike fs_exit, Cancel is the focused default: this one
+/// kills the game session.
+#[derive(Default)]
+struct EmuClosePrompt {
+    open: bool,
+    /// 0 = Close, 1 = Cancel — Tab/arrows toggle, hover follows.
+    sel: usize,
+    /// Painted fade 0..1 — trails `open` like fs_exit's.
+    vis: f32,
+    /// Close confirmed — the session stops once the fade completes.
+    pending_stop: bool,
+}
+
+impl EmuClosePrompt {
+    fn begin(&mut self, ctx: &egui::Context) {
+        self.sel = 1; // safe default: Cancel focused
+        self.open = true;
+        self.pending_stop = false;
+        ctx.request_repaint();
+    }
+}
+
+/// The same Switch-style confirmation for quitting the app — the
+/// main menu's Esc lands here (there's nothing left to go back to).
+/// Cancel is the focused default: confirming exits the process,
+/// killing any emulator session still running.
+#[derive(Default)]
+struct AppExitPrompt {
+    open: bool,
+    /// 0 = Exit, 1 = Cancel — Tab/arrows toggle, hover follows.
+    sel: usize,
+    /// Painted fade 0..1 — trails `open` like fs_exit's.
+    vis: f32,
+    /// Exit confirmed — the window closes once the fade completes.
+    pending_exit: bool,
+}
+
+impl AppExitPrompt {
+    fn begin(&mut self, ctx: &egui::Context) {
+        self.sel = 1; // safe default: Cancel focused
         self.open = true;
         self.pending_exit = false;
         ctx.request_repaint();
@@ -993,10 +1086,13 @@ impl AesRustApp {
             playing_track: None,
             pending_play: Vec::new(),
             sel_owner: SelOwner::None,
+            emu_sel_owner: SelOwner::None,
             alt_down: false,
             alt_clean: false,
             fs_exit: FsExitPrompt::default(),
             del_prompt: DeletePrompt::default(),
+            emu_close: EmuClosePrompt::default(),
+            app_exit: AppExitPrompt::default(),
             emu: emulation::EmuView::new(),
             started: std::time::Instant::now(),
         };
@@ -1432,7 +1528,7 @@ impl eframe::App for AesRustApp {
             // crossfade stalls until the next OS event arrives.
             ui.ctx().request_repaint();
         }
-        self.logo.advance(dt, "AES Lacrima [Rust]");
+        self.logo.advance(dt, "AES Oxide");
         // A glitch burst freezes mid-scramble if repaints stop —
         // keep frames coming until it plays out.
         if self.logo.glitching() {
@@ -1684,10 +1780,13 @@ impl eframe::App for AesRustApp {
             playing_track,
             pending_play,
             sel_owner,
+            emu_sel_owner,
             alt_down,
             alt_clean,
             fs_exit,
             del_prompt,
+            emu_close,
+            app_exit,
             emu,
             shadertoy,
             ..
@@ -1885,7 +1984,9 @@ impl eframe::App for AesRustApp {
             && !tag_editor.is_open()
             && !url_prompt.is_open()
             && !fs_exit.open
-            && !del_prompt.open;
+            && !del_prompt.open
+            && !emu_close.open
+            && !app_exit.open;
         // The scrollbar grab zone owns the window's bottom edge in the
         // Music view: suppress the resize grip over the same rect so
         // presses reach the scrollbar instead of starting a resize.
@@ -1902,7 +2003,7 @@ impl eframe::App for AesRustApp {
         };
         lacrima_window_frame(
             ui,
-            "AES Lacrima [Rust]",
+            "AES Oxide",
             logo,
             elapsed,
             back_icon,
@@ -2222,19 +2323,52 @@ impl eframe::App for AesRustApp {
                 if carousel.take_sel_touched() {
                     *sel_owner = SelOwner::Cards;
                 }
+                if emu.row.take_sel_touched() {
+                    *emu_sel_owner = SelOwner::Albums;
+                }
+                if emu.cards.take_sel_touched() {
+                    *emu_sel_owner = SelOwner::Cards;
+                }
                 // Emulation game-list edits (Add Roms / Scan Folder /
                 // Remove / Clear, Xenia path) persist immediately.
                 if emu.take_settings_dirty() {
                     settings::save(settings);
                 }
-                // Enter on the Emulation view launches the selected
-                // game when no session is running — with a game in
-                // the background it switches back to the capture
-                // viewport instead (one emulator at a time).
+                // The band's power button and the capture menu's
+                // "Close Emulator" park a close request — it becomes
+                // the same confirm prompt Ctrl+Q/Esc open.
+                if emu.take_close_request() {
+                    emu_close.begin(ui.ctx());
+                }
+                // The Emulation view owns the keys while it's up —
+                // the section strip and the game cards take the same
+                // shortcuts as the audio view's album strip and cover
+                // items: arrows navigate the owning surface,
+                // Shift+arrows reorder it, Tab cycles strip ↔ cards,
+                // Ctrl+A selects all, Enter opens the strip-selected
+                // section or launches the selected game, Delete is
+                // the cards' remove-confirm (sections aren't
+                // deletable). While the capture viewport is up the
+                // strip stays visible so it keeps nav — the covered
+                // cards can't hold ownership; Tab then runs the ⇄
+                // switch to reach them, as does Ctrl+S (the band's
+                // viewport toggle). The input tunnel is the one
+                // hard block — its keys belong to the game.
+                let cap_up = emu.session.is_some() && !emu.viewport_dismissed;
+                // Ctrl+M — the input tunnel (mouse emulation): pointer
+                // and keys over the capture PostMessage into the
+                // emulator's hidden window. Checked before the nav
+                // block because it must stay reachable while the
+                // tunnel is lit — the block below yields to it.
+                let tun_gate = cap_up
+                    && if cfg!(windows) {
+                        true
+                    } else {
+                        emu.session.as_ref().is_some_and(|s| s.embedded())
+                    };
                 if view_interactive
                     && nav.target() == View::Emulation
-                    && (emu.session.is_none() || emu.viewport_dismissed)
-                    && emu.active.is_some()
+                    && tun_gate
                     && !emu.editor.is_open()
                     && !emu.patches.is_open()
                     && !emu.cfg_ov.is_open()
@@ -2243,23 +2377,14 @@ impl eframe::App for AesRustApp {
                     && !ui.ctx().text_edit_focused()
                     && ui
                         .ctx()
-                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                        .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M))
                 {
-                    if emu.session.is_some() {
-                        emu.viewport_dismissed = false;
-                    } else if let Some(game) = emu.cards.primary_path() {
-                        emu.launch(&settings.emulation, &game);
-                    }
+                    emu.toggle_input_tunnel();
                 }
-                // The Emulation view owns the keys while it's up —
-                // the ROM cards navigate/select exactly like the
-                // audio list (arrows, Ctrl+A, Delete → confirm). With
-                // a session running they only work while the capture
-                // viewport is dismissed (the list is the visible UI).
                 if view_interactive
                     && nav.target() == View::Emulation
-                    && (emu.session.is_none() || emu.viewport_dismissed)
-                    && emu.active.is_some()
+                    && !emu.input_tun
+                    && (emu.active.is_some() || !emu.sections.is_empty())
                     && !emu.editor.is_open()
                     && !emu.patches.is_open()
                     && !emu.cfg_ov.is_open()
@@ -2267,8 +2392,26 @@ impl eframe::App for AesRustApp {
                     && !emu.render_open
                     && !ui.ctx().text_edit_focused()
                 {
+                    let owner = emu_key_owner(
+                        *emu_sel_owner,
+                        emu.list_open,
+                        emu.cards.has_items() && !cap_up,
+                    );
                     let (mut dx, mut dy) = (0i32, 0i32);
+                    let (mut mdx, mut mdy) = (0i32, 0i32);
                     ui.ctx().input_mut(|i| {
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
+                            mdx -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
+                            mdx += 1;
+                        }
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                            mdy -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                            mdy += 1;
+                        }
                         if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
                             dx -= 1;
                         }
@@ -2282,23 +2425,137 @@ impl eframe::App for AesRustApp {
                             dy += 1;
                         }
                     });
-                    if dx != 0 || dy != 0 {
-                        emu.cards.arrow(&emu.search.text, dx, dy);
+                    // Shift+arrows reorder; plain arrows navigate —
+                    // same owner routing either way.
+                    if mdx != 0 || mdy != 0 {
+                        match owner {
+                            SelOwner::Albums => {
+                                emu.row.move_selection(&mut emu.sections, mdx + mdy)
+                            }
+                            SelOwner::Cards => {
+                                emu.cards.move_selection(&emu.search.text, mdx, mdy)
+                            }
+                            SelOwner::None => {}
+                        }
+                    } else if dx != 0 || dy != 0 {
+                        match owner {
+                            SelOwner::Albums => emu.row.arrow(dx + dy),
+                            SelOwner::Cards => emu.cards.arrow(&emu.search.text, dx, dy),
+                            SelOwner::None => {}
+                        }
                     }
                     if ui
                         .ctx()
                         .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
                     {
-                        emu.cards.select_all(&emu.search.text);
+                        match owner {
+                            SelOwner::Albums => emu.row.select_all(),
+                            _ => emu.cards.select_all(&emu.search.text),
+                        }
                     }
                     if ui
                         .ctx()
                         .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                        && owner == SelOwner::Cards
                     {
                         let paths = emu.cards.selected_paths();
                         if !paths.is_empty() {
                             emu.pending_delete = Some(paths);
                         }
+                    }
+                    // Tab — the strip ↔ cards focus cycle (the audio
+                    // view's SelOwner swap). The flipped owner clamps
+                    // through `emu_key_owner`, so a collapsed strip or
+                    // empty card view keeps the current surface.
+                    // While the capture is up the cards can't own
+                    // focus — Tab runs the band's ⇄ switch instead and
+                    // hands them the selection once they're visible.
+                    if ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+                    {
+                        if cap_up {
+                            emu.dismiss_viewport();
+                            *emu_sel_owner = SelOwner::Cards;
+                            emu.cards.focus(&emu.search.text);
+                        } else {
+                            let next = if *emu_sel_owner == SelOwner::Cards {
+                                SelOwner::Albums
+                            } else {
+                                SelOwner::Cards
+                            };
+                            *emu_sel_owner =
+                                emu_key_owner(next, emu.list_open, emu.cards.has_items());
+                            match *emu_sel_owner {
+                                SelOwner::Albums => emu.row.focus(),
+                                SelOwner::Cards => emu.cards.focus(&emu.search.text),
+                                SelOwner::None => {}
+                            }
+                        }
+                    }
+                    // Enter — activates the owning surface like a
+                    // double-click: opens the strip-selected section,
+                    // launches the selected game.
+                    if ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                    {
+                        match owner {
+                            SelOwner::Albums => {
+                                if let Some(dir) = emu.row.selected_dir() {
+                                    if let Some(i) = emu
+                                        .sections
+                                        .iter()
+                                        .position(|s| s.dir.to_string_lossy() == dir)
+                                    {
+                                        emu.activate_section(i, &settings.emulation);
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Enter on a card is the double-click's
+                                // Play route: the running game swaps
+                                // back to the capture, a different one
+                                // queues behind the session's close.
+                                if let Some(game) = emu.cards.primary_path() {
+                                    emu.play_card(&game, &settings.emulation);
+                                }
+                            }
+                        }
+                    }
+                    // Ctrl+S — the band's ⇄ switch (capture ↔ card
+                    // list), reachable while the capture is up. Not
+                    // while the tunnel owns input: Ctrl+S is RPCS3's
+                    // graceful-stop key and belongs to the game then.
+                    if emu.session.is_some()
+                        && ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S))
+                    {
+                        emu.toggle_viewport();
+                    }
+                    // Ctrl+E — the capture's double-click: toggles
+                    // game-fullscreen. From the list it jumps straight
+                    // into fullscreen capture (entering un-dismisses).
+                    if emu.session.is_some()
+                        && ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E))
+                    {
+                        emu.toggle_fullscreen();
+                    }
+                    // Ctrl+Q — asks to close the emulator session,
+                    // same prompt Esc's session branch and the band's
+                    // power button open. While the tunnel owns input
+                    // the key goes to the emulator instead — where
+                    // Ctrl+Q is most emulators' own quit shortcut,
+                    // so the outcome is the same.
+                    if emu.session.is_some()
+                        && ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Q))
+                    {
+                        emu_close.begin(ui.ctx());
                     }
                 }
                 // egui's own focus navigation (begin_pass reads raw Tab/
@@ -2512,7 +2769,14 @@ impl eframe::App for AesRustApp {
                                 }
                             }
                         },
-                        View::Emulation => emu.search.open(),
+                        View::Emulation => {
+                            // The item pill hides while the capture
+                            // layer is up — don't arm a field that
+                            // isn't on screen.
+                            if emu.session.is_none() || emu.viewport_dismissed {
+                                emu.search.open()
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2523,13 +2787,21 @@ impl eframe::App for AesRustApp {
                 // and Backspace are the back button. The overlays'
                 // own Esc handling runs while they're open —
                 // view_interactive gates this path then.
-                if view_interactive || fs_exit.open || del_prompt.open {
+                if view_interactive || fs_exit.open || del_prompt.open || emu_close.open
+                    || app_exit.open
+                {
                     let esc = ui
                         .ctx()
                         .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                     if esc {
                         if fs_exit.open {
                             fs_exit.open = false;
+                        } else if emu_close.open {
+                            // Esc dismisses the close prompt — the
+                            // session keeps running.
+                            emu_close.open = false;
+                        } else if app_exit.open {
+                            app_exit.open = false;
                         } else if del_prompt.open {
                             del_prompt.dismiss();
                         } else if transport.overflow_open {
@@ -2561,13 +2833,18 @@ impl eframe::App for AesRustApp {
                             // the session keeps running.
                             emu.game_fs = false;
                         } else if nav.target() == View::Emulation && emu.session.is_some() {
-                            // Esc while a game runs closes the
-                            // emulator session (graceful WM_CLOSE,
-                            // TerminateProcess fallback).
-                            emu.stop_session();
+                            // Esc while a game runs asks to close the
+                            // emulator session — the Switch-style
+                            // confirm, same as Ctrl+Q and the power
+                            // button.
+                            emu_close.begin(ui.ctx());
                         } else if !ui.ctx().text_edit_focused() {
                             if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                                 fs_exit.begin(ui.ctx());
+                            } else if nav.target() == View::Main {
+                                // The main menu has nothing to go back
+                                // to — Esc asks to quit the app.
+                                app_exit.begin(ui.ctx());
                             } else {
                                 esc_back = true;
                             }
@@ -3496,6 +3773,80 @@ impl eframe::App for AesRustApp {
                     if fs_exit.pending_exit && fs_exit.vis <= 0.001 {
                         fs_exit.pending_exit = false;
                         set_fullscreen(ui.ctx(), false);
+                    }
+                }
+                // "Close emulator?" confirmation — same Switch-style
+                // dialog. The session stop waits for the fade so the
+                // capture doesn't vanish out from under the veil; a
+                // game that exits on its own while the prompt is up
+                // resolves the question by itself.
+                if emu_close.open || emu_close.vis > 0.001 {
+                    if emu.session.is_none() {
+                        emu_close.open = false;
+                        emu_close.pending_stop = false;
+                    }
+                    let dtc = ui.ctx().input(|i| i.stable_dt);
+                    emu_close.vis = (emu_close.vis
+                        + dtc / if emu_close.open { 0.18 } else { -0.14 })
+                    .clamp(0.0, 1.0);
+                    match confirm_overlay(
+                        ui,
+                        content,
+                        "Close emulator?",
+                        "Unsaved progress in the running game will be lost.",
+                        "Close",
+                        "Cancel",
+                        &mut emu_close.sel,
+                        s,
+                        emu_close.vis,
+                        emu_close.open,
+                        "emu-close",
+                    ) {
+                        DialogAction::Confirm => {
+                            emu_close.open = false;
+                            emu_close.pending_stop = true;
+                        }
+                        DialogAction::Cancel => emu_close.open = false,
+                        DialogAction::None => {}
+                    }
+                    ui.ctx().request_repaint();
+                    if emu_close.pending_stop && emu_close.vis <= 0.001 {
+                        emu_close.pending_stop = false;
+                        emu.stop_session();
+                    }
+                }
+                // "Exit application?" — same dialog again; the window
+                // close (View::Main Esc) waits for the fade like every
+                // other armed action.
+                if app_exit.open || app_exit.vis > 0.001 {
+                    let dta = ui.ctx().input(|i| i.stable_dt);
+                    app_exit.vis = (app_exit.vis
+                        + dta / if app_exit.open { 0.18 } else { -0.14 })
+                    .clamp(0.0, 1.0);
+                    match confirm_overlay(
+                        ui,
+                        content,
+                        "Exit application?",
+                        "Are you sure you want to quit?",
+                        "Exit",
+                        "Cancel",
+                        &mut app_exit.sel,
+                        s,
+                        app_exit.vis,
+                        app_exit.open,
+                        "app-exit",
+                    ) {
+                        DialogAction::Confirm => {
+                            app_exit.open = false;
+                            app_exit.pending_exit = true;
+                        }
+                        DialogAction::Cancel => app_exit.open = false,
+                        DialogAction::None => {}
+                    }
+                    ui.ctx().request_repaint();
+                    if app_exit.pending_exit && app_exit.vis <= 0.001 {
+                        app_exit.pending_exit = false;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
                 // Delete confirmation — same dialog, payload parked in
@@ -7044,7 +7395,7 @@ mod tests {
         let covers = |c: char| {
             names.iter().any(|name| {
                 defs.font_data.get(name).is_some_and(|d| {
-                    skrifa::FontRef::from_index(d.font.as_ref(), d.index).is_ok_and(|f| {
+                    skrifa::FontRef::from_index(d.font.as_ref().as_ref(), d.index).is_ok_and(|f| {
                         f.charmap().map(c).is_some_and(|g| g != skrifa::GlyphId::NOTDEF)
                     })
                 })
@@ -7177,6 +7528,54 @@ mod tests {
         assert!(!p.open && p.pending.is_none() && p.confirmed.is_none());
     }
 
+    /// The emulator-close prompt defaults to Cancel (it kills the
+    /// session, unlike fs_exit), arms the stop exactly once on
+    /// confirm, and a re-open clears a stale arm.
+    #[test]
+    fn emu_close_prompt_lifecycle() {
+        let ctx = egui::Context::default();
+        let mut p = EmuClosePrompt::default();
+        p.begin(&ctx);
+        assert!(p.open && !p.pending_stop);
+        assert_eq!(p.sel, 1); // safe default: Cancel focused
+
+        // What DialogAction::Confirm does at the dialog site.
+        p.open = false;
+        p.pending_stop = true;
+        assert!(p.pending_stop);
+        // The vis-gated consumer clears the arm — the stop fires once.
+        p.pending_stop = false;
+        assert!(!p.pending_stop);
+
+        // A fresh begin never carries a leftover armed stop.
+        p.pending_stop = true;
+        p.begin(&ctx);
+        assert!(!p.pending_stop && p.open);
+    }
+
+    /// The app-exit prompt (main-menu Esc) mirrors emu_close: Cancel
+    /// focused by default, the exit arms once on confirm, a fresh
+    /// begin clears any stale arm.
+    #[test]
+    fn app_exit_prompt_lifecycle() {
+        let ctx = egui::Context::default();
+        let mut p = AppExitPrompt::default();
+        p.begin(&ctx);
+        assert!(p.open && !p.pending_exit);
+        assert_eq!(p.sel, 1); // safe default: Cancel focused
+
+        p.open = false;
+        p.pending_exit = true;
+        assert!(p.pending_exit);
+        // The vis-gated consumer clears the arm — Close fires once.
+        p.pending_exit = false;
+        assert!(!p.pending_exit);
+
+        p.pending_exit = true;
+        p.begin(&ctx);
+        assert!(!p.pending_exit && p.open);
+    }
+
     /// Multi-export file naming: identical album titles must not
     /// overwrite each other's .apl — second claims ` (2)`, third ` (3)`.
     #[test]
@@ -7290,5 +7689,55 @@ mod tests {
         assert!(out.ends_with('…') && out.len() < 200);
         let out = ellipsize(&painter, &"ÿ𝄞".repeat(100), &font, 60.0);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn emu_key_owner_clamps_by_surface() {
+        // A collapsed section strip can't own keys — falls to the
+        // card view (or None when no section is loaded either).
+        assert_eq!(
+            emu_key_owner(SelOwner::Albums, false, true),
+            SelOwner::Cards
+        );
+        assert_eq!(
+            emu_key_owner(SelOwner::Albums, false, false),
+            SelOwner::None
+        );
+        // Empty cards fall back to the strip.
+        assert_eq!(
+            emu_key_owner(SelOwner::Cards, true, false),
+            SelOwner::Albums
+        );
+        // Untouched: a loaded section's cards win, else the strip —
+        // the audio view's arrow-key default.
+        assert_eq!(emu_key_owner(SelOwner::None, true, true), SelOwner::Cards);
+        assert_eq!(emu_key_owner(SelOwner::None, true, false), SelOwner::Albums);
+        assert_eq!(emu_key_owner(SelOwner::None, false, false), SelOwner::None);
+        // Valid owners pass through unchanged.
+        assert_eq!(emu_key_owner(SelOwner::Albums, true, true), SelOwner::Albums);
+        assert_eq!(emu_key_owner(SelOwner::Cards, true, true), SelOwner::Cards);
+    }
+
+    /// Fullscreen must always pair with `Decorations(false)` — the
+    /// bare `Fullscreen` command leaves winit's 1px shadow inset
+    /// (WM_NCCALCSIZE `top += 1`), a desktop strip across the top of
+    /// a fullscreen capture (egui #8399). The game_fs path regressed
+    /// on exactly this.
+    #[test]
+    fn fullscreen_always_pairs_decorations_off() {
+        for on in [true, false] {
+            let ctx = egui::Context::default();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                set_fullscreen(&ctx, on);
+            });
+            let cmds = out
+                .viewport_output
+                .values()
+                .flat_map(|v| v.commands.iter().cloned())
+                .collect::<Vec<_>>();
+            assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(on)));
+            assert!(cmds.contains(&egui::ViewportCommand::Decorations(false)));
+            out.textures_delta.clear();
+        }
     }
 }

@@ -734,6 +734,10 @@ pub struct EmuView {
     /// "Reboot" context-menu request — relaunches the running game at
     /// the view level where `cfg` is in scope.
     reboot: bool,
+    /// A UI close request (power button, "Close Emulator" menu item)
+    /// parked for the caller — it owns the confirm prompt that guards
+    /// every session stop.
+    close_req: bool,
     /// Lacrima's `_pendingEmulatorLaunchRequest` — a double-click on
     /// another game while a session runs stores the request here and
     /// closes the running emulator; it fires once the old session is
@@ -874,6 +878,7 @@ impl EmuView {
             pillar_prog: 1.0,
             pillar_lock: None,
             reboot: false,
+            close_req: false,
             pending_launch: None,
             aspect_applied: false,
             input_tun: false,
@@ -962,6 +967,76 @@ impl EmuView {
         console_art(self.art_dir.as_deref(), &key)
             .into_iter()
             .next()
+    }
+
+    /// Select + load a section — the shared body of the strip's
+    /// double-click and keyboard Enter paths. Switching sections while
+    /// a game is being captured means the user wants the list: the
+    /// presentation is dismissed so the newly opened section shows
+    /// (the game keeps running underneath — same side effects as the
+    /// band's viewport toggle).
+    pub fn activate_section(&mut self, i: usize, cfg: &settings::Emulation) {
+        let switching = self.active != Some(i);
+        self.active = Some(i);
+        self.open_section(i, cfg);
+        if switching && self.session.is_some() && !self.viewport_dismissed {
+            self.dismiss_viewport();
+        }
+    }
+
+    /// Dismiss the capture viewport — the ⇄ band button's hide
+    /// half: the card list comes back, so fullscreen capture and
+    /// the input tunnel no longer have anything to drive.
+    pub fn dismiss_viewport(&mut self) {
+        self.viewport_dismissed = true;
+        self.game_fs = false;
+        self.input_tun = false;
+    }
+
+    /// The band's ⇄ switch — capture ↔ card list, shared by the
+    /// band button and Ctrl+S.
+    pub fn toggle_viewport(&mut self) {
+        if self.viewport_dismissed {
+            self.viewport_dismissed = false;
+        } else {
+            self.dismiss_viewport();
+        }
+    }
+
+    /// Capture fullscreen — the capture's double-click, the session
+    /// context-menu "Fullscreen" entry and Ctrl+E all share this.
+    /// Entering also un-dismisses the viewport: `game_fs` alone is a
+    /// no-op while the capture isn't on screen, and asking for
+    /// fullscreen is itself the request to be there.
+    pub fn toggle_fullscreen(&mut self) {
+        self.game_fs = !self.game_fs;
+        if self.game_fs {
+            self.viewport_dismissed = false;
+        }
+    }
+
+    /// The input-tunnel toggle — the band's pointer icon and Ctrl+M:
+    /// while lit, clicks/keys over the capture PostMessage into the
+    /// emulator's hidden window.
+    pub fn toggle_input_tunnel(&mut self) {
+        self.input_tun = !self.input_tun;
+    }
+
+    /// Play a card by path — the carousel's `Action::Play` routing
+    /// as a method so keyboard Enter shares it: the running game
+    /// just un-dismisses the viewport, a different game queues
+    /// behind the running session's close, no session launches
+    /// straight away.
+    pub fn play_card(&mut self, game: &Path, cfg: &settings::Emulation) {
+        let running_same = self.session.as_ref().is_some_and(|s| s.game == game);
+        match play_route(self.session.is_some(), running_same) {
+            PlayRoute::UnDismiss => self.viewport_dismissed = false,
+            PlayRoute::QueuePending => {
+                self.pending_launch = Some(game.to_path_buf());
+                self.stop_session();
+            }
+            PlayRoute::Launch => self.launch(cfg, game),
+        }
     }
 
     /// Load a section's persisted games into the card view and spawn
@@ -1371,6 +1446,18 @@ impl EmuView {
         }
     }
 
+    /// Flag a close request — the caller turns it into the Switch-style
+    /// "Close emulator?" confirm instead of stopping directly.
+    pub fn request_close(&mut self) {
+        self.close_req = true;
+    }
+
+    /// Consume a parked close request — once, so a stale flag can't
+    /// reopen the prompt after it's been answered.
+    pub fn take_close_request(&mut self) -> bool {
+        std::mem::replace(&mut self.close_req, false)
+    }
+
     pub fn take_settings_dirty(&mut self) -> bool {
         std::mem::replace(&mut self.settings_dirty, false)
     }
@@ -1702,8 +1789,10 @@ pub fn view(
         emu.fs_drove = true;
         emu.fs_seen = false;
         emu.fs_prev_max = win_max;
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        // set_fullscreen pairs Fullscreen with Decorations(false) —
+        // the bare command leaves winit's 1px shadow inset, a
+        // desktop strip across the top of the fullscreen capture.
+        crate::set_fullscreen(ui.ctx(), true);
     }
     if emu.fs_drove && win_fs {
         emu.fs_seen = true; // the request landed at least once
@@ -1720,8 +1809,7 @@ pub fn view(
         // put back the pre-entry maximized flag.
         emu.fs_drove = false;
         emu.fs_seen = false;
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        crate::set_fullscreen(ui.ctx(), false);
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Maximized(emu.fs_prev_max));
     }
@@ -1820,7 +1908,7 @@ pub fn view(
     if emu.session.is_some() && cap_a > 0.5 {
         let cap = ui.interact(pres_rect, ui.id().with("emu-capture-layer"), Sense::click());
         if cap.double_clicked() && !emu.input_tun {
-            emu.game_fs = !emu.game_fs;
+            emu.toggle_fullscreen();
         }
         let mut open_editor = false;
         let mut stop = false;
@@ -1922,7 +2010,7 @@ pub fn view(
                 })
                 .clicked()
             {
-                emu.game_fs = !emu.game_fs;
+                emu.toggle_fullscreen();
                 ui.close();
             }
             if ui.button("Close Emulator").clicked() {
@@ -1936,9 +2024,7 @@ pub fn view(
             emu.editor.open(ui.ctx(), g, String::new(), x360);
         }
         if stop {
-            if let Some(session) = &emu.session {
-                session.stop();
-            }
+            emu.request_close();
         }
     }
     // In game-fullscreen the chrome (band, strip, search, overlays'
@@ -2017,7 +2103,7 @@ pub fn view(
             .active
             .and_then(|i| emu.sections.get(i))
             .map(|s| section_key(s));
-        let upd_sub = upd_key.as_ref().and_then(|k| emu.upd_skipped.get(k));
+        let upd_sub = upd_key.as_ref().and_then(|k| emu.upd_skipped.get(k).cloned());
         // Balance split: when the free lane left and right of the
         // pause fits the same icon count, the innermost right-cluster
         // slots park left so both sides read equal (3 | pause | 3).
@@ -2104,7 +2190,7 @@ pub fn view(
                 "Control Emulator — clicks and keys reach the game"
             });
             if r.clicked() {
-                emu.input_tun = !emu.input_tun;
+                emu.toggle_input_tunnel();
             }
             if r.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -2122,9 +2208,9 @@ pub fn view(
             } else {
                 ui.interact(ub, ui.id().with("emu-update"), Sense::hover())
             }
-            .on_hover_text(upd_sub.cloned().unwrap_or_else(|| "Update available".into()));
+            .on_hover_text(upd_sub.clone().unwrap_or_else(|| "Update available".into()));
             if r.clicked() {
-                if let (Some(k), Some(sub)) = (upd_key.clone(), upd_sub.cloned()) {
+                if let (Some(k), Some(sub)) = (upd_key.clone(), upd_sub.clone()) {
                     emu.upd_key = k;
                     emu.upd_subtitle = sub;
                     emu.upd_sel = 0;
@@ -2289,12 +2375,7 @@ pub fn view(
             transport::icon_power(&painter, pw, alpha);
         }
         if toggle_viewport {
-            emu.viewport_dismissed = !emu.viewport_dismissed;
-            if emu.viewport_dismissed {
-                emu.game_fs = false;
-                // The capture isn't on screen — nothing to tunnel into.
-                emu.input_tun = false;
-            }
+            emu.toggle_viewport();
         }
         if toggle_pause {
             if let Some(session) = &emu.session {
@@ -2302,9 +2383,7 @@ pub fn view(
             }
         }
         if close_emu {
-            if let Some(session) = &emu.session {
-                session.stop();
-            }
+            emu.request_close();
         }
 
         // Right: the cover-layout cycle (Margin 0,0,50,0) — persists
@@ -2358,22 +2437,10 @@ pub fn view(
                         .iter()
                         .position(|s| s.dir.to_string_lossy() == dir)
                     {
-                        let switching = emu.active != Some(i);
-                        emu.active = Some(i);
                         // Load the section's persisted games into the card
                         // view on first activation — the key travels on the
                         // tile's `emu:` dir so reordering can't miskey it.
-                        emu.open_section(i, cfg);
-                        // Opening a different section while a game is being
-                        // captured means the user wants the list — dismiss
-                        // the presentation so the newly opened section
-                        // shows (the game keeps running underneath). Same
-                        // side effects as the band's viewport toggle.
-                        if switching && emu.session.is_some() && !emu.viewport_dismissed {
-                            emu.viewport_dismissed = true;
-                            emu.game_fs = false;
-                            emu.input_tun = false;
-                        }
+                        emu.activate_section(i, cfg);
                     }
                 }
                 _ => {}
@@ -4039,17 +4106,7 @@ fn draw_items(
         // Lacrima's RequestEmulatorLaunch — queue the request and
         // close the running emulator first, the new launch fires
         // once the old session reports finished.
-        carousel::Action::Play(p) => {
-            let running_same = emu.session.as_ref().is_some_and(|s| s.game == p);
-            match play_route(emu.session.is_some(), running_same) {
-                PlayRoute::UnDismiss => emu.viewport_dismissed = false,
-                PlayRoute::QueuePending => {
-                    emu.pending_launch = Some(p);
-                    emu.stop_session();
-                }
-                PlayRoute::Launch => emu.launch(cfg, &p),
-            }
-        }
+        carousel::Action::Play(p) => emu.play_card(&p, cfg),
         // "Edit Metadata" — the EmulationMetadataOverlay port.
         carousel::Action::Edit(p) => {
             let platform = emu
@@ -5536,5 +5593,95 @@ mod tests {
         back.emulation.cover_layout_mode = (back.emulation.cover_layout_mode + 1) % 3;
         assert_eq!(back.emulation.cover_layout_mode, 0);
         assert_eq!(back.carousel.layout_mode, 1);
+    }
+
+    /// Dismissing the capture viewport — the ⇄ switch's hide half,
+    /// shared by the band button, Tab-to-cards during capture and
+    /// Enter-opening another section mid-session — must drop
+    /// game-fullscreen and the input tunnel: with no capture on
+    /// screen both have nothing to drive.
+    #[test]
+    fn dismiss_viewport_drops_fullscreen_and_tunnel() {
+        let mut emu = EmuView::new();
+        emu.viewport_dismissed = false;
+        emu.game_fs = true;
+        emu.input_tun = true;
+        emu.dismiss_viewport();
+        assert!(emu.viewport_dismissed);
+        assert!(!emu.game_fs);
+        assert!(!emu.input_tun);
+    }
+
+    /// The ⇄ switch shared by the band button and Ctrl+S: hide
+    /// clears fullscreen + tunnel, show just restores the capture.
+    #[test]
+    fn toggle_viewport_round_trips() {
+        let mut emu = EmuView::new();
+        emu.toggle_viewport();
+        assert!(emu.viewport_dismissed);
+        emu.toggle_viewport();
+        assert!(!emu.viewport_dismissed);
+        emu.game_fs = true;
+        emu.input_tun = true;
+        emu.toggle_viewport();
+        assert!(emu.viewport_dismissed);
+        assert!(!emu.game_fs);
+        assert!(!emu.input_tun);
+    }
+
+    /// Capture fullscreen (double-click / context menu / Ctrl+E):
+    /// entering while the list is showing jumps straight into the
+    /// fullscreen capture — the flag alone does nothing while the
+    /// viewport is dismissed. Exiting stays on the current surface.
+    #[test]
+    fn fullscreen_enter_unhides_viewport() {
+        let mut emu = EmuView::new();
+        emu.viewport_dismissed = true;
+        emu.toggle_fullscreen();
+        assert!(emu.game_fs);
+        assert!(!emu.viewport_dismissed);
+        emu.toggle_fullscreen();
+        assert!(!emu.game_fs);
+        assert!(!emu.viewport_dismissed);
+    }
+
+    /// The input tunnel (mouse emulation) — the band's pointer icon
+    /// and Ctrl+M share this flip; the capture dismiss path (Esc
+    /// aside) is what force-clears it.
+    #[test]
+    fn input_tunnel_toggles() {
+        let mut emu = EmuView::new();
+        emu.toggle_input_tunnel();
+        assert!(emu.input_tun);
+        emu.toggle_input_tunnel();
+        assert!(!emu.input_tun);
+    }
+
+    /// Ctrl+Q / Esc's session branch: stopping with no session must be
+    /// a clean no-op — the guard in `stop_session` is what keeps a
+    /// stray keypress between teardown and relaunch from touching
+    /// `pending_launch` or panicking on the absent session.
+    #[test]
+    fn stop_session_noops_without_session() {
+        let mut emu = EmuView::new();
+        emu.pending_launch = Some("rom.iso".into());
+        emu.stop_session();
+        assert!(emu.session.is_none());
+        assert_eq!(
+            emu.pending_launch.as_deref(),
+            Some(std::path::Path::new("rom.iso"))
+        );
+    }
+
+    /// The power button / "Close Emulator" menu item park a close
+    /// request for the caller's confirm prompt — consumed exactly
+    /// once so an answered request can't reopen the dialog.
+    #[test]
+    fn close_request_consumed_once() {
+        let mut emu = EmuView::new();
+        assert!(!emu.take_close_request());
+        emu.request_close();
+        assert!(emu.take_close_request());
+        assert!(!emu.take_close_request());
     }
 }

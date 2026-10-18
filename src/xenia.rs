@@ -13,6 +13,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::thread::JoinHandle;
@@ -644,6 +646,13 @@ impl Session {
                 }
             }
         }
+        // Our window owns OS focus right now (the launch came from
+        // a click/keypress) — snapshot it before the emulator's
+        // window can steal the foreground, so the worker can hand
+        // it back every sweep. Without this a parked emulator keeps
+        // the keyboard and every app shortcut goes dead.
+        #[cfg(windows)]
+        let app_hwnd = capture_app_hwnd().0 as usize;
         let child = cmd
             .current_dir(work_dir)
             .spawn()
@@ -696,6 +705,7 @@ impl Session {
                             low_latency,
                             kind,
                             transcript,
+                            app_hwnd,
                         )
                     }))
                     .is_err()
@@ -1646,7 +1656,9 @@ fn worker_main(
     low_latency: bool,
     kind: Kind,
     transcript: Option<PathBuf>,
+    app_hwnd: usize,
 ) {
+    let app_hwnd = HWND(app_hwnd as _);
     let set_status = |s: Status| {
         session_log(&format!("pid={pid} status -> {s:?}"));
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
@@ -1728,7 +1740,7 @@ fn worker_main(
     };
     let mut waited = 0u64;
     while waited < delay {
-        sweep_hide(pid, HWND::default(), &mut hidden, kind);
+        sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
         if stop.load(Ordering::Relaxed)
             || (!alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)))
         {
@@ -1751,7 +1763,7 @@ fn worker_main(
                 if stop.load(Ordering::Relaxed) || !alive(proc) {
                     break;
                 }
-                sweep_hide(pid, HWND::default(), &mut hidden, kind);
+                sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
                 if let Ok(meta) = std::fs::metadata(tp) {
                     if meta.len() < pos {
                         pos = 0;
@@ -1791,7 +1803,7 @@ fn worker_main(
                 if stop.load(Ordering::Relaxed) || !alive(proc) {
                     break;
                 }
-                sweep_hide(pid, HWND::default(), &mut hidden, kind);
+                sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
                 let ready = logs.iter().any(|p| {
                     std::fs::read_to_string(p)
                         .map(|t| t.to_lowercase().contains("run title"))
@@ -1851,7 +1863,7 @@ fn worker_main(
         if !alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)) {
             break;
         }
-        sweep_hide(pid, HWND::default(), &mut hidden, kind);
+        sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
         hwnd = resolve_capture_target(pid, kind);
         if !hwnd.is_invalid() {
             if kind == Kind::Xemu {
@@ -2172,7 +2184,7 @@ fn worker_main(
         strip_menu(hwnd);
     }
     // Catch anything that appeared since the last poll.
-    sweep_hide(pid, hwnd, &mut hidden, kind);
+    sweep_hide(pid, hwnd, &mut hidden, kind, app_hwnd);
 
     if kind == Kind::RetroArch {
         // The sweep has had the whole process cloaked since spawn —
@@ -2218,7 +2230,7 @@ fn worker_main(
         {
             break;
         }
-        sweep_hide(pid, hwnd, &mut hidden, kind);
+        sweep_hide(pid, hwnd, &mut hidden, kind, app_hwnd);
         if kind == Kind::RetroArch {
             retroarch_watchdog(
                 pid,
@@ -3709,6 +3721,75 @@ fn hide_console_window(hwnd: HWND) {
     }
 }
 
+/// The app's own foreground HWND — captured at launch while our
+/// window still owns input. The emulator's window steals OS focus
+/// when it first appears, and a cloaked/parked window never hands
+/// it back: without a reclaim every app shortcut (and the input
+/// tunnel's egui event source) is dead for the whole session.
+/// Cached so a queued re-launch that starts unfocused can still
+/// find our handle.
+#[cfg(windows)]
+static APP_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot the foreground window if it belongs to this process —
+/// `Session::start` runs on the UI thread right after the user's
+/// click/keypress, so the foreground window is ours. Falls back to
+/// the last good capture when the foreground is elsewhere.
+#[cfg(windows)]
+fn capture_app_hwnd() -> HWND {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if !hwnd.is_invalid() && pid == std::process::id() {
+            APP_HWND.store(hwnd.0 as usize, Ordering::Relaxed);
+            hwnd
+        } else {
+            HWND(APP_HWND.load(Ordering::Relaxed) as _)
+        }
+    }
+}
+
+/// Focus-reclaim decision: only steal the foreground back when an
+/// EMULATOR-owned window holds it — a user alt-tabbed to another
+/// program (or our own window already focused) is left alone.
+/// Pure so the no-fight rule stays unit-tested.
+#[cfg(windows)]
+fn should_reclaim_focus(app: HWND, fg: HWND, fg_pid: u32, emu_pids: &[u32]) -> bool {
+    !app.is_invalid() && !fg.is_invalid() && fg != app && emu_pids.contains(&fg_pid)
+}
+
+/// Give OS focus back to the app window while the parked emulator
+/// holds it — without this the hidden window keeps the keyboard
+/// and app shortcuts are dead. A deliberate alt-tab to another
+/// program is left alone: only an emulator-owned foreground is
+/// reclaimed. Same AttachThreadInput sidestep as `send_ctrl_s` —
+/// SetForegroundWindow quietly fails from a background thread.
+#[cfg(windows)]
+fn reclaim_app_focus(app: HWND, emu_pids: &[u32]) {
+    if app.is_invalid() {
+        return;
+    }
+    unsafe {
+        let fg = GetForegroundWindow();
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        if !should_reclaim_focus(app, fg, pid, emu_pids) {
+            return;
+        }
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let this_tid = GetCurrentThreadId();
+        let attached = fg_tid != 0
+            && fg_tid != this_tid
+            && AttachThreadInput(this_tid, fg_tid, true).as_bool();
+        let _ = SetForegroundWindow(app);
+        let _ = SetFocus(Some(app));
+        if attached {
+            let _ = AttachThreadInput(this_tid, fg_tid, false);
+        }
+    }
+}
+
 /// Strip the frame off RA's render window so only the game surface
 /// shows even when a core re-centers it on-screen. Removing
 /// WS_CAPTION drops the title bar but NOT the HMENU — a menu-less
@@ -3931,7 +4012,9 @@ fn sweep_hide(
     skip: HWND,
     hidden: &mut std::collections::HashMap<usize, SavedWindow>,
     kind: Kind,
+    app: HWND,
 ) {
+    let pids = win_pids(pid, kind);
     // RetroArchHandler.PrepareProcessForCapture is a NO-OP:
     // "RetroArch uses Vulkan/DX and can fail to render if its window
     // is hidden before capture." That refers to SW_HIDE/ShowWindow
@@ -3945,7 +4028,7 @@ fn sweep_hide(
     // windows report the owner's pid on Win11) — those get SW_HIDE,
     // the reliable console hide.
     if kind == Kind::RetroArch {
-        for hwnd in process_windows_of(&win_pids(pid, kind), false) {
+        for hwnd in process_windows_of(&pids, false) {
             if hwnd == skip || hwnd.is_invalid() {
                 continue;
             }
@@ -3955,9 +4038,10 @@ fn sweep_hide(
                 set_cloaked(hwnd, true);
             }
         }
+        reclaim_app_focus(app, &pids);
         return;
     }
-    for hwnd in process_windows_of(&win_pids(pid, kind), false) {
+    for hwnd in process_windows_of(&pids, false) {
         if hwnd == skip || hwnd.is_invalid() {
             continue;
         }
@@ -4002,6 +4086,11 @@ fn sweep_hide(
             }
         });
     }
+    // The emulator grabbed OS focus when its window appeared — a
+    // parked/cloaked window never gives it back, so every app
+    // shortcut (and the input tunnel's event source) goes dead for
+    // the session. Hand it back to the app window.
+    reclaim_app_focus(app, &pids);
 }
 
 /// Lacrima's TrySendControlS — RPCS3's graceful stop shortcut. Focus
@@ -4396,6 +4485,41 @@ mod tests {
         assert!(super::retroarch_needs_retarget(dead, alive));
         assert!(!super::retroarch_needs_retarget(alive, alive));
         assert!(!super::retroarch_needs_retarget(dead, HWND::default()));
+    }
+
+    /// Focus reclaim only fires when an emulator-owned window holds
+    /// the foreground — the parked emulator steals OS focus at
+    /// launch and never returns it, killing every app shortcut.
+    /// Already-focused, invalid handles, and a deliberate user
+    /// alt-tab to another program must never be fought.
+    #[test]
+    #[cfg(windows)]
+    fn focus_reclaim_only_on_emulator_foreground() {
+        use super::HWND;
+        let app = HWND(0x1000usize as _);
+        let emu = HWND(0x2000usize as _);
+        let other = HWND(0x3000usize as _);
+        let pids = [111u32, 222];
+        // Emulator window in front → reclaim.
+        assert!(super::should_reclaim_focus(app, emu, 111, &pids));
+        // Already ours → nothing to do.
+        assert!(!super::should_reclaim_focus(app, app, 0, &pids));
+        // User alt-tabbed to another program → leave them alone.
+        assert!(!super::should_reclaim_focus(app, other, 999, &pids));
+        // No captured app hwnd → can't reclaim anywhere.
+        assert!(!super::should_reclaim_focus(
+            HWND::default(),
+            emu,
+            111,
+            &pids
+        ));
+        // No foreground window → nothing to reclaim from.
+        assert!(!super::should_reclaim_focus(
+            app,
+            HWND::default(),
+            0,
+            &pids
+        ));
     }
 
     /// Regression: a Failed capture must end the session — otherwise

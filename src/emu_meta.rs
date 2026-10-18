@@ -1131,15 +1131,21 @@ fn norm_crc(v: &str) -> String {
         .to_uppercase()
 }
 
+/// Lowercase hex for a digest — the 0.11 digest crates' hybrid-array
+/// output no longer implements `LowerHex`.
+fn digest_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// md5 → sha1 → crc, in that order (Lacrima's TryResolveHashes).
 fn hash_db_resolve(file: &'static str, bytes: &[u8]) -> Option<String> {
     use md5::Digest as _;
     let db = hash_title_db(file);
-    let md5 = format!("{:x}", md5::Md5::digest(bytes));
+    let md5 = digest_hex(&md5::Md5::digest(bytes));
     if let Some(t) = db.md5.get(&md5) {
         return Some(t.clone());
     }
-    let sha1 = format!("{:x}", sha1::Sha1::digest(bytes));
+    let sha1 = digest_hex(&sha1::Sha1::digest(bytes));
     if let Some(t) = db.sha1.get(&sha1) {
         return Some(t.clone());
     }
@@ -1820,8 +1826,8 @@ fn hash_db_resolve_file(path: &Path, dbs: &[&'static str]) -> Option<String> {
         crc.update(&buf[..n]);
     }
     let (md5, sha1, crc) = (
-        format!("{:x}", md5.finalize()),
-        format!("{:x}", sha1.finalize()),
+        digest_hex(&md5.finalize()),
+        digest_hex(&sha1.finalize()),
         format!("{:08X}", crc.finalize()),
     );
     for file in dbs {

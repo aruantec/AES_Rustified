@@ -1,6 +1,6 @@
-# AES Lacrima [Rust]
+# AES Oxide
 
-**AES Lacrima [Rust] is a Rust/egui port of [AES_Lacrima](https://github.com/aruantec/AES_Lacrima).**
+**AES Oxide is a Rust/egui port of [AES_Lacrima](https://github.com/aruantec/AES_Lacrima).**
 
 AES stands for **"Aruan's Entertainment Software"**, formerly known as **@ES** in a small emulation
 community. AES_Lacrima is a personal research project, emulation frontend and multimedia app
@@ -30,7 +30,7 @@ is fed a 512-wide spectrum texture every frame).
 | Key | Function |
 |---|---|
 | `F12` | Toggle fullscreen — entering is instant, exiting shows a confirmation prompt |
-| `Esc` | Layered back-out: close prompt → close search → exit game-fullscreen → stop emulator → fullscreen prompt → navigate back |
+| `Esc` | Layered back-out: close prompt → close search → exit game-fullscreen → ask to close emulator → fullscreen prompt → navigate back → ask to exit the app (Main view) |
 | `Backspace` | Back navigation |
 | `Ctrl+F` | Focus search (album filter, item search, or the emulation pill) |
 | `Ctrl+R` | Cycle repeat mode (Off → All → One) |
@@ -55,11 +55,18 @@ is fed a 512-wide spectrum texture every frame).
 
 | Key | Function |
 |---|---|
-| `←` `→` `↑` `↓` | Navigate the ROM card grid |
-| `Ctrl+A` | Select all ROMs |
-| `Delete` | Delete selected ROMs (with confirmation) |
-| `Enter` | Launch the selected ROM — or return to the running game's capture |
-| `Esc` | Exit game-fullscreen → stop the emulator on the next press |
+| `←` `→` `↑` `↓` | Navigate the section strip / ROM card grid — the strip stays navigable while a game is captured |
+| `Shift` + arrows | Reorder sections or ROMs |
+| `Ctrl+A` | Select all on the owning list |
+| `Delete` | Remove selected ROMs (with confirmation) |
+| `Tab` | Cycle keyboard ownership between the section strip and the ROM grid — while capturing, switches back to the list |
+| `Enter` | Open the selected section / launch the selected ROM — or return to the running game's capture |
+| `Ctrl+S` | Switch between the capture viewport and the ROM list (the ⇄ band button) |
+| `Ctrl+E` | Toggle capture fullscreen (same as double-clicking the capture) |
+| `Ctrl+M` | Toggle the input tunnel — clicks/keys over the capture reach the emulator; `Esc` also releases it |
+| `Ctrl+Q` | Ask to close the running emulator (same prompt as the power button) |
+| `Esc` | Release the input tunnel → exit game-fullscreen → ask to close the emulator |
+| `F12` | Application fullscreen |
 | Double-click on capture | Toggle game-fullscreen (capture covers the whole screen) |
 
 ### Dialogs & widgets

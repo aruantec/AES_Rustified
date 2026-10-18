@@ -13,11 +13,11 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "AES Lacrima [Rust]"
+            VALUE "FileDescription", "AES Oxide"
             VALUE "FileVersion", "0.1.0"
             VALUE "InternalName", "AES-Rustified"
             VALUE "OriginalFilename", "AES-Rustified.exe"
-            VALUE "ProductName", "AES Lacrima [Rust]"
+            VALUE "ProductName", "AES Oxide"
             VALUE "ProductVersion", "0.1.0"
         END
     END

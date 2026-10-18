@@ -19,14 +19,15 @@ use lofty::file::TaggedFileExt;
 use lofty::tag::ItemKey;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::Resampler as _;
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
 use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use symphonia::default::{get_codecs, get_probe};
 
@@ -183,7 +184,7 @@ impl AudioPlayer {
             return Err("audio device does not support f32 output".into());
         }
         let config = supported.config();
-        let out_rate = config.sample_rate.0;
+        let out_rate = config.sample_rate;
         let channels = config.channels as usize;
         if channels == 0 {
             return Err("audio device reports zero channels".into());
@@ -317,7 +318,7 @@ impl AudioPlayer {
             }
         };
         let stream = device.build_output_stream(
-            &config,
+            config,
             data_cb,
             |err| eprintln!("audio output error: {err}"),
             None,
@@ -634,23 +635,33 @@ fn run_decoder(
         Source::Stream { url, key } => http_source(&url, &key, true)?,
     };
     let mss = MediaSourceStream::new(media, Default::default());
-    let probed = get_probe().format(
+    let mut format = get_probe().probe(
         &Hint::new(),
         mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
-    let mut format = probed.format;
     let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
+        .find(|t| {
+            t.codec_params
+                .as_ref()
+                .and_then(|p| p.audio())
+                .is_some_and(|a| {
+                    a.codec != CODEC_ID_NULL_AUDIO && a.sample_rate.is_some()
+                })
+        })
+        .ok_or("no audio track")?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
         .ok_or("no audio track")?;
     let track_id = track.id;
-    let src_rate = track.codec_params.sample_rate.unwrap();
+    let src_rate = params.sample_rate.unwrap();
     let duration = track
-        .codec_params
-        .n_frames
+        .num_frames
         .map(|n| n as f64 / src_rate as f64)
         .unwrap_or(0.0);
     shared.duration.store(duration.to_bits(), Ordering::Relaxed);
@@ -659,7 +670,8 @@ fn run_decoder(
     shared.eof.store(false, Ordering::Relaxed);
     shared.flush_seq.fetch_add(1, Ordering::Relaxed);
 
-    let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let mut decoder =
+        get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default())?;
     let mut resampler = Resampler::new(src_rate, out_rate);
     let mut rg = RgTrack::new();
     let mut denoiser = Denoiser::new();
@@ -678,7 +690,7 @@ fn run_decoder(
             let _ = format.seek(
                 SeekMode::Accurate,
                 SeekTo::Time {
-                    time: Time::new(t as u64, t.fract()),
+                    time: Time::try_from_secs_f64(t).unwrap_or(Time::ZERO),
                     track_id: Some(track_id),
                 },
             );
@@ -694,37 +706,38 @@ fn run_decoder(
         rg.refresh(shared, rg_file.as_deref(), rg_key.as_deref());
 
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
             Err(SymphoniaError::ResetRequired) => {
                 decoder.reset();
                 continue;
             }
-            Err(_) => {
-                // A short track may end before the last checkpoint —
-                // finalize the analysis with whatever decoded.
+            // Ok(None) is the clean end-of-stream; a short track may
+            // also error before the last checkpoint — either way,
+            // finalize the analysis with whatever decoded.
+            Ok(None) | Err(_) => {
                 rg.finish(shared, rg_key.as_deref());
                 return Ok(DecodeEnd::Eof);
             }
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
-        let decoded: AudioBufferRef = match decoder.decode(&packet) {
+        let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        let spec = *decoded.spec();
+        let spec = decoded.spec().clone();
         let frames = decoded.frames() as u64;
         if frames == 0 {
             continue;
         }
-        let mut buf = SampleBuffer::<f32>::new(frames, spec);
-        buf.copy_interleaved_ref(decoded);
-        let nch = spec.channels.count().max(1);
+        let nch = spec.channels().count().max(1);
+        let mut samples = Vec::with_capacity(frames as usize * nch);
+        decoded.copy_to_vec_interleaved(&mut samples);
         let stereo: Vec<f32> = if nch == 1 {
-            buf.samples().iter().flat_map(|&s| [s, s]).collect()
+            samples.iter().flat_map(|&s| [s, s]).collect()
         } else {
-            buf.samples()
+            samples
                 .chunks_exact(nch)
                 .flat_map(|f| [f[0], f[1]])
                 .collect()
@@ -758,7 +771,7 @@ fn run_decoder(
 /// Feed interleaved stereo samples into the resampler and yield the
 /// output chunks. `identity` short-circuits when rates already match.
 struct Resampler {
-    inner: Option<rubato::SincFixedIn<f32>>,
+    inner: Option<rubato::Async<f32>>,
     acc: [Vec<f32>; 2],
 }
 
@@ -767,18 +780,19 @@ const RESAMPLE_CHUNK: usize = 1024;
 impl Resampler {
     fn new(rate_in: u32, rate_out: u32) -> Self {
         let inner = (rate_in != rate_out).then(|| {
-            rubato::SincFixedIn::new(
+            rubato::Async::new_sinc(
                 rate_out as f64 / rate_in as f64,
                 2.0,
-                rubato::SincInterpolationParameters {
+                &rubato::SincInterpolationParameters {
                     sinc_len: 128,
-                    f_cutoff: 0.95,
+                    f_cutoff: Some(0.95),
                     interpolation: rubato::SincInterpolationType::Linear,
                     oversampling_factor: 128,
                     window: rubato::WindowFunction::BlackmanHarris2,
                 },
                 RESAMPLE_CHUNK,
                 2,
+                rubato::FixedAsync::Input,
             )
             .expect("resampler")
         });
@@ -810,13 +824,13 @@ impl Resampler {
         while self.acc[0].len() >= RESAMPLE_CHUNK {
             let l: Vec<f32> = self.acc[0].drain(..RESAMPLE_CHUNK).collect();
             let rr: Vec<f32> = self.acc[1].drain(..RESAMPLE_CHUNK).collect();
-            if let Ok(chans) = r.process(&[l, rr], None) {
-                let n = chans[0].len().min(chans[1].len());
-                out.push(
-                    (0..n)
-                        .flat_map(|i| [chans[0][i], chans[1][i]])
-                        .collect(),
-                );
+            let pair = [l, rr];
+            let input =
+                SequentialSliceOfVecs::new(&pair, 2, RESAMPLE_CHUNK).expect("resample input");
+            // InterleavedOwned hands the frames back already
+            // interleaved — straight into the ring.
+            if let Ok(buf) = r.process(&input, None) {
+                out.push(buf.take_data());
             }
         }
         out
@@ -1018,10 +1032,10 @@ fn rg_tag_gain(path: &Path, tag_source: u8) -> Option<f64> {
     let tagged = lofty::read_from_path(path).ok()?;
     for tag in tagged.tags() {
         let album = tag
-            .get_string(&ItemKey::ReplayGainAlbumGain)
+            .get_string(ItemKey::ReplayGainAlbumGain)
             .and_then(parse_gain_db);
         let track = tag
-            .get_string(&ItemKey::ReplayGainTrackGain)
+            .get_string(ItemKey::ReplayGainTrackGain)
             .and_then(parse_gain_db);
         let pick = if tag_source == 1 {
             album.or(track)
@@ -1718,31 +1732,35 @@ mod tests {
             http_source(&url, &key, true).expect("http_source")
         };
         let mss = MediaSourceStream::new(media, Default::default());
-        let probed = get_probe()
-            .format(
+        let mut format = get_probe()
+            .probe(
                 &Hint::new(),
                 mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .expect("probe");
-        let mut format = probed.format;
         let track = format
             .tracks()
             .iter()
             .find(|t| {
-                t.codec_params.codec != CODEC_TYPE_NULL
-                    && t.codec_params.sample_rate.is_some()
+                t.codec_params
+                    .as_ref()
+                    .and_then(|p| p.audio())
+                    .is_some_and(|a| {
+                        a.codec != CODEC_ID_NULL_AUDIO && a.sample_rate.is_some()
+                    })
             })
             .expect("audio track")
             .clone();
-        eprintln!("track: {:?} rate={:?}", track.codec_params.codec, track.codec_params.sample_rate);
+        let params = track.codec_params.as_ref().and_then(|p| p.audio()).expect("audio");
+        eprintln!("track: {:?} rate={:?}", params.codec, params.sample_rate);
         let mut dec = get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
             .expect("decoder");
         for _ in 0..20 {
             match format.next_packet() {
-                Ok(p) if p.track_id() == track.id => {
+                Ok(Some(p)) if p.track_id == track.id => {
                     dec.decode(&p).expect("decode");
                 }
                 Ok(_) => {}

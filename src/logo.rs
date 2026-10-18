@@ -395,7 +395,7 @@ mod tests {
     /// on screen forever (the "garbled logo" report).
     #[test]
     fn glitch_burst_always_terminates() {
-        let title = "AES Lacrima [Rust]";
+        let title = "AES Oxide";
         let mut logo = TitleLogo::new(false);
         // 60s at 60fps: whenever a burst is active it must finish
         // within 2s of steady frames (5-9 steps of ≤110ms each) and

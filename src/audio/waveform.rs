@@ -11,13 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
 use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::units::Timestamp;
 use symphonia::default::{get_codecs, get_probe};
 
 use super::player::patch_media;
@@ -95,24 +96,28 @@ fn file_stamp(path: &Path) -> (u64, u64) {
 /// actual length on every load.
 fn probe_duration(media: Box<dyn MediaSource>) -> Option<f64> {
     let mss = MediaSourceStream::new(media, Default::default());
-    let probed = get_probe()
-        .format(
+    let format = get_probe()
+        .probe(
             &Hint::new(),
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .ok()?;
-    probed
-        .format
+    format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
-        .and_then(|t| t.codec_params.n_frames.zip(t.codec_params.time_base))
-        .map(|(nf, tb)| {
-            let t = tb.calc_time(nf);
-            t.seconds as f64 + t.frac
+        .find(|t| {
+            t.codec_params
+                .as_ref()
+                .and_then(|p| p.audio())
+                .is_some_and(|a| {
+                    a.codec != CODEC_ID_NULL_AUDIO && a.sample_rate.is_some()
+                })
         })
+        .and_then(|t| t.num_frames.and_then(|nf| t.time_base.map(|tb| (nf, tb))))
+        .and_then(|(nf, tb)| tb.calc_time(Timestamp::new(nf as i64)))
+        .map(|t| t.as_secs_f64())
         .filter(|d| *d > 0.1)
 }
 
@@ -386,37 +391,43 @@ fn generate(
     g: &mut Gen,
 ) -> bool {
     let mss = MediaSourceStream::new(media, Default::default());
-    let Ok(probed) = get_probe().format(
+    let Ok(mut format) = get_probe().probe(
         &Hint::new(),
         mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     ) else {
         return false;
     };
-    let mut format = probed.format;
     let Some(track) = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
+        .find(|t| {
+            t.codec_params
+                .as_ref()
+                .and_then(|p| p.audio())
+                .is_some_and(|a| {
+                    a.codec != CODEC_ID_NULL_AUDIO && a.sample_rate.is_some()
+                })
+        })
     else {
         return false;
     };
+    let Some(params) = track.codec_params.as_ref().and_then(|p| p.audio()) else {
+        return false;
+    };
     let track_id = track.id;
-    let Some(src_rate) = track.codec_params.sample_rate else {
+    let Some(src_rate) = params.sample_rate else {
         return false;
     };
     // Total duration from the header maps decode time -> bucket 1:1,
     // so live snapshots fill left-to-right at their final positions
     // (Lacrima streams buckets the same way while ffmpeg decodes).
     let dur_secs = track
-        .codec_params
-        .n_frames
-        .zip(track.codec_params.time_base)
-        .map(|(nf, tb)| {
-            let t = tb.calc_time(nf);
-            t.seconds as f64 + t.frac
-        })
+        .num_frames
+        .and_then(|nf| track.time_base.map(|tb| (nf, tb)))
+        .and_then(|(nf, tb)| tb.calc_time(Timestamp::new(nf as i64)))
+        .map(|t| t.as_secs_f64())
         .filter(|d| *d > 0.1);
     // A re-probed duration that moved means bucket positions computed
     // against the old length are wrong — start the accumulation over.
@@ -426,7 +437,8 @@ fn generate(
         }
     }
     g.dur_secs = dur_secs;
-    let Ok(mut decoder) = get_codecs().make(&track.codec_params, &DecoderOptions::default())
+    let Ok(mut decoder) =
+        get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default())
     else {
         return false;
     };
@@ -472,28 +484,28 @@ fn generate(
             break;
         }
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
             Err(SymphoniaError::ResetRequired) => {
                 decoder.reset();
                 continue;
             }
-            Err(_) => break,
+            Ok(None) | Err(_) => break,
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
-        let decoded: AudioBufferRef = match decoder.decode(&packet) {
+        let decoded: GenericAudioBufferRef = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        let spec = *decoded.spec();
+        let spec = decoded.spec().clone();
         if decoded.frames() == 0 {
             continue;
         }
-        let mut buf = SampleBuffer::<f32>::new(decoded.frames() as u64, spec);
-        buf.copy_interleaved_ref(decoded);
-        let nch = spec.channels.count().max(1);
-        for frame in buf.samples().chunks(nch) {
+        let nch = spec.channels().count().max(1);
+        let mut samples = Vec::with_capacity(decoded.frames() * nch);
+        decoded.copy_to_vec_interleaved(&mut samples);
+        for frame in samples.chunks(nch) {
             // Lacrima mixes down to mono (-ac 1) before peaking.
             let mono: f32 = frame.iter().sum::<f32>() / frame.len() as f32;
             slot_peak = slot_peak.max(mono.abs());
