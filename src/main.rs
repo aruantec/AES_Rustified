@@ -2117,6 +2117,8 @@ impl eframe::App for AesRustApp {
                                         && (*sel_owner == SelOwner::Albums
                                             || (*sel_owner == SelOwner::None
                                                 && !carousel.has_items()));
+                                    album_row.show_titles =
+                                        settings.effects.show_album_title_bar;
                                     let (ra, sk, play, ed, pr, del, cl, ex) = music_view(
                                         ui,
                                         content,
@@ -2173,6 +2175,8 @@ impl eframe::App for AesRustApp {
                                     // Emulation.CoverLayoutMode —
                                     // independent of the music band's
                                     // Carousel.LayoutMode.
+                                    emu.row.show_titles =
+                                        settings.effects.show_album_title_bar;
                                     emulation::view(
                                         ui,
                                         content,
@@ -3268,6 +3272,9 @@ impl eframe::App for AesRustApp {
                     settings.emulation.clone(),
                     settings.effects.lacrima_cover_color,
                 );
+                // Tuple PartialEq stops at 12 elements — the title-bar
+                // toggle compares separately instead of joining fx_before.
+                let title_bar_before = settings.effects.show_album_title_bar;
                 let slide = overlay_slide;
                 if slide > 0.001 {
                     settings_overlay(
@@ -3379,6 +3386,7 @@ impl eframe::App for AesRustApp {
                         settings.emulation.clone(),
                         settings.effects.lacrima_cover_color,
                     )
+                    || settings.effects.show_album_title_bar != title_bar_before
                     || settings.equalizer.bands != eq_before;
                 // Audio-tab changes apply live to the player — Lacrima
                 // mirrors the same set onto AudioPlayer and recomputes
@@ -5135,8 +5143,9 @@ fn settings_overlay(
     );
 }
 
-/// UI tab content: the "Scaling" slider (Lacrima's ScaleFactor), then
-/// the "Effects" section with the Show Lacrima toggle and count slider.
+/// UI tab content: the "Scaling" slider (Lacrima's ScaleFactor), the
+/// "Effects" and "ShaderToy" sections, then the port-only "Albums"
+/// section (strip title-bar visibility).
 fn ui_tab_effects(
     ui: &mut egui::Ui,
     panel: Rect,
@@ -5334,6 +5343,30 @@ fn ui_tab_effects(
                 ui.selectable_value(&mut settings.effects.shadertoy, name.clone(), name.as_str());
             }
         });
+    y += 45.0 * s;
+
+    // "Albums" section — port-only (Lacrima's UI tab has no album
+    // options): the strip's title-bar visibility toggle.
+    painter.text(
+        Pos2::new(x, y),
+        Align2::LEFT_TOP,
+        "Albums",
+        FontId::proportional(30.0 * s),
+        Color32::WHITE.gamma_multiply(t),
+    );
+    y += 46.0 * s;
+    painter.line_segment(
+        [Pos2::new(x, y), Pos2::new(right, y)],
+        Stroke::new(1.0, Color32::from_gray(55).gamma_multiply(t)),
+    );
+    y += 15.0 * s;
+    label_row(
+        ui,
+        y,
+        "Album title bar",
+        &mut settings.effects.show_album_title_bar,
+        "album-title-bar-toggle",
+    );
 }
 
 /// Audio tab content: Lacrima's "Spectrum" section — height/width/

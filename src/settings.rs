@@ -98,6 +98,10 @@ pub struct Effects {
     /// SelectedShadertoy — the shader's file-stem name).
     pub show_shadertoy: bool,
     pub shadertoy: String,
+    /// Album tiles keep their bottom title bar + count badge painted.
+    /// Off hides them behind a per-tile hover reveal (fade in/out) so
+    /// the strip shows bare covers.
+    pub show_album_title_bar: bool,
 }
 
 impl Default for Effects {
@@ -111,6 +115,7 @@ impl Default for Effects {
             show_shadertoy: true,
             // EnsureDefaultSelectedShaderToy prefers this name.
             shadertoy: "AnimatedBackground".to_string(),
+            show_album_title_bar: true,
         }
     }
 }

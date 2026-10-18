@@ -289,6 +289,14 @@ pub struct AlbumRow {
     /// reorders are dropped instead of silently reordering a clone
     /// (or worse, the real list at shown-space indices).
     pub filtered: bool,
+    /// Settings toggle: tiles keep their bottom title bar painted.
+    /// Off hides the bar + count badge behind a per-tile hover
+    /// reveal (see `title_fade`) so the strip shows bare covers.
+    pub show_titles: bool,
+    /// Per-album title-bar fade (dir → 0..1): pinned at 1 while
+    /// `show_titles` is on; otherwise eases in on hover and back
+    /// out. Dir-keyed so filtering/reorders don't reset it.
+    title_fade: HashMap<String, f32>,
     /// Brief focus flash (1→0) on Tab focus-in — a fading border
     /// around the strip so the user sees where the keys now land.
     focus_flash: f32,
@@ -388,6 +396,8 @@ impl AlbumRow {
             nav_view: None,
             last_dirs: Vec::new(),
             filtered: false,
+            show_titles: true,
+            title_fade: HashMap::new(),
             focus_flash: 0.0,
             pop: 0.0,
         }
@@ -455,6 +465,40 @@ impl AlbumRow {
         self.drag = None;
         self.editing = None;
         self.pending_reveal = None;
+    }
+
+    /// Title-bar reveal fades — pinned at 1 while `show_titles` is
+    /// on; otherwise each shown tile's bar eases in while hovered and
+    /// back out. Dir-keyed (via `last_dirs`) so filters/reorders
+    /// don't reset it. Returns true while any fade is still moving so
+    /// the caller keeps repainting — the app is event-driven and an
+    /// unstopped fade would freeze on its last frame.
+    fn title_fade_step(&mut self, dt: f32) -> bool {
+        let mut moving = false;
+        for (i, d) in self.last_dirs.iter().enumerate() {
+            let tgt = if self.show_titles || i as i32 == self.hovered {
+                1.0
+            } else {
+                0.0
+            };
+            let e = self
+                .title_fade
+                .entry(d.clone())
+                .or_insert(if self.show_titles { 1.0 } else { 0.0 });
+            *e += (tgt - *e) * (dt / 0.16).min(1.0);
+            // Snap inside epsilon like the hover springs do — a pure
+            // lerp asymptotes and hidden entries would never reach 0.
+            if (*e - tgt).abs() <= 0.002 {
+                *e = tgt;
+            } else {
+                moving = true;
+            }
+            *e = e.clamp(0.0, 1.0);
+        }
+        // Settled-hidden entries get pruned so scrolled-past or
+        // filtered-out albums don't accrete in the map.
+        self.title_fade.retain(|_, v| *v > 0.001);
+        moving
     }
 
     fn metrics(&self, rect: Rect, count: usize) -> Metrics {
@@ -1280,6 +1324,11 @@ impl AlbumRow {
         if hover_moving {
             ui.ctx().request_repaint();
         }
+        // Title-bar reveal — same keepalive contract as the springs:
+        // a fade mid-flight needs frames or it freezes part-way.
+        if self.title_fade_step(dt) {
+            ui.ctx().request_repaint();
+        }
         // Swap-offset slide: non-dragged tiles ease toward the slots
         // that open a gap under the dragged tile (AnimateSwapOffsets —
         // frozen while the drop glide runs since they've arrived).
@@ -1912,12 +1961,24 @@ impl AlbumRow {
 
         // Cover fan: covers clipped to the cover area (rect clip is
         // fine — the rounded corners come from each cover mesh itself).
-        let cover_h = m.tile_h * scale - TITLE_BAR_H * self.scale * scale;
+        // Titles off: the cover claims the band's strip too — the
+        // title bar becomes a hover-revealed overlay on its bottom
+        // edge instead of a layout region.
+        let band_h = TITLE_BAR_H * self.scale * scale;
+        let cover_h = if self.show_titles {
+            m.tile_h * scale - band_h
+        } else {
+            m.tile_h * scale
+        };
         let cover_rect = Rect::from_min_size(tile.min, Vec2::new(tile.width(), cover_h));
         let item_size = tile.width().max(cover_h);
         let base_x = tile.width() - item_size;
         let spread = self.fans.get(index).map(|f| f.spread).unwrap_or(0.0);
         let cover_painter = painter.with_clip_rect(cover_rect);
+        // Titles off: dest matches the cover region so the mesh's
+        // rounded bottom corners land on the tile's bottom edge — a
+        // square dest would clip the arcs into a straight cut.
+        let dest_h = if self.show_titles { item_size } else { cover_h };
         // Resolve the album's top cover first: fan layers without their
         // own art draw the album cover (Lacrima's UseFolderCover layers),
         // not the note placeholder.
@@ -1949,7 +2010,7 @@ impl AlbumRow {
             draw_i += 1;
             let dest = Rect::from_min_size(
                 Pos2::new(cover_rect.min.x + x, cover_rect.min.y),
-                Vec2::splat(item_size),
+                Vec2::new(item_size, dest_h),
             );
             paint::paint_cover(
                 &cover_painter,
@@ -1965,7 +2026,7 @@ impl AlbumRow {
         if n == 0 {
             let dest = Rect::from_min_size(
                 Pos2::new(cover_rect.min.x + base_x, cover_rect.min.y),
-                Vec2::splat(item_size),
+                Vec2::new(item_size, dest_h),
             );
             paint::paint_cover(
                 &cover_painter,
@@ -1977,23 +2038,47 @@ impl AlbumRow {
             );
         }
 
-        // Title bar + album title (centered, wrapped, clipped).
-        let title_rect = Rect::from_min_max(
-            Pos2::new(tile.min.x, tile.min.y + cover_h),
-            tile.max,
-        );
-        painter.rect_filled(title_rect, 0.0, TITLE_BG.gamma_multiply(alpha));
+        // Title bar + album title (centered, wrapped, clipped). With
+        // titles off it overlays the cover's bottom edge, faded in
+        // per-tile while hovered (`title_fade`).
+        let title_rect =
+            Rect::from_min_max(Pos2::new(tile.min.x, tile.max.y - band_h), tile.max);
+        let title_a = if self.show_titles {
+            alpha
+        } else {
+            alpha * self
+                .title_fade
+                .get(dir_key.as_ref())
+                .copied()
+                .unwrap_or(0.0)
+        };
+        if title_a > 0.001 {
+            // Overlay bar: bottom corners rounded to the tile's radius
+            // so it doesn't poke past the cover's rounded arcs.
+            let bar_cr = if self.show_titles {
+                egui::CornerRadius::ZERO
+            } else {
+                let r = (TILE_RADIUS * self.scale).round() as u8;
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: r,
+                    se: r,
+                }
+            };
+            painter.rect_filled(title_rect, bar_cr, TITLE_BG.gamma_multiply(title_a));
+        }
         // While the inline editor is open on this tile the painted
         // title stays out — it would bleed around the TextEdit's frame.
         let title_editing =
             self.editing.as_deref() == Some(album.dir.to_string_lossy().as_ref());
-        if !title_editing {
+        if !title_editing && title_a > 0.001 {
             // Wrap to at most 2 rows with an ellipsis tail.
             let mut title_job = egui::text::LayoutJob::single_section(
                 album.title.clone(),
                 egui::TextFormat::simple(
                     FontId::proportional(18.0 * self.scale),
-                    Color32::WHITE.gamma_multiply(alpha),
+                    Color32::WHITE.gamma_multiply(title_a),
                 ),
             );
             title_job.wrap = egui::text::TextWrapping {
@@ -2157,5 +2242,39 @@ mod tests {
             full[1].dir.to_string_lossy().as_ref(),
             "a"
         );
+    }
+
+    /// Title-bar reveal: pinned at 1 while `show_titles` is on;
+    /// off, each tile's bar eases in only while it's the hovered one
+    /// and fully-hidden entries get pruned (dir-keyed).
+    #[test]
+    fn title_fades_follow_show_and_hover() {
+        let mut row = AlbumRow::new();
+        row.last_dirs = vec!["a".into(), "b".into()];
+        assert!(row.show_titles);
+        // On: every shown tile's fade pins at 1.
+        for _ in 0..30 {
+            row.title_fade_step(0.016);
+        }
+        assert!(row.title_fade.values().all(|&v| v > 0.99));
+        // Off + hovering "b": "a" fades out to pruning, "b" stays lit.
+        row.show_titles = false;
+        row.hovered = 1;
+        assert!(row.title_fade_step(0.016)); // still moving
+        for _ in 0..60 {
+            row.title_fade_step(0.016);
+        }
+        assert!(row.title_fade.get("a").is_none());
+        assert!(*row.title_fade.get("b").unwrap() > 0.99);
+        // Back on: hidden tiles fade IN — reinserted at 0 only when
+        // they're unhovered... under `show_titles` the insert seed is
+        // 1 so a mid-list tile never blinks black.
+        row.show_titles = true;
+        row.hovered = -1;
+        for _ in 0..60 {
+            row.title_fade_step(0.016);
+        }
+        assert!(row.title_fade.values().all(|&v| v > 0.99));
+        assert!(!row.title_fade_step(0.016)); // settled -> no repaint
     }
 }
