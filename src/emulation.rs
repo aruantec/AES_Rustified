@@ -2349,22 +2349,31 @@ pub fn view(
             ) {
                 // Like the music album row: a single click only selects
                 // the tile — opening a section requires a double-click.
-                album_row::Action::Opened(i) => {
-                    let switching = emu.active != Some(i);
-                    emu.active = Some(i);
-                    // Load the section's persisted games into the card
-                    // view on first activation — the key travels on the
-                    // tile's `emu:` dir so reordering can't miskey it.
-                    emu.open_section(i, cfg);
-                    // Opening a different section while a game is being
-                    // captured means the user wants the list — dismiss
-                    // the presentation so the newly opened section
-                    // shows (the game keeps running underneath). Same
-                    // side effects as the band's viewport toggle.
-                    if switching && emu.session.is_some() && !emu.viewport_dismissed {
-                        emu.viewport_dismissed = true;
-                        emu.game_fs = false;
-                        emu.input_tun = false;
+                // The payload is the tile's `emu:` dir — resolved back
+                // to a position here (the row may render a filtered
+                // subset, so indices don't survive the round trip).
+                album_row::Action::Opened(dir) => {
+                    if let Some(i) = emu
+                        .sections
+                        .iter()
+                        .position(|s| s.dir.to_string_lossy() == dir)
+                    {
+                        let switching = emu.active != Some(i);
+                        emu.active = Some(i);
+                        // Load the section's persisted games into the card
+                        // view on first activation — the key travels on the
+                        // tile's `emu:` dir so reordering can't miskey it.
+                        emu.open_section(i, cfg);
+                        // Opening a different section while a game is being
+                        // captured means the user wants the list — dismiss
+                        // the presentation so the newly opened section
+                        // shows (the game keeps running underneath). Same
+                        // side effects as the band's viewport toggle.
+                        if switching && emu.session.is_some() && !emu.viewport_dismissed {
+                            emu.viewport_dismissed = true;
+                            emu.game_fs = false;
+                            emu.input_tun = false;
+                        }
                     }
                 }
                 _ => {}

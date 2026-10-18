@@ -73,10 +73,13 @@ const HOLE_ALPHA: f32 = 0.7;
 #[allow(dead_code)] // Opened/Selected payloads get used by the album view next
 pub enum Action {
     None,
-    /// Single click selects an album.
-    Selected(usize),
+    /// Single click selects an album. Carries the album's dir, not
+    /// its index — the shown list can be a filter-clone, so an index
+    /// would resolve against the wrong list in the caller.
+    Selected(String),
     /// Double-clicked — will open the album's track view later.
-    Opened(usize),
+    /// Dir-keyed for the same reason.
+    Opened(String),
     /// "Delete Album" on the pointed tile (Lacrima's DeleteFolder —
     /// removes it from the list, not from disk). Carries the albums'
     /// dirs, not indices — the shown list can be filter-cloned. The
@@ -277,6 +280,15 @@ pub struct AlbumRow {
     /// Last frame's view rect + tile metrics — arrow-key navigation
     /// glides the target tile into view between paints.
     nav_view: Option<(Rect, Metrics)>,
+    /// Dirs of the list last rendered — `ui` may receive a
+    /// filter-cloned list, so every outward-facing selection API
+    /// resolves through this snapshot instead of raw indices.
+    last_dirs: Vec<String>,
+    /// Set by the caller when the shown list is a filtered subset —
+    /// a reorder then can't map back to the real list, so drag/arrow
+    /// reorders are dropped instead of silently reordering a clone
+    /// (or worse, the real list at shown-space indices).
+    pub filtered: bool,
     /// Brief focus flash (1→0) on Tab focus-in — a fading border
     /// around the strip so the user sees where the keys now land.
     focus_flash: f32,
@@ -374,6 +386,8 @@ impl AlbumRow {
             edit_armed: false,
             pending_reveal: None,
             nav_view: None,
+            last_dirs: Vec::new(),
+            filtered: false,
             focus_flash: 0.0,
             pop: 0.0,
         }
@@ -592,29 +606,34 @@ impl AlbumRow {
         };
         if landed {
             let d = self.drag.take().unwrap();
-            let bs = Self::block_start(&d, count);
-            let already = d
-                .indices
-                .iter()
-                .enumerate()
-                .all(|(k, &i)| i == bs + k);
-            if !already {
-                let mut pulled: Vec<Album> = Vec::with_capacity(d.indices.len());
-                for &i in d.indices.iter().rev() {
-                    pulled.push(albums.remove(i));
+            // A filtered strip renders a clone — a drop can't be mapped
+            // back to the real list, so the reorder is dropped instead
+            // of writing a shown-space permutation into the model.
+            if !self.filtered {
+                let bs = Self::block_start(&d, count);
+                let already = d
+                    .indices
+                    .iter()
+                    .enumerate()
+                    .all(|(k, &i)| i == bs + k);
+                if !already {
+                    let mut pulled: Vec<Album> = Vec::with_capacity(d.indices.len());
+                    for &i in d.indices.iter().rev() {
+                        pulled.push(albums.remove(i));
+                    }
+                    pulled.reverse();
+                    for (k, a) in pulled.into_iter().enumerate() {
+                        albums.insert(bs + k, a);
+                    }
                 }
-                pulled.reverse();
-                for (k, a) in pulled.into_iter().enumerate() {
-                    albums.insert(bs + k, a);
-                }
+                let pr = d
+                    .indices
+                    .iter()
+                    .position(|&i| i == d.index)
+                    .unwrap_or(0);
+                self.note_reorder(&d.indices, bs, pr);
+                self.order_dirty = true;
             }
-            let pr = d
-                .indices
-                .iter()
-                .position(|&i| i == d.index)
-                .unwrap_or(0);
-            self.note_reorder(&d.indices, bs, pr);
-            self.order_dirty = true;
             return;
         }
         // Commit glide still in flight (or no drag at all) — nothing
@@ -893,6 +912,16 @@ impl AlbumRow {
     ) -> Action {
         let mut action = Action::None;
         self.scale = scale;
+        // Snapshot the rendered order — outward selection APIs and the
+        // key handlers resolve through it so a filter-cloned `albums`
+        // can't leak shown-space indices into the caller's real list.
+        self.last_dirs = albums
+            .iter()
+            .map(|a| a.dir.to_string_lossy().into_owned())
+            .collect();
+        // Reorders are meaningless on a filtered subset — disarm the
+        // lift cue (the drop commit itself is gated below).
+        let reorder_armed = reorder_armed && !self.filtered;
         let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
         // Shift held = reorder armed — the selected tiles lift
         // slightly to signal they can be moved. A tile press that
@@ -1112,7 +1141,7 @@ impl AlbumRow {
                         }
                         self.sel_touched = true;
                         self.selected = hit;
-                        action = Action::Selected(hit as usize);
+                        action = Action::Selected(dir.clone());
                         // Start tracking the press as a potential drag
                         // (BeginItemDrag); it becomes a visual drag past
                         // DRAG_START_PX. A selected tile drags the whole
@@ -1159,7 +1188,9 @@ impl AlbumRow {
                 let hit = self.hit_tile(rect, &m, albums.len(), p);
                 if hit >= 0 {
                     self.selected = hit;
-                    action = Action::Opened(hit as usize);
+                    action = Action::Opened(
+                        albums[hit as usize].dir.to_string_lossy().into_owned(),
+                    );
                 }
             }
         }
@@ -1556,13 +1587,19 @@ impl AlbumRow {
         action
     }
 
-    /// Keep the selection index sane after an album was removed from
-    /// the list (`DeleteFolder`).
-    pub fn removed(&mut self, idx: usize) {
-        if self.selected == idx as i32 {
-            self.selected = -1;
-        } else if self.selected > idx as i32 {
-            self.selected -= 1;
+    /// Keep the selection sane after an album was removed from the
+    /// list (`DeleteFolder`). `selected` indexes the last SHOWN list
+    /// (`last_dirs`), so the removal is tracked in that space — and
+    /// the snapshot drops the dir too, keeping multi-deletes in one
+    /// frame consistent.
+    pub fn removed(&mut self, dir: &str) {
+        if let Some(r) = self.last_dirs.iter().position(|d| d == dir) {
+            self.last_dirs.remove(r);
+            if self.selected == r as i32 {
+                self.selected = -1;
+            } else if self.selected > r as i32 {
+                self.selected -= 1;
+            }
         }
     }
 
@@ -1576,12 +1613,14 @@ impl AlbumRow {
 
     /// Arrow-key navigation (ListBox directional nav on a horizontal
     /// strip — every arrow steps ±1): collapse the selection to the
-    /// neighbor tile and glide it into view.
-    pub fn arrow(&mut self, albums: &[Album], dir: i32) {
-        if albums.is_empty() {
+    /// neighbor tile and glide it into view. Steps through the last
+    /// SHOWN list (`last_dirs`) — under an active filter that's the
+    /// filtered order, matching the tiles on screen.
+    pub fn arrow(&mut self, dir: i32) {
+        if self.last_dirs.is_empty() {
             return;
         }
-        let n = albums.len() as i32;
+        let n = self.last_dirs.len() as i32;
         // No selection yet: the first arrow enters at an edge.
         let base = if self.selected >= 0 {
             self.selected
@@ -1595,7 +1634,7 @@ impl AlbumRow {
             return;
         }
         self.selected = new;
-        let dir_key = albums[new as usize].dir.to_string_lossy().into_owned();
+        let dir_key = self.last_dirs[new as usize].clone();
         self.sel_dirs.clear();
         self.sel_dirs.insert(dir_key.clone());
         self.sel_anchor = dir_key;
@@ -1603,15 +1642,15 @@ impl AlbumRow {
         self.scroll_tile_into_view(new);
     }
 
-    /// Tab focus-in — ensure a selection exists (first tile when none)
-    /// and reveal it.
-    pub fn focus(&mut self, albums: &[Album]) {
-        if albums.is_empty() {
+    /// Tab focus-in — ensure a selection exists (first shown tile when
+    /// none) and reveal it.
+    pub fn focus(&mut self) {
+        if self.last_dirs.is_empty() {
             return;
         }
         if self.selected < 0 {
             self.selected = 0;
-            let dir = albums[0].dir.to_string_lossy().into_owned();
+            let dir = self.last_dirs[0].clone();
             self.sel_dirs.insert(dir.clone());
             self.sel_anchor = dir;
         }
@@ -1625,7 +1664,10 @@ impl AlbumRow {
     /// contiguous run, `note_reorder` keeps fans/selection aligned).
     pub fn move_selection(&mut self, albums: &mut Vec<Album>, dir: i32) {
         let count = albums.len();
-        if dir == 0 || count < 2 || self.selected < 0 {
+        // A filtered strip renders a clone — there is no meaningful
+        // reorder target, so the move is dropped rather than corrupting
+        // the real list at shown-space indices.
+        if dir == 0 || count < 2 || self.selected < 0 || self.filtered {
             return;
         }
         // Selected tile indices (dir-keyed selection → positions).
@@ -1690,26 +1732,28 @@ impl AlbumRow {
         }
     }
 
-    /// Ctrl+A — every listed album selected (keyed by dir, like the
+    /// Ctrl+A — every shown album selected (keyed by dir, like the
     /// click gestures, so filtering/reordering can't shift members).
-    pub fn select_all(&mut self, albums: &[Album]) {
-        self.sel_dirs = albums
-            .iter()
-            .map(|a| a.dir.to_string_lossy().into_owned())
-            .collect();
-        self.sel_anchor = albums
-            .first()
-            .map(|a| a.dir.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    /// Under an active filter that's the filtered set — the same
+    /// semantics as a filtered ListBox.
+    pub fn select_all(&mut self) {
+        self.sel_dirs = self.last_dirs.iter().cloned().collect();
+        self.sel_anchor = self.last_dirs.first().cloned().unwrap_or_default();
         if !self.sel_dirs.is_empty() {
             self.sel_touched = true;
         }
     }
 
-    /// The primary selection's index — Enter opens it like a
-    /// double-click.
-    pub fn selected_index(&self) -> Option<usize> {
-        (self.selected >= 0).then_some(self.selected as usize)
+    /// The primary selection's album dir — Enter opens it like a
+    /// double-click. `selected` indexes the last SHOWN list, so the
+    /// dir comes from `last_dirs`, never a caller-side index (the
+    /// filtered-open regression: an index into the filtered clone
+    /// resolved against the full list opened a different album).
+    pub fn selected_dir(&self) -> Option<String> {
+        if self.selected < 0 {
+            return None;
+        }
+        self.last_dirs.get(self.selected as usize).cloned()
     }
 
     /// A user selection gesture happened since the last check — the
@@ -1718,12 +1762,12 @@ impl AlbumRow {
         std::mem::take(&mut self.sel_touched)
     }
 
-    /// Selected albums' dirs in list order (the Delete key payload).
-    pub fn selected_dirs(&self, albums: &[Album]) -> Vec<String> {
-        albums
+    /// Selected albums' dirs in shown order (the Delete key payload).
+    pub fn selected_dirs(&self) -> Vec<String> {
+        self.last_dirs
             .iter()
-            .filter(|a| self.sel_dirs.contains(a.dir.to_string_lossy().as_ref()))
-            .map(|a| a.dir.to_string_lossy().into_owned())
+            .filter(|d| self.sel_dirs.contains(d.as_str()))
+            .cloned()
             .collect()
     }
 
@@ -2032,5 +2076,86 @@ fn dashed_rect(painter: &egui::Painter, rect: Rect, dash: f32, width: f32, color
             painter.line_segment([a + dir * t, a + dir * seg], stroke);
             t += dash * 2.0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filtered-open regression: `selected` indexes the SHOWN
+    /// (possibly filter-cloned) list — Enter must resolve through
+    /// `last_dirs` to a dir, so a filtered strip opens the album the
+    /// user pointed at, not the full-list item at the same index.
+    #[test]
+    fn selected_dir_resolves_shown_space() {
+        let mut row = AlbumRow::new();
+        // Full list a,b,c — selected the second tile.
+        row.last_dirs = vec!["a".into(), "b".into(), "c".into()];
+        row.selected = 1;
+        assert_eq!(row.selected_dir().as_deref(), Some("b"));
+        // Filtered down to ["c"]: index 0 must yield "c", not "a".
+        row.last_dirs = vec!["c".into()];
+        row.selected = 0;
+        assert_eq!(row.selected_dir().as_deref(), Some("c"));
+        // Out of range (filter shrank past the selection) — None,
+        // never a wrong-album index.
+        row.selected = 5;
+        assert_eq!(row.selected_dir(), None);
+        row.selected = -1;
+        assert_eq!(row.selected_dir(), None);
+    }
+
+    /// Deletion bookkeeping runs in shown space too — `removed(dir)`
+    /// shifts `selected` against `last_dirs` so several removes in one
+    /// frame stay consistent.
+    #[test]
+    fn removed_shifts_selection_in_shown_space() {
+        let mut row = AlbumRow::new();
+        row.last_dirs = vec!["a".into(), "b".into(), "c".into()];
+        row.selected = 2; // "c" highlighted
+        row.removed("a"); // removed before the selection -> shift left
+        assert_eq!(row.selected, 1);
+        assert_eq!(row.selected_dir().as_deref(), Some("c"));
+        row.removed("b");
+        assert_eq!(row.selected, 0);
+        assert_eq!(row.selected_dir().as_deref(), Some("c"));
+        row.removed("c"); // the selected album itself leaves
+        assert_eq!(row.selected, -1);
+        assert_eq!(row.selected_dir(), None);
+    }
+
+    /// Filtered strips can't reorder — the real list isn't the shown
+    /// one, so both reorder paths are gated on `filtered`.
+    #[test]
+    fn move_selection_drops_while_filtered() {
+        let mut row = AlbumRow::new();
+        row.last_dirs = vec!["a".into(), "b".into(), "c".into()];
+        row.selected = 0;
+        row.sel_dirs.insert("a".into());
+        let mut full: Vec<Album> = vec![
+            Album::placeholder("a"),
+            Album::placeholder("b"),
+            Album::placeholder("c"),
+        ];
+        row.filtered = true;
+        row.move_selection(&mut full, 1);
+        assert!(!row.order_dirty);
+        assert_eq!(
+            full.iter()
+                .map(|a| a.dir.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // Unfiltered, the same move lands (`fans` mirrors the list —
+        // ui() maintains that; the test seeds it directly).
+        row.filtered = false;
+        row.fans = (0..full.len()).map(|_| Fan::default()).collect();
+        row.move_selection(&mut full, 1);
+        assert!(row.order_dirty);
+        assert_eq!(
+            full[1].dir.to_string_lossy().as_ref(),
+            "a"
+        );
     }
 }

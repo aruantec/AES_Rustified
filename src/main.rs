@@ -2246,7 +2246,7 @@ impl eframe::App for AesRustApp {
                 {
                     match *sel_owner {
                         SelOwner::Albums => {
-                            let dirs = album_row.selected_dirs(albums);
+                            let dirs = album_row.selected_dirs();
                             if !dirs.is_empty() {
                                 row_action = album_row::Action::DeleteAlbum(dirs);
                             }
@@ -2272,7 +2272,7 @@ impl eframe::App for AesRustApp {
                         .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
                 {
                     match *sel_owner {
-                        SelOwner::Albums => album_row.select_all(albums),
+                        SelOwner::Albums => album_row.select_all(),
                         SelOwner::Cards => carousel.select_all(&search.text),
                         // Same default as the arrow keys: a loaded
                         // album's cards own it, else the strip.
@@ -2280,7 +2280,7 @@ impl eframe::App for AesRustApp {
                             if carousel.has_items() {
                                 carousel.select_all(&search.text)
                             } else {
-                                album_row.select_all(albums)
+                                album_row.select_all()
                             }
                         }
                     }
@@ -2337,13 +2337,13 @@ impl eframe::App for AesRustApp {
                         }
                     } else if dx != 0 || dy != 0 {
                         match *sel_owner {
-                            SelOwner::Albums => album_row.arrow(albums, dx + dy),
+                            SelOwner::Albums => album_row.arrow(dx + dy),
                             SelOwner::Cards => carousel.arrow(&search.text, dx, dy),
                             SelOwner::None => {
                                 if carousel.has_items() {
                                     carousel.arrow(&search.text, dx, dy)
                                 } else {
-                                    album_row.arrow(albums, dx + dy)
+                                    album_row.arrow(dx + dy)
                                 }
                             }
                         }
@@ -2370,7 +2370,7 @@ impl eframe::App for AesRustApp {
                         next
                     };
                     match *sel_owner {
-                        SelOwner::Albums => album_row.focus(albums),
+                        SelOwner::Albums => album_row.focus(),
                         SelOwner::Cards => carousel.focus(&search.text),
                         SelOwner::None => {}
                     }
@@ -2386,8 +2386,8 @@ impl eframe::App for AesRustApp {
                 {
                     match *sel_owner {
                         SelOwner::Albums => {
-                            if let Some(i) = album_row.selected_index() {
-                                row_action = album_row::Action::Opened(i);
+                            if let Some(dir) = album_row.selected_dir() {
+                                row_action = album_row::Action::Opened(dir);
                             }
                         }
                         SelOwner::Cards => {
@@ -2678,7 +2678,7 @@ impl eframe::App for AesRustApp {
                                     carousel.close();
                                 }
                                 albums.remove(i);
-                                album_row.removed(i);
+                                album_row.removed(&dir);
                                 album_row.deselect_dir(&dir);
                                 let lib = &mut settings.library;
                                 // Imported albums aren't scan results —
@@ -2905,13 +2905,17 @@ impl eframe::App for AesRustApp {
                             settings::save(settings);
                         }
                     }
-                    album_row::Action::Opened(i) => {
+                    album_row::Action::Opened(dir) => {
                         // Double-click loads the album's tracks into the
                         // cover view (Lacrima's LoadedAlbum -> CoverItems);
                         // playback only starts when a track item itself
                         // is double-clicked. The spectrum cover gradient
-                        // follows the album's top cover.
-                        if let Some(album) = albums.get(i) {
+                        // follows the album's top cover. The payload is
+                        // the album's dir — the row may have rendered a
+                        // filter-clone, so an index would land on the
+                        // wrong album.
+                        let i = albums.iter().position(|a| a.dir.to_string_lossy() == dir);
+                        if let Some(album) = i.and_then(|i| albums.get(i)) {
                             // The top cover feeds the spectrum gradient +
                             // shadertoy palette — decode it off the UI
                             // thread: a Web source is a network fetch
@@ -4612,6 +4616,10 @@ fn music_view(
             .collect();
         &mut filtered
     };
+    // `shown` can be a filter-clone — the row must not reorder a clone
+    // (drag/Shift+arrow drops the move instead of corrupting `albums`
+    // at shown-space indices).
+    row.filtered = !album_search.text.trim().is_empty();
     let action = if list_t > 0.001 {
         let slide = row_rect.translate(Vec2::new(
             0.0,
@@ -6947,9 +6955,9 @@ mod tests {
     fn frame_action_beats_pending() {
         let merged = or_row_action(
             album_row::Action::DeleteAlbum(vec!["a".into()]),
-            album_row::Action::Opened(2),
+            album_row::Action::Opened("b".into()),
         );
-        assert!(matches!(merged, album_row::Action::Opened(2)));
+        assert!(matches!(merged, album_row::Action::Opened(ref d) if d == "b"));
     }
 
     /// Settings tabs wrap into extra rows on narrow panels — before
