@@ -1386,7 +1386,6 @@ pub fn view(
     emu: &mut EmuView,
     cfg: &mut settings::Emulation,
     car_cfg: &settings::Carousel,
-    cover_layout: &mut u8,
     radius: u8,
     s: f32,
 ) {
@@ -1666,13 +1665,14 @@ pub fn view(
     // receiving input only once the layer is mostly faded out. While
     // the layer is fully opaque the cards aren't painted at all.
     if emu.active.is_some() && cap_a < 0.999 {
+        let layout = cfg.cover_layout_mode.min(2);
         draw_items(
             ui,
             upper,
             emu,
             cfg,
             car_cfg,
-            *cover_layout,
+            layout,
             alpha,
             interactive && cap_a < 0.5,
             s,
@@ -2307,10 +2307,12 @@ pub fn view(
             }
         }
 
-        // Right: the cover-layout cycle (Margin 0,0,50,0) — Lacrima binds
-        // the same global CoverLayoutMode the music band uses. While a
-        // session runs it makes room for the power button (Lacrima's
-        // right StackPanel order: layout … power … volume).
+        // Right: the cover-layout cycle (Margin 0,0,50,0) — persists
+        // Emulation.CoverLayoutMode, independent of the music band's
+        // Carousel.LayoutMode (Lacrima binds one global CoverLayoutMode
+        // to both). While a session runs it makes room for the power
+        // button (Lacrima's right StackPanel order: layout … power …
+        // volume).
         let right_x = layout_x;
         let btn = Rect::from_center_size(Pos2::new(right_x, cy), Vec2::splat(60.0 * s));
         let r = if interactive {
@@ -2320,12 +2322,13 @@ pub fn view(
         }
         .on_hover_text("Cover Layout");
         if r.clicked() {
-            *cover_layout = (*cover_layout + 1) % 3;
+            cfg.cover_layout_mode = (cfg.cover_layout_mode + 1) % 3;
+            emu.settings_dirty = true;
         }
         if r.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        transport::icon_layout(&painter, btn, *cover_layout, alpha);
+        transport::icon_layout(&painter, btn, cfg.cover_layout_mode.min(2), alpha);
 
         // Row 2 — the section strip slides down out of view while the
         // band holds (same trick as the music album row).
@@ -3936,7 +3939,7 @@ fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, al
 
 /// The item area with a section loaded and no session: the shared
 /// `Carousel` widget in ROM mode — the audio view's exact list (the
-/// band's layout icon drives the same CoverLayoutMode, so carousel /
+/// band's layout icon drives Emulation.CoverLayoutMode, so carousel /
 /// vertical / horizontal grids all work). Menus speak emulation:
 /// Add Roms / Scan Folder / Play / Remove / Clear Section.
 fn draw_items(
@@ -5505,5 +5508,24 @@ mod tests {
         assert_eq!(play_route(true, true), PlayRoute::UnDismiss);
         assert_eq!(play_route(true, false), PlayRoute::QueuePending);
         assert_eq!(play_route(false, false), PlayRoute::Launch);
+    }
+
+    /// The emulation band's cover-layout cycles its own persisted key —
+    /// the shared CoverLayoutMode regression: cycling one view used to
+    /// switch the other. Emulation.CoverLayoutMode and
+    /// Carousel.LayoutMode must serialize and round-trip independently.
+    #[test]
+    fn cover_layout_modes_are_independent() {
+        let mut s = settings::Settings::default();
+        s.emulation.cover_layout_mode = 2;
+        s.carousel.layout_mode = 1;
+        let json = serde_json::to_string(&s).unwrap();
+        let mut back: settings::Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.emulation.cover_layout_mode, 2);
+        assert_eq!(back.carousel.layout_mode, 1);
+        // Cycling the emulation mode leaves the carousel's alone.
+        back.emulation.cover_layout_mode = (back.emulation.cover_layout_mode + 1) % 3;
+        assert_eq!(back.emulation.cover_layout_mode, 0);
+        assert_eq!(back.carousel.layout_mode, 1);
     }
 }

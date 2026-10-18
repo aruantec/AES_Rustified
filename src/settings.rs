@@ -374,6 +374,11 @@ pub struct Emulation {
     /// EmulationUseBackCoverLetterboxFill — fill the capture's
     /// letterbox bars with the game's back cover art.
     pub back_cover_letterbox_fill: bool,
+    /// The emulation band's cover-layout mode: 0 = Carousel,
+    /// 1 = VerticalGrid, 2 = HorizontalGrid. Independent of the
+    /// music band's Carousel.LayoutMode (Lacrima shares one global
+    /// CoverLayoutMode; the views cycle their own here).
+    pub cover_layout_mode: u8,
     /// GameplayRecordingOutputDirectory — where recorded videos land.
     pub recording_dir: String,
     /// Emulator executable paths keyed by handler id (Lacrima's
@@ -481,6 +486,7 @@ impl Default for Emulation {
             use_first_item_cover: true,
             gameplay_autoplay: false,
             back_cover_letterbox_fill: false,
+            cover_layout_mode: 0,
             // Lacrima: MyVideos/AES_Lacrima, else DataRoot/Recordings.
             recording_dir: dirs::video_dir()
                 .map(|d| d.join("AES_Rustified").to_string_lossy().into_owned())

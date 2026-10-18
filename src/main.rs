@@ -2091,9 +2091,10 @@ impl eframe::App for AesRustApp {
                                     export_album = ex;
                                 }
                                 View::Emulation => {
-                                    // The layout toggle shares the
-                                    // global CoverLayoutMode — the same
-                                    // setting the music band cycles.
+                                    // The layout toggle persists
+                                    // Emulation.CoverLayoutMode —
+                                    // independent of the music band's
+                                    // Carousel.LayoutMode.
                                     emulation::view(
                                         ui,
                                         content,
@@ -2102,7 +2103,6 @@ impl eframe::App for AesRustApp {
                                         emu,
                                         &mut settings.emulation,
                                         &settings.carousel,
-                                        &mut transport.cover_layout,
                                         radius,
                                         s,
                                     );
