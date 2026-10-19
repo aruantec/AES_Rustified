@@ -506,15 +506,7 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
         };
         // Resolved labels persist in the metadata cache — a hit means
         // no network at all (Lacrima's .meta store semantics).
-        if let Some(mut c) = crate::meta_cache::load(&url) {
-            // Older entries predate the duration field — fill it once
-            // via the lightweight watch-page scrape and re-persist.
-            if c.duration.is_none() {
-                c.duration = crate::ytdlp::youtube_duration(&url);
-                if c.duration.is_some() {
-                    crate::meta_cache::save(&url, &c);
-                }
-            }
+        if let Some(c) = crate::meta_cache::load(&url) {
             if !c.title.is_empty() {
                 t.title = c.title;
             }
@@ -534,10 +526,13 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
             t.artist = m.author;
             t.cover_url = m.thumb;
             // oEmbed (and the og: fallback) carry no duration — the
-            // yt-dlp branch's own value wins when present.
-            t.duration = m
-                .duration
-                .or_else(|| crate::ytdlp::youtube_duration(&url));
+            // yt-dlp branch's own value wins when present. No
+            // watch-page scrape: per-item page fetches tripped
+            // YouTube's bot/rate defenses (regression — resolved
+            // streams stopped being served). Duration arrives via
+            // the resolved stream's `dur=` param instead (Lacrima's
+            // persist-on-play model).
+            t.duration = m.duration;
             if !t.title.is_empty() || !t.artist.is_empty() {
                 crate::meta_cache::save(
                     &url,

@@ -659,6 +659,10 @@ pub enum ExtractorProfile {
     HighQualityStreams,
     /// yt-dlp's own extractor defaults.
     Unrestricted,
+    /// `android_music,android_creator,tv_embedded` — serves DASH
+    /// audio-only itags (m4a/AAC-LC) without the sign-in gate that
+    /// Unrestricted's default clients now hit.
+    AndroidMusic,
 }
 
 /// `AddCommonYtDlpArgs` — extractor client profile, available JS
@@ -671,6 +675,9 @@ fn common_args(profile: ExtractorProfile) -> Vec<String> {
             match profile {
                 ExtractorProfile::HighQualityStreams => {
                     "youtube:player_client=android_sdkless"
+                }
+                ExtractorProfile::AndroidMusic => {
+                    "youtube:player_client=android_music,android_creator,tv_embedded;player_skip=webpage,configs"
                 }
                 _ => "youtube:player_client=android,web_safari,tv;player_skip=webpage,configs",
             }
@@ -1062,27 +1069,11 @@ pub struct OnlineMeta {
     pub duration: Option<f64>,
 }
 
-/// Stream length in seconds from the watch page's player response —
-/// oEmbed doesn't carry duration, so a lightweight page scrape fills
-/// it without paying for a yt-dlp metadata pass per item.
-pub fn youtube_duration(url: &str) -> Option<f64> {
-    let id = extract_video_id(url)?;
-    let html = fetch_text(&format!("https://www.youtube.com/watch?v={id}"), 15)?;
-    parse_length_seconds(&html)
-}
-
-/// `"lengthSeconds":"NNN"` (string or numeric JSON) — the first hit
-/// is the player response's own field.
-fn parse_length_seconds(html: &str) -> Option<f64> {
-    const KEY: &str = "\"lengthSeconds\"";
-    let rest = &html[html.find(KEY)? + KEY.len()..];
-    let rest = rest.trim_start_matches([':', '"', ' ']);
-    let num: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    num.parse::<f64>().ok().filter(|d| *d > 0.0)
-}
+/// Duration intentionally has no watch-page fallback — per-item page
+/// fetches tripped YouTube's bot/rate defenses (regression: resolved
+/// streams stopped being served). Duration arrives from the resolved
+/// stream's `dur=` param and persists in the metadata cache (Lacrima's
+/// persist-on-play model).
 
 pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
     if let Some(id) = extract_video_id(url) {
@@ -1339,25 +1330,6 @@ mod tests {
         assert_eq!(
             clean_video_link("https://example.com/radio.pls"),
             "https://example.com/radio.pls"
-        );
-    }
-
-    /// `lengthSeconds` arrives as a JSON string or number inside the
-    /// player response; the column needs a positive float either way.
-    #[test]
-    fn parse_length_seconds_handles_both_forms() {
-        assert_eq!(
-            parse_length_seconds(r#"{"lengthSeconds":"2135","x":1}"#),
-            Some(2135.0)
-        );
-        assert_eq!(
-            parse_length_seconds(r#"{"lengthSeconds":2135.5}"#),
-            Some(2135.5)
-        );
-        assert_eq!(parse_length_seconds("no field"), None);
-        assert_eq!(
-            parse_length_seconds(r#"{"lengthSeconds":"0"}"#),
-            None
         );
     }
 }

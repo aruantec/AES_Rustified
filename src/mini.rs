@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Vec2};
+use eframe::egui::epaint::{Mesh, Shape, Vertex};
 
 use crate::{
     album_row, audio, carousel, ellipsize, equalizer, fmt_time, settings, spectrum_bar,
@@ -143,7 +144,7 @@ pub(crate) fn view(
     let art = playing_track
         .and_then(|t| carousel.cover_for(t))
         .and_then(|src| row.cover_tex(&ctx, &src));
-    match art {
+    match &art {
         Some(tex) => {
             // Uniform fit — preserve the art's aspect, centered in the
             // square slot (a 16:9 thumbnail letterboxes like Lacrima,
@@ -561,6 +562,48 @@ pub(crate) fn view(
         Pos2::new(content.min.x + pad_x, list_top),
         Pos2::new(content.max.x - pad_x * 0.6, foot_top),
     );
+    // Lacrima's Row=4 backdrop: the loaded cover stretched
+    // UniformToFill across the whole playlist band at 0.4 opacity,
+    // under an opacity mask that fades it in from transparent at
+    // the top to full by the 80% mark (LinearGradient 50%,1% →
+    // 50%,80% in the XAML). Painted as a uv-mesh so the fill-crop
+    // and the fade live in the same vertices.
+    if let Some(tex) = &art {
+        let bg = Rect::from_min_max(
+            Pos2::new(content.min.x, list_top),
+            Pos2::new(content.max.x, foot_top),
+        );
+        if bg.width() > 0.0 && bg.height() > 0.0 {
+            let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
+            let fill = (bg.width() / tw).max(bg.height() / th);
+            let wr = bg.width() / fill / tw;
+            let hr = bg.height() / fill / th;
+            let u0 = (1.0 - wr) * 0.5;
+            let v0 = (1.0 - hr) * 0.5;
+            // Opacity-mask ramp: 0% alpha at the top edge, border
+            // opacity from 80% height down — 0.2 (Lacrima's 0.4
+            // toned down per user).
+            let a = 51u8;
+            let fy = bg.min.y + 0.8 * bg.height();
+            let fv = v0 + 0.8 * hr;
+            let mut mesh = Mesh::with_texture(tex.id());
+            for (py, vy, pa) in [
+                (bg.min.y, v0, 0u8),
+                (fy, fv, a),
+                (bg.max.y, v0 + hr, a),
+            ] {
+                for (px, ux) in [(bg.min.x, u0), (bg.max.x, u0 + wr)] {
+                    mesh.vertices.push(Vertex {
+                        pos: Pos2::new(px, py),
+                        uv: Pos2::new(ux, vy),
+                        color: Color32::from_white_alpha(pa),
+                    });
+                }
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
+            painter.add(Shape::mesh(mesh));
+        }
+    }
     if list.height() > 0.15 * h {
         let font = FontId::proportional(0.12 * h);
         let row_h = font.size * 1.75;

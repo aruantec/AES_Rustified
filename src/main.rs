@@ -1369,8 +1369,14 @@ impl AesRustApp {
                     let first = one(sel, ytdlp::ExtractorProfile::Default);
                     let stream = match &first {
                         Some(u) if is_audio_mime(u) => first.clone(),
-                        _ => one(sel, ytdlp::ExtractorProfile::Unrestricted)
+                        // Unrestricted's default clients are now
+                        // sign-in gated; the android_music family
+                        // still serves audio-only itags. Try it
+                        // first, unrestricted last.
+                        _ => one(sel, ytdlp::ExtractorProfile::AndroidMusic)
                             .filter(|u| is_audio_mime(u))
+                            .or_else(|| one(sel, ytdlp::ExtractorProfile::Unrestricted)
+                                .filter(|u| is_audio_mime(u)))
                             .or(first),
                     };
                     let stream = stream
