@@ -429,6 +429,9 @@ pub struct TrackInfo {
     /// Online items only — the real thumbnail URL (replaces the
     /// guessed img.youtube.com candidate list once known).
     pub cover_url: Option<String>,
+    /// Tag/probe duration in seconds — the mini list's duration
+    /// column and footer total.
+    pub duration: Option<f64>,
 }
 
 /// Read tags for `tracks` on a worker thread; results arrive in order.
@@ -489,7 +492,7 @@ pub fn spawn_url_info(
 /// have no local tags: cheap online scrape instead (Lacrima's
 /// MetadataScrapper → GetOnlineMetadataAsync).
 fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
-    use lofty::file::TaggedFileExt;
+    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::Accessor;
     if is_url(path) {
         let url = path.to_string_lossy().into_owned();
@@ -499,6 +502,7 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
             album: album_title.to_string(),
             number: None,
             cover_url: None,
+            duration: None,
         };
         // Resolved labels persist in the metadata cache — a hit means
         // no network at all (Lacrima's .meta store semantics).
@@ -520,6 +524,7 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
             }
             t.artist = m.author;
             t.cover_url = m.thumb;
+            t.duration = m.duration;
             if !t.title.is_empty() || !t.artist.is_empty() {
                 crate::meta_cache::save(
                     &url,
@@ -546,8 +551,10 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
             album: album_title.to_string(),
             number: filename_track_number(&stem()),
             cover_url: None,
+            duration: None,
         };
     };
+    let duration = tagged.properties().duration().as_secs_f64();
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
     let title = tag
         .and_then(|t| t.title().map(|s| s.into_owned()))
@@ -566,6 +573,7 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
             .unwrap_or_else(|| album_title.to_string()),
         number,
         cover_url: None,
+        duration: Some(duration),
     }
 }
 

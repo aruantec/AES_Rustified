@@ -46,6 +46,38 @@ pub struct Settings {
 pub struct Window {
     pub width: f32,
     pub height: f32,
+    /// Outer position of the normal window — restored when switching
+    /// back from the mini shell. Session-only: never serialized, so a
+    /// fresh launch always centers (`None`).
+    #[serde(skip)]
+    pub x: Option<f32>,
+    #[serde(skip)]
+    pub y: Option<f32>,
+    /// The compact mini-player shell instead of the normal view
+    /// stack — a window closed in mini mode reopens in mini mode.
+    #[serde(default)]
+    pub mini: bool,
+    /// The mini shell keeps its own geometry; the normal window's
+    /// rect is restored as-is when switching back.
+    #[serde(default = "Window::default_mini_width")]
+    pub mini_width: f32,
+    #[serde(default = "Window::default_mini_height")]
+    pub mini_height: f32,
+    /// Mini window's outer position — same session-only rule as
+    /// `x`/`y`: restored on mode switches, never on a fresh launch.
+    #[serde(skip)]
+    pub mini_x: Option<f32>,
+    #[serde(skip)]
+    pub mini_y: Option<f32>,
+}
+
+impl Window {
+    fn default_mini_width() -> f32 {
+        crate::mini::DEFAULT_SIZE.x
+    }
+    fn default_mini_height() -> f32 {
+        crate::mini::DEFAULT_SIZE.y
+    }
 }
 
 impl Default for Window {
@@ -53,6 +85,13 @@ impl Default for Window {
         Self {
             width: 960.0,
             height: 600.0,
+            x: None,
+            y: None,
+            mini: false,
+            mini_width: Self::default_mini_width(),
+            mini_height: Self::default_mini_height(),
+            mini_x: None,
+            mini_y: None,
         }
     }
 }

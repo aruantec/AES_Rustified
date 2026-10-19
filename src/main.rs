@@ -18,6 +18,7 @@ mod library;
 mod libretro;
 mod logo;
 mod meta_cache;
+mod mini;
 mod paint;
 mod particles;
 mod pillarbox;
@@ -294,19 +295,47 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // The persisted shell mode picks the window geometry: the mini
+    // player keeps its own rect and smaller size floor so the normal
+    // window's size survives a round-trip through mini mode. Window
+    // position is session-only — every launch centers.
+    let w = &settings.window;
+    let (inner, min) = if w.mini {
+        (
+            Vec2::new(
+                w.mini_width.max(mini::MIN_SIZE.x),
+                w.mini_height.max(mini::MIN_SIZE.y),
+            ),
+            mini::MIN_SIZE,
+        )
+    } else {
+        (
+            Vec2::new(w.width.max(360.0), w.height.max(260.0)),
+            Vec2::new(360.0, 260.0),
+        )
+    };
+    let pos = if w.mini {
+        w.mini_x.zip(w.mini_y)
+    } else {
+        w.x.zip(w.y)
+    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("AES Oxide")
+        // Taskbar/alt-tab icon (the file icon comes from app.rc).
+        .with_icon(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/AES.png"))
+                .expect("embedded app icon"),
+        )
+        .with_inner_size(inner)
+        .with_min_inner_size(min)
+        .with_decorations(false)
+        .with_transparent(true);
+    if let Some((x, y)) = pos {
+        viewport = viewport.with_position(Pos2::new(x, y));
+    }
     let native_options = eframe::NativeOptions {
         wgpu_options,
-        viewport: egui::ViewportBuilder::default()
-            .with_title("AES Oxide")
-            // Taskbar/alt-tab icon (the file icon comes from app.rc).
-            .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/AES.png"))
-                    .expect("embedded app icon"),
-            )
-            .with_inner_size(Vec2::new(settings.window.width, settings.window.height))
-            .with_min_inner_size(Vec2::new(360.0, 260.0))
-            .with_decorations(false)
-            .with_transparent(true),
+        viewport,
         ..Default::default()
     };
 
@@ -395,10 +424,27 @@ pub(crate) fn set_fullscreen(ctx: &egui::Context, on: bool) {
     ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
 }
 
+/// In-flight normal ⇄ mini switch: the content fades to black in its
+/// own window, the shell flips and the geometry commands fire once
+/// fully dark, then the veil lifts over the new shell — the black
+/// hold ends the moment the OS has applied the target rect, so a
+/// slow resize can't leave stale content visible and a fast one
+/// doesn't stall on black.
+struct ModeSwitch {
+    at: std::time::Instant,
+    /// Flag flipped + target geometry sent (at full black).
+    swapped: bool,
+    /// Fade-in anchor — set once the applied inner size matches the
+    /// target (or the hold cap hits).
+    done: Option<std::time::Instant>,
+}
+
 struct AesRustApp {
     icons: icons::MenuIcons,
     menu_scales: [f32; 4],
     centered: bool,
+    /// Armed by the title-bar switch button; drives the crossfade.
+    mode_switch: Option<ModeSwitch>,
     shadertoy: Option<shadertoy::Shadertoy>,
     logo: logo::TitleLogo,
     lacrima: particles::LacrimaParticles,
@@ -973,7 +1019,14 @@ impl AesRustApp {
         let mut app = Self {
             icons: icons::load(&cc.egui_ctx),
             menu_scales: [1.0; 4],
-            centered: false,
+            // Positions are session-only so this is always None on a
+            // fresh launch → the work-area centering below runs.
+            centered: if settings.window.mini {
+                settings.window.mini_x.is_some() && settings.window.mini_y.is_some()
+            } else {
+                settings.window.x.is_some() && settings.window.y.is_some()
+            },
+            mode_switch: None,
             shadertoy: cc.wgpu_render_state.as_ref().map(|rs| {
                 let mut toy = shadertoy::Shadertoy::new(rs);
                 toy.select(&settings.effects.shadertoy);
@@ -1477,8 +1530,10 @@ impl eframe::App for AesRustApp {
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         let is_fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
         // Mirror the current window size into settings (un-maximized only,
-        // so the restored size is the normal one).
-        if !maximized && !is_fullscreen {
+        // so the restored size is the normal one). Suspended during a
+        // mode switch — the mid-transition size must not corrupt the
+        // outgoing slot's snapshot or race the incoming geometry.
+        if !maximized && !is_fullscreen && self.mode_switch.is_none() {
             // Wayland reports no window position, so `inner_rect` is
             // None there — fall back to the screen rect (identical size
             // in points) or the size is never persisted.
@@ -1497,8 +1552,26 @@ impl eframe::App for AesRustApp {
                     boot_mark(&format!("window size {size:?}"));
                 }
             }
-            self.settings.window.width = size.x;
-            self.settings.window.height = size.y;
+            let w = &mut self.settings.window;
+            if w.mini {
+                w.mini_width = size.x;
+                w.mini_height = size.y;
+            } else {
+                w.width = size.x;
+                w.height = size.y;
+            }
+            // Position too — the mode switch restores the other
+            // shell's rect verbatim (None on Wayland — positions stay
+            // unset there and the window centers instead).
+            if let Some(outer) = ui.ctx().input(|i| i.viewport().outer_rect) {
+                if w.mini {
+                    w.mini_x = Some(outer.min.x);
+                    w.mini_y = Some(outer.min.y);
+                } else {
+                    w.x = Some(outer.min.x);
+                    w.y = Some(outer.min.y);
+                }
+            }
         }
 
         // Global UI scale — Lacrima's ScaleFactor/ScalableDecorator: the
@@ -1599,6 +1672,7 @@ impl eframe::App for AesRustApp {
         };
         let mut back_clicked = false;
         let mut esc_back = false;
+        let mut mini_clicked = false;
         // Set by the title-bar's fullscreen-exit button — consumed
         // after the frame to open the exit confirmation.
         let mut fs_exit_req = false;
@@ -1973,6 +2047,59 @@ impl eframe::App for AesRustApp {
         let settings_active = *settings_open;
         let animate_title = settings.effects.animate_title;
         let interactive = matches!(nav, Nav::Settled(_));
+        // Normal ⇄ mini crossfade. Phase 1: content dims to black in
+        // its own window — resizing early would visibly squash the
+        // outgoing view into the incoming rect. Phase 2: the flag +
+        // target geometry land together at full black, and the veil
+        // holds until the OS reports the target inner size (a real
+        // wait, not a guessed delay). Phase 3: fade back in.
+        const SWITCH_OUT: f32 = 0.22;
+        const SWITCH_IN: f32 = 0.3;
+        const SWITCH_HOLD: f32 = 0.45;
+        let mut switch_fade = 0.0f32;
+        if let Some(sw) = &mut self.mode_switch {
+            let t = sw.at.elapsed().as_secs_f32();
+            if !sw.swapped && t >= SWITCH_OUT {
+                apply_window_mode(ui.ctx(), settings, &mut self.centered);
+                sw.swapped = true;
+            }
+            // Smoothstep on both halves — the veil eases in, sits at
+            // black for the geometry swap, and eases back out.
+            let ease = |x: f32| {
+                let x = x.clamp(0.0, 1.0);
+                x * x * (3.0 - 2.0 * x)
+            };
+            switch_fade = if t < SWITCH_OUT {
+                ease(t / SWITCH_OUT)
+            } else {
+                let applied = sw.swapped && {
+                    let w = &settings.window;
+                    let (tw, th) = if w.mini {
+                        (w.mini_width, w.mini_height)
+                    } else {
+                        (w.width, w.height)
+                    };
+                    ui.ctx()
+                        .input(|i| i.viewport().inner_rect)
+                        .map(|r| {
+                            (r.width() - tw).abs() < 4.0 && (r.height() - th).abs() < 4.0
+                        })
+                        // No rect reporting (Wayland) — don't hold.
+                        .unwrap_or(true)
+                };
+                if applied || t >= SWITCH_OUT + SWITCH_HOLD {
+                    let at = sw.done.get_or_insert_with(std::time::Instant::now);
+                    1.0 - ease(at.elapsed().as_secs_f32() / SWITCH_IN)
+                } else {
+                    1.0
+                }
+            };
+            if sw.done.is_some() && switch_fade <= 0.0 {
+                self.mode_switch = None;
+                switch_fade = 0.0;
+            }
+            ui.ctx().request_repaint();
+        }
         // While the settings overlay is open (or sliding) nothing
         // behind it accepts input — including the carousel's raw
         // pointer paths that bypass egui's widget hit routing.
@@ -1980,6 +2107,7 @@ impl eframe::App for AesRustApp {
             ui.ctx()
                 .animate_bool_with_time(egui::Id::new("settings-overlay"), *settings_open, 0.3);
         let view_interactive = interactive
+            && self.mode_switch.is_none()
             && overlay_slide < 0.001
             && !tag_editor.is_open()
             && !url_prompt.is_open()
@@ -1993,8 +2121,9 @@ impl eframe::App for AesRustApp {
         // Inset horizontally by the grip width — the full-width band
         // used to swallow the bottom corner resize handles, leaving no
         // working grip in these views.
-        let resize_exclude = if (nav.target() == View::Music && transport.album_list_open)
-            || (nav.target() == View::Emulation && emu.list_open)
+        let resize_exclude = if !settings.window.mini
+            && ((nav.target() == View::Music && transport.album_list_open)
+                || (nav.target() == View::Emulation && emu.list_open))
         {
             let row = album_row_rect(content, s);
             let zone = album_row::AlbumRow::scroll_zone(row, s);
@@ -2016,6 +2145,8 @@ impl eframe::App for AesRustApp {
             settings_icon,
             settings_active,
             &mut gear_clicked,
+            settings.window.mini,
+            &mut mini_clicked,
             animate_title,
             s,
             resize_exclude,
@@ -2084,6 +2215,50 @@ impl eframe::App for AesRustApp {
                 // the dirty check since fx_before is taken after it.
                 let eq_before = settings.equalizer.bands;
                 ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
+                    // The mini shell replaces the whole view stack —
+                    // its outputs land in the same vars the shared
+                    // action tail below already handles.
+                    if settings.window.mini {
+                        let stream_loading =
+                            playing_track.as_ref().is_some_and(|t| library::is_url(t))
+                                && (resolve_rx.is_some()
+                                    || player.as_ref().is_some_and(|p| p.buffering()));
+                        let mout = mini::view(
+                            ui,
+                            content,
+                            view_interactive,
+                            carousel,
+                            album_row,
+                            player.as_ref(),
+                            playing_track.as_deref(),
+                            stream_loading,
+                            waveform_shown,
+                            *waveform_loading,
+                            waveform_bar,
+                            transport,
+                            spectrum,
+                            &settings.spectrum,
+                            Color32::from_rgb(
+                                settings.carousel.grid_bg[0],
+                                settings.carousel.grid_bg[1],
+                                settings.carousel.grid_bg[2],
+                            ),
+                            spectrum_colors.as_deref(),
+                            Color32::from_rgb(
+                                settings.audio.volume_knob_color[0],
+                                settings.audio.volume_knob_color[1],
+                                settings.audio.volume_knob_color[2],
+                            ),
+                            s,
+                        );
+                        if let Some(t) = mout.seek {
+                            seek_secs = Some(t);
+                        }
+                        if let Some(p) = mout.play {
+                            play_path = Some(p);
+                        }
+                        return;
+                    }
                     let a = nav.alpha(View::Main);
                     if a > 0.0 {
                         ui.set_opacity(a);
@@ -3205,6 +3380,8 @@ impl eframe::App for AesRustApp {
                                                     .unwrap_or_else(|| album_title.clone()),
                                                 number: None,
                                                 cover_url: None,
+                                                duration: (it.duration > 0.0)
+                                                    .then_some(it.duration),
                                             },
                                         );
                                     }
@@ -3909,6 +4086,15 @@ impl eframe::App for AesRustApp {
                     }
                     ui.ctx().request_repaint();
                 }
+                // Mode-switch veil — last thing painted over the
+                // content so the shell swap lands on black.
+                if switch_fade > 0.0 {
+                    ui.painter().rect_filled(
+                        content,
+                        0,
+                        Color32::from_black_alpha((switch_fade * 255.0) as u8),
+                    );
+                }
             },
         );
         if fs_exit_req {
@@ -3925,6 +4111,13 @@ impl eframe::App for AesRustApp {
         }
         if gear_clicked {
             self.settings_open = !self.settings_open;
+        }
+        if mini_clicked && self.mode_switch.is_none() {
+            self.mode_switch = Some(ModeSwitch {
+                at: std::time::Instant::now(),
+                swapped: false,
+                done: None,
+            });
         }
         {
             static FRAME2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3994,6 +4187,69 @@ fn widget_menu(
     }
 }
 
+/// The shell swap, fired at the veil's full-black point: snapshot the
+/// outgoing mode's rect (the frame mirror keeps it current, but a
+/// maximized window skips the mirror — its restored size is what it
+/// was before the maximize), flip the flag, then send the target
+/// mode's size, position and size floor — all on black, so the OS
+/// resize morphs behind the veil. With no saved position the
+/// one-time centering runs on a later frame (`centered` reset).
+fn apply_window_mode(ctx: &egui::Context, settings: &mut settings::Settings, centered: &mut bool) {
+    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    if maximized {
+        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+    }
+    let outer = ctx.input(|i| i.viewport().outer_rect);
+    let inner = ctx.input(|i| i.viewport().inner_rect);
+    let w = &mut settings.window;
+    if w.mini {
+        // Leaving mini — record its rect, restore the normal one.
+        if !maximized {
+            if let Some(r) = outer {
+                w.mini_x = Some(r.min.x);
+                w.mini_y = Some(r.min.y);
+            }
+            if let Some(r) = inner {
+                w.mini_width = r.width();
+                w.mini_height = r.height();
+            }
+        }
+        w.mini = false;
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(360.0, 260.0)));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+            w.width.max(360.0),
+            w.height.max(260.0),
+        )));
+        match w.x.zip(w.y) {
+            Some((x, y)) => ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(x, y))),
+            None => *centered = false,
+        }
+    } else {
+        // Leaving the normal window — record its rect, apply mini's.
+        if !maximized {
+            if let Some(r) = outer {
+                w.x = Some(r.min.x);
+                w.y = Some(r.min.y);
+            }
+            if let Some(r) = inner {
+                w.width = r.width();
+                w.height = r.height();
+            }
+        }
+        w.mini = true;
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(mini::MIN_SIZE));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+            w.mini_width.max(mini::MIN_SIZE.x),
+            w.mini_height.max(mini::MIN_SIZE.y),
+        )));
+        match w.mini_x.zip(w.mini_y) {
+            Some((x, y)) => ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(x, y))),
+            None => *centered = false,
+        }
+    }
+    settings::save(settings);
+}
+
 /// Frameless transparent window whose content is painted inside a rounded
 /// border, matching the AES_Lacrima window chrome:
 /// `CornerRadius=10`, `BorderBrush=DimGray`, `BorderThickness=0.5`, black fill.
@@ -4008,6 +4264,8 @@ fn lacrima_window_frame(
     settings_icon: egui::TextureId,
     settings_active: bool,
     gear_clicked: &mut bool,
+    mini_active: bool,
+    mini_clicked: &mut bool,
     animate_title: bool,
     scale: f32,
     resize_exclude: Option<Rect>,
@@ -4263,18 +4521,22 @@ fn lacrima_window_frame(
                     if title_button(ui, TitleButton::Minimize, scale).clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                     }
-                    let kind = if is_fullscreen {
-                        TitleButton::FullscreenExit
-                    } else {
-                        TitleButton::Fullscreen
-                    };
-                    if title_button(ui, kind, scale).clicked() {
-                        // Exiting fullscreen goes through the
-                        // confirmation prompt like Esc does.
-                        if is_fullscreen {
-                            *fs_exit_req = true;
+                    // The mini shell hides the fullscreen button — a
+                    // compact player has no fullscreen state.
+                    if !mini_active {
+                        let kind = if is_fullscreen {
+                            TitleButton::FullscreenExit
                         } else {
-                            set_fullscreen(&ctx, true);
+                            TitleButton::Fullscreen
+                        };
+                        if title_button(ui, kind, scale).clicked() {
+                            // Exiting fullscreen goes through the
+                            // confirmation prompt like Esc does.
+                            if is_fullscreen {
+                                *fs_exit_req = true;
+                            } else {
+                                set_fullscreen(&ctx, true);
+                            }
                         }
                     }
                     // Settings gear, left of the window buttons like
@@ -4311,6 +4573,35 @@ fn lacrima_window_frame(
                         *gear_clicked = true;
                     }
                     gear.on_hover_text("Settings");
+                    // Shell switch — left of the gear, the same swap
+                    // glyph the emulator view uses for capture ⇄
+                    // list. Lit while the mini shell is up; toggles
+                    // the window between the full view stack and the
+                    // compact mini player.
+                    let (rect, sw) = ui
+                        .allocate_exact_size(Vec2::new(35.0 * scale, 30.0 * scale), Sense::click());
+                    if sw.hovered() {
+                        ctx.set_cursor_icon(CursorIcon::PointingHand);
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same((6.0 * scale).round() as u8),
+                            Color32::from_white_alpha(20),
+                        );
+                    }
+                    transport::icon_viewport(
+                        ui.painter(),
+                        Rect::from_center_size(rect.center(), Vec2::splat(24.0 * scale)),
+                        mini_active,
+                        1.0,
+                    );
+                    if sw.clicked() {
+                        *mini_clicked = true;
+                    }
+                    sw.on_hover_text(if mini_active {
+                        "Back to Full View"
+                    } else {
+                        "Mini Player"
+                    });
                 });
             });
 

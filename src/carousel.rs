@@ -153,6 +153,9 @@ struct Item {
     title: String,
     artist: String,
     album: String,
+    /// Tag duration in seconds — `None` for ROM items and items
+    /// whose info hasn't resolved yet (the mini list shows "--:--").
+    duration: Option<f64>,
 }
 
 struct Press {
@@ -409,6 +412,7 @@ impl Carousel {
                     title: stem,
                     artist: String::new(),
                     album: album.title.clone(),
+                    duration: None,
                 }
             })
             .collect();
@@ -469,6 +473,7 @@ impl Carousel {
             artist: String::new(),
             album: section.to_string(),
             path,
+            duration: None,
         }
     }
 
@@ -545,6 +550,7 @@ impl Carousel {
                 .first()
                 .map(|i| i.album.clone())
                 .unwrap_or_default(),
+            duration: None,
         });
     }
 
@@ -726,6 +732,7 @@ impl Carousel {
             };
             item.artist = info.artist.clone();
             item.album = info.album.clone();
+            item.duration = info.duration;
             if let Some(u) = &info.cover_url {
                 item.cover = Self::item_cover(&item.path, u);
             }
@@ -753,6 +760,7 @@ impl Carousel {
             };
             item.artist = info.artist;
             item.album = info.album;
+            item.duration = info.duration;
             // Online items: the resolved thumbnail replaces the
             // guessed img.youtube.com candidate list (unless an edited
             // local cover exists — it wins).
@@ -765,6 +773,26 @@ impl Carousel {
     /// Index of `path` in the loaded items (the playing track).
     pub fn index_of(&self, path: &Path) -> Option<usize> {
         self.items.iter().position(|i| i.path == path)
+    }
+
+    /// (index, path, duration) triples in loaded order — the mini
+    /// shell's flat track list.
+    pub fn item_paths(&self) -> impl Iterator<Item = (usize, &Path, Option<f64>)> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (i, it.path.as_path(), it.duration))
+    }
+
+    /// Summed tag durations of the loaded items — the mini footer's
+    /// total play time.
+    pub fn total_duration(&self) -> f64 {
+        self.items.iter().filter_map(|i| i.duration).sum()
+    }
+
+    /// Number of loaded items (the mini shell's "n of m" strip).
+    pub fn len(&self) -> usize {
+        self.items.len()
     }
 
     /// Queue a scroll-to for `path`'s item — the playing item drives

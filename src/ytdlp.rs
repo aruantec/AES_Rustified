@@ -1058,6 +1058,8 @@ pub struct OnlineMeta {
     pub title: String,
     pub author: String,
     pub thumb: Option<String>,
+    /// Stream length when the resolver knows it (yt-dlp metadata).
+    pub duration: Option<f64>,
 }
 
 pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
@@ -1073,6 +1075,7 @@ pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
                         title,
                         author: jstr(&v, "author_name").unwrap_or_default(),
                         thumb: jstr(&v, "thumbnail_url"),
+                        duration: None,
                     });
                 }
             }
@@ -1089,6 +1092,7 @@ pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
                     .or(info.channel)
                     .unwrap_or_default(),
                 thumb: info.thumbnail_url,
+                duration: info.duration,
             });
         }
     }
@@ -1116,6 +1120,7 @@ pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
         ),
         thumb: meta_content(&html, "og:image")
             .or_else(|| meta_content(&html, "twitter:image")),
+        duration: None,
     })
 }
 

@@ -1073,7 +1073,7 @@ pub(crate) fn icon_album_list(painter: &egui::Painter, rect: Rect, open: bool, a
     );
 }
 
-fn icon_stop(painter: &egui::Painter, rect: Rect, alpha: f32) {
+pub(crate) fn icon_stop(painter: &egui::Painter, rect: Rect, alpha: f32) {
     let k = rect.height() / 100.0;
     painter.rect_filled(
         cv_rect(rect, 100.0, 20.0, 20.0, 60.0, 60.0),
@@ -1082,7 +1082,7 @@ fn icon_stop(painter: &egui::Painter, rect: Rect, alpha: f32) {
     );
 }
 
-fn icon_prev(painter: &egui::Painter, rect: Rect, alpha: f32) {
+pub(crate) fn icon_prev(painter: &egui::Painter, rect: Rect, alpha: f32) {
     let k = rect.height() / 100.0;
     let c = WHITE.gamma_multiply(alpha);
     painter.rect_filled(
@@ -1136,7 +1136,7 @@ pub(crate) fn icon_play(painter: &egui::Painter, rect: Rect, playing: bool, alph
     }
 }
 
-fn icon_next(painter: &egui::Painter, rect: Rect, alpha: f32) {
+pub(crate) fn icon_next(painter: &egui::Painter, rect: Rect, alpha: f32) {
     let k = rect.height() / 100.0;
     let c = WHITE.gamma_multiply(alpha);
     tri(
@@ -1186,7 +1186,12 @@ fn magnifier_icon(painter: &egui::Painter, center: Pos2, k: f32, c: Color32) {
     );
 }
 
-fn icon_repeat(painter: &egui::Painter, rect: Rect, mode: RepeatMode, alpha: f32) {
+pub(crate) fn icon_repeat(
+    painter: &egui::Painter,
+    rect: Rect,
+    mode: RepeatMode,
+    alpha: f32,
+) {
     let c = (if mode == RepeatMode::Off { DIM } else { LIT }).gamma_multiply(alpha);
     let canvas = 120.0;
     let stroke = Stroke::new(11.0 * rect.height() / canvas, c);

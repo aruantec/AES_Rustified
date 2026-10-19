@@ -1124,6 +1124,7 @@ impl EmuView {
                                     album: String::new(),
                                     number: None,
                                     cover_url: None,
+                                    duration: None,
                                 },
                             );
                         }
@@ -2499,6 +2500,7 @@ pub fn view(
                         album: String::new(),
                         number: None,
                         cover_url: None,
+                        duration: None,
                     },
                 );
             }
