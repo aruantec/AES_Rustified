@@ -1990,13 +1990,17 @@ impl eframe::App for AesRustApp {
         // The scrollbar grab zone owns the window's bottom edge in the
         // Music view: suppress the resize grip over the same rect so
         // presses reach the scrollbar instead of starting a resize.
+        // Inset horizontally by the grip width — the full-width band
+        // used to swallow the bottom corner resize handles, leaving no
+        // working grip in these views.
         let resize_exclude = if (nav.target() == View::Music && transport.album_list_open)
             || (nav.target() == View::Emulation && emu.list_open)
         {
             let row = album_row_rect(content, s);
+            let zone = album_row::AlbumRow::scroll_zone(row, s);
             Some(Rect::from_min_max(
-                album_row::AlbumRow::scroll_zone(row, s).min,
-                content.max,
+                Pos2::new(zone.min.x + RESIZE_BORDER, zone.min.y),
+                Pos2::new(content.max.x - RESIZE_BORDER, content.max.y),
             ))
         } else {
             None
