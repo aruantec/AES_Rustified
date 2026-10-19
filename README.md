@@ -51,6 +51,23 @@ is fed a 512-wide spectrum texture every frame).
 | `Ctrl` + `←`/`→` | Seek ∓5s / ±5s |
 | `1`–`9` | Activate the numbered main-menu entries (Main view only) |
 
+### Re/Decompilation view
+
+A curated catalog of decomp, recomp and disassembly projects (zeldaret, n64decomp, pret, RSDK,
+devilution and friends). Each card shows the game's box art (fetched once via the same image
+pipeline that powers emulation covers, then cached under `Decomps/covers/`), install state,
+and the band's refresh button checks `pushed_at` on every repo and flags updates. Install/Update
+downloads the project's latest release build for your OS when it publishes one (DevilutionX,
+OpenGOAL, Zelda64Recomp and friends ship real binaries); projects that don't publish releases
+fall back to the source zipball — those still need the project's own toolchain and a baserom.
+Installs land in `Decomps/` under the app data directory.
+
+| Key | Function |
+|---|---|
+| `←` `→` `↑` `↓` | Navigate the project grid |
+| `Enter` | Run the card's action — Install / Update / Open folder |
+| `Esc` | Back to the main menu |
+
 ### Emulation view
 
 | Key | Function |

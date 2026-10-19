@@ -4759,6 +4759,29 @@ pub fn gather_image_candidates(query: &str) -> Vec<String> {
     out
 }
 
+/// Box-art bytes for a game title — the ROM fetcher's candidate
+/// ladder (flat front cover > landscape scan > product photo) minus
+/// the sidecar save, for callers that cache under their own dir
+/// (the decomp catalog does, per project).
+pub fn boxart_bytes(query: &str) -> Option<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(8)))
+        .http_status_as_error(true)
+        .build()
+        .into();
+    let mut photo: Option<Vec<u8>> = None;
+    let mut landscape: Option<Vec<u8>> = None;
+    for img in image_candidates(&agent, query, 0.72, Duration::from_millis(4500)) {
+        match download_classify(&agent, &img, "N64") {
+            Some((b, CoverClass::Good)) => return Some(b),
+            Some((b, CoverClass::Photo)) if photo.is_none() => photo = Some(b),
+            Some((b, CoverClass::Landscape)) if landscape.is_none() => landscape = Some(b),
+            _ => {}
+        }
+    }
+    landscape.or(photo)
+}
+
 /// Download + decode-validate an image URL for the editor (`Add
 /// URL`, picking a search result). Returns raw bytes.
 pub fn fetch_image(url: &str) -> Option<Vec<u8>> {

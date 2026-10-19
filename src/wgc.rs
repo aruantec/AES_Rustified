@@ -134,7 +134,7 @@ pub struct GpuShare {
     pub w: u32,
     #[allow(dead_code)]
     pub h: u32,
-    pub gen: u64,
+    pub generation: u64,
 }
 
 /// A live capture session. Drop it to stop capturing — the thread
@@ -660,14 +660,14 @@ fn gpu_copy(
                 return Err(err.unwrap_or_else(|| "shared ring".to_string()));
             };
             ctx.gpu_gen += 1;
-            let gen = ctx.gpu_gen;
+            let generation = ctx.gpu_gen;
             ctx.gpu_ring = Some((ring, desc.Width, desc.Height));
             *ctx.gpu.share.lock().unwrap_or_else(|p| p.into_inner()) = Some(GpuShare {
                 tex: handles,
                 fence: ctx.gpu_fence_handle.0 as isize,
                 w: desc.Width,
                 h: desc.Height,
-                gen,
+                generation,
             });
         }
 
@@ -682,16 +682,16 @@ fn gpu_copy(
         // keyed mutex only grants the key it currently holds: first
         // acquire is 0 (initial state), later acquires 1 (our own
         // release) so the wait is always instant.
-        if let Ok(km) = ring[slot].cast::<windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex>() {
+        match ring[slot].cast::<windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex>() { Ok(km) => {
             // Per-slot mutex state — the first ring cycle acquires
             // each slot's initial key 0, later cycles acquire 1.
             let key = if v <= 3 { 0 } else { 1 };
             let _ = km.AcquireSync(key, 10);
             ctx.context.CopyResource(&ring[slot], src);
             let _ = km.ReleaseSync(1);
-        } else {
+        } _ => {
             ctx.context.CopyResource(&ring[slot], src);
-        }
+        }}
         ctx.ctx4
             .as_ref()
             .unwrap()

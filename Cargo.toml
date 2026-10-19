@@ -1,7 +1,7 @@
 [package]
 name = "aes_rustified"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "AES Oxide"
 
 # The shipped binary is AES-Rustified.exe — the package name stays a
@@ -49,6 +49,12 @@ md-5 = "0.11"
 sha1 = "0.11"
 crc32fast = "1"
 encoding_rs = "0.8"
+
+# Color emoji: seguiemj's COLR paints (Win11) / CBDT strikes (Win10)
+# rasterized to textures — egui's glyph atlas is alpha-only.
+skrifa = "0.48"
+tiny-skia = "0.11"
+read-fonts = "0.45"
 
 # POSIX kill()/SIGSTOP/SIGCONT for session stop+pause on unix.
 [target.'cfg(unix)'.dependencies]
@@ -115,6 +121,4 @@ windows = { version = "0.62", features = [
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
 
-# Font-coverage diagnostics in tests only (the app loads fonts via egui).
-[target.'cfg(windows)'.dev-dependencies]
-skrifa = "0.48"
+

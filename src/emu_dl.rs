@@ -346,7 +346,7 @@ fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
     nested.iter().find_map(|d| find_dir(d, name))
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(600)))
@@ -354,7 +354,7 @@ fn agent() -> ureq::Agent {
     )
 }
 
-fn set(dl: &Shared, stage: &str, frac: f32) {
+pub(crate) fn set(dl: &Shared, stage: &str, frac: f32) {
     let mut p = dl.lock().unwrap_or_else(|e| e.into_inner());
     p.stage = stage.to_string();
     p.frac = frac;
@@ -392,7 +392,7 @@ pub fn download_patches(root: PathBuf) -> Shared {
 /// whichever sorts first (the armhf DuckStation AppImage got selected
 /// on x86_64 exactly this way). Marker-less names pass — several
 /// emulators ship a single unmarked Linux build.
-fn arch_ok(n: &str) -> bool {
+pub(crate) fn arch_ok(n: &str) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         ![
@@ -1369,7 +1369,7 @@ fn mark_exec(p: &Path) {
 #[cfg(not(unix))]
 fn mark_exec(_p: &Path) {}
 
-fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), String> {
+pub(crate) fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), String> {
     let mut resp = agent()
         .get(url)
         .header("User-Agent", USER_AGENT)
@@ -1411,7 +1411,7 @@ fn download(dl: &Shared, stage: &str, url: &str, dest: &Path) -> Result<(), Stri
 /// ArchiveExtractionHelper does when managed extraction fails.
 /// Unix tarballs go through the system `tar` (GNU tar auto-detects
 /// gz/xz/zst/bz2 by content).
-fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+pub(crate) fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
     #[cfg(unix)]
     let name = archive
         .file_name()
@@ -1499,7 +1499,7 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// If the archive ships a single root folder, descend into it.
-fn normalize_root(extracted: &Path) -> PathBuf {
+pub(crate) fn normalize_root(extracted: &Path) -> PathBuf {
     let dirs: Vec<PathBuf> = std::fs::read_dir(extracted)
         .map(|rd| {
             rd.flatten()
@@ -1518,7 +1518,7 @@ fn normalize_root(extracted: &Path) -> PathBuf {
     }
 }
 
-fn copy_dir_contents(src: &Path, dst: &Path, skip_prefix: &str) -> Result<(), String> {
+pub(crate) fn copy_dir_contents(src: &Path, dst: &Path, skip_prefix: &str) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("Copy failed: {e}"))?;
     let mut files = Vec::new();
     walk(src, &mut files);

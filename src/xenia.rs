@@ -106,7 +106,7 @@ pub fn session_log(msg: &str) {
 // (OpenProcess + NtSuspendProcess / NtResumeProcess).
 #[cfg(windows)]
 #[link(name = "ntdll")]
-extern "system" {
+unsafe extern "system" {
     fn NtSuspendProcess(process: *mut core::ffi::c_void) -> i32;
     fn NtResumeProcess(process: *mut core::ffi::c_void) -> i32;
 }
@@ -2371,7 +2371,7 @@ struct EnumCtx {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL {
+unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
     let ctx = &mut *(lparam.0 as *mut EnumCtx);
     if !ctx.include_hidden && !IsWindowVisible(hwnd).as_bool() {
         return BOOL(1);
@@ -2382,7 +2382,7 @@ unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL {
         ctx.out.push(hwnd);
     }
     BOOL(1)
-}
+}}
 
 #[cfg(windows)]
 fn process_windows(pid: u32, include_hidden: bool) -> Vec<HWND> {
@@ -2498,7 +2498,7 @@ struct ChildCtx {
 }
 #[cfg(windows)]
 
-unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
+unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
     let ctx = &mut *(lparam.0 as *mut ChildCtx);
     let score = match ctx.kind {
         Kind::Rpcs3 => score_rpcs3_child(hwnd, ctx.pid),
@@ -2510,7 +2510,7 @@ unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
         ctx.best = hwnd;
     }
     BOOL(1)
-}
+}}
 
 /// Score a window as a Xenia render-surface child
 /// (ScoreXeniaRenderChildCandidate).
@@ -3482,7 +3482,7 @@ struct ClickCtx {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn enum_button(hwnd: HWND, lparam: LPARAM) -> BOOL {
+unsafe extern "system" fn enum_button(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
     let ctx = &mut *(lparam.0 as *mut ClickCtx);
     if ctx.clicked {
         return BOOL(0);
@@ -3499,7 +3499,7 @@ unsafe extern "system" fn enum_button(hwnd: HWND, lparam: LPARAM) -> BOOL {
     SendMessageW(hwnd, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0)));
     ctx.clicked = true;
     BOOL(0)
-}
+}}
 
 #[cfg(windows)]
 fn click_dialog_button(dialog: HWND, text: &str) -> bool {

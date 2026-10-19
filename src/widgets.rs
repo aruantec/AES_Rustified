@@ -320,10 +320,16 @@ impl WidgetFrame {
     /// The persistable position: the anchor itself — the widget's
     /// center as a fraction of `frame`. Returned from intent so a
     /// clamped or transient display rect can't leak into the save.
+    /// A widget that never began (e.g. the app ran only in mini mode)
+    /// has a Rect::NOTHING rect — return ZERO rather than ±inf, which
+    /// would serialize as `null` and corrupt the saved geometry.
     pub fn anchor_offset(&self, frame: Rect) -> Vec2 {
         match self.anchor {
             Some(f) => f,
-            None => ((self.focus)(self.rect) - frame.min) / frame.size(),
+            None if self.rect.is_finite() && self.rect.is_positive() => {
+                ((self.focus)(self.rect) - frame.min) / frame.size()
+            }
+            None => Vec2::ZERO,
         }
     }
 }
@@ -1282,6 +1288,21 @@ mod tests {
         // left-of-center so the offset focus lands on the middle.
         assert_eq!(w.rect.min.x + 50.0, wide_frame.center().x);
         assert!((w.rect.center().x - wide_frame.center().x).abs() > 1.0);
+    }
+
+    /// A widget that never began (the app ran only in the mini shell,
+    /// where widgets don't draw) has `anchor=None` and
+    /// `rect=NOTHING` — `anchor_offset`'s fallback must stay finite or
+    /// ±inf would be serialized into the saved layout and corrupt it.
+    #[test]
+    fn anchor_offset_of_unbegun_widget_is_finite() {
+        let w = WidgetFrame::new(None, fixed_default, Vec2::splat(80.0), "t", |r| {
+            r.center()
+        });
+        let frame = Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 560.0));
+        let off = w.anchor_offset(frame);
+        assert!(off.is_finite());
+        assert_eq!(off, Vec2::ZERO);
     }
 
     /// `MainContentWidgetLayout.Apply` for the info strip: full

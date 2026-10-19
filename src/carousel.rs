@@ -784,6 +784,22 @@ impl Carousel {
             .map(|(i, it)| (i, it.path.as_path(), it.duration))
     }
 
+    /// (index, path, title, album, duration) rows — the mini
+    /// shell's playlist view (Lacrima's CoverItems list).
+    pub fn item_rows(
+        &self,
+    ) -> impl Iterator<Item = (usize, &Path, &str, &str, Option<f64>)> {
+        self.items.iter().enumerate().map(|(i, it)| {
+            (
+                i,
+                it.path.as_path(),
+                it.title.as_str(),
+                it.album.as_str(),
+                it.duration,
+            )
+        })
+    }
+
     /// Summed tag durations of the loaded items — the mini footer's
     /// total play time.
     pub fn total_duration(&self) -> f64 {
@@ -793,6 +809,35 @@ impl Carousel {
     /// Number of loaded items (the mini shell's "n of m" strip).
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Move the items at `from` (any order) into a block starting at
+    /// `to`, where `to` counts positions in the sequence of NON-moved
+    /// items — the mini playlist's drag-reorder (Lacrima's
+    /// ListboxItemDragBehavior commit).
+    pub fn move_items(&mut self, from: &[usize], to: usize) {
+        let mut idx: Vec<usize> = from.to_vec();
+        idx.sort_unstable();
+        idx.dedup();
+        idx.retain(|&i| i < self.items.len());
+        if idx.is_empty() {
+            return;
+        }
+        let sel: std::collections::HashSet<usize> = idx.iter().copied().collect();
+        let mut moving = Vec::with_capacity(idx.len());
+        let mut rest = Vec::with_capacity(self.items.len() - idx.len());
+        for (i, it) in self.items.drain(..).enumerate() {
+            if sel.contains(&i) {
+                moving.push(it);
+            } else {
+                rest.push(it);
+            }
+        }
+        let at = to.min(rest.len());
+        for (j, it) in moving.into_iter().enumerate() {
+            rest.insert(at + j, it);
+        }
+        self.items = rest;
     }
 
     /// Queue a scroll-to for `path`'s item — the playing item drives
@@ -2872,6 +2917,24 @@ impl Carousel {
         true
     }
 
+    /// The mini player's title marquee — same hold/scroll/re-entry as
+    /// `marquee_step` but not gated on `marquee_title` (the mini bar
+    /// always marquees when the title overflows). Returns the lane x
+    /// offset while active, `None` when the title fits.
+    pub(crate) fn mini_marquee(
+        &mut self,
+        title: &str,
+        tw: f32,
+        avail_w: f32,
+        s: f32,
+        dt: f32,
+    ) -> Option<f32> {
+        let saved = std::mem::replace(&mut self.marquee_title, true);
+        let active = self.marquee_step(title, tw, avail_w, s, dt, Instant::now());
+        self.marquee_title = saved;
+        active.then_some(self.marquee_off)
+    }
+
     /// One item's overlay text block — title, artist, album — drawn
     /// centered at `cx`, stacked upward from `cy`.
     #[allow(clippy::too_many_arguments)]
@@ -3800,5 +3863,24 @@ mod tests {
         // A fitting title never engages and clears the state.
         assert!(!c.marquee_step("short", 100.0, avail, s, 0.016, now));
         assert!(c.marquee_text.is_empty());
+    }
+
+    /// The mini bar marquees regardless of the compact-mode
+    /// `marquee_title` flag: an overflowing title engages and yields
+    /// the lane offset, a fitting one doesn't, and the flag itself is
+    /// left as it was.
+    #[test]
+    fn mini_marquee_ignores_compact_flag() {
+        let mut c = Carousel::new();
+        assert!(!c.marquee_title);
+        // Overflowing title: active, offset reported, hold starts at 0.
+        assert_eq!(c.mini_marquee("long title", 400.0, 200.0, 1.0, 0.016), Some(0.0));
+        assert!(!c.marquee_title, "flag must be restored");
+        // Fitting title: no marquee.
+        assert_eq!(c.mini_marquee("short", 100.0, 200.0, 1.0, 0.016), None);
+        // A set flag is preserved too.
+        c.marquee_title = true;
+        let _ = c.mini_marquee("long title", 400.0, 200.0, 1.0, 0.016);
+        assert!(c.marquee_title);
     }
 }

@@ -3556,8 +3556,8 @@ fn draw_session(
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(share) = share {
-            if emu.gpu_cap.as_ref().map(|g| g.gen) != Some(share.gen)
-                && emu.gpu_failed_gen != share.gen
+            if emu.gpu_cap.as_ref().map(|g| g.generation) != Some(share.generation)
+                && emu.gpu_failed_gen != share.generation
             {
                 match emu.cap_shader.as_mut().map(|cs| cs.import_share(&share)) {
                     Some(Ok(r)) => {
@@ -3566,7 +3566,7 @@ fn draw_session(
                         emu.gpu_err = None;
                     }
                     Some(Err(e)) => {
-                        emu.gpu_failed_gen = share.gen;
+                        emu.gpu_failed_gen = share.generation;
                         emu.gpu_err = Some(e);
                     }
                     None => {}
@@ -3779,13 +3779,13 @@ fn draw_session(
         // mirror path: named shader via PaintCallback or plain blit.
         let seq = emu.frame_seq;
         let adjust = render_adjust(emu);
-        let cb = if let Some((bg, fence, size)) = emu.gpu_cap.as_ref().map(|gc| {
+        let cb = match emu.gpu_cap.as_ref().map(|gc| {
             (
                 gc.bgs[(seq % 3) as usize].clone(),
                 gc.fence.clone(),
                 gc.size,
             )
-        }) {
+        }) { Some((bg, fence, size)) => {
             emu.cap_shader.as_mut().and_then(|cs| {
                 cs.callback_gpu(
                     &emu.render.shader,
@@ -3800,7 +3800,7 @@ fn draw_session(
                     adjust,
                 )
             })
-        } else {
+        } _ => {
             emu.cap_shader.as_mut().and_then(|cs| {
                 cs.callback(
                     &emu.render.shader,
@@ -3812,7 +3812,7 @@ fn draw_session(
                     ui.ctx().pixels_per_point(),
                 )
             })
-        };
+        }};
         match cb {
             Some(cb) => {
                 // Must be the egui_wgpu::Callback wrapper — the

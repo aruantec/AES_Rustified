@@ -28,6 +28,11 @@ const UNPLAYED: Color32 = Color32::from_rgb(0x69, 0x69, 0x69); // DimGray
 const INDICATOR: Color32 = Color32::GRAY; // IndicatorColor="Gray"
 const TRIANGLE: Color32 = Color32::WHITE;
 const TEXT: Color32 = Color32::LIGHT_GRAY; // TextForegroundColor
+// MinView's plain progress pill: dark track, light elapsed fill,
+// thin lighter outline.
+const MINI_TRACK: Color32 = Color32::from_rgb(0x4D, 0x4D, 0x4D);
+const MINI_FILL: Color32 = Color32::from_rgb(0xC8, 0xC8, 0xC8);
+const MINI_BORDER: Color32 = Color32::from_rgb(0x8A, 0x8A, 0x8A);
 
 /// Scrub state: while the pointer is held the bar previews `scrub`
 /// seconds locally (Lacrima's _dragValue); the player only hears
@@ -236,23 +241,131 @@ impl WaveformBar {
 
         // Loading spinner while the waveform decodes.
         if loading {
-            let angle = ui.ctx().input(|i| i.time) as f32 * 360.0;
-            let c = rect.center();
-            for i in 0..SPINNER_SPOKES {
-                let rad = (angle + i as f32 * (360.0 / SPINNER_SPOKES as f32)).to_radians();
-                let (sin, cos) = rad.sin_cos();
-                let a = ((i + 1) * 255 / SPINNER_SPOKES) as f32 / 255.0 * alpha;
-                painter.line_segment(
-                    [
-                        c + Vec2::new(cos, sin) * (SPINNER_R * 0.5 * s),
-                        c + Vec2::new(cos, sin) * (SPINNER_R * s),
-                    ],
-                    Stroke::new(3.0 * s, Color32::from_white_alpha((a * 255.0) as u8)),
-                );
-            }
-            ui.ctx().request_repaint();
+            self.loading(ui, rect, alpha, s);
         }
 
         seek
+    }
+
+    /// True while the pointer is scrubbing inside the named mini bar
+    /// — the mini volume pill stays expanded for the drag's duration.
+    /// Each `mini_ui` call site owns its scrub slot keyed by `id`.
+    pub fn mini_scrubbing(&self, ctx: &egui::Context, id: &str) -> bool {
+        ctx.data_mut(|d| {
+            d.get_temp::<f64>(egui::Id::new(("mini-bar-scrub", id)))
+                .is_some()
+        })
+    }
+
+    /// The mini shell's plain seek track — Lacrima's MinView progress
+    /// bar: a full-radius pill with the elapsed portion filled light.
+    /// Same scrub-hold/pending plumbing as the waveform strip, but
+    /// keyed by `id` so coexisting mini bars (seek + volume) can't
+    /// steal each other's in-flight drag.
+    pub fn mini_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        position: f64,
+        duration: f64,
+        interactive: bool,
+        id: &str,
+        live: bool,
+    ) -> Option<f64> {
+        let mut seek = None;
+        let resp = ui.interact(rect, ui.id().with(id), Sense::click_and_drag());
+        let sid = egui::Id::new(("mini-bar-scrub", id));
+        let pid = egui::Id::new(("mini-bar-pending", id));
+        let mut scrub: Option<f64> = ui.ctx().data_mut(|d| d.get_temp(sid));
+        let mut pending: Option<(f64, std::time::Instant)> =
+            ui.ctx().data_mut(|d| d.get_temp(pid));
+        if interactive {
+            if resp.is_pointer_button_down_on() {
+                if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                    let ratio = ((p.x - rect.min.x) / rect.width().max(1.0)) as f64;
+                    scrub = Some(ratio.clamp(0.0, 1.0) * duration.max(0.0));
+                    // Live bars (volume) apply while dragging; the
+                    // seek bar still waits for the release.
+                    if live {
+                        seek = scrub;
+                    }
+                }
+            } else if let Some(v) = scrub.take() {
+                seek = Some(v);
+                pending = Some((v, std::time::Instant::now()));
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        } else if scrub.is_some() && !ui.ctx().input(|i| i.pointer.primary_down()) {
+            seek = scrub.take();
+            if let Some(v) = seek {
+                pending = Some((v, std::time::Instant::now()));
+            }
+        }
+        if let Some((t, when)) = pending {
+            if (position - t).abs() < 0.25 || when.elapsed().as_secs_f32() > 0.75 {
+                pending = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+        let shown = scrub.or(pending.map(|(t, _)| t)).unwrap_or(position);
+        ui.ctx().data_mut(|d| {
+            if let Some(v) = scrub {
+                d.insert_temp(sid, v);
+            } else {
+                d.remove::<f64>(sid);
+            }
+            if let Some(v) = pending {
+                d.insert_temp(pid, v);
+            } else {
+                d.remove::<(f64, std::time::Instant)>(pid);
+            }
+        });
+        let progress = if duration > 0.0 {
+            (shown / duration).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+
+        let painter = ui.painter();
+        let rr = egui::CornerRadius::same((rect.height() * 0.5).round() as u8);
+        painter.rect_filled(rect, rr, MINI_TRACK);
+        if progress > 0.0 {
+            // Minimum width of one diameter so the head always reads
+            // as a round cap instead of a flat sliver.
+            let w = (progress * rect.width()).max(rect.height());
+            let fill =
+                Rect::from_min_max(rect.min, Pos2::new(rect.min.x + w, rect.max.y));
+            painter.rect_filled(fill, rr, MINI_FILL);
+        }
+        painter.rect_stroke(
+            rect,
+            rr,
+            Stroke::new(1.0, MINI_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        seek
+    }
+
+    /// Spinner used by the strip while a waveform decodes.
+    fn loading(&self, ui: &mut egui::Ui, rect: Rect, alpha: f32, s: f32) {
+        let painter = ui.painter();
+        let angle = ui.ctx().input(|i| i.time) as f32 * 360.0;
+        let c = rect.center();
+        for i in 0..SPINNER_SPOKES {
+            let rad = (angle + i as f32 * (360.0 / SPINNER_SPOKES as f32)).to_radians();
+            let (sin, cos) = rad.sin_cos();
+            let a = ((i + 1) * 255 / SPINNER_SPOKES) as f32 / 255.0 * alpha;
+            painter.line_segment(
+                [
+                    c + Vec2::new(cos, sin) * (SPINNER_R * 0.5 * s),
+                    c + Vec2::new(cos, sin) * (SPINNER_R * s),
+                ],
+                Stroke::new(3.0 * s, Color32::from_white_alpha((a * 255.0) as u8)),
+            );
+        }
+        ui.ctx().request_repaint();
     }
 }

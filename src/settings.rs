@@ -259,6 +259,11 @@ pub struct Spectrum {
     pub cover_colors: bool,
     /// SpectrumColor0..4: the manual 5-stop gradient (RGB).
     pub gradient: [[u8; 3]; 5],
+    /// The mini shell's extension toggles — Lacrima's persisted
+    /// IsVisualizerActive / IsEqualizerActive; the ExtensionArea is
+    /// single-slot so turning one on clears the other.
+    pub mini_visualizer: bool,
+    pub mini_equalizer: bool,
 }
 
 impl Default for Spectrum {
@@ -277,6 +282,8 @@ impl Default for Spectrum {
                 [0xFF, 0x00, 0x4D],
                 [0xFF, 0xB3, 0x00],
             ],
+            mini_visualizer: false,
+            mini_equalizer: false,
         }
     }
 }

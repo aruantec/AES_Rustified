@@ -29,6 +29,9 @@ const LEFT_EXTENT: f32 = SIDE_MARGIN + BTN + RIGHT_SPACING + BTN;
 /// plus its side cluster's extent. Pub so the caller can bound the
 /// expanding search pill at the cluster's left edge.
 pub(crate) const CENTER_HALF: f32 = (BTN * 4.0 + PLAY_BTN + CENTER_SPACING * 4.0) * 0.5;
+/// The mini control cluster's span in base units — four 0.85-size
+/// satellites around the play button plus spacing.
+pub(crate) const MINI_CONTROLS_SPAN: f32 = BTN * 0.85 * 4.0 + PLAY_BTN + CENTER_SPACING * 4.0;
 /// Right-cluster extent (base px): margin + knob + gap + eq +
 /// gap + layout — the wider of the two side clusters.
 const RIGHT_EXTENT: f32 = SIDE_MARGIN + KNOB_D + (RIGHT_SPACING + BTN) * 2.0;
@@ -79,8 +82,9 @@ pub enum RepeatMode {
 
 /// Prev/Next button intents — the caller resolves them against the
 /// loaded cover items (MusicViewModel's Previous/NextMedia commands).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Step {
+    #[default]
     None,
     Prev,
     Next,
@@ -139,6 +143,9 @@ pub struct Transport {
     /// The app consumes it via `take_play_request` and picks what to
     /// start instead.
     play_request: bool,
+    /// The mini shell's volume pill open state — a search-pill-style
+    /// circle that expands rightward on hover into the volume slider.
+    pub mini_vol_open: bool,
 }
 
 impl Transport {
@@ -521,6 +528,139 @@ impl Transport {
         );
         self.volume(ui, vol_rect, player, alpha, interactive, accent, cs, "t-cvol");
         step
+    }
+
+    /// The mini player's control cluster — the full band's center
+    /// row (stop/prev/play/next/repeat) right-packed into `rect`.
+    /// `tm-` ids: the band isn't drawn in mini mode, but the prefix
+    /// keeps the interact ids distinct anyway.
+    #[allow(clippy::too_many_arguments)]
+    pub fn controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        player: Option<&AudioPlayer>,
+        alpha: f32,
+        interactive: bool,
+        s: f32,
+    ) -> Step {
+        let mut step = Step::None;
+        let cy = rect.center().y;
+        let hit = |r: Rect, id: &str, tip: &str| {
+            if interactive {
+                ui.interact(r, ui.id().with(id), Sense::click())
+            } else {
+                ui.interact(r, ui.id().with(id), Sense::hover())
+            }
+            .on_hover_text(tip)
+        };
+
+        // Side buttons render at 0.85 of the band's BTN — Lacrima's
+        // mini controls keep the play button dominant and the
+        // satellites small, which also narrows the cluster and frees
+        // title-lane space.
+        let side = BTN * 0.85;
+        let widths = [side, side, PLAY_BTN, side, side];
+        let total = widths.iter().sum::<f32>() * s + CENTER_SPACING * s * 4.0;
+        let mut x = rect.max.x - total;
+        let at = |i: usize, x: &mut f32| {
+            let w = widths[i] * s;
+            let r = Rect::from_min_size(Pos2::new(*x, cy - w * 0.5), Vec2::splat(w));
+            *x += w + CENTER_SPACING * s;
+            r
+        };
+        let stop = at(0, &mut x);
+        let prev = at(1, &mut x);
+        let play = at(2, &mut x);
+        let next = at(3, &mut x);
+        let repeat = at(4, &mut x);
+
+        let playing = matches!(player.map(|p| p.state()), Some(PlayerState::Playing));
+
+        let r = hit(stop, "tm-stop", "Stop");
+        if r.clicked() {
+            if let Some(p) = player {
+                p.stop();
+            }
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(stop, self.press_scale(ui, &r));
+        icon_stop(ui.painter(), ic, alpha);
+
+        let r = hit(prev, "tm-prev", "Previous Track");
+        if r.clicked() {
+            step = Step::Prev;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(prev, self.press_scale(ui, &r));
+        icon_prev(ui.painter(), ic, alpha);
+
+        let r = hit(play, "tm-play", "Play / Pause");
+        if r.clicked() {
+            match player {
+                Some(p)
+                    if matches!(
+                        p.state(),
+                        PlayerState::Playing | PlayerState::Paused
+                    ) =>
+                {
+                    p.toggle()
+                }
+                _ => self.play_request = true,
+            }
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(play, self.press_scale(ui, &r));
+        icon_play(ui.painter(), ic, playing, alpha);
+
+        let r = hit(next, "tm-next", "Next Track");
+        if r.clicked() {
+            step = Step::Next;
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(next, self.press_scale(ui, &r));
+        icon_next(ui.painter(), ic, alpha);
+
+        let r = hit(repeat, "tm-repeat", "Repeat: Off / All / One");
+        if r.clicked() {
+            self.repeat = match self.repeat {
+                RepeatMode::Off => RepeatMode::All,
+                RepeatMode::All => RepeatMode::One,
+                RepeatMode::One => RepeatMode::Off,
+            };
+        }
+        hover_cursor(ui, &r);
+        let ic = scaled(repeat, self.press_scale(ui, &r));
+        icon_repeat(ui.painter(), ic, self.repeat, alpha);
+        step
+    }
+
+    /// Whether a cap-mute has stashed a volume to restore — the mini
+    /// speaker icon mirrors this.
+    pub fn muted(&self) -> bool {
+        self.muted_vol.is_some()
+    }
+
+    /// Store/restore mute — the same semantics as the volume knob's
+    /// cap click (min stashed 0.05 so a 0->restore round-trips).
+    pub fn toggle_mute(&mut self, player: Option<&AudioPlayer>) {
+        let vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
+        let v = match self.muted_vol.take() {
+            Some(prev) => prev,
+            None => {
+                self.muted_vol = Some(vol.max(0.05));
+                0.0
+            }
+        };
+        if let Some(p) = player {
+            p.set_volume(v);
+        }
+    }
+
+    /// Clearing the mute stash — the mini volume slider un-mutes by
+    /// moving, same as turning the knob.
+    pub fn unmute(&mut self) {
+        self.muted_vol = None;
     }
 
     /// The kebab's reveal drawer (compact strip): the full row's

@@ -260,6 +260,72 @@ impl SpectrumBar {
             x += pitch;
         }
     }
+
+    /// The mini drawer's auto-fitting variant: sub-samples the
+    /// displayed bins down to a comfortable pitch for the strip's
+    /// width, then spreads the bars edge to edge (Lacrima's
+    /// GlSpectrumControl fills its control; BlockHeight=5).
+    pub fn paint_mini(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        colors: &[Color32],
+        alpha: f32,
+    ) {
+        if alpha <= 0.001 || colors.is_empty() {
+            return;
+        }
+        let total = self.displayed.len();
+        if total == 0 {
+            return;
+        }
+        // ~7px pitch floor, at least 8 bars, at most the bin count.
+        let n = total.min((rect.width() / 7.0).max(8.0) as usize);
+        let pitch = rect.width() / n as f32;
+        let bar_w = pitch * 0.62;
+        let denom = self.global_max * 1.1 + 1e-9;
+        let bottom = rect.max.y;
+        let block_h = 5.0f32.min(rect.height() * 0.12);
+        let gap = block_h * 0.15;
+        let peak_h = 2.0f32;
+        for i in 0..n {
+            let src = i * total / n;
+            let x0 = rect.min.x + i as f32 * pitch;
+            let x1 = (x0 + bar_w).min(rect.max.x);
+            let level = (self.displayed[src] / denom).clamp(0.0, 1.0);
+            let peak = (self.peaks[src] / denom).clamp(0.0, 1.0);
+            let bar_top = bottom - level * rect.height();
+            let color = gradient_color(colors, i, n);
+
+            let mut cur = bottom;
+            while cur > bar_top {
+                let top = (cur - block_h).max(bar_top);
+                let vis_bottom = (cur - gap).max(top);
+                if vis_bottom > top {
+                    let cy = (top + vis_bottom) * 0.5;
+                    let v = ((bottom - cy) / rect.height()).clamp(0.0, 1.0);
+                    let a = (0.65 + 0.35 * v) * alpha;
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
+                        0.0,
+                        color.gamma_multiply(a),
+                    );
+                }
+                cur = top;
+            }
+            if peak > 0.001 {
+                let peak_top = (bottom - peak * rect.height()).clamp(rect.min.y, bottom);
+                let peak_bottom = (peak_top + peak_h).min(bottom);
+                if peak_bottom > peak_top {
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, peak_top), Pos2::new(x1, peak_bottom)),
+                        0.0,
+                        Color32::from_white_alpha((242.0 * alpha) as u8),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Horizontal gradient across bar index (GetGradientColor): `colors`

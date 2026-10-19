@@ -285,7 +285,7 @@ pub struct ImportedRing {
     pub bgs: Vec<wgpu::BindGroup>,
     pub fence: ID3D12Fence,
     pub size: [u32; 2],
-    pub gen: u64,
+    pub generation: u64,
 }
 
 /// Per-frame paint work — the uniform values are captured at callback
@@ -501,7 +501,7 @@ impl CaptureShader {
                 bgs,
                 fence,
                 size: [share.w, share.h],
-                gen: share.gen,
+                generation: share.generation,
             })
         }
     }

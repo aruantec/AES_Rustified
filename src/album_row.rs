@@ -2160,7 +2160,13 @@ impl AlbumRow {
 
 /// Dashed outline for the drop-slot hole — egui has no path effects,
 /// so the dashes are segments along each edge (`dash` on, `dash` off).
-fn dashed_rect(painter: &egui::Painter, rect: Rect, dash: f32, width: f32, color: Color32) {
+pub(crate) fn dashed_rect(
+    painter: &egui::Painter,
+    rect: Rect,
+    dash: f32,
+    width: f32,
+    color: Color32,
+) {
     let stroke = Stroke::new(width, color);
     for (a, b) in [
         (rect.min, Pos2::new(rect.max.x, rect.min.y)),

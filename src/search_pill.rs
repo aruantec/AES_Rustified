@@ -396,7 +396,8 @@ fn magnifier(painter: &egui::Painter, ic: Pos2, k: f32, c: Color32) {
     );
 }
 
-/// CubicEaseOut (Lacrima's width transition).
-fn ease_out_cubic(t: f32) -> f32 {
+/// CubicEaseOut (Lacrima's width transition) — shared with the mini
+/// shell's volume pill.
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }

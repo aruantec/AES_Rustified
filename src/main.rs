@@ -7,7 +7,9 @@ mod cap_shader;
 mod carousel;
 mod cemu_gpack;
 mod cemu_overlay;
+mod decomp;
 mod edge_border;
+mod emoji;
 mod emu_dl;
 mod emu_meta;
 mod emulation;
@@ -57,7 +59,7 @@ use eframe::egui_wgpu;
 
 const CORNER_RADIUS: u8 = 10;
 /// MainTopBar's declared height (virtual px, rendered at 1/ScaleFactor).
-const TITLE_BAR_HEIGHT: f32 = 70.0;
+pub(crate) const TITLE_BAR_HEIGHT: f32 = 70.0;
 const RESIZE_BORDER: f32 = 8.0;
 /// Seconds for one full fade-out -> fade-in view transition.
 const NAV_FADE_SECS: f32 = 0.55;
@@ -277,7 +279,8 @@ fn main() -> eframe::Result<()> {
             .contains(&tools.to_string_lossy().to_ascii_lowercase() as &str)
         {
             let sep = if cfg!(windows) { ";" } else { ":" };
-            std::env::set_var("PATH", format!("{path}{sep}{}", tools.display()));
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("PATH", format!("{path}{sep}{}", tools.display())) };
         }
     }
     let mut settings = settings::load();
@@ -382,7 +385,7 @@ fn work_area_rect(ctx: &egui::Context) -> Option<Rect> {
             right: i32,
             bottom: i32,
         }
-        extern "system" {
+        unsafe extern "system" {
             fn SystemParametersInfoW(
                 ui_action: u32,
                 ui_param: u32,
@@ -558,6 +561,9 @@ struct AesRustApp {
     emu_close: EmuClosePrompt,
     /// "Exit application?" confirmation — the main menu's Esc.
     app_exit: AppExitPrompt,
+    /// Re/Decompilation catalog view — install/update state for the
+    /// curated project list.
+    decomp: decomp::DecompView,
     /// Emulation view state — section strip, item search, active
     /// section (prototype; ROM items land later).
     emu: emulation::EmuView,
@@ -1146,6 +1152,7 @@ impl AesRustApp {
             del_prompt: DeletePrompt::default(),
             emu_close: EmuClosePrompt::default(),
             app_exit: AppExitPrompt::default(),
+            decomp: decomp::DecompView::new(),
             emu: emulation::EmuView::new(),
             started: std::time::Instant::now(),
         };
@@ -1653,20 +1660,26 @@ impl eframe::App for AesRustApp {
         // The back button is part of each view's chrome, so it crossfades
         // exactly like the content: out with the outgoing view during the
         // first half, in with the incoming view during the second.
-        let back_alpha = match &self.nav {
-            Nav::Settled(View::Main) => 0.0,
-            Nav::Settled(_) => 1.0,
-            Nav::Fading { from, to, t } => {
-                if *t < 0.5 {
-                    if *from == View::Main {
+        // The mini shell has no back navigation — hide the button
+        // regardless of which view was active when it opened.
+        let back_alpha = if self.settings.window.mini {
+            0.0
+        } else {
+            match &self.nav {
+                Nav::Settled(View::Main) => 0.0,
+                Nav::Settled(_) => 1.0,
+                Nav::Fading { from, to, t } => {
+                    if *t < 0.5 {
+                        if *from == View::Main {
+                            0.0
+                        } else {
+                            1.0 - ease(t * 2.0)
+                        }
+                    } else if *to == View::Main {
                         0.0
                     } else {
-                        1.0 - ease(t * 2.0)
+                        ease((t - 0.5) * 2.0)
                     }
-                } else if *to == View::Main {
-                    0.0
-                } else {
-                    ease((t - 0.5) * 2.0)
                 }
             }
         };
@@ -1861,6 +1874,7 @@ impl eframe::App for AesRustApp {
             del_prompt,
             emu_close,
             app_exit,
+            decomp,
             emu,
             shadertoy,
             ..
@@ -2237,7 +2251,8 @@ impl eframe::App for AesRustApp {
                             waveform_bar,
                             transport,
                             spectrum,
-                            &settings.spectrum,
+                            &mut settings.spectrum,
+                            &mut settings.equalizer,
                             Color32::from_rgb(
                                 settings.carousel.grid_bg[0],
                                 settings.carousel.grid_bg[1],
@@ -2256,6 +2271,37 @@ impl eframe::App for AesRustApp {
                         }
                         if let Some(p) = mout.play {
                             play_path = Some(p);
+                        }
+                        // Prev/next resolve exactly like the band's:
+                        // prev restarts the track once it's past 3s,
+                        // otherwise walks back one item; next walks
+                        // forward. RepeatAll wraps at the album edges.
+                        let wrap = transport.repeat == transport::RepeatMode::All;
+                        match mout.step {
+                            transport::Step::Prev => {
+                                if let Some(cur) = playing_track.as_deref() {
+                                    if player
+                                        .as_ref()
+                                        .is_some_and(|p| p.position().as_secs_f64() > 3.0)
+                                    {
+                                        if seek_secs.is_none() {
+                                            seek_secs = Some(0.0);
+                                        }
+                                    } else {
+                                        play_path = carousel
+                                            .step_path(cur, -1, wrap)
+                                            .or_else(|| play_path.take());
+                                    }
+                                }
+                            }
+                            transport::Step::Next => {
+                                if let Some(cur) = playing_track.as_deref() {
+                                    play_path = carousel
+                                        .step_path(cur, 1, wrap)
+                                        .or_else(|| play_path.take());
+                                }
+                            }
+                            transport::Step::None => {}
                         }
                         return;
                     }
@@ -2468,6 +2514,9 @@ impl eframe::App for AesRustApp {
                                         radius,
                                         s,
                                     );
+                                }
+                                View::Recomp => {
+                                    decomp::view(ui, content, a, view_interactive, decomp, s)
                                 }
                                 _ => placeholder_view(ui, content, v.name(), s),
                             }
@@ -2735,6 +2784,39 @@ impl eframe::App for AesRustApp {
                             .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Q))
                     {
                         emu_close.begin(ui.ctx());
+                    }
+                }
+                // The Re/Decompilation catalog — arrows navigate the
+                // card grid (vertical steps use the stamped column
+                // count), Enter runs the card's action
+                // (Install/Update/Open).
+                if view_interactive
+                    && nav.target() == View::Recomp
+                    && !ui.ctx().text_edit_focused()
+                {
+                    let (mut dx, mut dy) = (0i32, 0i32);
+                    ui.ctx().input_mut(|i| {
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                            dx -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                            dx += 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                            dy -= 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                            dy += 1;
+                        }
+                    });
+                    if dx != 0 || dy != 0 {
+                        decomp.move_selection(dx, dy);
+                    }
+                    if ui
+                        .ctx()
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                    {
+                        decomp.activate_selected();
                     }
                 }
                 // egui's own focus navigation (begin_pass reads raw Tab/
@@ -3865,9 +3947,15 @@ impl eframe::App for AesRustApp {
                 // anchor_offset evaluates the canonical intent — a
                 // clamped/transient display rect can't leak into the
                 // save (the source of the random shift on launches).
+                // The mini shell never runs the widgets — persisting
+                // them here would write uninitialized geometry (the
+                // anchor_offset fallback over Rect::NOTHING) into the
+                // saved layout, so the whole block is gated on !mini.
+                let (mut differs, mut pdiffers, mut idiffers) = (false, false, false);
+                if !settings.window.mini {
                 let off = clock.anchor_offset(frame_rect);
                 let wsize = clock.rect.size();
-                let differs = settings.clock.left != off.x
+                differs = settings.clock.left != off.x
                     || settings.clock.top != off.y
                     || settings.clock.width != wsize.x
                     || settings.clock.height != wsize.y
@@ -3880,7 +3968,7 @@ impl eframe::App for AesRustApp {
                 // The turntable widget persists the same way.
                 let poff = player_widget.anchor_offset(frame_rect);
                 let psize = player_widget.rect.size();
-                let pdiffers = settings.player.left != poff.x
+                pdiffers = settings.player.left != poff.x
                     || settings.player.top != poff.y
                     || settings.player.width != psize.x
                     || settings.player.height != psize.y
@@ -3893,7 +3981,7 @@ impl eframe::App for AesRustApp {
                 // The PlayerInfo strip persists the same way.
                 let ioff = player_info.anchor_offset(frame_rect);
                 let isize = player_info.rect.size();
-                let idiffers = settings.player_info.left != ioff.x
+                idiffers = settings.player_info.left != ioff.x
                     || settings.player_info.top != ioff.y
                     || settings.player_info.width != isize.x
                     || settings.player_info.height != isize.y
@@ -3903,6 +3991,7 @@ impl eframe::App for AesRustApp {
                 settings.player_info.width = isize.x;
                 settings.player_info.height = isize.y;
                 settings.player_info.visible = player_info.visible;
+                }
                 // Resizing the window re-anchors the widget every frame, so
                 // rate-limit writes; drag ends and menu changes save at
                 // once. Defer while any pointer press is held — a
@@ -4420,6 +4509,10 @@ fn lacrima_window_frame(
             // The bar matches the back button's resting face (~#20)
             // so the corner button reads as part of one surface —
             // hover/press still tint the button for feedback.
+            // The mini shell's cover gradient runs continuously from
+            // the window top through the now-playing bar (painted by
+            // mini::view under this overlay) — an opaque bar fill
+            // would cut it, so the fill drops out in mini mode.
             painter.rect_filled(
                 title_bar_rect,
                 CornerRadius {
@@ -4428,7 +4521,11 @@ fn lacrima_window_frame(
                     se: 0,
                     sw: 0,
                 },
-                Color32::from_rgb(0x20, 0x20, 0x20),
+                if mini_active {
+                    Color32::TRANSPARENT
+                } else {
+                    Color32::from_rgb(0x20, 0x20, 0x20)
+                },
             );
 
             logo.paint(&painter, title_bar_rect, elapsed, title, animate_title);
@@ -4501,13 +4598,17 @@ fn lacrima_window_frame(
                 }
             }
 
-            painter.line_segment(
-                [
-                    Pos2::new(panel_rect.min.x, title_bar_rect.max.y),
-                    title_bar_rect.right_bottom(),
-                ],
-                Stroke::new((1.5 * scale).max(1.0), Color32::from_gray(85)),
-            );
+            // The bar/content separator — suppressed in the mini shell
+            // where the now-playing bar's gradient flows into the bar.
+            if !mini_active {
+                painter.line_segment(
+                    [
+                        Pos2::new(panel_rect.min.x, title_bar_rect.max.y),
+                        title_bar_rect.right_bottom(),
+                    ],
+                    Stroke::new((1.5 * scale).max(1.0), Color32::from_gray(85)),
+                );
+            }
 
             ui.scope_builder(UiBuilder::new().max_rect(title_bar_rect), |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4590,8 +4691,8 @@ fn lacrima_window_frame(
                     }
                     transport::icon_viewport(
                         ui.painter(),
-                        Rect::from_center_size(rect.center(), Vec2::splat(24.0 * scale)),
-                        mini_active,
+                        Rect::from_center_size(rect.center(), Vec2::splat(28.0 * scale)),
+                        mini_active || sw.hovered(),
                         1.0,
                     );
                     if sw.clicked() {
@@ -5556,6 +5657,10 @@ const SETTINGS_TABS: [&str; 6] = [
     "Carousel",
     "Libraries",
 ];
+/// Hidden while the mini shell is up — the compact player has no
+/// emulation surface to configure, and no carousel/grid to lay out.
+const EMU_SETTINGS_TAB: usize = 1;
+const CAROUSEL_SETTINGS_TAB: usize = 4;
 
 /// Greedy row-packing for the settings tab strip: tabs go into the
 /// current row until the next one would exceed `strip_w`, then a new
@@ -5639,22 +5744,34 @@ fn settings_overlay(
     let gap = 28.0 * scale;
     let row_h = 44.0 * scale;
     let pad = 15.0 * scale;
-    let widths: Vec<f32> = SETTINGS_TABS
+    // The mini shell drops the Emulation and Carousel tabs; indices
+    // stay real SETTINGS_TABS positions so a persisted selection
+    // survives switching shells. A persisted hidden tab falls back
+    // to UI.
+    let hidden = |i: usize| i == EMU_SETTINGS_TAB || i == CAROUSEL_SETTINGS_TAB;
+    if settings.window.mini && hidden(*tab) {
+        *tab = 0;
+    }
+    let vis_tabs: Vec<usize> = (0..SETTINGS_TABS.len())
+        .filter(|&i| !(settings.window.mini && hidden(i)))
+        .collect();
+    let vis_widths: Vec<f32> = vis_tabs
         .iter()
-        .map(|n| {
+        .map(|&i| {
             painter
-                .layout_no_wrap(n.to_string(), font.clone(), Color32::WHITE)
+                .layout_no_wrap(SETTINGS_TABS[i].to_string(), font.clone(), Color32::WHITE)
                 .rect
                 .width()
         })
         .collect();
     let strip_w = body_panel.width() - 2.0 * pad;
-    let rows = pack_tab_rows(&widths, gap, strip_w);
+    let rows = pack_tab_rows(&vis_widths, gap, strip_w);
     for (r, row) in rows.iter().enumerate() {
         let mut x = panel.min.x + pad;
         let y = panel.min.y + 14.0 * scale + r as f32 * row_h;
-        for &i in row {
-            let text_w = widths[i];
+        for &vi in row {
+            let i = vis_tabs[vi];
+            let text_w = vis_widths[vi];
             let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(text_w, row_h));
             let resp = ui.interact(rect, ui.id().with(("settings-tab", i)), Sense::click());
             let color = if i == *tab {
@@ -7165,7 +7282,7 @@ enum MediaKey {
 #[cfg(windows)]
 fn media_key_events(mut f: impl FnMut(MediaKey)) {
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetAsyncKeyState(v_key: i32) -> i16;
     }
     const MAP: [(i32, MediaKey); 4] = [
