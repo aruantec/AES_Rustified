@@ -527,11 +527,14 @@ impl Carousel {
     /// same string or same canonical YouTube video id). Caller persists
     /// the url into settings.
     pub fn add_url(&mut self, url: &str) -> bool {
-        let url = url.trim();
-        if url.is_empty() || self.is_duplicate(url) {
+        // Canonical form (Lacrima's GetCleanVideoLink): the same video
+        // submitted as a playlist/mix link must not become a distinct
+        // item — or a distinct stream-cache key — from the watch url.
+        let url = crate::ytdlp::clean_video_link(url.trim());
+        if url.is_empty() || self.is_duplicate(&url) {
             return false;
         }
-        self.push_url_item(url);
+        self.push_url_item(&url);
         true
     }
 
@@ -798,6 +801,16 @@ impl Carousel {
                 it.duration,
             )
         })
+    }
+
+    /// Fill an item's duration once it becomes known (resolved stream
+    /// `dur=`, late metadata) — the mini list re-renders from this.
+    pub fn set_item_duration(&mut self, path: &Path, secs: f64) {
+        if let Some(it) = self.items.iter_mut().find(|i| i.path == path) {
+            if it.duration.is_none() {
+                it.duration = Some(secs);
+            }
+        }
     }
 
     /// Summed tag durations of the loaded items — the mini footer's
@@ -3882,5 +3895,30 @@ mod tests {
         c.marquee_title = true;
         let _ = c.mini_marquee("long title", 400.0, 200.0, 1.0, 0.016);
         assert!(c.marquee_title);
+    }
+
+    /// Regression: a video submitted as a playlist/mix link stored the
+    /// raw url as its path — which is also the stream-cache key, so the
+    /// item built its own cache (the one wedged on itag=18 leftovers)
+    /// instead of sharing the canonical video's. `add_url` must store
+    /// the cleaned link (Lacrima's GetCleanVideoLink).
+    #[test]
+    fn add_url_stores_canonical_watch_link() {
+        let mut c = Carousel::new();
+        assert!(c.add_url(
+            "https://www.youtube.com/watch?v=PiwDxH2HgIM&list=RDPiwDxH2HgIM&start_radio=1"
+        ));
+        assert_eq!(
+            c.items.last().unwrap().path,
+            PathBuf::from("https://www.youtube.com/watch?v=PiwDxH2HgIM")
+        );
+        // A later plain-link add of the same video still dedupes.
+        assert!(!c.add_url("https://www.youtube.com/watch?v=PiwDxH2HgIM"));
+        // Non-YouTube urls pass through untouched.
+        assert!(c.add_url("https://example.com/radio.pls"));
+        assert_eq!(
+            c.items.last().unwrap().path,
+            PathBuf::from("https://example.com/radio.pls")
+        );
     }
 }

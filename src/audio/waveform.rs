@@ -298,7 +298,15 @@ fn wait_for_more(cache: &Arc<StreamCache>, cancel: &AtomicBool) -> bool {
                 drop(inner);
                 std::thread::sleep(Duration::from_millis(250));
             }
-            _ => return matches!(cache.len(), Some(l) if covered >= l),
+            _ => {
+                // `cache.len()` locks inner — this guard MUST be
+                // dropped first: std::sync::Mutex is non-recursive,
+                // so locking while held deadlocks this thread forever
+                // AND wedges every later inner() (decode's
+                // ensure_format, feed appends) on this cache.
+                drop(inner);
+                return matches!(cache.len(), Some(l) if covered >= l);
+            }
         }
         if Instant::now() >= deadline {
             return false;
@@ -526,4 +534,35 @@ fn generate(
         .decoded_secs
         .max(slot_idx as f64 / SLOTS_PER_SEC as f64);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `wait_for_more`'s no-live arm used to call
+    /// `cache.len()` while still holding `cache.inner()` — locking a
+    /// non-recursive std Mutex twice on one thread deadlocked the
+    /// waveform worker while holding the cache guard, which wedged
+    /// every later `inner()` (decode's `ensure_format`, lane appends)
+    /// — the "stream plays nothing after a bad cache" freeze. A
+    /// completed/dead live feed lands exactly in that arm.
+    #[test]
+    fn wait_for_more_does_not_self_lock() {
+        let key = format!("wfm-selflock-{}", std::process::id());
+        let cache = super::super::stream_cache::cache_for(&key);
+        // A finished downloader leaves live()=done → the `_` arm that
+        // previously called cache.len() under the held guard.
+        cache.live_begin(1, 0, 1);
+        cache.live_worker_done(1, true);
+        let cancel = AtomicBool::new(false);
+        let c2 = cache.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wait_for_more(&c2, &cancel));
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("wait_for_more wedged on a recursive inner() lock");
+        super::super::stream_cache::delete(&key);
+    }
 }

@@ -1062,6 +1062,28 @@ pub struct OnlineMeta {
     pub duration: Option<f64>,
 }
 
+/// Stream length in seconds from the watch page's player response —
+/// oEmbed doesn't carry duration, so a lightweight page scrape fills
+/// it without paying for a yt-dlp metadata pass per item.
+pub fn youtube_duration(url: &str) -> Option<f64> {
+    let id = extract_video_id(url)?;
+    let html = fetch_text(&format!("https://www.youtube.com/watch?v={id}"), 15)?;
+    parse_length_seconds(&html)
+}
+
+/// `"lengthSeconds":"NNN"` (string or numeric JSON) — the first hit
+/// is the player response's own field.
+fn parse_length_seconds(html: &str) -> Option<f64> {
+    const KEY: &str = "\"lengthSeconds\"";
+    let rest = &html[html.find(KEY)? + KEY.len()..];
+    let rest = rest.trim_start_matches([':', '"', ' ']);
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    num.parse::<f64>().ok().filter(|d| *d > 0.0)
+}
+
 pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
     if let Some(id) = extract_video_id(url) {
         let api = format!(
@@ -1288,3 +1310,54 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: playlist/mix suffixes must strip to the canonical
+    /// watch link — the link text is also the stream-cache key, so an
+    /// uncleaned `&list=…&start_radio=1` item built its own poisoned
+    /// cache instead of sharing the video's healthy one.
+    #[test]
+    fn clean_video_link_strips_playlist_params() {
+        assert_eq!(
+            clean_video_link(
+                "https://www.youtube.com/watch?v=PiwDxH2HgIM&list=RDPiwDxH2HgIM&start_radio=1"
+            ),
+            "https://www.youtube.com/watch?v=PiwDxH2HgIM"
+        );
+        assert_eq!(
+            clean_video_link("https://youtu.be/PiwDxH2HgIM?t=5"),
+            "https://www.youtube.com/watch?v=PiwDxH2HgIM"
+        );
+        // Already-clean and non-YouTube urls are untouched.
+        assert_eq!(
+            clean_video_link("https://www.youtube.com/watch?v=PiwDxH2HgIM"),
+            "https://www.youtube.com/watch?v=PiwDxH2HgIM"
+        );
+        assert_eq!(
+            clean_video_link("https://example.com/radio.pls"),
+            "https://example.com/radio.pls"
+        );
+    }
+
+    /// `lengthSeconds` arrives as a JSON string or number inside the
+    /// player response; the column needs a positive float either way.
+    #[test]
+    fn parse_length_seconds_handles_both_forms() {
+        assert_eq!(
+            parse_length_seconds(r#"{"lengthSeconds":"2135","x":1}"#),
+            Some(2135.0)
+        );
+        assert_eq!(
+            parse_length_seconds(r#"{"lengthSeconds":2135.5}"#),
+            Some(2135.5)
+        );
+        assert_eq!(parse_length_seconds("no field"), None);
+        assert_eq!(
+            parse_length_seconds(r#"{"lengthSeconds":"0"}"#),
+            None
+        );
+    }
+}

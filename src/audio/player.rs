@@ -588,7 +588,13 @@ fn decode_thread(
                 // the audible end.
                 shared.eof.store(true, Ordering::Relaxed);
             }
-            DecodeEnd::Stopped => {}
+            DecodeEnd::Stopped => {
+                // A failed open (unprobeable stream, dead URL) must
+                // unlatch the preroll gate — open_stream sets it and
+                // only decoded PCM clears it, so leaving it latched
+                // mutes every subsequent source too.
+                shared.buffering.store(false, Ordering::Relaxed);
+            }
             DecodeEnd::Reload(s) => pending = Some(s),
             DecodeEnd::Quit => return,
         }
@@ -1076,6 +1082,24 @@ const SEGMENT: u64 = 1024 * 1024;
 const FEED_CHUNK: usize = 64 * 1024;
 const HTTP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+/// Shared agent for the streaming path — bare `ureq::get` sets no
+/// deadline at all, so a stalled googlevideo socket blocked the
+/// decode thread inside `http_source` forever (the queued `Cmd::Load`
+/// never returns, wedging every later open). Connect/response/body
+/// are all bounded; mid-body stalls still surface through the lane
+/// reader as errors the stalled() logic already handles.
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(15)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .build()
+            .into()
+    })
+}
+
 struct HttpSource {
     url: String,
     /// Absolute offset the consumer reads next.
@@ -1349,7 +1373,8 @@ impl Feed {
             return true;
         }
         let mut ok = true;
-        let req = ureq::get(&self.url)
+        let req = http_agent()
+            .get(&self.url)
             .header("Range", &format!("bytes={}-{}", at, end - 1))
             .header("User-Agent", HTTP_UA);
         match req.call() {
@@ -1472,7 +1497,8 @@ impl HttpSource {
             inner.covered_read(0, &mut head).unwrap_or(0)
         };
         if (have as u64) < want {
-            let resp = ureq::get(&self.url)
+            let resp = http_agent()
+                .get(&self.url)
                 .header("Range", &format!("bytes={}-{}", have, want - 1))
                 .header("User-Agent", HTTP_UA)
                 .call();
@@ -1493,7 +1519,8 @@ impl HttpSource {
     /// answers Content-Range without paying for a second connection —
     /// lane 0 opens the real download right after).
     fn head_len(url: &str) -> std::io::Result<Option<u64>> {
-        let resp = ureq::get(url)
+        let resp = http_agent()
+            .get(url)
             .header("Range", "bytes=0-0")
             .header("User-Agent", HTTP_UA)
             .call()

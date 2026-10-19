@@ -18,6 +18,11 @@ pub struct CachedMeta {
     pub artist: String,
     #[serde(default)]
     pub thumb: Option<String>,
+    /// Stream length in seconds — learned once (resolved-url `dur=`
+    /// or yt-dlp metadata) and persisted so the list column never
+    /// has to re-resolve it.
+    #[serde(default)]
+    pub duration: Option<f64>,
     // Metadata-editor fields for stream items — no file to tag, so
     // edits persist here (title/artist also feed the item labels).
     #[serde(default)]

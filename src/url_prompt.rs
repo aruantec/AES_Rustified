@@ -192,11 +192,20 @@ impl UrlPrompt {
         ));
 
         // Textbox — frameless; the pill above is the visual. Left
-        // padding clears the icon; the child ui's centered row keeps
-        // the text vertically centered in the 45px box.
+        // padding clears the icon. The child ui's max_rect is itself
+        // text-height centered on the box (the search_pill pattern —
+        // a full-height rect leaves the single-line galley top-biased
+        // no matter the row alignment).
+        let line_h = 16.0 * s * 1.4;
         let text_rect = Rect::from_min_max(
-            Pos2::new(box_rect.min.x + 42.0 * s, box_rect.min.y + 2.0 * s),
-            Pos2::new(box_rect.max.x - 16.0 * s, box_rect.max.y - 2.0 * s),
+            Pos2::new(
+                box_rect.min.x + 42.0 * s,
+                box_rect.center().y - line_h * 0.5,
+            ),
+            Pos2::new(
+                box_rect.max.x - 16.0 * s,
+                box_rect.center().y + line_h * 0.5,
+            ),
         );
         let mut tui = ui.new_child(
             egui::UiBuilder::new()
@@ -209,9 +218,11 @@ impl UrlPrompt {
         tui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         tui.visuals_mut().widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
         tui.visuals_mut().widgets.active.weak_bg_fill = Color32::TRANSPARENT;
-        // Natural height + the row's Align::Center keeps the text
-        // vertically centered in the pill — add_sized to the full
-        // box would top-align the single-line galley instead.
+        // hint_text resolves TextStyle::Body, not TextEdit::font —
+        // pin it so the hint renders at the same size.
+        tui.style_mut()
+            .text_styles
+            .insert(egui::TextStyle::Body, FontId::proportional(16.0 * s));
         let resp = tui.add(
             egui::TextEdit::singleline(&mut self.text)
                 .hint_text(hint)

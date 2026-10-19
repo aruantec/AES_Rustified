@@ -266,6 +266,16 @@ pub fn format_sig(url: &str) -> String {
     String::new()
 }
 
+/// `dur=` param — declared stream length in seconds. Free once the
+/// media url resolves; persisted to the metadata cache so the list
+/// column never re-resolves it.
+pub fn stream_dur_secs(url: &str) -> Option<f64> {
+    url.split(&['?', '&'][..])
+        .find_map(|p| p.strip_prefix("dur="))
+        .and_then(|d| d.parse::<f64>().ok())
+        .filter(|d| *d > 0.0)
+}
+
 /// Shared cache for an item (`key` = the page/item url — stable across
 /// resolves, unlike the signed media url).
 pub fn cache_for(key: &str) -> Arc<StreamCache> {

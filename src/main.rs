@@ -1190,6 +1190,12 @@ impl AesRustApp {
         if let Some(rx) = self.resolve_rx.as_ref() {
             match rx.try_recv() {
                 Ok((path, Ok(stream))) => {
+                    // `dur=` rides the resolved media url — fill the
+                    // item's duration so the playlist column shows it
+                    // from the first play onward.
+                    if let Some(d) = audio::stream_cache::stream_dur_secs(&stream) {
+                        self.carousel.set_item_duration(&path, d);
+                    }
                     if self.playing_track.as_ref() == Some(&path) {
                         if self.player.is_none() {
                             self.player = audio::AudioPlayer::new().ok();
@@ -1206,8 +1212,10 @@ impl AesRustApp {
                         }
                         // The item's page url keys the persistent
                         // stream cache — shared by playback and the
-                        // waveform worker, surviving restarts.
-                        let key = path.to_string_lossy().into_owned();
+                        // waveform worker, surviving restarts. Clean
+                        // it so playlist/mix urls use the canonical
+                        // video's cache instead of their own.
+                        let key = ytdlp::clean_video_link(&path.to_string_lossy());
                         if let Some(p) = self.player.as_ref() {
                             let _ = p.open_stream(&stream, &key);
                         }
@@ -1330,14 +1338,18 @@ impl AesRustApp {
             // ResolveMediaSourceAsync (bestaudio first,
             // muxed `best` fallback). Playback starts when
             // resolve_rx lands.
-            let url = track.to_string_lossy().into_owned();
+            // Resolve the canonical watch link (Lacrima:
+            // ResolveMediaSourceAsync cleans the url first) — a
+            // playlist/mix link plays the same video, and more
+            // importantly shares its stream cache.
+            let url = ytdlp::clean_video_link(&track.to_string_lossy());
             let item = track.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
                 .name("aes-stream-resolve".into())
                 .spawn(move || {
-                    let one = |sel: &str| {
-                        ytdlp::stream_urls(&url, sel, ytdlp::ExtractorProfile::Default)
+                    let one = |sel: &str, prof: ytdlp::ExtractorProfile| {
+                        ytdlp::stream_urls(&url, sel, prof)
                             .ok()
                             .and_then(|v| v.into_iter().next())
                     };
@@ -1349,11 +1361,37 @@ impl AesRustApp {
                     // HLS/DASH manifests symphonia can't
                     // parse). `best` muxed last resort.
                     let sel = "ba[ext=m4a][protocol^=http]/ba[acodec!=opus][protocol^=http]/b[protocol^=http]";
+                    // YouTube's SABR experiment can strip the
+                    // audio-only formats' URLs under the android
+                    // profile — the muxed `b` fallback then carries
+                    // HE-AAC, which symphonia can't decode. Retry
+                    // unrestricted clients for an audio-mime stream.
+                    let first = one(sel, ytdlp::ExtractorProfile::Default);
+                    let stream = match &first {
+                        Some(u) if is_audio_mime(u) => first.clone(),
+                        _ => one(sel, ytdlp::ExtractorProfile::Unrestricted)
+                            .filter(|u| is_audio_mime(u))
+                            .or(first),
+                    };
+                    let stream = stream
+                        .or_else(|| one("b", ytdlp::ExtractorProfile::Default));
+                    // `dur=` rides the resolved media url — merge it
+                    // into the item's cached metadata so the playlist
+                    // duration column fills after a single resolve.
+                    if let Some(d) = stream
+                        .as_deref()
+                        .and_then(audio::stream_cache::stream_dur_secs)
+                    {
+                        if let Some(mut m) = meta_cache::load(&url) {
+                            if m.duration.is_none() {
+                                m.duration = Some(d);
+                                meta_cache::save(&url, &m);
+                            }
+                        }
+                    }
                     let _ = tx.send((
                         item,
-                        one(sel)
-                            .or_else(|| one("b"))
-                            .ok_or_else(|| "no playable stream".to_string()),
+                        stream.ok_or_else(|| "no playable stream".to_string()),
                     ));
                 })
                 .ok();
@@ -1454,6 +1492,14 @@ fn end_advance(
             None => EndAdvance::Stop,
         },
     }
+}
+
+/// Resolved googlevideo urls carry `mime=audio%2F…` for audio-only
+/// streams and `mime=video%2F…` for muxed — the latter's embedded
+/// track can be HE-AAC, which symphonia can't decode, so audio-only
+/// results are strongly preferred.
+fn is_audio_mime(url: &str) -> bool {
+    url.contains("mime=audio")
 }
 
 /// Whether the end-of-track check may run this tick. While a play is
@@ -8151,5 +8197,25 @@ mod tests {
             assert!(cmds.contains(&egui::ViewportCommand::Decorations(false)));
             out.textures_delta.clear();
         }
+    }
+
+    /// The SABR-experiment regression: under the android client
+    /// profile YouTube strips audio-only format URLs, so the selector
+    /// falls to `b` (muxed) whose embedded audio can be HE-AAC —
+    /// symphonia can't decode it. The resolver retries unrestricted
+    /// clients and prefers audio-mime results; `is_audio_mime` is the
+    /// discriminator.
+    #[test]
+    fn audio_mime_prefers_audio_only_streams() {
+        assert!(is_audio_mime(
+            "https://rr2---sn-x.googlevideo.com/videoplayback?expire=1&mime=audio%2Fmp4&clen=100"
+        ));
+        assert!(is_audio_mime(
+            "https://x/videoplayback?mime=audio%2Fwebm&foo=bar"
+        ));
+        assert!(!is_audio_mime(
+            "https://x/videoplayback?mime=video%2Fmp4&clen=100"
+        ));
+        assert!(!is_audio_mime("https://x/manifest.m3u8"));
     }
 }

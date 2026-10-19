@@ -335,7 +335,7 @@ impl TagEditor {
     /// which returns the item to its remote thumbnail.
     fn save_stream(&mut self) -> Result<(), String> {
         let url = self.path.to_string_lossy().into_owned();
-        let thumb = crate::meta_cache::load(&url).and_then(|m| m.thumb);
+        let prev = crate::meta_cache::load(&url);
         crate::meta_cache::save(
             &url,
             &crate::meta_cache::CachedMeta {
@@ -347,7 +347,8 @@ impl TagEditor {
                 genre: self.genres.trim().to_string(),
                 comment: self.comment.trim().to_string(),
                 lyrics: self.lyrics.clone(),
-                thumb,
+                thumb: prev.as_ref().and_then(|m| m.thumb.clone()),
+                duration: prev.and_then(|m| m.duration),
             },
         );
         match self
