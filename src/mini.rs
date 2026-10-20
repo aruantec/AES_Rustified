@@ -278,7 +278,7 @@ pub(crate) fn view(
     // A slim pill below the header row, inset like the bar content.
     let track = Rect::from_min_max(
         Pos2::new(content.min.x + pad_x, bar_rect.max.y + 0.12 * h),
-        Pos2::new(content.max.x - pad_x, bar_rect.max.y + 0.12 * h + 0.0825 * h),
+        Pos2::new(content.max.x - pad_x, bar_rect.max.y + 0.12 * h + 0.132 * h),
     );
     let pos_s2 = player.map(|p| p.position().as_secs_f64()).unwrap_or(0.0);
     let dur_s2 = player
