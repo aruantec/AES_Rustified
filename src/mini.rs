@@ -65,6 +65,9 @@ pub(crate) fn view(
     cover_colors: Option<&[Color32]>,
     accent: Color32,
     s: f32,
+    // The normal window's virtual width — the spectrum strip sizes
+    // its bars off it so mini columns match the normal view's.
+    norm_w: f32,
 ) -> MiniOut {
     let painter = ui.painter().clone();
     painter.rect_filled(content, 0, grid_bg);
@@ -524,7 +527,15 @@ pub(crate) fn view(
             } else {
                 &grad
             };
-            spectrum.paint_mini(&painter.with_clip_rect(slot), spec_rect, cols, 1.0);
+            spectrum.paint_mini(
+                &painter.with_clip_rect(slot),
+                spec_rect,
+                spec_cfg,
+                cols,
+                1.0,
+                s,
+                norm_w,
+            );
             ctx.request_repaint();
         }
     }

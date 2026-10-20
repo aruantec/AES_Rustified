@@ -2378,6 +2378,7 @@ impl eframe::App for AesRustApp {
                                 settings.audio.volume_knob_color[2],
                             ),
                             s,
+                            settings.window.width / s,
                         );
                         if let Some(t) = mout.seek {
                             seek_secs = Some(t);

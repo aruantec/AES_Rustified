@@ -17,7 +17,7 @@ const RENDER_W: f32 = 960.0;
 const RENDER_H: f32 = 192.0;
 const MAX_BARS: usize = 192;
 /// MusicView's `BlockHeight=5`; segment gap is 15% of the block.
-const BLOCK_H: f32 = 5.0;
+const BLOCK_H: f32 = 7.5;
 /// Bar width renders at 0.8x the configured value.
 const BAR_W_SCALE: f32 = 0.8;
 
@@ -209,14 +209,20 @@ impl SpectrumBar {
         let denom = self.global_max * 1.1 + 1e-9;
         let sx = rect.width() / RENDER_W;
         let sy = rect.height() / RENDER_H;
-        let bar_w = cfg.bar_width * BAR_W_SCALE * sx;
-        let pitch = (cfg.bar_width * BAR_W_SCALE + cfg.bar_spacing) * sx;
-        let total_w = count as f32 * bar_w + (count - 1) as f32 * cfg.bar_spacing * sx;
-        let mut x = rect.min.x + (rect.width() - total_w).max(0.0) * 0.5;
-        let block_h = (BLOCK_H * sy).max(1.0);
-        let gap = block_h * 0.35;
-        let peak_h = (2.0 * sy).max(1.0);
-        let bottom = rect.max.y;
+        // Pixel-quantized grid: bar, gap, and slab heights are whole
+        // pixels — a fractional pitch lands every column on a
+        // different subpixel and the AA makes the gaps jitter.
+        let bar_w = (cfg.bar_width * BAR_W_SCALE * sx).round().max(1.0);
+        let spacing = (cfg.bar_spacing * sx).round().max(2.0);
+        let pitch = bar_w + spacing;
+        let total_w = count as f32 * bar_w + (count - 1) as f32 * spacing;
+        let mut x = rect.min.x + ((rect.width() - total_w).max(0.0) * 0.5).round();
+        let block_h = (BLOCK_H * sy).round().max(3.0);
+        let gap = (block_h * 0.35).round().max(1.0);
+        // Segment thickness is half the lit part of the cell — thin
+        // VFD slabs with the same row pitch and gap.
+        let slab_h = ((block_h - gap) * 0.5).round().max(1.0);
+        let bottom = rect.max.y.round();
 
         for i in 0..count {
             let x0 = x;
@@ -226,75 +232,115 @@ impl SpectrumBar {
             }
             let level = (self.displayed[i] / denom).clamp(0.0, 1.0);
             let peak = (self.peaks[i] / denom).clamp(0.0, 1.0);
-            let bar_top = bottom - level * rect.height();
             let color = gradient_color(colors, i, count);
-
-            // VFD ghost grid: the column's unlit segments faintly
-            // visible behind the lit stack.
-            let mut gcur = bottom;
-            while gcur > rect.min.y + gap {
-                let top = (gcur - block_h).max(rect.min.y);
-                let vis_bottom = (gcur - gap).max(top);
-                if vis_bottom > top {
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
-                        0.0,
-                        color.gamma_multiply(0.06 * alpha),
-                    );
-                }
-                gcur = top;
-            }
-
-            // Segmented bar: stacked blocks with a 15% gap, brighter
-            // toward the top (alpha 0.65 + 0.35 * height fraction).
-            let mut cur = bottom;
-            while cur > bar_top {
-                let top = (cur - block_h).max(bar_top);
-                let vis_bottom = (cur - gap).max(top);
-                if vis_bottom > top {
-                    let cy = (top + vis_bottom) * 0.5;
-                    let v = ((bottom - cy) / rect.height()).clamp(0.0, 1.0);
-                    let a = (0.65 + 0.35 * v) * alpha;
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
-                        0.0,
-                        color.gamma_multiply(a),
-                    );
-                }
-                cur = top;
-            }
-
-            // Peak box: a lit segment hanging at the peak level — the
-            // slowed `peaks` decay lets it float down like a hardware
-            // analyzer's marker.
-            if peak > 0.001 {
-                let peak_top = (bottom - peak * rect.height()).clamp(rect.min.y, bottom);
-                let peak_bottom = (peak_top + peak_h.max(block_h * 0.8)).min(bottom);
-                if peak_bottom > peak_top {
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, peak_top), Pos2::new(x1, peak_bottom)),
-                        0.0,
-                        color.gamma_multiply(0.95 * alpha),
-                    );
-                }
-            }
+            self.paint_column(
+                painter,
+                x0,
+                x1,
+                rect.min.y,
+                bottom,
+                rect.height(),
+                level,
+                peak,
+                color,
+                alpha,
+                block_h,
+                gap,
+                slab_h,
+            );
             x += pitch;
         }
     }
 
-    /// The mini drawer's auto-fitting variant: sub-samples the
-    /// displayed bins down to a comfortable pitch for the strip's
-    /// width, then spreads the bars edge to edge. The look follows
-    /// the classic analyzer style — wide thin slabs stacked with
-    /// clear gaps, a segment-sized peak box that hangs and falls
-    /// (the `peaks` physics decays it), and a fading mirror of the
-    /// stack under the baseline.
+    /// One VFD column: faint unlit-segment grid, the lit stack rising
+    /// from `bottom` over `area_h`, and the peak marker snapped to a
+    /// cell. Shared by `paint` and `paint_mini` so the two strips look
+    /// identical at equal virtual size.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_column(
+        &self,
+        painter: &egui::Painter,
+        x0: f32,
+        x1: f32,
+        top_y: f32,
+        bottom: f32,
+        area_h: f32,
+        level: f32,
+        peak: f32,
+        color: Color32,
+        alpha: f32,
+        block_h: f32,
+        gap: f32,
+        slab_h: f32,
+    ) {
+        let bar_top = bottom - level * area_h;
+
+        // Ghost grid: the column's unlit segments faintly visible
+        // behind the lit stack.
+        let mut gcur = bottom;
+        while gcur - gap > top_y {
+            let top = (gcur - gap - slab_h).max(top_y);
+            let vis_bottom = gcur - gap;
+            if vis_bottom > top {
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
+                    0.0,
+                    color.gamma_multiply(0.06 * alpha),
+                );
+            }
+            gcur -= block_h;
+        }
+
+        // Lit stack, brighter toward the top (0.65 + 0.35 * height).
+        let mut cur = bottom;
+        while cur - gap > bar_top {
+            let top = (cur - gap - slab_h).max(bar_top);
+            let vis_bottom = cur - gap;
+            if vis_bottom > top {
+                let cy = (top + vis_bottom) * 0.5;
+                let v = ((bottom - cy) / area_h).clamp(0.0, 1.0);
+                let a = (0.65 + 0.35 * v) * alpha;
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
+                    0.0,
+                    color.gamma_multiply(a),
+                );
+            }
+            cur -= block_h;
+        }
+
+        // Peak box: a lit segment hanging at the peak level, snapped
+        // to the grid so it jumps cell-to-cell like a real VFD
+        // marker — the `peaks` decay drives it.
+        if peak > 0.001 {
+            let k = (peak * area_h / block_h).ceil().max(1.0);
+            let peak_bottom = (bottom - (k - 1.0) * block_h - gap).min(bottom);
+            let peak_top = (peak_bottom - slab_h).max(top_y);
+            if peak_bottom > peak_top {
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, peak_top), Pos2::new(x1, peak_bottom)),
+                    0.0,
+                    color.gamma_multiply(0.95 * alpha),
+                );
+            }
+        }
+    }
+
+    /// The mini drawer's variant: identical geometry to `paint` —
+    /// the same bar/slab metrics the normal strip produces — but the
+    /// narrow strip fits only as many of those full-size columns as
+    /// the pitch allows and sub-samples `displayed` bins across them.
+    /// `norm_w` is the normal window's virtual width and `s` the UI
+    /// scale, so `sx`/`sy` resolve exactly like the normal view's.
     pub fn paint_mini(
         &self,
         painter: &egui::Painter,
         rect: Rect,
+        cfg: &settings::Spectrum,
         colors: &[Color32],
         alpha: f32,
+        s: f32,
+        norm_w: f32,
     ) {
         if alpha <= 0.001 || colors.is_empty() {
             return;
@@ -303,87 +349,60 @@ impl SpectrumBar {
         if total == 0 {
             return;
         }
-        // The bottom strip mirrors the bar stack, fading downward.
-        let reflect_h = rect.height() * 0.22;
-        let bottom = rect.max.y - reflect_h;
-        let area_h = bottom - rect.min.y;
+        let bottom = rect.max.y.round();
+        let area_h = rect.height();
         if area_h <= 4.0 {
             return;
         }
-        // ~11px pitch → wide bars; slab height tracks the area so the
-        // stack always reads as thin blocks, never squares.
-        let n = total.min((rect.width() / 11.0).max(8.0) as usize);
-        let pitch = rect.width() / n as f32;
-        let bar_w = pitch * 0.66;
         let denom = self.global_max * 1.1 + 1e-9;
-        let block_h = (area_h / 20.0).clamp(1.5, 4.0);
-        let gap = (block_h * 0.5).max(1.0);
-        let peak_h = block_h;
+        // Same formulas as `paint`, evaluated at the normal strip's
+        // scale — bar width, spacing, and segment pitch render at the
+        // same physical sizes there; only the column count differs.
+        let sx = norm_w / RENDER_W;
+        let sy = (cfg.height * s) / RENDER_H;
+        let norm_bar_w = (cfg.bar_width * BAR_W_SCALE * sx).round().max(1.0);
+        let norm_spacing = (cfg.bar_spacing * sx).round().max(2.0);
+        let fit = ((rect.width() + norm_spacing) / (norm_bar_w + norm_spacing))
+            .floor()
+            .max(1.0) as usize;
+        // ~2.1x the normal-fit column count: bars and gaps shrink
+        // proportionally so the strip keeps the normal look — the
+        // columns are just a bit narrower, not differently shaped.
+        let n = ((fit as f32 * 2.1).round() as usize).clamp(1, total.max(1));
+        let k = (fit as f32 / n as f32).min(1.0);
+        let bar_w = (norm_bar_w * k).round().max(1.0);
+        let spacing = (norm_spacing * k).round().max(1.0);
+        let pitch = bar_w + spacing;
+        let grid_w = n as f32 * pitch - spacing;
+        let x0_base = (rect.min.x + (rect.width() - grid_w).max(0.0) * 0.5).round();
+        let block_h = (BLOCK_H * sy).round().max(3.0);
+        let gap = (block_h * 0.35).round().max(1.0);
+        let slab_h = ((block_h - gap) * 0.5).round().max(1.0);
         for i in 0..n {
             let src = i * total / n;
-            let x0 = rect.min.x + i as f32 * pitch;
+            let x0 = x0_base + i as f32 * pitch;
             let x1 = (x0 + bar_w).min(rect.max.x);
+            if x1 <= x0 {
+                break;
+            }
             let level = (self.displayed[src] / denom).clamp(0.0, 1.0);
             let peak = (self.peaks[src] / denom).clamp(0.0, 1.0);
-            let bar_top = bottom - level * area_h;
             let color = gradient_color(colors, i, n);
-
-            // VFD look: the whole column is faintly lit "off" segments
-            // — the lit stack draws on top of the ghost grid.
-            let mut cur = bottom;
-            while cur > rect.min.y + gap {
-                let top = (cur - block_h).max(rect.min.y);
-                let vis_bottom = (cur - gap).max(top);
-                if vis_bottom > top {
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
-                        0.0,
-                        color.gamma_multiply(0.07 * alpha),
-                    );
-                }
-                cur = top;
-            }
-
-            let mut cur = bottom;
-            while cur > bar_top {
-                let top = (cur - block_h).max(bar_top);
-                let vis_bottom = (cur - gap).max(top);
-                if vis_bottom > top {
-                    let cy = (top + vis_bottom) * 0.5;
-                    let v = ((bottom - cy) / area_h).clamp(0.0, 1.0);
-                    let a = (0.65 + 0.35 * v) * alpha;
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
-                        0.0,
-                        color.gamma_multiply(a),
-                    );
-                    // Mirror slab under the baseline, fading out over
-                    // the reflection strip's height.
-                    let ry0 = bottom + (bottom - vis_bottom);
-                    let ry1 = bottom + (bottom - top);
-                    let fade = (1.0 - (ry0 - bottom) / reflect_h).max(0.0);
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, ry0), Pos2::new(x1, ry1)),
-                        0.0,
-                        color.gamma_multiply(a * 0.22 * fade),
-                    );
-                }
-                cur = top;
-            }
-            // Peak box: a lit segment that hangs above the stack then
-            // falls — the `peaks` decay gives it the slow gravity. It
-            // reads on the ghost grid even at the bar's own color.
-            if peak > 0.001 {
-                let peak_top = (bottom - peak * area_h).clamp(rect.min.y, bottom - peak_h);
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(x0, peak_top),
-                        Pos2::new(x1, peak_top + peak_h),
-                    ),
-                    0.0,
-                    color.gamma_multiply(alpha),
-                );
-            }
+            self.paint_column(
+                painter,
+                x0,
+                x1,
+                rect.min.y,
+                bottom,
+                area_h,
+                level,
+                peak,
+                color,
+                alpha,
+                block_h,
+                gap,
+                slab_h,
+            );
         }
     }
 }
