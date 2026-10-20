@@ -2030,11 +2030,15 @@ impl AlbumRow {
                 Pos2::new(cover_rect.min.x + x, cover_rect.min.y),
                 Vec2::new(item_size, dest_h),
             );
-            paint::paint_cover(
+            // Fanned-out layers slide under the cover rect's left edge —
+            // clip-shape the mesh or the axis cut paints the tile's left
+            // corners square over the base layer's arcs.
+            paint::paint_cover_clipped(
                 &cover_painter,
                 tex.id(),
                 tex.size(),
                 dest,
+                cover_rect,
                 COVER_RADIUS * self.scale,
                 alpha,
             );
@@ -2046,11 +2050,12 @@ impl AlbumRow {
                 Pos2::new(cover_rect.min.x + base_x, cover_rect.min.y),
                 Vec2::new(item_size, dest_h),
             );
-            paint::paint_cover(
+            paint::paint_cover_clipped(
                 &cover_painter,
                 placeholder.id(),
                 placeholder.size(),
                 dest,
+                cover_rect,
                 COVER_RADIUS * self.scale,
                 alpha,
             );
@@ -2071,20 +2076,12 @@ impl AlbumRow {
                 .unwrap_or(0.0)
         };
         if title_a > 0.001 {
-            // Overlay bar: bottom corners rounded to the tile's radius
-            // so it doesn't poke past the cover's rounded arcs.
-            let bar_cr = if self.show_titles {
-                egui::CornerRadius::ZERO
-            } else {
-                let r = (TILE_RADIUS * self.scale).round() as u8;
-                egui::CornerRadius {
-                    nw: 0,
-                    ne: 0,
-                    sw: r,
-                    se: r,
-                }
-            };
-            painter.rect_filled(title_rect, bar_cr, TITLE_BG.gamma_multiply(title_a));
+            // Always square: `rect_filled` radii are whole pixels, so a
+            // rounded bar never matches the cover mesh's exact arc —
+            // the mismatch reads as stray bright pixels at the corner.
+            // With titles off the corner_notch stamps below carve the
+            // silhouette back out of the square bar instead.
+            painter.rect_filled(title_rect, 0.0, TITLE_BG.gamma_multiply(title_a));
         }
         // While the inline editor is open on this tile the painted
         // title stays out — it would bleed around the TextEdit's frame.
@@ -2155,7 +2152,79 @@ impl AlbumRow {
                 egui::StrokeKind::Inside,
             );
         }
+
+        // Corner cleanup (titles off only): the cover meshes and the
+        // hover title bar only approximate the tile's rounded
+        // silhouette — mesh edges aren't antialiased and the bar's
+        // corner radius rounds to whole pixels — so stray cover pixels
+        // linger in the corner notches. Stamp them in the strip bg;
+        // outside the silhouette the row's own fill is the only
+        // legitimate paint. Skipped for tiles mid-glide (drag/swap) —
+        // they can sit over a neighbor whose pixels the stamp would eat.
+        if !self.show_titles && placement.is_none() && offset_x.abs() < 0.5 {
+            let r = TILE_RADIUS * self.scale;
+            let bg = ROW_BG.gamma_multiply(alpha);
+            let p = std::f32::consts::PI;
+            corner_notch(
+                &painter,
+                Pos2::new(tile.min.x, tile.max.y),
+                Pos2::new(tile.min.x + r, tile.max.y - r),
+                r,
+                p * 0.5,
+                bg,
+            );
+            corner_notch(
+                &painter,
+                tile.max,
+                Pos2::new(tile.max.x - r, tile.max.y - r),
+                r,
+                0.0,
+                bg,
+            );
+            // Top notches only while the tile's top edge still sits
+            // inside the strip — above it the bg isn't the row's fill.
+            if tile.min.y >= row.min.y {
+                corner_notch(
+                    &painter,
+                    tile.min,
+                    Pos2::new(tile.min.x + r, tile.min.y + r),
+                    r,
+                    p,
+                    bg,
+                );
+                corner_notch(
+                    &painter,
+                    Pos2::new(tile.max.x, tile.min.y),
+                    Pos2::new(tile.max.x - r, tile.min.y + r),
+                    r,
+                    p * 1.5,
+                    bg,
+                );
+            }
+        }
     }
+}
+
+/// `square minus quarter-disc` at one rounded-rect corner — stamped in
+/// the strip bg over a finished tile so cover/bar pixels that overshot
+/// the rounded silhouette get erased (mesh edges aren't antialiased and
+/// `rect_filled` corner radii round to whole pixels). The fan shares the
+/// cover mesh's arc subdivision, so the cut edge coincides with it.
+fn corner_notch(painter: &egui::Painter, outer: Pos2, center: Pos2, r: f32, start: f32, color: Color32) {
+    const SEG: usize = 6;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(outer, color);
+    for s in 0..=SEG {
+        let a = start + s as f32 / SEG as f32 * std::f32::consts::FRAC_PI_2;
+        mesh.colored_vertex(
+            Pos2::new(center.x + a.cos() * r, center.y + a.sin() * r),
+            color,
+        );
+    }
+    for i in 0..SEG as u32 {
+        mesh.add_triangle(0, 1 + i, 2 + i);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Dashed outline for the drop-slot hole — egui has no path effects,

@@ -83,6 +83,89 @@ pub fn rounded_image_mesh(
     mesh
 }
 
+/// Same triangle fan as `rounded_image_mesh`, but the perimeter is the
+/// intersection `dest ∩ clip` — needed when `dest` extends past the clip
+/// (fan layers sliding under a tile edge): the plain mesh would lose its
+/// arcs to the axis-aligned clip and paint a square edge. UVs still map
+/// over the full `dest`, so clipped pixels keep their image position.
+pub fn rounded_image_mesh_clipped(
+    tex: TextureId,
+    dest: Rect,
+    uv: Rect,
+    clip: Rect,
+    radius: f32,
+    tint: Color32,
+) -> Mesh {
+    let shape = dest.intersect(clip);
+    if shape.width() <= 0.0 || shape.height() <= 0.0 {
+        return Mesh::with_texture(tex);
+    }
+    let r = radius.min(shape.width() * 0.5).min(shape.height() * 0.5);
+    let mut mesh = Mesh::with_texture(tex);
+    let to_uv = |p: Pos2| {
+        Pos2::new(
+            uv.min.x + (p.x - dest.min.x) / dest.width() * uv.width(),
+            uv.min.y + (p.y - dest.min.y) / dest.height() * uv.height(),
+        )
+    };
+    mesh.vertices.push(Vertex {
+        pos: shape.center(),
+        uv: to_uv(shape.center()),
+        color: tint,
+    });
+    let corners = [
+        (Pos2::new(shape.min.x + r, shape.min.y + r), std::f32::consts::PI),
+        (
+            Pos2::new(shape.max.x - r, shape.min.y + r),
+            std::f32::consts::PI * 1.5,
+        ),
+        (Pos2::new(shape.max.x - r, shape.max.y - r), 0.0),
+        (
+            Pos2::new(shape.min.x + r, shape.max.y - r),
+            std::f32::consts::FRAC_PI_2,
+        ),
+    ];
+    for &(center, start) in &corners {
+        for s in 0..=CORNER_SEGMENTS {
+            let a = start + s as f32 / CORNER_SEGMENTS as f32 * std::f32::consts::FRAC_PI_2;
+            let p = Pos2::new(center.x + a.cos() * r, center.y + a.sin() * r);
+            let uv = to_uv(p);
+            mesh.vertices.push(Vertex {
+                pos: p,
+                uv,
+                color: tint,
+            });
+        }
+    }
+    let ring = 4 * (CORNER_SEGMENTS + 1) as u32;
+    for i in 0..ring - 1 {
+        mesh.indices.extend_from_slice(&[0, 1 + i, 2 + i]);
+    }
+    mesh.indices.extend_from_slice(&[0, ring, 1]);
+    mesh
+}
+
+/// Like `paint_cover`, but rounded-corner clips the mesh to `clip`:
+/// corners falling inside the clip edge still get their arc.
+pub fn paint_cover_clipped(
+    painter: &egui::Painter,
+    tex: TextureId,
+    src_size: [usize; 2],
+    dest: Rect,
+    clip: Rect,
+    radius: f32,
+    alpha: f32,
+) {
+    if alpha <= 0.001 {
+        return;
+    }
+    let uv = fill_uv(src_size, dest);
+    let tint = Color32::WHITE.gamma_multiply(alpha);
+    painter.add(egui::Shape::mesh(rounded_image_mesh_clipped(
+        tex, dest, uv, clip, radius, tint,
+    )));
+}
+
 /// Convenience: paint a texture into `rect` with rounded corners and
 /// fill-cropped UVs. `src_size` is the texture's pixel size.
 pub fn paint_cover(
