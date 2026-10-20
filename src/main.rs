@@ -60,6 +60,14 @@ use eframe::egui_wgpu;
 const CORNER_RADIUS: u8 = 10;
 /// MainTopBar's declared height (virtual px, rendered at 1/ScaleFactor).
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 70.0;
+/// The mini shell's bar height — the chrome band is 50 units and the
+/// few below it read as free space over the gradient; content starts
+/// under that so the playlist keeps most of the reclaimed space.
+pub(crate) const MINI_TITLE_BAR_HEIGHT: f32 = 56.0;
+/// Height of the mini bar's packed chrome band (logo, buttons,
+/// separator line) — the bar zone keeps `MINI_TITLE_BAR_HEIGHT` so the
+/// strip under the separator stays free space + window-drag area.
+pub(crate) const MINI_CHROME_HEIGHT: f32 = 50.0;
 const RESIZE_BORDER: f32 = 8.0;
 /// Seconds for one full fade-out -> fade-in view transition.
 const NAV_FADE_SECS: f32 = 0.55;
@@ -1680,6 +1688,8 @@ impl eframe::App for AesRustApp {
         // whole screen.
         let bar_h = if is_fullscreen {
             0.0
+        } else if self.settings.window.mini {
+            MINI_TITLE_BAR_HEIGHT * s
         } else {
             TITLE_BAR_HEIGHT * s
         };
@@ -4553,11 +4563,23 @@ fn lacrima_window_frame(
                     app_rect.min.y
                         + if is_fullscreen {
                             0.0
+                        } else if mini_active {
+                            MINI_TITLE_BAR_HEIGHT * scale
                         } else {
                             TITLE_BAR_HEIGHT * scale
                         },
                 ),
             );
+            // Mini mode packs the chrome (logo, buttons, separator)
+            // into a tighter band at the TOP of the bar — the drag
+            // zone keeps the full title_bar_rect, but everything below
+            // the raised separator reads as free space over the
+            // gradient, so the bar looks shorter without shrinking it.
+            let chrome_rect = if mini_active {
+                title_bar_rect.with_max_y(app_rect.min.y + MINI_CHROME_HEIGHT * scale)
+            } else {
+                title_bar_rect
+            };
             add_contents(ui);
 
             if !is_fullscreen {
@@ -4628,7 +4650,7 @@ fn lacrima_window_frame(
             // would cut it, so mini mode gets only a faint dark veil
             // instead.
             painter.rect_filled(
-                title_bar_rect,
+                chrome_rect,
                 CornerRadius {
                     nw: radius,
                     ne: radius,
@@ -4642,7 +4664,7 @@ fn lacrima_window_frame(
                 },
             );
 
-            logo.paint(&painter, title_bar_rect, elapsed, title, animate_title);
+            logo.paint(&painter, chrome_rect, elapsed, title, animate_title);
 
             // Back button at the top-left of the bar, like Lacrima's
             // arrow button bound to NavigationService.NavigateBackCommand.
@@ -4654,7 +4676,7 @@ fn lacrima_window_frame(
                 // while the face scales on press.
                 let btn = Rect::from_min_size(
                     panel_rect.min,
-                    Vec2::splat(title_bar_rect.max.y - panel_rect.min.y),
+                    Vec2::splat(chrome_rect.max.y - panel_rect.min.y),
                 );
                 let back_resp = ui.interact(btn, ui.id().with("back"), Sense::click());
                 if back_resp.hovered() {
@@ -4714,13 +4736,13 @@ fn lacrima_window_frame(
 
             painter.line_segment(
                 [
-                    Pos2::new(panel_rect.min.x, title_bar_rect.max.y),
-                    title_bar_rect.right_bottom(),
+                    Pos2::new(panel_rect.min.x, chrome_rect.max.y),
+                    chrome_rect.right_bottom(),
                 ],
                 Stroke::new((1.5 * scale).max(1.0), Color32::from_gray(85)),
             );
 
-            ui.scope_builder(UiBuilder::new().max_rect(title_bar_rect), |ui| {
+            ui.scope_builder(UiBuilder::new().max_rect(chrome_rect), |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Buttons carry Margin=10 in a Spacing=5 StackPanel:
                     // right edge padding, 25px between buttons.
@@ -5823,12 +5845,17 @@ fn settings_overlay(
     // version block; below ~480*s they overlap, which the old 240px floor
     // allowed in the mini shell.
     let w = (content.width() * 0.38).clamp(520.0 * scale, content.width());
-    // The panel starts below the title-bar separator — the stroke is
-    // centered on content.min.y, so sitting flush would cover its lower
-    // half.
+    // The panel starts below the title-bar separator — sitting flush
+    // would cover the stroke's lower half. In the mini shell the
+    // separator sits on the raised chrome band, above content.min.y.
     let sep = (1.5 * scale).max(1.0);
+    let sep_y = if settings.window.mini {
+        content.min.y - (MINI_TITLE_BAR_HEIGHT - MINI_CHROME_HEIGHT) * scale
+    } else {
+        content.min.y
+    };
     let panel = Rect::from_min_max(
-        Pos2::new(content.max.x - w * t, content.min.y + sep),
+        Pos2::new(content.max.x - w * t, sep_y + sep),
         content.max,
     );
     // Tab bodies and the footer lay out against a fixed-width rect that
@@ -5838,7 +5865,12 @@ fn settings_overlay(
     // tab's fixed-size controls do).
     let mut body_panel =
         Rect::from_min_max(panel.min, Pos2::new(panel.min.x + w, panel.max.y));
-    let painter = ui.painter().clone();
+    // The mini panel starts inside the bar's free strip (above the
+    // content scope's clip) — widen the clip so the fill isn't cut.
+    let painter = ui
+        .painter()
+        .clone()
+        .with_clip_rect(ui.clip_rect().union(panel));
 
     // Clicking the exposed content left of the panel closes it; the panel
     // itself swallows clicks so they don't reach the view underneath.

@@ -76,7 +76,7 @@ pub(crate) fn view(
     // through the now-playing bar, fading over ~two bar heights into
     // the background. The scope painter is clipped to `content`, so
     // this uses a clip widened to the title zone.
-    let title_h = crate::TITLE_BAR_HEIGHT * s;
+    let title_h = crate::MINI_TITLE_BAR_HEIGHT * s;
     let header = Rect::from_min_max(
         Pos2::new(content.min.x, content.min.y - title_h),
         Pos2::new(content.max.x, content.min.y + 2.0 * BAR_H),
