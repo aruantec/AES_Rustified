@@ -121,4 +121,13 @@ windows = { version = "0.62", features = [
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
 
+[build-dependencies]
+flate2 = "1.1.10"
+
+# First-launch cost scales with exe size (Defender scans the whole
+# file on a new binary) — thin LTO + symbol strip shave several MB.
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
 

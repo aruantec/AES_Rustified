@@ -24,7 +24,10 @@ const BAR_W_SCALE: f32 = 0.8;
 // UpdatePhysics constants (UseDeltaTime=true -> factors scaled by dt*60).
 const ATTACK: f32 = 0.42;
 const RELEASE: f32 = 0.38;
-const PEAK_DECAY: f32 = 0.85;
+// Peak-hold decay per 60fps tick — 0.85 collapsed the marker to the
+// bar almost instantly; ~0.045 makes it hang, then float down like a
+// hardware analyzer's peak segment.
+const PEAK_DECAY: f32 = 0.045;
 const PRE_POW: f32 = 0.90;
 const MAX_RISE_FRAC: f32 = 0.55;
 const MAX_RISE_ABS: f32 = 0.05;
@@ -211,7 +214,7 @@ impl SpectrumBar {
         let total_w = count as f32 * bar_w + (count - 1) as f32 * cfg.bar_spacing * sx;
         let mut x = rect.min.x + (rect.width() - total_w).max(0.0) * 0.5;
         let block_h = (BLOCK_H * sy).max(1.0);
-        let gap = block_h * 0.15;
+        let gap = block_h * 0.35;
         let peak_h = (2.0 * sy).max(1.0);
         let bottom = rect.max.y;
 
@@ -225,6 +228,22 @@ impl SpectrumBar {
             let peak = (self.peaks[i] / denom).clamp(0.0, 1.0);
             let bar_top = bottom - level * rect.height();
             let color = gradient_color(colors, i, count);
+
+            // VFD ghost grid: the column's unlit segments faintly
+            // visible behind the lit stack.
+            let mut gcur = bottom;
+            while gcur > rect.min.y + gap {
+                let top = (gcur - block_h).max(rect.min.y);
+                let vis_bottom = (gcur - gap).max(top);
+                if vis_bottom > top {
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
+                        0.0,
+                        color.gamma_multiply(0.06 * alpha),
+                    );
+                }
+                gcur = top;
+            }
 
             // Segmented bar: stacked blocks with a 15% gap, brighter
             // toward the top (alpha 0.65 + 0.35 * height fraction).
@@ -245,15 +264,17 @@ impl SpectrumBar {
                 cur = top;
             }
 
-            // Peak tick: 2px white sliver floating at the peak level.
+            // Peak box: a lit segment hanging at the peak level — the
+            // slowed `peaks` decay lets it float down like a hardware
+            // analyzer's marker.
             if peak > 0.001 {
                 let peak_top = (bottom - peak * rect.height()).clamp(rect.min.y, bottom);
-                let peak_bottom = (peak_top + peak_h).min(bottom);
+                let peak_bottom = (peak_top + peak_h.max(block_h * 0.8)).min(bottom);
                 if peak_bottom > peak_top {
                     painter.rect_filled(
                         Rect::from_min_max(Pos2::new(x0, peak_top), Pos2::new(x1, peak_bottom)),
                         0.0,
-                        Color32::from_white_alpha((242.0 * alpha) as u8),
+                        color.gamma_multiply(0.95 * alpha),
                     );
                 }
             }
@@ -263,8 +284,11 @@ impl SpectrumBar {
 
     /// The mini drawer's auto-fitting variant: sub-samples the
     /// displayed bins down to a comfortable pitch for the strip's
-    /// width, then spreads the bars edge to edge (Lacrima's
-    /// GlSpectrumControl fills its control; BlockHeight=5).
+    /// width, then spreads the bars edge to edge. The look follows
+    /// the classic analyzer style — wide thin slabs stacked with
+    /// clear gaps, a segment-sized peak box that hangs and falls
+    /// (the `peaks` physics decays it), and a fading mirror of the
+    /// stack under the baseline.
     pub fn paint_mini(
         &self,
         painter: &egui::Painter,
@@ -279,23 +303,46 @@ impl SpectrumBar {
         if total == 0 {
             return;
         }
-        // ~7px pitch floor, at least 8 bars, at most the bin count.
-        let n = total.min((rect.width() / 7.0).max(8.0) as usize);
+        // The bottom strip mirrors the bar stack, fading downward.
+        let reflect_h = rect.height() * 0.22;
+        let bottom = rect.max.y - reflect_h;
+        let area_h = bottom - rect.min.y;
+        if area_h <= 4.0 {
+            return;
+        }
+        // ~11px pitch → wide bars; slab height tracks the area so the
+        // stack always reads as thin blocks, never squares.
+        let n = total.min((rect.width() / 11.0).max(8.0) as usize);
         let pitch = rect.width() / n as f32;
-        let bar_w = pitch * 0.62;
+        let bar_w = pitch * 0.66;
         let denom = self.global_max * 1.1 + 1e-9;
-        let bottom = rect.max.y;
-        let block_h = 5.0f32.min(rect.height() * 0.12);
-        let gap = block_h * 0.15;
-        let peak_h = 2.0f32;
+        let block_h = (area_h / 20.0).clamp(1.5, 4.0);
+        let gap = (block_h * 0.5).max(1.0);
+        let peak_h = block_h;
         for i in 0..n {
             let src = i * total / n;
             let x0 = rect.min.x + i as f32 * pitch;
             let x1 = (x0 + bar_w).min(rect.max.x);
             let level = (self.displayed[src] / denom).clamp(0.0, 1.0);
             let peak = (self.peaks[src] / denom).clamp(0.0, 1.0);
-            let bar_top = bottom - level * rect.height();
+            let bar_top = bottom - level * area_h;
             let color = gradient_color(colors, i, n);
+
+            // VFD look: the whole column is faintly lit "off" segments
+            // — the lit stack draws on top of the ghost grid.
+            let mut cur = bottom;
+            while cur > rect.min.y + gap {
+                let top = (cur - block_h).max(rect.min.y);
+                let vis_bottom = (cur - gap).max(top);
+                if vis_bottom > top {
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
+                        0.0,
+                        color.gamma_multiply(0.07 * alpha),
+                    );
+                }
+                cur = top;
+            }
 
             let mut cur = bottom;
             while cur > bar_top {
@@ -303,26 +350,39 @@ impl SpectrumBar {
                 let vis_bottom = (cur - gap).max(top);
                 if vis_bottom > top {
                     let cy = (top + vis_bottom) * 0.5;
-                    let v = ((bottom - cy) / rect.height()).clamp(0.0, 1.0);
+                    let v = ((bottom - cy) / area_h).clamp(0.0, 1.0);
                     let a = (0.65 + 0.35 * v) * alpha;
                     painter.rect_filled(
                         Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, vis_bottom)),
                         0.0,
                         color.gamma_multiply(a),
                     );
+                    // Mirror slab under the baseline, fading out over
+                    // the reflection strip's height.
+                    let ry0 = bottom + (bottom - vis_bottom);
+                    let ry1 = bottom + (bottom - top);
+                    let fade = (1.0 - (ry0 - bottom) / reflect_h).max(0.0);
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, ry0), Pos2::new(x1, ry1)),
+                        0.0,
+                        color.gamma_multiply(a * 0.22 * fade),
+                    );
                 }
                 cur = top;
             }
+            // Peak box: a lit segment that hangs above the stack then
+            // falls — the `peaks` decay gives it the slow gravity. It
+            // reads on the ghost grid even at the bar's own color.
             if peak > 0.001 {
-                let peak_top = (bottom - peak * rect.height()).clamp(rect.min.y, bottom);
-                let peak_bottom = (peak_top + peak_h).min(bottom);
-                if peak_bottom > peak_top {
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x0, peak_top), Pos2::new(x1, peak_bottom)),
-                        0.0,
-                        Color32::from_white_alpha((242.0 * alpha) as u8),
-                    );
-                }
+                let peak_top = (bottom - peak * area_h).clamp(rect.min.y, bottom - peak_h);
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(x0, peak_top),
+                        Pos2::new(x1, peak_top + peak_h),
+                    ),
+                    0.0,
+                    color.gamma_multiply(alpha),
+                );
             }
         }
     }

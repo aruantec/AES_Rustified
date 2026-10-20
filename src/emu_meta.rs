@@ -83,6 +83,31 @@ fn save_cover(rom: &Path, bytes: &[u8]) -> Option<PathBuf> {
     Some(p)
 }
 
+/// Lazily inflates a gzip'd title database (build.rs compresses
+/// `assets/database/*.json` into OUT_DIR so the exe doesn't carry
+/// ~14MB of raw JSON — first-launch AV scan cost scales with size).
+/// Callers invoke it inside a OnceLock init, so each DB inflates once.
+fn db_json(name: &str) -> String {
+    let gz: &[u8] = match name {
+        "x360.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/x360.json.gz")),
+        "psx.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/psx.json.gz")),
+        "ps2.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/ps2.json.gz")),
+        "fbn.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/fbn.json.gz")),
+        "arcade.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/arcade.json.gz")),
+        "nes.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/nes.json.gz")),
+        "snes.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/snes.json.gz")),
+        "gba.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/gba.json.gz")),
+        "psp.json" => include_bytes!(concat!(env!("OUT_DIR"), "/db/psp.json.gz")),
+        "psp_redump.json" => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/db/psp_redump.json.gz"))
+        }
+        _ => include_bytes!(concat!(env!("OUT_DIR"), "/db/genesis.json.gz")),
+    };
+    let mut s = String::new();
+    let _ = flate2::read::GzDecoder::new(gz).read_to_string(&mut s);
+    s
+}
+
 // ------------------------------------------------------------------
 // Database: Lacrima's Database/x360.json (titleid -> title)
 // ------------------------------------------------------------------
@@ -95,8 +120,8 @@ struct TitleEntry {
 fn x360_titles() -> &'static HashMap<String, String> {
     static DB: OnceLock<HashMap<String, String>> = OnceLock::new();
     DB.get_or_init(|| {
-        let json = include_str!("../assets/database/x360.json");
-        serde_json::from_str::<Vec<TitleEntry>>(json)
+        let json = db_json("x360.json");
+        serde_json::from_str::<Vec<TitleEntry>>(&json)
             .unwrap_or_default()
             .into_iter()
             .filter(|e| e.titleid.len() == 8 && !e.title.is_empty())
@@ -1025,13 +1050,9 @@ fn ps_db(file: &'static str) -> &'static HashMap<String, String> {
     static PS2: OnceLock<HashMap<String, String>> = OnceLock::new();
     let slot = if file == "psx.json" { &PSX } else { &PS2 };
     slot.get_or_init(|| {
-        let json = if file == "psx.json" {
-            include_str!("../assets/database/psx.json")
-        } else {
-            include_str!("../assets/database/ps2.json")
-        };
+        let json = db_json(file);
         let mut map = HashMap::new();
-        for e in serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap_or_default() {
+        for e in serde_json::from_str::<Vec<serde_json::Value>>(&json).unwrap_or_default() {
             let (Some(serial), Some(title)) = (
                 e.get("serial").and_then(|s| s.as_str()),
                 e.get("title").and_then(|s| s.as_str()),
@@ -1073,28 +1094,20 @@ fn hash_title_db(file: &'static str) -> &'static HashTitleDb {
     static PSP_REDUMP: OnceLock<HashTitleDb> = OnceLock::new();
     static FBN: OnceLock<HashTitleDb> = OnceLock::new();
     static ARCADE: OnceLock<HashTitleDb> = OnceLock::new();
-    let (slot, json) = match file {
-        "fbn.json" => (&FBN, include_str!("../assets/database/fbn.json")),
-        "arcade.json" => (
-            &ARCADE,
-            include_str!("../assets/database/arcade.json"),
-        ),
-        "nes.json" => (&NES, include_str!("../assets/database/nes.json")),
-        "snes.json" => (&SNES, include_str!("../assets/database/snes.json")),
-        "gba.json" => (&GBA, include_str!("../assets/database/gba.json")),
-        "psp.json" => (&PSP, include_str!("../assets/database/psp.json")),
-        "psp_redump.json" => (
-            &PSP_REDUMP,
-            include_str!("../assets/database/psp_redump.json"),
-        ),
-        _ => (
-            &GENESIS,
-            include_str!("../assets/database/genesis.json"),
-        ),
+    let slot = match file {
+        "fbn.json" => &FBN,
+        "arcade.json" => &ARCADE,
+        "nes.json" => &NES,
+        "snes.json" => &SNES,
+        "gba.json" => &GBA,
+        "psp.json" => &PSP,
+        "psp_redump.json" => &PSP_REDUMP,
+        _ => &GENESIS,
     };
     slot.get_or_init(|| {
+        let json = db_json(file);
         let mut db = HashTitleDb::default();
-        for e in serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap_or_default() {
+        for e in serde_json::from_str::<Vec<serde_json::Value>>(&json).unwrap_or_default() {
             let Some(title) = e
                 .get("title")
                 .and_then(|s| s.as_str())
