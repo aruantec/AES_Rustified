@@ -240,6 +240,12 @@ impl AudioPlayer {
         let mut smoothed = 0.0f32;
         // Per-sample ramp coefficient for a ~50ms time constant.
         let ramp = 1.0 - (-1.0f32 / (out_rate as f32 * 0.05)).exp();
+        // Track-transition fades: ~500ms in after every flush (track
+        // open/seek/repeat-rewind) and ~500ms out while the decoder-
+        // flagged EOF tail drains, so song changes ease in and out of
+        // silence instead of slamming.
+        let fade_len = out_rate as usize / 2;
+        let mut fade_pos = 0usize;
         let data_cb = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // Decoder bumped the flush counter (new track/seek): drop
             // any stale PCM still in the ring.
@@ -247,6 +253,7 @@ impl AudioPlayer {
             if fseq != last_flush {
                 last_flush = fseq;
                 cons.clear();
+                fade_pos = 0;
             }
             eq.sync_gains(&cb_shared.band_db);
             let paused = cb_shared.state.load(Ordering::Relaxed) == STATE_PAUSE;
@@ -304,6 +311,33 @@ impl AudioPlayer {
                         }
                     }
                 };
+                // Transition fades: the fade-in ramp counts frames
+                // since the last flush; near EOF the remaining ring
+                // frames fade the tail out. Pauses and stream preroll
+                // freeze both so the ramp runs on audible audio, not
+                // dead time.
+                if !muted {
+                    if fade_pos < fade_len {
+                        fade_pos += 1;
+                        // Quadratic in: perceived loudness is
+                        // logarithmic, so a linear ramp gets loud
+                        // early — t² holds the gain down through the
+                        // first half and blooms at the end, which is
+                        // what keeps loud intros from slamming.
+                        let t = fade_pos as f32 / fade_len as f32;
+                        let g = t * t;
+                        l *= g;
+                        r *= g;
+                    }
+                    if cb_shared.eof.load(Ordering::Relaxed) {
+                        let rem = cons.occupied_len() / 2;
+                        if rem < fade_len {
+                            let g = rem as f32 / fade_len as f32;
+                            l *= g;
+                            r *= g;
+                        }
+                    }
+                }
                 eq.process(&mut l, &mut r);
                 let _ = spec_prod.try_push(l);
                 let _ = spec_prod.try_push(r);
