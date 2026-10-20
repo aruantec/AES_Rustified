@@ -1209,6 +1209,9 @@ impl AesRustApp {
                         &mut app.album_cover_rx,
                         &mut app.url_info_rx,
                     );
+                    // The last loaded track reopens selected — cover,
+                    // waveform, list highlight — without playing.
+                    app.restore_track(&cc.egui_ctx);
                 }
             }
         }
@@ -1514,6 +1517,73 @@ impl AesRustApp {
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.waveform_rx = Some(audio::waveform::spawn(track, cancel.clone()));
             self.waveform_cancel = Some(cancel);
+        }
+        // The loaded track survives restarts — the next launch
+        // restores it selected-but-not-playing once its album opens.
+        self.settings.library.last_track = Some(self
+            .playing_track
+            .as_ref()
+            .map(|t| t.to_string_lossy().into_owned())
+            .unwrap_or_default());
+        settings::save(&self.settings);
+    }
+
+    /// Session restore for the last loaded track: `playing_track`,
+    /// the list highlight/scroll-to, cover + palette and the waveform
+    /// all come up like a fresh `start_track` — minus `p.open`, so
+    /// nothing plays. Only fires when the item is actually in the
+    /// just-opened album (index_of guards deleted/moved tracks).
+    fn restore_track(&mut self, ctx: &egui::Context) {
+        let Some(track) = self
+            .settings
+            .library
+            .last_track
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .filter(|t| self.carousel.index_of(t).is_some())
+        else {
+            return;
+        };
+        self.carousel.reveal(&track);
+        if library::is_url(&track) {
+            // The remote thumb rides the same fetch worker as a real
+            // play — the stream itself is NOT resolved (no playback).
+            if let Some(src) = self.carousel.cover_for(&track) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let t = track.clone();
+                std::thread::Builder::new()
+                    .name("aes-cover-fetch".into())
+                    .spawn(move || {
+                        let _ = tx.send((t, library::decode_cover(&src)));
+                    })
+                    .ok();
+                self.playing_cover_rx = Some(rx);
+            }
+            self.playing_track = Some(track);
+        } else if track.exists() {
+            let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
+            self.spectrum_colors =
+                img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
+            if let (Some(toy), Some(img)) = (self.shadertoy.as_mut(), img.as_ref()) {
+                toy.set_cover_image(img);
+                if let Some(c) = self.spectrum_colors.as_deref() {
+                    toy.set_palette(c);
+                }
+            }
+            if let Some(img) = &img {
+                self.playing_cover = Some(ctx.load_texture(
+                    "player-cover",
+                    img.clone(),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            self.waveform.clear();
+            self.waveform_shown.clear();
+            self.waveform_loading = true;
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.waveform_rx = Some(audio::waveform::spawn(track.clone(), cancel.clone()));
+            self.waveform_cancel = Some(cancel);
+            self.playing_track = Some(track);
         }
     }
 }
@@ -1886,6 +1956,7 @@ impl eframe::App for AesRustApp {
                             &mut self.album_cover_rx,
                             &mut self.url_info_rx,
                         );
+                        self.restore_track(ui.ctx());
                     }
                 }
                 self.album_rx = None;

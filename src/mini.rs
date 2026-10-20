@@ -654,6 +654,10 @@ pub(crate) fn view(
         let palcol_id = ui.id().with("mv-sel-pal-col");
         // Seconds into the current drag — drives the stack gather.
         let dragt_id = ui.id().with("mv-drag-t");
+        // The track the list last scrolled to — used to scroll the
+        // playing item into view once per track change (the restored
+        // session track included).
+        let reveal_id = ui.id().with("mv-reveal");
 
         let mut sel: HashSet<PathBuf> =
             ctx.data_mut(|d| d.get_temp(sel_id)).unwrap_or_default();
@@ -668,6 +672,8 @@ pub(crate) fn view(
         let mut pal_key: Option<PathBuf> = ctx.data_mut(|d| d.get_temp(palkey_id));
         let pal_col: Option<Color32> = ctx.data_mut(|d| d.get_temp(palcol_id));
         let drag_t: f32 = ctx.data_mut(|d| d.get_temp(dragt_id)).unwrap_or(0.0);
+        let mut revealed: Option<PathBuf> =
+            ctx.data_mut(|d| d.get_temp(reveal_id)).unwrap_or(None);
 
         let rows: Vec<(usize, PathBuf, String, String, Option<f64>)> = carousel
             .item_rows()
@@ -752,6 +758,22 @@ pub(crate) fn view(
                     );
                     let selected = sel.contains(path);
                     let playing = playing_track == Some(path.as_path());
+                    // Follow the loaded track like the cover view's
+                    // reveal does — center its row AND own the
+                    // selection when it changes, so a session-restored
+                    // item arrives selected (palette tint) instead of
+                    // needing a click. A live drag keeps its multi-
+                    // selection untouched.
+                    if playing && revealed.as_deref() != Some(path.as_path()) {
+                        resp.scroll_to_me(Some(egui::Align::Center));
+                        revealed = Some(path.clone());
+                        if drag.is_none() {
+                            sel.clear();
+                            sel.insert(path.clone());
+                            anchor = *i;
+                            sel_dirty = true;
+                        }
+                    }
                     if interactive && drag.is_none() {
                         if resp.hovered() {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1031,6 +1053,7 @@ pub(crate) fn view(
                 }
             }
             d.insert_temp(disp_id, disp);
+            d.insert_temp(reveal_id, revealed);
             d.insert_temp(pal_id, pal);
             match &pal_key {
                 Some(v) => {

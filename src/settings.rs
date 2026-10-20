@@ -220,6 +220,10 @@ pub struct Library {
     /// The album loaded in the cover view / mini list when the app
     /// last closed — reopened once the scan lands at next launch.
     pub last_album: Option<String>,
+    /// The track loaded when the app last closed — restored selected
+    /// (cover, waveform, list highlight) once `last_album` reopens,
+    /// without starting playback.
+    pub last_track: Option<String>,
     /// "Rename Album" display-title overrides, keyed by album dir —
     /// folder names on disk are never touched, and virtual albums'
     /// `apl://` keys stay stable while their labels change.

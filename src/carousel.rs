@@ -888,8 +888,18 @@ impl Carousel {
 
     /// Queue a scroll-to for `path`'s item — the playing item drives
     /// the selection marker and gets scrolled into view on the next
-    /// frame (transport next/prev, auto-advance on track end).
+    /// frame (transport next/prev, auto-advance on track end). The
+    /// selection itself lands NOW: `pending_reveal` only carries the
+    /// scroll, which needs ui() geometry — contexts that never run
+    /// carousel.ui (the mini shell, a just-restored session) would
+    /// otherwise leave `sel` on items[0] and play_fallback would
+    /// resolve the wrong track.
     pub fn reveal(&mut self, path: &Path) {
+        if let Some(idx) = self.index_of(path) {
+            self.sel = idx;
+            self.sel_set = BTreeSet::from([idx]);
+            self.sel_anchor = idx;
+        }
         self.pending_reveal = Some(path.to_path_buf());
     }
 
