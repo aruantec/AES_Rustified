@@ -12,8 +12,8 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Vec2};
 use eframe::egui::epaint::{Mesh, Shape, Vertex};
 
 use crate::{
-    album_row, audio, carousel, ellipsize, equalizer, fmt_time, settings, spectrum_bar,
-    transport, waveform_bar,
+    album_row, audio, carousel, ellipsize, equalizer, fmt_time, library, settings,
+    spectrum_bar, transport, waveform_bar,
 };
 
 /// The mini window's floor — below this the rows stop fitting.
@@ -27,8 +27,8 @@ pub(crate) const DEFAULT_SIZE: Vec2 = Vec2::new(420.0, 560.0);
 /// `s`-scaled: the bar keeps this size at any UI scaling.
 const BAR_H: f32 = 80.0;
 /// The control cluster's base-unit scale: PLAY_BTN (100) renders at
-/// 50% of the bar height — Lacrima's proportions.
-const CTRL_K: f32 = 0.0052;
+/// ~55% of the bar height (Lacrima's 50%, user-tuned +10%).
+const CTRL_K: f32 = 0.0055;
 
 /// Playback intents the shell can't serve itself — the app's shared
 /// action tail resolves them exactly like the Music view's outputs.
@@ -40,6 +40,36 @@ pub(crate) struct MiniOut {
     pub seek: Option<f64>,
     /// Prev/Next from the media controls — resolved like the band's.
     pub step: transport::Step,
+    /// An album picked from the Tab-toggled albums list (its dir key —
+    /// the owner resolves it through open_album).
+    pub open: Option<String>,
+    /// Confirmed delete from the mini prompt — the owner applies it
+    /// (the shell's DeletePrompt paints in the normal view stack,
+    /// which mini mode returns before).
+    pub delete: Option<crate::PendingDelete>,
+    /// Shift+arrows reordered the albums list — the owner persists
+    /// library.album_order.
+    pub albums_dirty: bool,
+    /// A pick from the footer's "+" menu — the owner runs the
+    /// picker/prompt (rfd dialogs and url_prompt render outside the
+    /// mini view).
+    pub menu: Option<MiniMenu>,
+}
+
+/// The mini "+" menu's entries — mapped onto the same code the
+/// carousel/strip context menus run in the main view.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum MiniMenu {
+    /// Playlist: "Add Files" — local files into the loaded album.
+    AddFiles,
+    /// Playlist: "Add Url" — open the URL prompt.
+    AddUrl,
+    /// Playlist: "Add Playlist" — open the playlist URL prompt.
+    AddPlaylist,
+    /// Albums list: "Create Album" — append an empty virtual album.
+    CreateAlbum,
+    /// Albums list: "Open Folder" — pick a folder as a music root.
+    AddFolder,
 }
 
 /// Paint + interact for one frame of the mini shell. `content` is the
@@ -50,10 +80,11 @@ pub(crate) fn view(
     content: Rect,
     interactive: bool,
     carousel: &mut carousel::Carousel,
+    albums: &mut Vec<library::Album>,
     row: &mut album_row::AlbumRow,
     player: Option<&audio::AudioPlayer>,
     playing_track: Option<&Path>,
-    _stream_loading: bool,
+    stream_loading: bool,
     _waveform: &[f32],
     _waveform_loading: bool,
     bar: &mut waveform_bar::WaveformBar,
@@ -73,6 +104,14 @@ pub(crate) fn view(
     painter.rect_filled(content, 0, grid_bg);
     let ctx = ui.ctx().clone();
     let mut out = MiniOut::default();
+
+    // Mini-local delete confirm — the shell's DeletePrompt paints in
+    // the normal view stack, which mini mode returns before reaching.
+    // While a prompt is pending it owns all input.
+    let del_id = ui.id().with("mv-del");
+    let mut del: Option<crate::PendingDelete> =
+        ctx.data_mut(|d| d.get_temp(del_id)).unwrap_or_default();
+    let interactive = interactive && del.is_none();
 
     // The header gradient is ONE continuous wash from the window top
     // (behind the title bar — its fill is transparent in mini mode)
@@ -575,6 +614,141 @@ pub(crate) fn view(
         );
     }
 
+    // Footer center: "{playing index} of {count} - {total duration}"
+    // — Lacrima's centered #BDBDBD TextBlock (1-based Index of the
+    // loaded item, CoverItems count, summed Duration in hh:mm:ss).
+    if carousel.len() > 0 {
+        let idx = carousel
+            .item_rows()
+            .find(|(_, p, ..)| Some(*p) == playing_track)
+            .map(|(i, ..)| i + 1)
+            .unwrap_or(0);
+        let total = carousel.total_duration();
+        let ts = total.max(0.0) as u64;
+        let dur = if ts >= 3600 {
+            format!("{:02}:{:02}:{:02}", ts / 3600, (ts % 3600) / 60, ts % 60)
+        } else {
+            format!("{:02}:{:02}", ts / 60, ts % 60)
+        };
+        let font = FontId::proportional(0.13 * h); // Lacrima's 12 in the 90px world
+        let text = ellipsize(
+            &painter,
+            &format!("{idx} of {} - {dur}", carousel.len()),
+            &font,
+            content.width() - 28.0 * u,
+        );
+        painter.text(
+            Pos2::new(content.center().x, (foot_top + content.max.y) * 0.5),
+            Align2::CENTER_CENTER,
+            text,
+            font,
+            Color32::from_rgb(0xBD, 0xBD, 0xBD),
+        );
+    }
+
+    // "+" add-menu — bottom-left of the footer, mirroring the resize
+    // dots on the right. Playlist shows Lacrima's adds (files, url,
+    // playlist); the albums list shows Create Album / Open Folder.
+    let fbtn_cy = (foot_top + content.max.y) * 0.5 - 0.012 * h;
+    let pb = Rect::from_center_size(
+        Pos2::new(content.min.x + 0.16 * h, fbtn_cy),
+        Vec2::splat(0.1615 * h),
+    );
+    let presp = ui.interact(pb, ui.id().with("mv-plus"), egui::Sense::click());
+    painter.rect_stroke(
+        pb,
+        0.037 * h,
+        egui::Stroke::new(
+            (0.010 * h).max(1.0),
+            if presp.hovered() && interactive {
+                Color32::WHITE
+            } else {
+                Color32::from_white_alpha(140)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let (arm, th) = (0.0366 * h, 0.0133 * h);
+    for size in [Vec2::new(arm * 2.0, th), Vec2::new(th, arm * 2.0)] {
+        painter.rect_filled(
+            Rect::from_center_size(pb.center(), size),
+            th * 0.5,
+            Color32::WHITE,
+        );
+    }
+    let albums_open: bool = ctx
+        .data_mut(|d| d.get_temp(ui.id().with("mv-albums")))
+        .unwrap_or(false);
+    if interactive {
+        let menu_font = FontId::proportional(0.13 * h);
+        let items: &[(&str, MiniMenu)] = if albums_open {
+            &[
+                ("Create Album", MiniMenu::CreateAlbum),
+                ("Open Folder", MiniMenu::AddFolder),
+            ]
+        } else {
+            &[
+                ("Add Files", MiniMenu::AddFiles),
+                ("Add Url", MiniMenu::AddUrl),
+                ("Add Playlist", MiniMenu::AddPlaylist),
+            ]
+        };
+        egui::Popup::menu(&presp)
+            .align(egui::RectAlign::TOP_START)
+            .show(|ui| {
+                ui.set_min_width(1.3 * h);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for (label, act) in items {
+                    if ui
+                        .button(egui::RichText::new(*label).font(menu_font.clone()))
+                        .clicked()
+                    {
+                        out.menu = Some(*act);
+                        ui.close();
+                    }
+                }
+            });
+    }
+
+    // Grid toggle beside the "+" — the visible twin of the Tab key:
+    // flips between the playlist and the albums list. Bright while
+    // the albums list shows, dimmed on the playlist.
+    let gb = Rect::from_center_size(
+        Pos2::new(pb.max.x + 0.16 * h, pb.center().y),
+        Vec2::splat(0.19 * h),
+    );
+    let gresp = ui.interact(gb, ui.id().with("mv-grid"), egui::Sense::click());
+    let (cell, gap) = (0.031 * h, 0.016 * h);
+    let span = cell * 3.0 + gap * 2.0;
+    let on_col = if albums_open {
+        Color32::WHITE
+    } else if gresp.hovered() && interactive {
+        Color32::from_white_alpha(170)
+    } else {
+        Color32::from_white_alpha(100)
+    };
+    for r in 0..3 {
+        for c in 0..3 {
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(
+                        gb.center().x - span * 0.5 + c as f32 * (cell + gap),
+                        gb.center().y - span * 0.5 + r as f32 * (cell + gap),
+                    ),
+                    Vec2::splat(cell),
+                ),
+                cell * 0.2,
+                on_col,
+            );
+        }
+    }
+    if gresp.clicked() && interactive {
+        ctx.data_mut(|d| {
+            d.insert_temp(ui.id().with("mv-albums"), !albums_open);
+        });
+    }
+
     let list_top = iy + icon + 0.10 * h + h * ext_t + 0.06 * h;
     let list = Rect::from_min_max(
         Pos2::new(content.min.x + pad_x, list_top),
@@ -621,6 +795,10 @@ pub(crate) fn view(
             mesh.indices.extend_from_slice(&[0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
             painter.add(Shape::mesh(mesh));
         }
+    }
+    // The busy pulse/spinner needs frames until the stream opens.
+    if stream_loading {
+        ctx.request_repaint();
     }
     if list.height() > 0.15 * h {
         let font = FontId::proportional(0.12 * h);
@@ -684,6 +862,194 @@ pub(crate) fn view(
         let mut m = is_sel.iter().filter(|b| **b).count();
         let sel_bg = pal_col.unwrap_or(accent);
 
+        // Tab swaps the playlist for the albums list — `albums_on`
+        // persists, `at` eases the crossfade (0 = playlist,
+        // 1 = albums).
+        let ab_id = ui.id().with("mv-albums");
+        let mut albums_on: bool =
+            ctx.data_mut(|d| d.get_temp(ab_id)).unwrap_or(false);
+        let asel_id = ui.id().with("mv-asel");
+        let mut asel: usize =
+            ctx.data_mut(|d| d.get_temp(asel_id)).unwrap_or(0);
+        // Dir-keyed selection set + `asel` as anchor — the playlist's
+        // sel/anchor pair, keyed by dir so reorder/deletes can't
+        // desync it.
+        let aselset_id = ui.id().with("mv-asel-set");
+        let mut asel_set: HashSet<String> =
+            ctx.data_mut(|d| d.get_temp(aselset_id)).unwrap_or_default();
+        // Eased + a touch longer than the raw bool animation — the
+        // eased value drives both opacities and the slide offsets.
+        let at = egui::emath::easing::quadratic_in_out(
+            ctx.animate_bool_with_time(ui.id().with("mv-albums-t"), albums_on, 0.3),
+        );
+
+        // Reseed when the set can't map to a live album (fresh state,
+        // deletions) — the anchor is the implicit selection.
+        {
+            let an = albums.len();
+            if an > 0 {
+                asel = asel.min(an - 1);
+                asel_set.retain(|d| {
+                    albums.iter().any(|a| a.dir.to_string_lossy() == d.as_str())
+                });
+                if asel_set.is_empty() {
+                    asel_set
+                        .insert(albums[asel].dir.to_string_lossy().into_owned());
+                }
+            } else {
+                asel = 0;
+                asel_set.clear();
+            }
+        }
+
+        // Keyboard: plain arrows move the one-row selection like a
+        // ListBox (collapse to the landing row, scrolled into view);
+        // Shift+arrows move the selection block one row — album_row's
+        // move_selection semantics on the same items (disp glides the
+        // rows to their new slots). In albums mode the same arrows
+        // walk the album rows and Enter opens one.
+        let mut kreveal: Option<PathBuf> = None;
+        let mut a_kreveal = false;
+        if interactive && !ctx.text_edit_focused() {
+            let (mut mv, mut nav) = (0i32, 0i32);
+            let (mut tab, mut enter, mut delreq) = (false, false, false);
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                    tab = true;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    enter = true;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
+                    delreq = true;
+                }
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                    mv = -1;
+                }
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                    mv = 1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    nav = -1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    nav = 1;
+                }
+            });
+            if tab {
+                albums_on = !albums_on;
+                ctx.data_mut(|d| d.insert_temp(ab_id, albums_on));
+            }
+            if albums_on {
+                // Albums list owns the keys — the playlist's rules:
+                // plain arrows collapse the selection onto the landing
+                // row, Shift+arrows move the selection block one row
+                // (album_row's move_selection semantics — `to` counts
+                // positions in the list without the moved rows).
+                let an = albums.len();
+                if mv != 0 && an >= 2 {
+                    let from = album_sel_indices(albums, &asel_set, asel);
+                    let m = from.len();
+                    if m > 0 {
+                        let to = (from[0] as i32 + mv)
+                            .clamp(0, an as i32 - m as i32)
+                            as usize;
+                        if !from.iter().enumerate().all(|(j, &i)| i == to + j) {
+                            let pr =
+                                from.iter().position(|&i| i == asel).unwrap_or(0);
+                            move_albums_block(albums, &from, to);
+                            asel = to + pr;
+                            ctx.data_mut(|d| d.insert_temp(asel_id, asel));
+                            out.albums_dirty = true;
+                            a_kreveal = true;
+                        }
+                    }
+                } else if nav != 0 && an > 0 {
+                    asel = (asel as i32 + nav).clamp(0, an as i32 - 1) as usize;
+                    asel_set.clear();
+                    asel_set
+                        .insert(albums[asel].dir.to_string_lossy().into_owned());
+                    ctx.data_mut(|d| d.insert_temp(asel_id, asel));
+                    a_kreveal = true;
+                }
+                if enter {
+                    if let Some(a) = albums.get(asel.min(an.saturating_sub(1))) {
+                        out.open = Some(a.dir.to_string_lossy().into_owned());
+                        // Back to the playlist once an album loads.
+                        albums_on = false;
+                        ctx.data_mut(|d| d.insert_temp(ab_id, false));
+                    }
+                }
+                if delreq {
+                    let dirs: Vec<String> = albums
+                        .iter()
+                        .filter(|a| {
+                            asel_set.contains(a.dir.to_string_lossy().as_ref())
+                        })
+                        .map(|a| a.dir.to_string_lossy().into_owned())
+                        .collect();
+                    if !dirs.is_empty() {
+                        del = Some(crate::PendingDelete::Albums(dirs));
+                        ctx.data_mut(|d| {
+                            d.insert_temp(ui.id().with("mv-del-sel"), 1usize);
+                        });
+                    }
+                }
+            } else if delreq {
+                let paths: Vec<PathBuf> = sel.iter().cloned().collect();
+                if !paths.is_empty() {
+                    del = Some(crate::PendingDelete::Items(paths));
+                    ctx.data_mut(|d| {
+                        d.insert_temp(ui.id().with("mv-del-sel"), 1usize);
+                    });
+                }
+            } else if mv != 0 && m > 0 && n >= 2 {
+                let from: Vec<usize> = is_sel
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b)
+                    .map(|(i, _)| i)
+                    .collect();
+                // `to` counts non-moved positions = the block's final
+                // start index (album_row's `bs` clamped to [0, n-m]).
+                let to = ((from[0] as i32 + mv).clamp(0, (n - m) as i32)) as usize;
+                if to != from[0] {
+                    kreveal = rows.get(from[0]).map(|(_, p, ..)| p.clone());
+                    carousel.move_items(&from, to);
+                    anchor = to;
+                }
+            } else {
+                if nav != 0 && n > 0 {
+                    let target = if sel.is_empty() {
+                        if nav < 0 { n - 1 } else { 0 }
+                    } else {
+                        (anchor as i32 + nav).clamp(0, n as i32 - 1) as usize
+                    };
+                    if let Some((_, p, ..)) = rows.get(target) {
+                        sel.clear();
+                        sel.insert(p.clone());
+                        anchor = target;
+                        is_sel = rows.iter().map(|(_, p, ..)| sel.contains(p)).collect();
+                        m = 1;
+                        kreveal = Some(p.clone());
+                    }
+                }
+                // Enter plays the selection (anchor row wins when it's
+                // selected, else the first selected row) — the
+                // double-click's keyboard twin.
+                if enter {
+                    let idx = if is_sel.get(anchor).copied().unwrap_or(false) {
+                        anchor
+                    } else {
+                        is_sel.iter().position(|b| *b).unwrap_or(anchor)
+                    };
+                    if let Some((_, p, ..)) = rows.get(idx.min(n.saturating_sub(1))) {
+                        out.play = Some(p.clone());
+                    }
+                }
+            }
+        }
+
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
         let mut animating = false;
         egui::ScrollArea::vertical()
@@ -707,7 +1073,8 @@ pub(crate) fn view(
                      title: &str,
                      album: &str,
                      dur: Option<f64>,
-                     fg: Color32| {
+                     fg: Color32,
+                     busy: bool| {
                         let cy = r.center().y;
                         lp.text(
                             Pos2::new(r.min.x + idx_w - 0.06 * h, cy),
@@ -740,15 +1107,35 @@ pub(crate) fn view(
                             &font,
                             fg,
                         );
-                        lp.text(
-                            Pos2::new(r.max.x - dur_right, cy),
-                            Align2::RIGHT_CENTER,
-                            dur.map(fmt_time).unwrap_or_else(|| "--:--".into()),
-                            font.clone(),
-                            fg,
-                        );
+                        if busy {
+                            // Stream resolving — a spinner arc sits in
+                            // the duration slot (its "--:--" would
+                            // read as a failed lookup).
+                            let c = Pos2::new(r.max.x - dur_right - dur_w * 0.5, cy);
+                            let rad = dur_w.min(row_h) * 0.28;
+                            let a0 = ctx.input(|i| i.time) as f32 * std::f32::consts::TAU;
+                            let pts: Vec<Pos2> = (0..=8)
+                                .map(|k| {
+                                    let a = a0 + k as f32 / 8.0 * std::f32::consts::TAU * 0.72;
+                                    c + Vec2::angled(a) * rad
+                                })
+                                .collect();
+                            lp.add(Shape::line(
+                                pts,
+                                egui::Stroke::new((0.02 * h).max(1.2), fg),
+                            ));
+                        } else {
+                            lp.text(
+                                Pos2::new(r.max.x - dur_right, cy),
+                                Align2::RIGHT_CENTER,
+                                dur.map(fmt_time).unwrap_or_else(|| "--:--".into()),
+                                font.clone(),
+                                fg,
+                            );
+                        }
                     };
-                let lp = ui.painter().with_clip_rect(list);
+                let mut lp = ui.painter().with_clip_rect(list);
+                lp.set_opacity(1.0 - at);
 
                 let mut sel_dirty = false;
                 for (i, path, title, album, dur) in rows.iter() {
@@ -758,6 +1145,14 @@ pub(crate) fn view(
                     );
                     let selected = sel.contains(path);
                     let playing = playing_track == Some(path.as_path());
+                    // Keyboard reveal — a nav/Shift-move target scrolls
+                    // into view (path-keyed so it survives a reorder
+                    // between frames). Minimal scroll: Align::Center
+                    // re-snapped every step and read as "jumpy".
+                    if kreveal.as_deref() == Some(path.as_path()) {
+                        resp.scroll_to_me(None);
+                        kreveal = None;
+                    }
                     // Follow the loaded track like the cover view's
                     // reveal does — center its row AND own the
                     // selection when it changes, so a session-restored
@@ -774,7 +1169,7 @@ pub(crate) fn view(
                             sel_dirty = true;
                         }
                     }
-                    if interactive && drag.is_none() {
+                    if interactive && drag.is_none() && at < 0.5 {
                         if resp.hovered() {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
@@ -842,17 +1237,26 @@ pub(crate) fn view(
                     if !r.intersects(list) {
                         continue;
                     }
+                    // Resolving stream — the row fill breathes while
+                    // the direct url is fetched (a few seconds for
+                    // an uncached item).
+                    let busy = playing && stream_loading;
+                    let pulse = if busy {
+                        0.6 + 0.4 * (ctx.input(|i| i.time) as f32 * 4.0).sin().abs()
+                    } else {
+                        1.0
+                    };
                     if selected {
-                        lp.rect_filled(r, 0.08 * h, sel_bg.gamma_multiply(0.45));
+                        lp.rect_filled(r, 0.08 * h, sel_bg.gamma_multiply(0.45 * pulse));
                         lp.rect_stroke(
                             r,
                             0.08 * h,
-                            egui::Stroke::new(1.0, sel_bg.gamma_multiply(0.85)),
+                            egui::Stroke::new(1.0, sel_bg.gamma_multiply(0.85 * pulse)),
                             egui::StrokeKind::Inside,
                         );
                     } else if playing {
-                        lp.rect_filled(r, 0.08 * h, accent.gamma_multiply(0.35));
-                    } else if resp.hovered() && interactive {
+                        lp.rect_filled(r, 0.08 * h, accent.gamma_multiply(0.35 * pulse));
+                    } else if resp.hovered() && interactive && at < 0.5 {
                         lp.rect_filled(r, 0.08 * h, Color32::from_white_alpha(10));
                     }
                     let fg = if selected || playing {
@@ -860,7 +1264,7 @@ pub(crate) fn view(
                     } else {
                         idle_fg.gamma_multiply(0.7)
                     };
-                    draw_row(&lp, r, *i, title, album, *dur, fg);
+                    draw_row(&lp, r, *i, title, album, *dur, fg, busy);
                 }
 
                 // Dashed drop-slot holes + the floating stack.
@@ -916,7 +1320,7 @@ pub(crate) fn view(
                                 egui::Stroke::new(1.0, sel_bg.gamma_multiply(0.9)),
                                 egui::StrokeKind::Inside,
                             );
-                            draw_row(&lp, fr, *i, title, album, *dur, Color32::WHITE);
+                            draw_row(&lp, fr, *i, title, album, *dur, Color32::WHITE, false);
                             j += 1;
                         }
                         // Edge auto-scroll while dragging.
@@ -951,6 +1355,530 @@ pub(crate) fn view(
                     );
                 }
             });
+
+        // --- Albums list (Tab toggle) — card rows: square cover,
+        // bold title, muted artist below when a tag supplies one, and
+        // a track count at the right edge.
+        //
+        // Selection follows the playlist's rules: the selected card
+        // tints with its cover's dominant color (`apal`, decoded on a
+        // worker per dir) and pointer drags reorder through a floating
+        // card + dashed slot (`adrag`, `adisp` glide map, `adrag_t`
+        // gather blend).
+        let apal_id = ui.id().with("mv-album-pal");
+        let mut apal: HashMap<String, Option<Vec<Color32>>> =
+            ctx.data_mut(|d| d.get_temp(apal_id)).unwrap_or_default();
+        let adrag_id = ui.id().with("mv-album-drag");
+        let mut adrag: Option<(f32, usize)> =
+            ctx.data_mut(|d| d.get_temp(adrag_id));
+        let adisp_id = ui.id().with("mv-album-disp");
+        let mut adisp: HashMap<String, f32> =
+            ctx.data_mut(|d| d.get_temp(adisp_id)).unwrap_or_default();
+        let adragt_id = ui.id().with("mv-album-drag-t");
+        let adrag_t: f32 =
+            ctx.data_mut(|d| d.get_temp(adragt_id)).unwrap_or(0.0);
+        if at > 0.0 {
+            // Artists resolve lazily — one worker pass fills the
+            // whole map (dir → artist) so the list never blocks on
+            // tag reads.
+            let art_id = ui.id().with("mv-artists");
+            let artists: HashMap<String, Option<String>> =
+                ctx.data_mut(|d| d.get_temp(art_id)).unwrap_or_default();
+            let missing: Vec<(String, PathBuf)> = albums
+                .iter()
+                .filter(|a| {
+                    !artists.contains_key(a.dir.to_string_lossy().as_ref())
+                })
+                .filter_map(|a| {
+                    a.tracks
+                        .first()
+                        .map(|t| (a.dir.to_string_lossy().into_owned(), t.clone()))
+                })
+                .collect();
+            if !missing.is_empty() {
+                ctx.data_mut(|d| {
+                    let mut mm: HashMap<String, Option<String>> =
+                        d.get_temp(art_id).unwrap_or_default();
+                    for (dir, _) in &missing {
+                        mm.insert(dir.clone(), None);
+                    }
+                    d.insert_temp(art_id, mm);
+                });
+                let ctx2 = ctx.clone();
+                std::thread::Builder::new()
+                    .name("aes-album-artists".into())
+                    .spawn(move || {
+                        use lofty::file::TaggedFileExt;
+                        let mut found = HashMap::new();
+                        for (dir, track) in missing {
+                            let artist = lofty::read_from_path(&track)
+                                .ok()
+                                .and_then(|t| {
+                                    t.primary_tag()
+                                        .or_else(|| t.first_tag())
+                                        .and_then(|tag| {
+                                            use lofty::tag::Accessor;
+                                            tag.artist().map(|s| s.into_owned())
+                                        })
+                                })
+                                .filter(|s: &String| !s.trim().is_empty());
+                            found.insert(dir, artist);
+                        }
+                        ctx2.data_mut(|d| {
+                            let mut mm: HashMap<String, Option<String>> =
+                                d.get_temp(art_id).unwrap_or_default();
+                            mm.extend(found);
+                            d.insert_temp(art_id, mm);
+                        });
+                        ctx2.request_repaint();
+                    })
+                    .ok();
+            }
+
+            // Selected album's cover → palette, decoded off-thread —
+            // the playlist's `pal` pipeline keyed by dir.
+            let an = albums.len();
+            if an > 0 {
+                let gi = asel.min(an - 1);
+                let dir = albums[gi].dir.to_string_lossy().into_owned();
+                if !apal.contains_key(&dir) {
+                    apal.insert(dir.clone(), None);
+                    if let Some(src) = albums[gi].covers.last().cloned() {
+                        let ctx2 = ctx.clone();
+                        std::thread::spawn(move || {
+                            let cols = crate::library::decode_cover(&src)
+                                .map(|img| {
+                                    spectrum_bar::dominant_colors(&img, 3)
+                                });
+                            ctx2.data_mut(|d| {
+                                let mut mm: HashMap<
+                                    String,
+                                    Option<Vec<Color32>>,
+                                > = d.get_temp(apal_id).unwrap_or_default();
+                                mm.insert(dir, cols);
+                                d.insert_temp(apal_id, mm);
+                            });
+                            ctx2.request_repaint();
+                        });
+                    }
+                }
+            }
+
+            let mut child2 =
+                ui.new_child(egui::UiBuilder::new().max_rect(list));
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(&mut child2, |ui| {
+                    let w = ui.available_width();
+                    let content_y0 = ui.min_rect().min.y;
+                    let an = albums.len();
+                    let mut lp = ui.painter().with_clip_rect(list);
+                    lp.set_opacity(at);
+                    let card_h = 0.5 * h;
+                    let pitch = card_h + 0.05 * h;
+                    let pad = 0.05 * h;
+                    let tfont = FontId::proportional(0.15 * h);
+                    let afont = FontId::proportional(0.105 * h);
+                    let sfont = FontId::proportional(0.1 * h);
+                    // Selected indices — the cards that float during a
+                    // drag and the rows that count as "m" below.
+                    let afrom = album_sel_indices(albums, &asel_set, asel);
+                    let am = afrom.len();
+                    // Same insertion-slot tracking as the playlist —
+                    // t indexes the list without the selected cards.
+                    if let Some((_, t)) = adrag.as_mut() {
+                        if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                            *t = ((pos.y - content_y0) / pitch)
+                                .round()
+                                .clamp(0.0, an.saturating_sub(am) as f32)
+                                as usize;
+                        }
+                    }
+                    // One tint for the whole selection — the anchor
+                    // album's cover palette (the playlist's pal_col).
+                    let acol = albums
+                        .get(asel.min(an.saturating_sub(1)))
+                        .map(|a| a.dir.to_string_lossy().into_owned())
+                        .and_then(|d| {
+                            apal.get(&d)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|c| c.first().copied())
+                        })
+                        .unwrap_or(sel_bg);
+                    let mut paint_card = |lp: &egui::Painter,
+                                          card: Rect,
+                                          a: &library::Album,
+                                          artist: Option<String>,
+                                          acol: Color32,
+                                          sel_a: bool,
+                                          hover: bool| {
+                        if sel_a {
+                            lp.rect_filled(
+                                card,
+                                0.09 * h,
+                                acol.gamma_multiply(0.45),
+                            );
+                            lp.rect_stroke(
+                                card,
+                                0.09 * h,
+                                egui::Stroke::new(
+                                    1.0,
+                                    acol.gamma_multiply(0.85),
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                        } else if hover {
+                            lp.rect_filled(
+                                card,
+                                0.09 * h,
+                                Color32::from_white_alpha(10),
+                            );
+                        } else {
+                            lp.rect_filled(
+                                card,
+                                0.09 * h,
+                                Color32::from_white_alpha(7),
+                            );
+                        }
+                        // Cover — square, uniform-to-fill crop.
+                        let cov = card_h - 2.0 * pad;
+                        let cr = Rect::from_min_size(
+                            Pos2::new(card.min.x + pad, card.center().y - cov * 0.5),
+                            Vec2::splat(cov),
+                        );
+                        lp.rect_filled(cr, 0.07 * h, Color32::from_gray(34));
+                        if let Some(tex) =
+                            a.covers.last().and_then(|src| row.cover_tex(&ctx, src))
+                        {
+                            let (tw, th) =
+                                (tex.size()[0] as f32, tex.size()[1] as f32);
+                            let fill = (cr.width() / tw).max(cr.height() / th);
+                            let wr = cr.width() / fill / tw;
+                            let hr = cr.height() / fill / th;
+                            let u0 = (1.0 - wr) * 0.5;
+                            let v0 = (1.0 - hr) * 0.5;
+                            let mut mesh = Mesh::with_texture(tex.id());
+                            for (px, ux) in [(cr.min.x, u0), (cr.max.x, u0 + wr)] {
+                                for (py, vy) in [(cr.min.y, v0), (cr.max.y, v0 + hr)] {
+                                    mesh.vertices.push(Vertex {
+                                        pos: Pos2::new(px, py),
+                                        uv: Pos2::new(ux, vy),
+                                        color: Color32::WHITE,
+                                    });
+                                }
+                            }
+                            mesh.indices.extend_from_slice(&[0, 2, 3, 0, 3, 1]);
+                            lp.with_clip_rect(cr).add(Shape::mesh(mesh));
+                            lp.rect_stroke(
+                                cr,
+                                0.07 * h,
+                                egui::Stroke::new(1.0, Color32::from_black_alpha(60)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        // Title + artist (below, muted — image layout).
+                        let tx = cr.max.x + 0.12 * h;
+                        let cy = card.center().y;
+                        let text_r = card.max.x - 0.7 * h;
+                        if let Some(art) = artist {
+                            lp.text(
+                                Pos2::new(tx, cy - 0.11 * h),
+                                Align2::LEFT_CENTER,
+                                ellipsize(&lp, &a.title, &tfont, text_r - tx),
+                                tfont.clone(),
+                                Color32::WHITE,
+                            );
+                            lp.text(
+                                Pos2::new(tx, cy + 0.13 * h),
+                                Align2::LEFT_CENTER,
+                                ellipsize(&lp, &art, &afont, text_r - tx),
+                                afont.clone(),
+                                Color32::from_gray(160),
+                            );
+                        } else {
+                            lp.text(
+                                Pos2::new(tx, cy),
+                                Align2::LEFT_CENTER,
+                                ellipsize(&lp, &a.title, &tfont, text_r - tx),
+                                tfont.clone(),
+                                Color32::WHITE,
+                            );
+                        }
+                        // Item count at the card's right edge.
+                        lp.text(
+                            Pos2::new(card.max.x - 0.10 * h, cy),
+                            Align2::RIGHT_CENTER,
+                            format!("{} Tracks", a.tracks.len() + a.url_count),
+                            sfont.clone(),
+                            Color32::from_gray(150),
+                        );
+                    };
+                    for (i, a) in albums.iter().enumerate() {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            Vec2::new(w, pitch),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let live = interactive && at > 0.5;
+                        // The loaded album's own artist comes from its
+                        // live items — tag reads haven't landed yet.
+                        let dir = a.dir.to_string_lossy().into_owned();
+                        let sel_a = asel_set.contains(dir.as_str());
+                        let artist = artists
+                            .get(dir.as_str())
+                            .cloned()
+                            .flatten()
+                            .or_else(|| {
+                                (carousel.album_key() == Some(dir.as_str()))
+                                    .then(|| {
+                                        carousel
+                                            .first_artist()
+                                            .map(|s| s.to_string())
+                                    })
+                                    .flatten()
+                            });
+                        if live {
+                            if resp.clicked() {
+                                // The playlist's click rules: Ctrl
+                                // toggles, Shift extends the range
+                                // from the anchor, plain selects one.
+                                let mods = ctx.input(|i| i.modifiers);
+                                if mods.command {
+                                    if !asel_set.remove(dir.as_str()) {
+                                        asel_set.insert(dir.clone());
+                                    }
+                                } else if mods.shift {
+                                    let (a0, b0) = (asel.min(i), asel.max(i));
+                                    for j in a0..=b0.min(an - 1) {
+                                        asel_set.insert(
+                                            albums[j]
+                                                .dir
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                        );
+                                    }
+                                } else {
+                                    asel_set.clear();
+                                    asel_set.insert(dir.clone());
+                                }
+                                asel = i;
+                                ctx.data_mut(|d| d.insert_temp(asel_id, asel));
+                            }
+                            if resp.double_clicked() {
+                                out.open = Some(dir.clone());
+                                albums_on = false;
+                                ctx.data_mut(|d| d.insert_temp(ab_id, false));
+                            }
+                            if resp.drag_started() {
+                                if let Some(pos) = resp.interact_pointer_pos() {
+                                    // Grabbing an unselected card
+                                    // selects just it — the playlist's
+                                    // rule for pointer drags.
+                                    if !sel_a {
+                                        asel_set.clear();
+                                        asel_set.insert(dir.clone());
+                                    }
+                                    asel = i;
+                                    adrag = Some((pos.y - rect.min.y, i));
+                                }
+                            }
+                            if a_kreveal && i == asel {
+                                resp.scroll_to_me(None);
+                            }
+                        }
+                        // Selected cards leave their slots and ride
+                        // the pointer — they're painted below.
+                        if adrag.is_some() && sel_a {
+                            continue;
+                        }
+                        // Non-selected cards shift to make room at the
+                        // drop slot — `adisp` eases them there.
+                        let slot = if let Some((_, t)) = adrag {
+                            let p =
+                                i - afrom.iter().filter(|&&j| j < i).count();
+                            (p + if p >= t { am } else { 0 }) as f32
+                        } else {
+                            i as f32
+                        };
+                        let cur0 = adisp.get(dir.as_str()).copied().unwrap_or(slot);
+                        let cur = if (cur0 - slot).abs() < 0.02 {
+                            slot
+                        } else {
+                            animating = true;
+                            cur0 + (slot - cur0) * follow
+                        };
+                        adisp.insert(dir, cur);
+                        // Cards drift up into place while fading in —
+                        // the eased `at` makes it read as one motion.
+                        let card = rect
+                            .shrink2(Vec2::new(0.0, 0.025 * h))
+                            .translate(Vec2::new(
+                                0.0,
+                                (cur - i as f32) * pitch + (1.0 - at) * 0.06 * h,
+                            ));
+                        if !card.intersects(list) {
+                            continue;
+                        }
+                        paint_card(
+                            &lp,
+                            card,
+                            a,
+                            artist,
+                            acol,
+                            sel_a,
+                            live && resp.hovered(),
+                        );
+                    }
+                    // Dashed drop slots + the floating stack.
+                    if let Some((grab, t)) = adrag {
+                        let afrom = album_sel_indices(albums, &asel_set, asel);
+                        let am = afrom.len();
+                        for j in 0..am {
+                            let hole = Rect::from_min_size(
+                                Pos2::new(
+                                    list.min.x,
+                                    content_y0 + (t + j) as f32 * pitch,
+                                ),
+                                Vec2::new(w, card_h),
+                            );
+                            album_row::dashed_rect(
+                                &lp,
+                                hole.shrink(1.5),
+                                0.09 * h,
+                                0.02 * h,
+                                Color32::from_white_alpha(60),
+                            );
+                        }
+                        if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                            let top = pos.y - grab;
+                            let e = ease_in_out_quad((adrag_t / 0.5).min(1.0));
+                            let mut j = 0;
+                            for &gi in afrom.iter() {
+                                let ga = &albums[gi];
+                                let dir = ga.dir.to_string_lossy().into_owned();
+                                let artist = artists
+                                    .get(dir.as_str())
+                                    .cloned()
+                                    .flatten()
+                                    .or_else(|| {
+                                        (carousel.album_key() == Some(dir.as_str()))
+                                            .then(|| {
+                                                carousel
+                                                    .first_artist()
+                                                    .map(|s| s.to_string())
+                                            })
+                                            .flatten()
+                                    });
+                                // A timed blend sweeps each card from
+                                // its slot into the pointer stack —
+                                // the playlist's same 0.5s gather.
+                                let tgt =
+                                    (top + j as f32 * pitch - content_y0) / pitch;
+                                let cur0 =
+                                    adisp.get(dir.as_str()).copied().unwrap_or(gi as f32);
+                                let cur = if e >= 1.0 {
+                                    tgt
+                                } else {
+                                    animating = true;
+                                    cur0 + (tgt - cur0) * e
+                                };
+                                adisp.insert(dir, cur);
+                                let card = Rect::from_min_size(
+                                    Pos2::new(
+                                        list.min.x,
+                                        content_y0 + cur * pitch + 0.025 * h,
+                                    ),
+                                    Vec2::new(w, card_h),
+                                );
+                                paint_card(&lp, card, ga, artist, acol, true, false);
+                                j += 1;
+                            }
+                            // Edge auto-scroll while dragging.
+                            if pos.y < list.min.y + pitch {
+                                ui.scroll_to_rect(
+                                    Rect::from_min_size(
+                                        Pos2::new(list.min.x, content_y0 - pitch),
+                                        Vec2::new(1.0, pitch),
+                                    ),
+                                    Some(egui::Align::Min),
+                                );
+                                ctx.request_repaint();
+                            } else if pos.y > list.max.y - pitch {
+                                ui.scroll_to_rect(
+                                    Rect::from_min_size(
+                                        Pos2::new(
+                                            list.min.x,
+                                            content_y0 + an as f32 * pitch,
+                                        ),
+                                        Vec2::new(1.0, pitch),
+                                    ),
+                                    Some(egui::Align::Max),
+                                );
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                    if albums.is_empty() {
+                        lp.text(
+                            list.center(),
+                            Align2::CENTER_CENTER,
+                            "No albums",
+                            font.clone(),
+                            Color32::from_gray(120),
+                        );
+                    }
+                });
+        }
+
+        // Albums drag commit — a released pointer lands the card at t
+        // (the insertion index in the list without it), Esc cancels
+        // and `adisp` glides everything home.
+        if let Some((grab, t)) = adrag {
+            let esc = interactive
+                && ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                });
+            if esc {
+                let _ = grab;
+                adrag = None;
+                animating = true;
+            } else if !ctx.input(|i| i.pointer.primary_down()) {
+                let from = album_sel_indices(albums, &asel_set, asel);
+                let m = from.len();
+                let an = albums.len();
+                if m > 0 && an >= 2 {
+                    let to = t.min(an - m);
+                    if !from.iter().enumerate().all(|(j, &i)| i == to + j) {
+                        let pr =
+                            from.iter().position(|&i| i == asel).unwrap_or(0);
+                        move_albums_block(albums, &from, to);
+                        asel = to + pr;
+                        ctx.data_mut(|d| d.insert_temp(asel_id, asel));
+                        out.albums_dirty = true;
+                    }
+                }
+                let _ = grab;
+                adrag = None;
+            }
+        }
+        adisp.retain(|k, _| {
+            albums.iter().any(|a| a.dir.to_string_lossy() == k.as_str())
+        });
+        ctx.data_mut(|d| {
+            d.insert_temp(apal_id, apal);
+            d.insert_temp(adisp_id, adisp);
+            d.insert_temp(aselset_id, asel_set);
+            d.insert_temp(asel_id, asel);
+            match adrag {
+                Some(v) => {
+                    d.insert_temp(adrag_id, v);
+                    d.insert_temp(adragt_id, adrag_t + dt);
+                }
+                None => {
+                    d.remove::<(f32, usize)>(adrag_id);
+                    d.remove::<f32>(adragt_id);
+                }
+            }
+        });
 
         // Commit on release — the moved rows glide home from their
         // floating slots via `disp`. Esc cancels mid-drag instead:
@@ -1076,7 +2004,104 @@ pub(crate) fn view(
         ctx.request_repaint();
     }
 
+    // Delete confirm — the shell's DeletePrompt paints in the normal
+    // view stack mini returns before reaching, so the dialog lives
+    // here (same Switch-style widget, same labels).
+    {
+        let vis_id = ui.id().with("mv-del-vis");
+        let sel_id = ui.id().with("mv-del-sel");
+        let mut vis: f32 = ctx.data_mut(|d| d.get_temp(vis_id)).unwrap_or(0.0);
+        let mut psel: usize = ctx.data_mut(|d| d.get_temp(sel_id)).unwrap_or(1);
+        let open = del.is_some();
+        if open || vis > 0.001 {
+            let ddt = ctx.input(|i| i.stable_dt);
+            vis = (vis + ddt / if open { 0.18 } else { -0.14 }).clamp(0.0, 1.0);
+            let (title, subtitle) = match &del {
+                Some(crate::PendingDelete::Items(p)) => (
+                    if p.len() == 1 {
+                        "Delete item?".to_string()
+                    } else {
+                        format!("Delete {} items?", p.len())
+                    },
+                    "Removed from the album — the files stay on disk.".to_string(),
+                ),
+                Some(crate::PendingDelete::Albums(d)) => (
+                    if d.len() == 1 {
+                        "Delete album?".to_string()
+                    } else {
+                        format!("Delete {} albums?", d.len())
+                    },
+                    "Removed from the library — the files stay on disk.".to_string(),
+                ),
+                _ => ("Delete?".to_string(), String::new()),
+            };
+            // Escape dismisses; the overlay eats Tab/arrows/Enter.
+            if open
+                && ctx
+                    .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                del = None;
+            }
+            // The dialog is sized in `s` units — scale it down on
+            // windows narrower than the fixed panel.
+            let ds = s * (content.width() / (440.0 * s)).min(1.0);
+            match crate::confirm_overlay(
+                ui, content, &title, &subtitle, "Delete", "Cancel", &mut psel, ds,
+                vis, open, "mv-del-confirm",
+            ) {
+                crate::DialogAction::Confirm => out.delete = del.take(),
+                crate::DialogAction::Cancel => del = None,
+                crate::DialogAction::None => {}
+            }
+            ctx.data_mut(|d| {
+                d.insert_temp(vis_id, vis);
+                d.insert_temp(sel_id, psel);
+            });
+            ctx.request_repaint();
+        }
+        // Store the whole Option — get_temp downcasts by exact type,
+        // so a bare PendingDelete would never read back.
+        ctx.data_mut(|d| d.insert_temp(del_id, del.clone()));
+    }
+
     out
+}
+
+/// Sorted indices of `set`'s dirs — the albums list's `is_sel`
+/// equivalent. Falls back to the anchor when nothing maps (the
+/// anchor is the implicit selection).
+fn album_sel_indices(
+    albums: &[library::Album],
+    set: &HashSet<String>,
+    anchor: usize,
+) -> Vec<usize> {
+    let idx: Vec<usize> = albums
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| set.contains(a.dir.to_string_lossy().as_ref()))
+        .map(|(i, _)| i)
+        .collect();
+    if idx.is_empty() && anchor < albums.len() {
+        vec![anchor]
+    } else {
+        idx
+    }
+}
+
+/// Move the rows at `from` (sorted, non-empty) so the block starts
+/// at `to` — `to` indexes the list without the moved rows, matching
+/// `carousel::move_items` / `album_row::move_selection` semantics.
+/// A non-contiguous `from` collapses into a contiguous run.
+fn move_albums_block(albums: &mut Vec<library::Album>, from: &[usize], to: usize) {
+    let mut pulled: Vec<library::Album> = Vec::with_capacity(from.len());
+    for &i in from.iter().rev() {
+        pulled.push(albums.remove(i));
+    }
+    pulled.reverse();
+    let at = to.min(albums.len());
+    for (j, a) in pulled.into_iter().enumerate() {
+        albums.insert(at + j, a);
+    }
 }
 
 /// Widest duration cell across the loaded items — the playlist's
@@ -1152,5 +2177,53 @@ fn speaker(painter: &egui::Painter, r: Rect, muted: bool, col: Color32) {
                 .collect();
             painter.add(egui::Shape::line(pts, egui::Stroke::new(6.0 * k, col)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn album(dir: &str) -> library::Album {
+        library::Album::virtual_album(dir, dir.to_string(), &[])
+    }
+
+    fn dirs(albums: &[library::Album]) -> Vec<String> {
+        albums
+            .iter()
+            .map(|a| a.dir.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn album_sel_indices_maps_dirs_and_falls_back_to_anchor() {
+        let albums = vec![album("a"), album("b"), album("c")];
+        let set: HashSet<String> = ["a".into(), "c".into()].into_iter().collect();
+        assert_eq!(album_sel_indices(&albums, &set, 0), vec![0, 2]);
+        // Stale/empty set → the anchor index is the implicit selection.
+        let stale: HashSet<String> = ["gone".into()].into_iter().collect();
+        assert_eq!(album_sel_indices(&albums, &stale, 1), vec![1]);
+        // Anchor out of range → no selection.
+        assert!(album_sel_indices(&albums, &stale, 5).is_empty());
+    }
+
+    #[test]
+    fn move_albums_block_matches_move_items_semantics() {
+        // Single card down: [A,B,C,D] move 0→1 → [B,A,C,D].
+        let mut a = vec![album("a"), album("b"), album("c"), album("d")];
+        move_albums_block(&mut a, &[0], 1);
+        assert_eq!(dirs(&a), vec!["b", "a", "c", "d"]);
+        // Contiguous block up: [A,B,C,D] move {C,D}→0 → [C,D,A,B].
+        let mut a2 = vec![album("a"), album("b"), album("c"), album("d")];
+        move_albums_block(&mut a2, &[2, 3], 0);
+        assert_eq!(dirs(&a2), vec!["c", "d", "a", "b"]);
+        // Non-contiguous selection collapses to a run: {A,D}→1 → [B,A,D,C].
+        let mut b = vec![album("a"), album("b"), album("c"), album("d")];
+        move_albums_block(&mut b, &[0, 3], 1);
+        assert_eq!(dirs(&b), vec!["b", "a", "d", "c"]);
+        // `to` indexes the list without the moved rows and clamps.
+        let mut c = vec![album("a"), album("b"), album("c")];
+        move_albums_block(&mut c, &[0], 3);
+        assert_eq!(dirs(&c), vec!["b", "c", "a"]);
     }
 }

@@ -1071,9 +1071,59 @@ pub struct OnlineMeta {
 
 /// Duration intentionally has no watch-page fallback — per-item page
 /// fetches tripped YouTube's bot/rate defenses (regression: resolved
-/// streams stopped being served). Duration arrives from the resolved
-/// stream's `dur=` param and persists in the metadata cache (Lacrima's
-/// persist-on-play model).
+/// streams stopped being served). See `durations` for the sanctioned
+/// batch path instead.
+///
+/// Stream lengths for several items in ONE yt-dlp pass —
+/// `--print "%(webpage_url)s|%(duration)s"`. Player-API calls only
+/// (`player_skip=webpage`), the same traffic shape as a resolve, and
+/// yt-dlp paces the URLs sequentially inside the single process, so
+/// the request rate stays far below the per-item webpage scrape that
+/// got us flagged. Results are keyed back by canonical URL —
+/// `clean_video_link` on both sides — since yt-dlp omits output lines
+/// for failed inputs.
+pub fn durations(urls: &[String]) -> Vec<(String, f64)> {
+    let Ok(exe) = require_exe() else {
+        return Vec::new();
+    };
+    let mut args = common_args(ExtractorProfile::Default);
+    args.push("--no-playlist".into());
+    args.extend(["--print".into(), "%(webpage_url)s|%(duration)s".into()]);
+    args.extend(urls.iter().cloned());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let Ok(out) = run_output(&exe, &arg_refs) else {
+        return Vec::new();
+    };
+    parse_durations(&out, urls)
+}
+
+/// `webpage_url|duration` lines → `(input url, secs)` — matched by
+/// canonical link so failed inputs (yt-dlp skips their lines) can't
+/// misalign the results.
+fn parse_durations(out: &str, urls: &[String]) -> Vec<(String, f64)> {
+    let mut got = std::collections::HashSet::new();
+    let mut res = Vec::new();
+    for line in out.replace("\r\n", "\n").lines() {
+        let Some((page, dur)) = line.trim().split_once('|') else {
+            continue;
+        };
+        let Ok(d) = dur.parse::<f64>() else {
+            continue;
+        };
+        if d <= 0.0 {
+            continue;
+        }
+        let key = clean_video_link(page);
+        if let Some(u) = urls
+            .iter()
+            .find(|u| !got.contains(*u) && clean_video_link(u) == key)
+        {
+            got.insert(u.clone());
+            res.push((u.clone(), d));
+        }
+    }
+    res
+}
 
 pub fn online_metadata(url: &str) -> Option<OnlineMeta> {
     if let Some(id) = extract_video_id(url) {
@@ -1331,5 +1381,29 @@ mod tests {
             clean_video_link("https://example.com/radio.pls"),
             "https://example.com/radio.pls"
         );
+    }
+
+    /// Batch output lines map back to their input urls by canonical
+    /// link — a dropped line (failed input) or a playlist-decorated
+    /// input can't misalign or lose the result.
+    #[test]
+    fn parse_durations_maps_lines_by_canonical_link() {
+        let urls = vec![
+            "https://www.youtube.com/watch?v=AAAAAAAAAAA&list=RDAAAAAAAAAAA".to_string(),
+            "https://www.youtube.com/watch?v=BBBBBBBBBBB".to_string(),
+            "https://www.youtube.com/watch?v=CCCCCCCCCCC".to_string(),
+        ];
+        let out = "https://www.youtube.com/watch?v=AAAAAAAAAAA|101\n\
+                   https://www.youtube.com/watch?v=CCCCCCCCCCC|303\n";
+        let res = parse_durations(out, &urls);
+        assert_eq!(
+            res,
+            vec![
+                (urls[0].clone(), 101.0),
+                (urls[2].clone(), 303.0),
+            ]
+        );
+        // Garbage/NA/zero lines are skipped.
+        assert!(parse_durations("junk\nhttps://www.youtube.com/watch?v=AAAAAAAAAAA|NA\nhttps://www.youtube.com/watch?v=AAAAAAAAAAA|0\n", &urls).is_empty());
     }
 }

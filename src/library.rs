@@ -8,7 +8,7 @@ use std::sync::mpsc;
 
 use eframe::egui;
 
-const AUDIO_EXTS: &[&str] = &[
+pub(crate) const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "wav", "aif", "aiff", "wma", "ape",
     "mpc", "wv",
 ];
@@ -452,6 +452,83 @@ pub fn spawn_track_info(
         })
         .expect("track info thread");
     rx
+}
+
+/// Throttled stream-duration backfill. Items that still lack a
+/// duration after `track_info` (new items, old cache entries) are
+/// offered here; `poll` kicks a `ytdlp::durations` batch of up to
+/// `BATCH` URLs and then idles `DELAY` before the next — one process
+/// per batch with yt-dlp pacing the player-API calls internally, so
+/// the request rate stays far below the per-item webpage scrape that
+/// got us flagged. `dur=` on play remains the fallback for anything
+/// this misses.
+pub struct DurLoader {
+    pending: std::collections::VecDeque<PathBuf>,
+    /// Once-per-session marker — a URL that failed to yield a
+    /// duration isn't re-queued every album open.
+    seen: std::collections::HashSet<PathBuf>,
+    rx: Option<mpsc::Receiver<Vec<(String, f64)>>>,
+    next: std::time::Instant,
+}
+
+impl DurLoader {
+    const BATCH: usize = 6;
+    const DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+
+    pub fn new() -> Self {
+        Self {
+            pending: Default::default(),
+            seen: Default::default(),
+            rx: None,
+            next: std::time::Instant::now(),
+        }
+    }
+
+    /// Queue `p` for a duration lookup (URL items only).
+    pub fn offer(&mut self, p: &Path) {
+        if is_url(p) && self.seen.insert(p.to_path_buf()) {
+            self.pending.push_back(p.to_path_buf());
+        }
+    }
+
+    /// Drain finished batches and kick the next when due — returns
+    /// resolved `(item path, secs)` pairs for the caller to apply.
+    pub fn poll(&mut self) -> Vec<(PathBuf, f64)> {
+        let mut out = Vec::new();
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(rs) => {
+                    self.rx = None;
+                    out = rs
+                        .into_iter()
+                        .map(|(u, d)| (PathBuf::from(u), d))
+                        .collect();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.rx.is_none()
+            && !self.pending.is_empty()
+            && std::time::Instant::now() >= self.next
+        {
+            let n = self.pending.len().min(Self::BATCH);
+            let batch: Vec<String> = (0..n)
+                .filter_map(|_| self.pending.pop_front())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let (tx, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("aes-dur-batch".into())
+                .spawn(move || {
+                    let _ = tx.send(crate::ytdlp::durations(&batch));
+                })
+                .expect("dur batch thread");
+            self.rx = Some(rx);
+            self.next = std::time::Instant::now() + Self::DELAY;
+        }
+        out
+    }
 }
 
 /// Fetch metadata for each path on a small worker pool — every

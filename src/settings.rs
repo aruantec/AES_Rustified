@@ -201,6 +201,11 @@ pub struct Library {
     /// top of the scan order the way `album_order` is — unknown (new)
     /// items keep their scan order at the end.
     pub item_order: std::collections::BTreeMap<String, Vec<String>>,
+    /// Local files added via "Add Files" — paths outside the album's
+    /// scanned folder that persist with the album the way url_items
+    /// do (Lacrima serializes Children including added items).
+    /// Key = album dir string.
+    pub added_items: std::collections::BTreeMap<String, Vec<String>>,
     /// Album dirs removed via "Delete Album" — filtered out of every
     /// scan so they don't resurrect on rescan.
     pub excluded_albums: Vec<String>,

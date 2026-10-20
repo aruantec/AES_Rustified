@@ -391,31 +391,38 @@ impl Carousel {
     /// album's persisted URL items appended after its files. Returns
     /// the spawn args for `library::spawn_track_info` so tag metadata
     /// can land asynchronously.
-    pub fn open(&mut self, album: &Album, urls: &[String]) -> (Vec<PathBuf>, String) {
+    pub fn open(
+        &mut self,
+        album: &Album,
+        urls: &[String],
+        extras: &[String],
+    ) -> (Vec<PathBuf>, String) {
         let fallback = album
             .covers
             .iter()
             .find(|c| matches!(c, CoverSrc::File(_)))
             .cloned();
-        self.items = album
-            .tracks
-            .iter()
-            .map(|p| {
-                let stem = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.display().to_string());
-                Item {
-                    path: p.clone(),
-                    cover: CoverSrc::Tag(p.clone()),
-                    fallback: fallback.clone(),
-                    title: stem,
-                    artist: String::new(),
-                    album: album.title.clone(),
-                    duration: None,
-                }
-            })
-            .collect();
+        let mk = |p: &std::path::Path| Item {
+            path: p.to_path_buf(),
+            cover: CoverSrc::Tag(p.to_path_buf()),
+            fallback: fallback.clone(),
+            title: p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string()),
+            artist: String::new(),
+            album: album.title.clone(),
+            duration: None,
+        };
+        self.items = album.tracks.iter().map(|p| mk(p)).collect();
+        // "Add Files" extras — local files outside the album's scanned
+        // folder, persisted per album via library.added_items.
+        for e in extras {
+            let p = PathBuf::from(e);
+            if !self.items.iter().any(|i| i.path == p) {
+                self.items.push(mk(&p));
+            }
+        }
         for u in urls {
             self.push_url_item(u);
         }
@@ -557,6 +564,36 @@ impl Carousel {
         });
     }
 
+    /// "Add Files" (Lacrima's AddItemsCommand) — append picked local
+    /// files to the loaded album, deduped by path. Returns the items
+    /// that actually landed; persist_url_items records them in
+    /// `library.added_items`.
+    pub fn add_files(&mut self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let fallback = self.items.iter().find_map(|i| i.fallback.clone());
+        let album = self.album_title.clone();
+        let mut added = Vec::new();
+        for p in paths {
+            if self.items.iter().any(|i| i.path == *p) {
+                continue;
+            }
+            let stem = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string());
+            self.items.push(Item {
+                path: p.clone(),
+                cover: CoverSrc::Tag(p.clone()),
+                fallback: fallback.clone(),
+                title: stem,
+                artist: String::new(),
+                album: album.clone(),
+                duration: None,
+            });
+            added.push(p.clone());
+        }
+        added
+    }
+
     /// The cover source for a resolved stream thumbnail — an edited
     /// local cover in the meta cache wins over remote art.
     fn item_cover(path: &Path, thumb: &str) -> CoverSrc {
@@ -576,6 +613,15 @@ impl Carousel {
             let p = i.path.to_string_lossy();
             p == url || (new_id.is_some() && new_id == crate::ytdlp::extract_video_id(&p))
         })
+    }
+
+    /// First non-empty item artist — the loaded album's artist line
+    /// for the mini albums list (resolved tags land via apply_info).
+    pub fn first_artist(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .map(|i| i.artist.as_str())
+            .find(|a| !a.trim().is_empty())
     }
 
     /// The loaded album's persistence key for URL items.
@@ -735,7 +781,10 @@ impl Carousel {
             };
             item.artist = info.artist.clone();
             item.album = info.album.clone();
-            item.duration = info.duration;
+            // A known duration survives a metadata result without one
+            // — the dur-loader batch and `dur=` fill it ahead of the
+            // url_info pass, which usually carries None.
+            item.duration = info.duration.or(item.duration);
             if let Some(u) = &info.cover_url {
                 item.cover = Self::item_cover(&item.path, u);
             }
@@ -3963,5 +4012,104 @@ mod tests {
             c.items.last().unwrap().path,
             PathBuf::from("https://example.com/radio.pls")
         );
+    }
+
+    /// Shift+arrow in the mini playlist commits through `move_items`
+    /// with `to` counted in NON-moved positions — album_row's
+    /// move_selection semantics: the selection collapses to a
+    /// contiguous run whose first element lands at clamp(first+dir).
+    #[test]
+    fn move_items_keyboard_step_semantics() {
+        let mk = |n: usize| {
+            let mut c = Carousel::new();
+            for i in 0..n {
+                c.items.push(Item {
+                    path: PathBuf::from(format!("t{i}")),
+                    cover: CoverSrc::Web(Vec::new()),
+                    fallback: None,
+                    title: format!("t{i}"),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration: None,
+                });
+            }
+            c
+        };
+        let names = |c: &Carousel| {
+            c.items
+                .iter()
+                .map(|i| i.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        // Contiguous block down one step: to = first+1.
+        let mut c = mk(5);
+        c.move_items(&[1, 2], 2);
+        assert_eq!(names(&c), ["t0", "t3", "t1", "t2", "t4"]);
+        // Up one step from the top: clamped no-op.
+        let mut c = mk(5);
+        c.move_items(&[0, 1], 0);
+        assert_eq!(names(&c), ["t0", "t1", "t2", "t3", "t4"]);
+        // Non-contiguous selection down one: run starts at first+1.
+        let mut c = mk(6);
+        c.move_items(&[0, 2, 4], 1);
+        assert_eq!(names(&c), ["t1", "t0", "t2", "t4", "t3", "t5"]);
+        // Non-contiguous selection up one: run starts at first-1.
+        let mut c = mk(6);
+        c.move_items(&[1, 3], 0);
+        assert_eq!(names(&c), ["t1", "t3", "t0", "t2", "t4", "t5"]);
+        // Down at the bottom edge: clamp to n-m.
+        let mut c = mk(5);
+        c.move_items(&[3, 4], 3);
+        assert_eq!(names(&c), ["t0", "t1", "t2", "t3", "t4"]);
+        assert!(c.reorder_dirty);
+    }
+
+    #[test]
+    fn first_artist_skips_empty_and_whitespace() {
+        let mut c = Carousel::new();
+        let item = |title: &str, artist: &str| Item {
+            path: PathBuf::from(title),
+            cover: CoverSrc::Web(Vec::new()),
+            fallback: None,
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: String::new(),
+            duration: None,
+        };
+        assert_eq!(c.first_artist(), None);
+        c.items.push(item("a", ""));
+        c.items.push(item("b", "   "));
+        c.items.push(item("c", "The Artist"));
+        assert_eq!(c.first_artist(), Some("The Artist"));
+    }
+
+    #[test]
+    fn add_files_dedups_and_open_restores_extras() {
+        let mut c = Carousel::new();
+        let files = vec![
+            PathBuf::from("x/one.mp3"),
+            PathBuf::from("x/two.mp3"),
+        ];
+        let added = c.add_files(&files);
+        assert_eq!(added.len(), 2);
+        // Same path twice → skipped (AddItems' IsMediaDuplicate).
+        assert!(c.add_files(&[PathBuf::from("x/one.mp3")]).is_empty());
+        assert_eq!(c.len(), 2);
+
+        // Reopen persists extras: open() re-adds paths that aren't in
+        // the scan and dedups ones that are.
+        let mut c = Carousel::new();
+        let album = Album::virtual_album("apl://t", "t".to_string(), &[]);
+        c.open(
+            &album,
+            &[],
+            &[
+                "x/one.mp3".to_string(),
+                "x/one.mp3".to_string(),
+                "x/three.mp3".to_string(),
+            ],
+        );
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.items[0].title, "one");
     }
 }
