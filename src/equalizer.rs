@@ -34,6 +34,22 @@ const ACTIVE: Color32 = Color32::from_rgb(100, 180, 255);
 const CURVE: Color32 = Color32::from_rgb(120, 190, 255);
 const TEXT: Color32 = Color32::from_rgb(210, 210, 210);
 
+/// (TINT, ACTIVE, CURVE) derived from one base color — the mini shell
+/// tints the drawer with the playing cover's palette, so the muted
+/// track color and the two bright shades keep the same offsets from
+/// the base as the defaults do.
+fn shades(base: Color32) -> (Color32, Color32, Color32) {
+    let lighten = |c: Color32, f: f32| {
+        let [r, g, b, _] = c.to_array();
+        Color32::from_rgb(
+            (r as f32 + (255.0 - r as f32) * f) as u8,
+            (g as f32 + (255.0 - g as f32) * f) as u8,
+            (b as f32 + (255.0 - b as f32) * f) as u8,
+        )
+    };
+    (base.gamma_multiply(0.6), lighten(base, 0.3), lighten(base, 0.45))
+}
+
 struct BandGeom {
     /// Knob center per band.
     points: [Pos2; 10],
@@ -61,7 +77,9 @@ pub fn panel(
     alpha: f32,
     interactive: bool,
     s: f32,
+    tint: Option<Color32>,
 ) -> bool {
+    let (tint, active, curve) = tint.map(shades).unwrap_or((TINT, ACTIVE, CURVE));
     // Full-size layout rect, bottom-anchored into the animated strip.
     let full = Rect::from_min_max(
         Pos2::new(rect.min.x, rect.max.y - PANEL_H * s),
@@ -153,7 +171,7 @@ pub fn panel(
     // as a triangle strip per segment since the curve isn't convex.
     if (rect.width() as i32) > 0 && (rect.height() as i32) > 0 {
         let mut mesh = Mesh::default();
-        let fill = TINT.gamma_multiply(0.12 * alpha);
+        let fill = tint.gamma_multiply(0.12 * alpha);
         for i in 0..9 {
             let base = mesh.vertices.len() as u32;
             let (a, b) = (geom.points[i], geom.points[i + 1]);
@@ -176,7 +194,7 @@ pub fn panel(
         // The 3px connecting line through the knobs.
         painter.add(Shape::line(
             geom.points.to_vec(),
-            Stroke::new(3.0 * s, CURVE.gamma_multiply(0.86 * alpha)),
+            Stroke::new(3.0 * s, curve.gamma_multiply(0.86 * alpha)),
         ));
     }
 
@@ -184,26 +202,26 @@ pub fn panel(
         // Faint hint track above the knob; solid segment below it.
         painter.line_segment(
             [Pos2::new(p.x, geom.track_top), p],
-            Stroke::new(2.0 * s, TINT.gamma_multiply(0.16 * alpha)),
+            Stroke::new(2.0 * s, tint.gamma_multiply(0.16 * alpha)),
         );
         painter.circle_filled(
             Pos2::new(p.x, geom.track_bottom),
             2.5 * s,
-            TINT.gamma_multiply(0.35 * alpha),
+            tint.gamma_multiply(0.35 * alpha),
         );
         painter.line_segment(
             [Pos2::new(p.x, geom.track_bottom), p],
-            Stroke::new(4.0 * s, ACTIVE.gamma_multiply(0.86 * alpha)),
+            Stroke::new(4.0 * s, active.gamma_multiply(0.86 * alpha)),
         );
         // Pressed knob gets the double glow halo.
         if active_band == Some(i) {
             painter.circle_stroke(
                 p,
                 geom.knob_r + 5.0 * s,
-                Stroke::new(6.0 * s, ACTIVE.gamma_multiply(0.3 * alpha)),
+                Stroke::new(6.0 * s, active.gamma_multiply(0.3 * alpha)),
             );
         }
-        painter.circle_filled(p, geom.knob_r, ACTIVE.gamma_multiply(alpha));
+        painter.circle_filled(p, geom.knob_r, active.gamma_multiply(alpha));
         // Frequency label under the track.
         painter.text(
             Pos2::new(p.x, geom.track_bottom + 14.0 * s),

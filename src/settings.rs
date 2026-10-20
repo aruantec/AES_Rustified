@@ -197,6 +197,10 @@ pub struct Library {
     /// URL media items per album dir (Lacrima persists url children
     /// with the album). Key = album dir string, value = added urls.
     pub url_items: std::collections::BTreeMap<String, Vec<String>>,
+    /// Item paths per album dir in the user's drag order; applied on
+    /// top of the scan order the way `album_order` is — unknown (new)
+    /// items keep their scan order at the end.
+    pub item_order: std::collections::BTreeMap<String, Vec<String>>,
     /// Album dirs removed via "Delete Album" — filtered out of every
     /// scan so they don't resurrect on rescan.
     pub excluded_albums: Vec<String>,
@@ -213,6 +217,9 @@ pub struct Library {
     /// synthetic "apl://..." key also used in `url_items`.
     #[serde(alias = "ImportedAlbums")]
     pub virtual_albums: Vec<VirtualAlbum>,
+    /// The album loaded in the cover view / mini list when the app
+    /// last closed — reopened once the scan lands at next launch.
+    pub last_album: Option<String>,
     /// "Rename Album" display-title overrides, keyed by album dir —
     /// folder names on disk are never touched, and virtual albums'
     /// `apl://` keys stay stable while their labels change.

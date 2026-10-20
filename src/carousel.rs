@@ -851,6 +851,39 @@ impl Carousel {
             rest.insert(at + j, it);
         }
         self.items = rest;
+        // Same persist path as the hold-to-lift reorder — file items
+        // too, via the library's per-album item_order.
+        self.reorder_dirty = true;
+    }
+
+    /// Reorder `items` to a persisted path order (`settings.library.
+    /// item_order`): listed paths take their saved slots in order,
+    /// unknown items keep their scan order appended at the end —
+    /// `album_order`'s merge semantics applied inside one album.
+    pub fn apply_order(&mut self, order: &[String]) {
+        if order.is_empty() || self.items.is_empty() {
+            return;
+        }
+        let pos: std::collections::HashMap<&str, usize> = order
+            .iter()
+            .map(|s| s.as_str())
+            .enumerate()
+            .map(|(i, s)| (s, i))
+            .collect();
+        let mut keyed: Vec<(usize, usize, Item)> = self
+            .items
+            .drain(..)
+            .enumerate()
+            .map(|(i, it)| {
+                let p = pos
+                    .get(it.path.to_string_lossy().as_ref())
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                (p, i, it)
+            })
+            .collect();
+        keyed.sort_by_key(|(p, i, _)| (*p, *i));
+        self.items = keyed.into_iter().map(|(.., it)| it).collect();
     }
 
     /// Queue a scroll-to for `path`'s item — the playing item drives

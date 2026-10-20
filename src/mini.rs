@@ -499,6 +499,13 @@ pub(crate) fn view(
                 1.0,
                 interactive && ext_t > 0.95,
                 h / equalizer::PANEL_H,
+                // The drawer tints with the playing cover's palette —
+                // the accent color stands in when there's no art.
+                Some(
+                    cover_colors
+                        .and_then(|c| c.first().copied())
+                        .unwrap_or(accent),
+                ),
             ) {
                 if let Some(pl) = player {
                     for (i, &db) in eq.bands.iter().enumerate() {
@@ -634,6 +641,8 @@ pub(crate) fn view(
         let pal_id = ui.id().with("mv-sel-pal");
         let palkey_id = ui.id().with("mv-sel-pal-key");
         let palcol_id = ui.id().with("mv-sel-pal-col");
+        // Seconds into the current drag — drives the stack gather.
+        let dragt_id = ui.id().with("mv-drag-t");
 
         let mut sel: HashSet<PathBuf> =
             ctx.data_mut(|d| d.get_temp(sel_id)).unwrap_or_default();
@@ -647,6 +656,7 @@ pub(crate) fn view(
             ctx.data_mut(|d| d.get_temp(pal_id)).unwrap_or_default();
         let mut pal_key: Option<PathBuf> = ctx.data_mut(|d| d.get_temp(palkey_id));
         let pal_col: Option<Color32> = ctx.data_mut(|d| d.get_temp(palcol_id));
+        let drag_t: f32 = ctx.data_mut(|d| d.get_temp(dragt_id)).unwrap_or(0.0);
 
         let rows: Vec<(usize, PathBuf, String, String, Option<f64>)> = carousel
             .item_rows()
@@ -689,6 +699,10 @@ pub(crate) fn view(
                             font.clone(),
                             fg.gamma_multiply(0.65),
                         );
+                        // Filenames keep their "NN." track number —
+                        // the index column already shows it, so drop
+                        // the filename's copy (double numeration).
+                        let title = strip_track_no(title);
                         let text = if album.is_empty() {
                             title.to_string()
                         } else {
@@ -838,13 +852,25 @@ pub(crate) fn view(
                             if !is_sel[*i] {
                                 continue;
                             }
+                            // A timed blend sweeps the row from its
+                            // slot into the pointer stack over ~0.5s
+                            // (ease_in_out on the blend factor, so it
+                            // lands softly even as the target moves).
+                            // Past that the row is pinned — stack drags
+                            // track the pointer with no lag.
+                            let tgt = (top + j as f32 * row_h - content_y0) / row_h;
+                            let cur0 = disp.get(path).copied().unwrap_or(*i as f32);
+                            let e = ease_in_out_quad((drag_t / 0.5).min(1.0));
+                            let cur = if e >= 1.0 {
+                                tgt
+                            } else {
+                                animating = true;
+                                cur0 + (tgt - cur0) * e
+                            };
+                            disp.insert(path.clone(), cur);
                             let fr = Rect::from_min_size(
-                                Pos2::new(list.min.x, top + j as f32 * row_h),
+                                Pos2::new(list.min.x, content_y0 + cur * row_h),
                                 Vec2::new(w, row_h),
-                            );
-                            disp.insert(
-                                path.clone(),
-                                (fr.min.y - content_y0) / row_h,
                             );
                             lp.rect_filled(
                                 fr,
@@ -894,9 +920,19 @@ pub(crate) fn view(
             });
 
         // Commit on release — the moved rows glide home from their
-        // floating slots via `disp`.
+        // floating slots via `disp`. Esc cancels mid-drag instead:
+        // nothing commits and the rows glide back the same way (the
+        // key is consumed so the global Esc ladder never sees it).
         if let Some((grab, t)) = drag {
-            if !ctx.input(|i| i.pointer.primary_down()) {
+            let esc = interactive
+                && ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                });
+            if esc {
+                let _ = (grab, t);
+                drag = None;
+                animating = true;
+            } else if !ctx.input(|i| i.pointer.primary_down()) {
                 let from: Vec<usize> = is_sel
                     .iter()
                     .enumerate()
@@ -975,9 +1011,12 @@ pub(crate) fn view(
             match drag {
                 Some(v) => {
                     d.insert_temp(drag_id, v);
+                    // The gather blend keeps advancing while dragging.
+                    d.insert_temp(dragt_id, drag_t + dt);
                 }
                 None => {
                     d.remove::<(f32, usize)>(drag_id);
+                    d.remove::<f32>(dragt_id);
                 }
             }
             d.insert_temp(disp_id, disp);
@@ -1023,6 +1062,17 @@ fn rows_dur_w(painter: &egui::Painter, font: &FontId, carousel: &carousel::Carou
                 .width()
         })
         .fold(0.0, f32::max)
+}
+
+/// Drop a leading "NN." track number from a display title — the
+/// list's index column owns numeration.
+fn strip_track_no(t: &str) -> &str {
+    let t = t.trim_start();
+    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    match t[digits..].strip_prefix('.') {
+        Some(rest) if digits > 0 => rest.trim_start(),
+        _ => t,
+    }
 }
 
 /// QuadraticEaseInOut — the ExtensionArea drawer's 0.62s easing.

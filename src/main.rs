@@ -448,6 +448,9 @@ struct AesRustApp {
     centered: bool,
     /// Armed by the title-bar switch button; drives the crossfade.
     mode_switch: Option<ModeSwitch>,
+    /// The last session's open album, queued for reopen once the scan
+    /// lands (or immediately when no scan runs at all).
+    restore_album: Option<String>,
     shadertoy: Option<shadertoy::Shadertoy>,
     logo: logo::TitleLogo,
     lacrima: particles::LacrimaParticles,
@@ -845,7 +848,7 @@ fn export_playlists(
 /// (Lacrima's album Children contain both kinds).
 fn open_album(
     album: &library::Album,
-    settings: &settings::Settings,
+    settings: &mut settings::Settings,
     carousel: &mut carousel::Carousel,
     album_cover_rx: &mut Option<
         std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
@@ -874,6 +877,17 @@ fn open_album(
         .cloned()
         .unwrap_or_default();
     let (tracks, title) = carousel.open(album, &urls);
+    if let Some(order) = settings
+        .library
+        .item_order
+        .get(&album.dir.to_string_lossy().into_owned())
+    {
+        carousel.apply_order(order);
+    }
+    // The open album survives restarts — the next launch's scan lands
+    // on this key.
+    settings.library.last_album = Some(album.dir.to_string_lossy().into_owned());
+    settings::save(settings);
     *url_info_rx = Some(library::spawn_url_info(tracks, title));
 }
 
@@ -1033,6 +1047,7 @@ impl AesRustApp {
                 settings.window.x.is_some() && settings.window.y.is_some()
             },
             mode_switch: None,
+            restore_album: settings.library.last_album.clone(),
             shadertoy: cc.wgpu_render_state.as_ref().map(|rs| {
                 let mut toy = shadertoy::Shadertoy::new(rs);
                 toy.select(&settings.effects.shadertoy);
@@ -1169,6 +1184,26 @@ impl AesRustApp {
         app.ytdlp.ensure_queried();
         // Restore persisted per-section game lists onto the tiles.
         app.emu.seed_games(&app.settings.emulation);
+        // No scan runs without music roots — the last session's album
+        // (virtual ones carry their tracks already) reopens now or
+        // `restore_album` would wait on a scan-done that never comes.
+        if app.album_rx.is_none() {
+            if let Some(key) = app.restore_album.take() {
+                if let Some(album) = app
+                    .albums
+                    .iter()
+                    .find(|a| !a.tracks.is_empty() && a.dir.to_string_lossy() == key)
+                {
+                    open_album(
+                        album,
+                        &mut app.settings,
+                        &mut app.carousel,
+                        &mut app.album_cover_rx,
+                        &mut app.url_info_rx,
+                    );
+                }
+            }
+        }
         boot_mark("app::new done");
         app
     }
@@ -1827,6 +1862,22 @@ impl eframe::App for AesRustApp {
                     .map(|a| a.dir.to_string_lossy().into_owned())
                     .collect();
                 settings::save(&self.settings);
+                // The scan just landed — reopen the album that was
+                // open last session (placeholders carry no tracks
+                // until now). Once only: a rescan never re-fires it.
+                if let Some(key) = self.restore_album.take() {
+                    if let Some(album) =
+                        self.albums.iter().find(|a| a.dir.to_string_lossy() == key)
+                    {
+                        open_album(
+                            album,
+                            &mut self.settings,
+                            &mut self.carousel,
+                            &mut self.album_cover_rx,
+                            &mut self.url_info_rx,
+                        );
+                    }
+                }
                 self.album_rx = None;
             }
             ui.ctx().request_repaint();
@@ -3486,6 +3537,15 @@ impl eframe::App for AesRustApp {
                                 if let Some(album) = albums.last() {
                                     let album_title = album.title.clone();
                                     let (tracks, t) = carousel.open(album, &urls);
+                                    if let Some(order) = settings
+                                        .library
+                                        .item_order
+                                        .get(&album.dir.to_string_lossy().into_owned())
+                                    {
+                                        carousel.apply_order(order);
+                                    }
+                                    settings.library.last_album =
+                                        Some(album.dir.to_string_lossy().into_owned());
                                     // Seed the .apl's display labels on
                                     // the open view; workers still
                                     // re-resolve fresh metadata.
@@ -3520,6 +3580,7 @@ impl eframe::App for AesRustApp {
                                         );
                                     }
                                     *url_info_rx = Some(library::spawn_url_info(tracks, t));
+                                    settings::save(settings);
                                 }
                             }
                             ui.ctx().request_repaint();
@@ -4564,7 +4625,8 @@ fn lacrima_window_frame(
             // The mini shell's cover gradient runs continuously from
             // the window top through the now-playing bar (painted by
             // mini::view under this overlay) — an opaque bar fill
-            // would cut it, so the fill drops out in mini mode.
+            // would cut it, so mini mode gets only a faint dark veil
+            // instead.
             painter.rect_filled(
                 title_bar_rect,
                 CornerRadius {
@@ -4574,7 +4636,7 @@ fn lacrima_window_frame(
                     sw: 0,
                 },
                 if mini_active {
-                    Color32::TRANSPARENT
+                    Color32::from_black_alpha(70)
                 } else {
                     Color32::from_rgb(0x20, 0x20, 0x20)
                 },
@@ -4650,17 +4712,13 @@ fn lacrima_window_frame(
                 }
             }
 
-            // The bar/content separator — suppressed in the mini shell
-            // where the now-playing bar's gradient flows into the bar.
-            if !mini_active {
-                painter.line_segment(
-                    [
-                        Pos2::new(panel_rect.min.x, title_bar_rect.max.y),
-                        title_bar_rect.right_bottom(),
-                    ],
-                    Stroke::new((1.5 * scale).max(1.0), Color32::from_gray(85)),
-                );
-            }
+            painter.line_segment(
+                [
+                    Pos2::new(panel_rect.min.x, title_bar_rect.max.y),
+                    title_bar_rect.right_bottom(),
+                ],
+                Stroke::new((1.5 * scale).max(1.0), Color32::from_gray(85)),
+            );
 
             ui.scope_builder(UiBuilder::new().max_rect(title_bar_rect), |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5284,6 +5342,7 @@ fn music_view(
             alpha,
             interactive && eq_t > 0.95,
             s,
+            None,
         ) {
             if let Some(p) = player {
                 for (i, &db) in eq.bands.iter().enumerate() {
@@ -5637,7 +5696,16 @@ fn persist_url_items(
         let covers = carousel.url_covers();
         a.sync_url_covers(covers, urls.len());
     }
-    settings.library.url_items.insert(key, urls);
+    settings.library.url_items.insert(key.clone(), urls);
+    // The full item order (files + urls) persists too, so a drag
+    // reorder in either shell survives the next folder rescan.
+    settings.library.item_order.insert(
+        key,
+        carousel
+            .item_paths()
+            .map(|(_, p, _)| p.to_string_lossy().into_owned())
+            .collect(),
+    );
     settings::save(settings);
 }
 
@@ -5751,8 +5819,18 @@ fn settings_overlay(
     toy_names: &[String],
     scale: f32,
 ) {
-    let w = (content.width() * 0.38).clamp(240.0, content.width());
-    let panel = Rect::from_min_max(Pos2::new(content.max.x - w * t, content.min.y), content.max);
+    // The footer holds the 320*s directory button plus the right-anchored
+    // version block; below ~480*s they overlap, which the old 240px floor
+    // allowed in the mini shell.
+    let w = (content.width() * 0.38).clamp(520.0 * scale, content.width());
+    // The panel starts below the title-bar separator — the stroke is
+    // centered on content.min.y, so sitting flush would cover its lower
+    // half.
+    let sep = (1.5 * scale).max(1.0);
+    let panel = Rect::from_min_max(
+        Pos2::new(content.max.x - w * t, content.min.y + sep),
+        content.max,
+    );
     // Tab bodies and the footer lay out against a fixed-width rect that
     // translates with the slide: `panel.max.x` stays pinned to the window
     // edge while `panel.min.x` moves, so content anchored to it would
@@ -5773,6 +5851,9 @@ fn settings_overlay(
     }
     ui.interact(panel, ui.id().with("settings-panel"), Sense::click());
 
+    // In the mini shell the panel sits over the cover-color gradient, so
+    // keep it translucent enough for that tint to bleed through.
+    let bg_alpha = if settings.window.mini { 200.0 } else { 242.0 };
     painter.rect_filled(
         panel,
         CornerRadius {
@@ -5781,7 +5862,7 @@ fn settings_overlay(
             sw: 0,
             se: radius,
         },
-        Color32::from_black_alpha((242.0 * t) as u8),
+        Color32::from_black_alpha((bg_alpha * t) as u8),
     );
     painter.line_segment(
         [panel.left_top(), panel.left_bottom()],
