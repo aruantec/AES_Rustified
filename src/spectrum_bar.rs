@@ -273,6 +273,9 @@ impl SpectrumBar {
         gap: f32,
         slab_h: f32,
     ) {
+        // Resting level: a bar never fully vanishes — at silence the
+        // bottom segment stays lit like a VFD's idle row.
+        let level = level.max(((gap + slab_h) / area_h).min(1.0));
         let bar_top = bottom - level * area_h;
 
         // Ghost grid: the column's unlit segments faintly visible
