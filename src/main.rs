@@ -2649,6 +2649,7 @@ impl eframe::App for AesRustApp {
                             ),
                             s,
                             settings.window.width / s,
+                            settings.ui.progress_knob,
                         );
                         if let Some(t) = mout.seek {
                             seek_secs = Some(t);
@@ -2937,6 +2938,7 @@ impl eframe::App for AesRustApp {
                                                 && !carousel.has_items()));
                                     album_row.show_titles =
                                         settings.effects.show_album_title_bar;
+                                    carousel.progress_knob = settings.ui.progress_knob;
                                     let (ra, sk, play, ed, pr, del, cl, ex) = music_view(
                                         ui,
                                         content,
@@ -6723,6 +6725,30 @@ fn ui_tab_effects(
         "Album title bar",
         &mut settings.effects.show_album_title_bar,
         "album-title-bar-toggle",
+    );
+    y += 40.0 * s;
+
+    // "Progress" section — port-only: the grab-knob affordance on
+    // the pill progress bars (carousel + mini seek/volume).
+    painter.text(
+        Pos2::new(x, y),
+        Align2::LEFT_TOP,
+        "Progress",
+        FontId::proportional(30.0 * s),
+        Color32::WHITE.gamma_multiply(t),
+    );
+    y += 46.0 * s;
+    painter.line_segment(
+        [Pos2::new(x, y), Pos2::new(right, y)],
+        Stroke::new(1.0, Color32::from_gray(55).gamma_multiply(t)),
+    );
+    y += 15.0 * s;
+    label_row(
+        ui,
+        y,
+        "Show knob",
+        &mut settings.ui.progress_knob,
+        "progress-knob-toggle",
     );
 }
 

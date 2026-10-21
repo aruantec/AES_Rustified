@@ -606,6 +606,10 @@ pub struct Ui {
     /// migrated/first slider touch. The effective factor recomputes
     /// each frame, so the UI follows DPI across monitors.
     pub scale_manual: Option<f32>,
+    /// "Show knob" (UI tab) — the grab-knob affordance on the pill
+    /// progress bars (carousel + mini seek/volume). Off keeps the
+    /// plain fill look.
+    pub progress_knob: bool,
 }
 
 impl Default for Ui {
@@ -613,6 +617,7 @@ impl Default for Ui {
         Self {
             scale_factor: 1.0,
             scale_manual: None,
+            progress_knob: false,
         }
     }
 }

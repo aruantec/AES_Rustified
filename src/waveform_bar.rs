@@ -271,6 +271,7 @@ impl WaveformBar {
         interactive: bool,
         id: &str,
         live: bool,
+        knob: bool,
     ) -> Option<f64> {
         let mut seek = None;
         let resp = ui.interact(rect, ui.id().with(id), Sense::click_and_drag());
@@ -346,6 +347,27 @@ impl WaveformBar {
             Stroke::new(1.0, MINI_BORDER),
             egui::StrokeKind::Inside,
         );
+        // Grab knob at the fill's leading edge — the cue that the
+        // pill is draggable. Clamped inside the capsule ends;
+        // brightens and swells on hover/drag. (UI tab: "Show knob".)
+        if knob {
+            let hot = resp.hovered() || resp.is_pointer_button_down_on();
+            // Eased swell — the knob inflates/deflates over ~120ms
+            // instead of popping between sizes.
+            let hot_t = ui
+                .ctx()
+                .animate_bool_with_time(ui.id().with((id, "knob-hot")), hot, 0.12);
+            let kr = rect.height() * (0.57 + 0.11 * hot_t);
+            let kx = (rect.min.x + rect.width() * progress)
+                .clamp(rect.min.x + kr, rect.max.x - kr);
+            let kcol = if hot { Color32::WHITE } else { MINI_FILL };
+            painter.circle(
+                Pos2::new(kx, rect.center().y),
+                kr,
+                kcol,
+                Stroke::new(1.0, MINI_BORDER),
+            );
+        }
         seek
     }
 

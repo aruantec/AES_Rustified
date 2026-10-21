@@ -99,6 +99,8 @@ pub(crate) fn view(
     // The normal window's virtual width — the spectrum strip sizes
     // its bars off it so mini columns match the normal view's.
     norm_w: f32,
+    // UI tab's "Show knob" — the pill bars' grab-knob affordance.
+    progress_knob: bool,
 ) -> MiniOut {
     let painter = ui.painter().clone();
     painter.rect_filled(content, 0, grid_bg);
@@ -333,7 +335,16 @@ pub(crate) fn view(
         .map(|p| p.duration().as_secs_f64())
         .filter(|d| *d > 0.0)
         .unwrap_or(dur_s);
-    out.seek = bar.mini_ui(ui, track, pos_s2, dur_s2, interactive, "mv-seek", false);
+    out.seek = bar.mini_ui(
+        ui,
+        track,
+        pos_s2,
+        dur_s2,
+        interactive,
+        "mv-seek",
+        false,
+        progress_knob,
+    );
 
     // --- Toggle strip (Lacrima row 2) -------------------------------
     // Visualizer / Equalizer / Mute — 20px toggles, left-aligned,
@@ -486,7 +497,9 @@ pub(crate) fn view(
             Pos2::new(pl + ph + 6.0, r.center().y - 3.5),
             Pos2::new(pill.max.x - 6.0, r.center().y + 3.5),
         );
-        if let Some(v) = bar.mini_ui(ui, slider, vol as f64, 1.0, interactive, "mv-vol", true) {
+        if let Some(v) = bar.mini_ui(
+            ui, slider, vol as f64, 1.0, interactive, "mv-vol", true, progress_knob,
+        ) {
             if let Some(p) = player {
                 p.set_volume(v as f32);
             }

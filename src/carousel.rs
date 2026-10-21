@@ -335,6 +335,9 @@ pub struct Carousel {
     marquee_off: f32,
     marquee_text: String,
     marquee_pause: Instant,
+    /// UI tab's "Show knob" — the pill slider's grab-knob affordance.
+    /// Runtime flag set from `settings.ui.progress_knob` each frame.
+    pub progress_knob: bool,
 }
 
 impl Carousel {
@@ -383,6 +386,7 @@ impl Carousel {
             marquee_off: 0.0,
             marquee_text: String::new(),
             marquee_pause: Instant::now(),
+            progress_knob: false,
         }
     }
 
@@ -3154,7 +3158,7 @@ impl Carousel {
         // widget over the transport band stealing its clicks.
         let slider = Rect::from_center_size(
             Pos2::new(rect.center().x, cy + 62.0 * s),
-            Vec2::new(520.0 * s, 28.0 * s),
+            Vec2::new(520.0 * s, 42.0 * s),
         );
         if visible.len() > 1 && view.contains_rect(slider) {
             self.pill_slider(
@@ -3181,7 +3185,7 @@ impl Carousel {
         s: f32,
     ) {
         let painter = ui.painter().clone();
-        let track_h = (16.0 * s).min(rect.height() - 4.0).max(8.0);
+        let track_h = (25.0 * s).min(rect.height() - 4.0).max(8.0);
         let outer = Rect::from_min_max(
             Pos2::new(rect.min.x + 2.0, rect.center().y - track_h * 0.5),
             Pos2::new(rect.max.x - 2.0, rect.center().y + track_h * 0.5),
@@ -3239,6 +3243,37 @@ impl Carousel {
             let top = Color32::from_rgb(0xF5, 0xF5, 0xF5).gamma_multiply(0.71 * alpha);
             let bot = Color32::from_rgb(0xF5, 0xF5, 0xF5).gamma_multiply(0.39 * alpha);
             painter.add(Shape::mesh(capsule_mesh(fill, ir, top, bot)));
+        }
+
+        // Grab knob at the fill's leading edge — the cue that the pill
+        // is draggable, not just a readout. Brightens and swells on
+        // hover/drag so it invites the grab. (UI tab: "Show knob".)
+        let hot = resp.hovered() || resp.is_pointer_button_down_on();
+        if interactive && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if self.progress_knob {
+            // Eased swell — the knob inflates/deflates over ~120ms
+            // instead of popping between sizes.
+            let hot_t = ui
+                .ctx()
+                .animate_bool_with_time(ui.id().with("carousel-pill-hot"), hot, 0.12);
+            let kr = track_h * (0.57 + 0.11 * hot_t);
+            // Clamp inside the capsule ends — at pct 0/1 the
+            // edge-placed knob would hang half outside the track.
+            let kx = (inner.min.x + inner.width() * pct)
+                .clamp(inner.min.x + kr, inner.max.x - kr);
+            let kcol = if hot {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(0xE8, 0xE8, 0xE8)
+            };
+            painter.circle(
+                Pos2::new(kx, outer.center().y),
+                kr,
+                kcol.gamma_multiply(alpha),
+                Stroke::new(1.0, Color32::from_gray(90).gamma_multiply(alpha)),
+            );
         }
     }
 
