@@ -303,13 +303,14 @@ impl Album {
     }
 }
 
-/// Decode a cover to a ColorImage (256px max), for the UI thread.
-/// `Web` tries each candidate URL in order (img.youtube.com quality
-/// fallbacks); fetches are blocking and run on cover worker threads.
-pub fn decode_cover(src: &CoverSrc) -> Option<egui::ColorImage> {
-    let bytes = match src {
-        CoverSrc::File(p) => std::fs::read(p).ok()?,
-        CoverSrc::Tag(p) => tag_picture(p)?,
+/// The raw bytes behind a cover source — `decode_cover` without the
+/// decode/crop/resize, for consumers that need the image file itself
+/// (the metadata editor's cover card). `Web` runs the same
+/// cache-then-ladder fetch; blocking — call it off the UI thread.
+pub fn cover_bytes(src: &CoverSrc) -> Option<Vec<u8>> {
+    match src {
+        CoverSrc::File(p) => std::fs::read(p).ok(),
+        CoverSrc::Tag(p) => tag_picture(p),
         CoverSrc::Web(urls) => {
             // Cached candidates win instantly — thumbnail bytes
             // persist on disk, so a hit skips the network entirely.
@@ -348,9 +349,16 @@ pub fn decode_cover(src: &CoverSrc) -> Option<egui::ColorImage> {
                 drop(tx);
                 found = rx.recv().ok();
             }
-            found?
+            found
         }
-    };
+    }
+}
+
+/// Decode a cover to a ColorImage (256px max), for the UI thread.
+/// `Web` tries each candidate URL in order (img.youtube.com quality
+/// fallbacks); fetches are blocking and run on cover worker threads.
+pub fn decode_cover(src: &CoverSrc) -> Option<egui::ColorImage> {
+    let bytes = cover_bytes(src)?;
     let img = image::load_from_memory(&bytes).ok()?;
     // YouTube thumbnails bake letterbox/pillarbox bars into the image
     // (hqdefault is 4:3 holding 16:9 content) — crop uniform near-black
@@ -756,3 +764,25 @@ fn note_contains(u: f32, v: f32) -> bool {
     inside
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_bytes_reads_file_source() {
+        // The metadata editor's stream-cover fallback needs the raw
+        // bytes — the File arm is a plain read round-trip.
+        let dir = std::env::temp_dir().join(format!(
+            "aes-cb-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.bin");
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(cover_bytes(&CoverSrc::File(p.clone())), Some(bytes));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(cover_bytes(&CoverSrc::File(p)), None);
+    }
+}
