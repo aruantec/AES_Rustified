@@ -1125,7 +1125,21 @@ fn app_font_definitions() -> egui::FontDefinitions {
 }
 
 impl AesRustApp {
-    fn new(cc: &eframe::CreationContext<'_>, settings: settings::Settings) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, mut settings: settings::Settings) -> Self {
+        // Migrate a persisted absolute ScaleFactor into the manual
+        // offset: effective = monitor DPI base x manual. A factor that
+        // matched the display maps to 1.0 (pure auto); anything else
+        // keeps the same effective value on this monitor and follows
+        // the base on others.
+        if settings.ui.scale_manual.is_none() {
+            let base = cc
+                .egui_ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0)
+                .clamp(1.0, 2.0);
+            settings.ui.scale_manual =
+                Some((settings.ui.scale_factor / base).clamp(0.3, 3.0));
+        }
         let defs = app_font_definitions();
         let have_font = defs.font_data.contains_key("consolas-bold");
         let have_light_font = defs.font_data.contains_key("segoe-light");
@@ -1882,8 +1896,20 @@ impl eframe::App for AesRustApp {
         // and rendered at 1/scale, so interior metrics divide by the
         // factor (higher value = smaller, denser UI). Quantized to 0.05
         // so scaled font sizes stay bounded while the slider drags.
-        let scale =
-            ((self.settings.ui.scale_factor.clamp(1.0, 3.0) * 20.0).round() / 20.0).max(1.0);
+        // Effective = live monitor DPI base x the manual slider offset —
+        // moving the window across displays re-densifies on its own.
+        let base = ui
+            .ctx()
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0)
+            .clamp(1.0, 2.0);
+        let scale = (((base * self.settings.ui.scale_manual.unwrap_or(1.0))
+            .clamp(1.0, 3.0)
+            * 20.0)
+            .round()
+            / 20.0)
+            .max(1.0);
+        self.settings.ui.scale_factor = scale;
         let s = 1.0 / scale;
         // Fullscreen hides the title bar — the content covers the
         // whole screen.
@@ -6516,6 +6542,15 @@ fn ui_tab_effects(
         t,
         None,
     ) {
+        // The slider edits the effective factor — persist the offset
+        // from this monitor's DPI base so the auto scale still applies
+        // when the window lands on a differently-scaled display.
+        let base = ui
+            .ctx()
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0)
+            .clamp(1.0, 2.0);
+        settings.ui.scale_manual = Some((factor / base).clamp(0.3, 3.0));
         settings.ui.scale_factor = factor;
     }
     painter.text(
@@ -7407,7 +7442,7 @@ fn ui_tab_carousel(
         );
         y += 44.0 * s;
         let readout = format!("{:.2}X", car.scale);
-        slider_row(ui, y, "Item Scale", &mut car.scale, 0.5, 2.0, 0.01, readout);
+        slider_row(ui, y, "Item Scale", &mut car.scale, 0.5, 4.0, 0.01, readout);
         y += 44.0 * s;
         let readout = format!("{:.0}", car.vertical_offset);
         slider_row(

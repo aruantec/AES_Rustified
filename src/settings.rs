@@ -599,12 +599,21 @@ impl Default for Equalizer {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Ui {
+    /// Last effective factor (monitor base x manual) — a readable
+    /// cache and the migration source for `scale_manual`.
     pub scale_factor: f32,
+    /// Manual offset from the monitor's auto DPI scale — None until
+    /// migrated/first slider touch. The effective factor recomputes
+    /// each frame, so the UI follows DPI across monitors.
+    pub scale_manual: Option<f32>,
 }
 
 impl Default for Ui {
     fn default() -> Self {
-        Self { scale_factor: 1.0 }
+        Self {
+            scale_factor: 1.0,
+            scale_manual: None,
+        }
     }
 }
 
