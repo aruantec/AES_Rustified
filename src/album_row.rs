@@ -2112,7 +2112,7 @@ impl AlbumRow {
 
         // Track-count badge, top-right — files + url items (Lacrima
         // counts all album Children, not just disk tracks).
-        let count = album.tracks.len() + album.url_count;
+        let count = album.tracks.len() + album.added.len() + album.url_count;
         if count > 0 {
             let text = count.to_string();
             let font = FontId::proportional(20.0 * self.scale);

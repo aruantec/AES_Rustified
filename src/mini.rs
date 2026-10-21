@@ -54,6 +54,9 @@ pub(crate) struct MiniOut {
     /// picker/prompt (rfd dialogs and url_prompt render outside the
     /// mini view).
     pub menu: Option<MiniMenu>,
+    /// Committed inline album-title edit — the owner applies the same
+    /// rename path as the strip's `Action::Rename`.
+    pub rename: Option<(String, String)>,
 }
 
 /// The mini "+" menu's entries — mapped onto the same code the
@@ -1072,10 +1075,55 @@ pub(crate) fn view(
             }
         }
 
+        // Right-click on empty playlist space — the footer "+" menu's
+        // playlist items. Registered before the rows so a row's own
+        // menu (same items) wins on top.
+        if interactive && at < 0.5 {
+            let bg = ui.interact(
+                list,
+                ui.id().with("mv-playlist-bg"),
+                egui::Sense::click(),
+            );
+            bg.context_menu(|ui| {
+                ui.set_min_width(1.3 * h);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let font = FontId::proportional(0.13 * h);
+                for (label, menu) in [
+                    ("Add Files", MiniMenu::AddFiles),
+                    ("Add Url", MiniMenu::AddUrl),
+                    ("Add Playlist", MiniMenu::AddPlaylist),
+                ] {
+                    if ui
+                        .button(egui::RichText::new(label).font(font.clone()))
+                        .clicked()
+                    {
+                        out.menu = Some(menu);
+                        ui.close();
+                    }
+                }
+            });
+        }
+
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
+        // The albums list owns the same rect while `albums_on` — the
+        // playlist keeps painting for the fade but must not claim
+        // input: its ScrollArea runs first and would eat the wheel
+        // delta, scrollbar drags, and row clicks meant for albums.
+        // Keep `.show` running regardless — it must still consume its
+        // own scroll_to_me targets or they'd leak into the albums
+        // scroll area.
+        if albums_on {
+            child.disable();
+        }
         let mut animating = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
+            // Own scroll state — the albums list below builds the
+            // same UiBuilder on the same rect, so without salts both
+            // areas share one egui scroll id and the playlist's
+            // clamp would pin the albums offset (a 1-item playlist
+            // pins it to 0).
+            .id_salt("mv-playlist-scroll")
             .show(&mut child, |ui| {
                 let w = ui.available_width();
                 let content_y0 = ui.min_rect().min.y;
@@ -1229,6 +1277,50 @@ pub(crate) fn view(
                                 drag = Some((pos.y - rect.min.y, *i));
                             }
                         }
+                        // Right-click a row — the footer "+" menu's
+                        // playlist items, then the pointed row's own
+                        // delete under the break.
+                        resp.context_menu(|ui| {
+                            ui.set_min_width(1.3 * h);
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let font = FontId::proportional(0.13 * h);
+                            for (label, menu) in [
+                                ("Add Files", MiniMenu::AddFiles),
+                                ("Add Url", MiniMenu::AddUrl),
+                                ("Add Playlist", MiniMenu::AddPlaylist),
+                            ] {
+                                if ui
+                                    .button(
+                                        egui::RichText::new(label)
+                                            .font(font.clone()),
+                                    )
+                                    .clicked()
+                                {
+                                    out.menu = Some(menu);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .button(
+                                    egui::RichText::new("Delete Item")
+                                        .font(font),
+                                )
+                                .clicked()
+                            {
+                                // Pointing inside a multi-selection
+                                // deletes the set (the Delete key's
+                                // rule); otherwise just this row.
+                                let paths: Vec<PathBuf> =
+                                    if selected && sel.len() > 1 {
+                                        sel.iter().cloned().collect()
+                                    } else {
+                                        vec![path.clone()]
+                                    };
+                                del = Some(crate::PendingDelete::Items(paths));
+                                ui.close();
+                            }
+                        });
                     }
                     if sel_dirty {
                         is_sel = rows.iter().map(|(_, p, ..)| sel.contains(p)).collect();
@@ -1399,6 +1491,16 @@ pub(crate) fn view(
         let adragt_id = ui.id().with("mv-album-drag-t");
         let adrag_t: f32 =
             ctx.data_mut(|d| d.get_temp(adragt_id)).unwrap_or(0.0);
+        // Press-edge selection bookkeeping — `clicked` fires on
+        // release and loses to micro-drags; press-select keeps
+        // selection immediate and this flag swallows the release
+        // click that would re-run it.
+        let press_sel_id = ui.id().with("mv-album-press-sel");
+        let mut press_sel: bool =
+            ctx.data_mut(|d| d.get_temp(press_sel_id)).unwrap_or(false);
+        // The delete dialog's focused-button slot lives on the view
+        // ui — grab its id here where `ui` still is that ui.
+        let delsel_id = ui.id().with("mv-del-sel");
         if at > 0.0 {
             // Artists resolve lazily — one worker pass fills the
             // whole map (dir → artist) so the list never blocks on
@@ -1414,6 +1516,7 @@ pub(crate) fn view(
                 .filter_map(|a| {
                     a.tracks
                         .first()
+                        .or(a.added.first())
                         .map(|t| (a.dir.to_string_lossy().into_owned(), t.clone()))
                 })
                 .collect();
@@ -1486,10 +1589,67 @@ pub(crate) fn view(
                 }
             }
 
+            // Inline title edit (Create Album / a card's "Rename
+            // Album") — (dir, text, armed); `armed` flips once the
+            // editor got its first-frame focus+select-all. The strip
+            // does the same over the tile's title band in the normal
+            // view; here it overlays the card's title text. A global
+            // Id — the owner's Create Album handler arms it without
+            // knowing the scroll ui's id space.
+            let edit_id = egui::Id::new("mv-album-edit");
+            let mut edit: Option<(String, String, bool)> =
+                ctx.data_mut(|d| d.get_temp(edit_id));
+            // Dir this edit session already scrolled to — the
+            // strip's pending_reveal is one-shot; a per-frame
+            // scroll_to_me while the editor can't paint would pin
+            // the list's scroll.
+            let edit_seen_id = egui::Id::new("mv-album-edit-seen");
+            let mut edit_seen: Option<String> =
+                ctx.data_mut(|d| d.get_temp(edit_seen_id));
+
+            // The strip's empty-space menu — album-level actions
+            // without a card under the pointer. Registered before the
+            // cards so their own menus win on top of it.
+            if interactive && at > 0.5 {
+                let bg = ui.interact(
+                    list,
+                    ui.id().with("mv-albums-bg"),
+                    egui::Sense::click(),
+                );
+                bg.context_menu(|ui| {
+                    ui.set_min_width(1.3 * h);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let font = FontId::proportional(0.13 * h);
+                    if ui
+                        .button(egui::RichText::new("Create Album").font(font.clone()))
+                        .clicked()
+                    {
+                        out.menu = Some(MiniMenu::CreateAlbum);
+                        ui.close();
+                    }
+                    if ui
+                        .button(egui::RichText::new("Open Folder").font(font))
+                        .clicked()
+                    {
+                        out.menu = Some(MiniMenu::AddFolder);
+                        ui.close();
+                    }
+                });
+            }
+
             let mut child2 =
                 ui.new_child(egui::UiBuilder::new().max_rect(list));
+            // While `at > 0` this keeps painting through the fade-out
+            // too — but once `albums_on` flips off, input belongs to
+            // the playlist again.
+            if !albums_on {
+                child2.disable();
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
+                // See the playlist's salt above — same rect, same
+                // builder would collide scroll ids.
+                .id_salt("mv-albums-scroll")
                 .show(&mut child2, |ui| {
                     let w = ui.available_width();
                     let content_y0 = ui.min_rect().min.y;
@@ -1630,7 +1790,7 @@ pub(crate) fn view(
                         lp.text(
                             Pos2::new(card.max.x - 0.10 * h, cy),
                             Align2::RIGHT_CENTER,
-                            format!("{} Tracks", a.tracks.len() + a.url_count),
+                            format!("{} Tracks", a.tracks.len() + a.added.len() + a.url_count),
                             sfont.clone(),
                             Color32::from_gray(150),
                         );
@@ -1658,16 +1818,34 @@ pub(crate) fn view(
                                     })
                                     .flatten()
                             });
+                        // The inline title editor's card — scrolled
+                        // into view once per arming (the strip's
+                        // pending_reveal), then painted below.
+                        let editing_this =
+                            edit.as_ref().is_some_and(|(d, ..)| *d == dir);
+                        if editing_this && edit_seen.as_deref() != Some(dir.as_str()) {
+                            resp.scroll_to_me(None);
+                            edit_seen = Some(dir.clone());
+                        }
                         if live {
-                            if resp.clicked() {
-                                // The playlist's click rules: Ctrl
-                                // toggles, Shift extends the range
-                                // from the anchor, plain selects one.
+                            // Selection lands on PRESS — a release
+                            // `clicked` loses to click_and_drag's 6pt
+                            // decision, turning a drifting click into
+                            // a micro-drag whose ~0.5s gather/drop
+                            // reads as the card selecting late.
+                            // `press_sel` swallows the release click
+                            // so a Ctrl+press add isn't toggled back
+                            // off.
+                            if !sel_a
+                                && resp.is_pointer_button_down_on()
+                                && ctx.input(|i| {
+                                    i.pointer
+                                        .button_pressed(egui::PointerButton::Primary)
+                                })
+                            {
                                 let mods = ctx.input(|i| i.modifiers);
                                 if mods.command {
-                                    if !asel_set.remove(dir.as_str()) {
-                                        asel_set.insert(dir.clone());
-                                    }
+                                    asel_set.insert(dir.clone());
                                 } else if mods.shift {
                                     let (a0, b0) = (asel.min(i), asel.max(i));
                                     for j in a0..=b0.min(an - 1) {
@@ -1684,6 +1862,35 @@ pub(crate) fn view(
                                 }
                                 asel = i;
                                 ctx.data_mut(|d| d.insert_temp(asel_id, asel));
+                                press_sel = true;
+                            }
+                            if resp.clicked() {
+                                if !press_sel {
+                                    // The playlist's click rules: Ctrl
+                                    // toggles, Shift extends the range
+                                    // from the anchor, plain selects one.
+                                    let mods = ctx.input(|i| i.modifiers);
+                                    if mods.command {
+                                        if !asel_set.remove(dir.as_str()) {
+                                            asel_set.insert(dir.clone());
+                                        }
+                                    } else if mods.shift {
+                                        let (a0, b0) = (asel.min(i), asel.max(i));
+                                        for j in a0..=b0.min(an - 1) {
+                                            asel_set.insert(
+                                                albums[j]
+                                                    .dir
+                                                    .to_string_lossy()
+                                                    .into_owned(),
+                                            );
+                                        }
+                                    } else {
+                                        asel_set.clear();
+                                        asel_set.insert(dir.clone());
+                                    }
+                                    asel = i;
+                                    ctx.data_mut(|d| d.insert_temp(asel_id, asel));
+                                }
                             }
                             if resp.double_clicked() {
                                 out.open = Some(dir.clone());
@@ -1694,8 +1901,10 @@ pub(crate) fn view(
                                 if let Some(pos) = resp.interact_pointer_pos() {
                                     // Grabbing an unselected card
                                     // selects just it — the playlist's
-                                    // rule for pointer drags.
-                                    if !sel_a {
+                                    // rule for pointer drags. Re-check
+                                    // the set (press may have selected
+                                    // it since `sel_a` was read).
+                                    if !asel_set.contains(dir.as_str()) {
                                         asel_set.clear();
                                         asel_set.insert(dir.clone());
                                     }
@@ -1706,6 +1915,88 @@ pub(crate) fn view(
                             if a_kreveal && i == asel {
                                 resp.scroll_to_me(None);
                             }
+                            // Card menu — the strip's order: Create up
+                            // top, the pointed card's own actions
+                            // after the break.
+                            resp.context_menu(|ui| {
+                                ui.set_min_width(1.3 * h);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let font = FontId::proportional(0.13 * h);
+                                // The pointed card's primary action —
+                                // the double-click's menu twin.
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Open Album")
+                                            .font(font.clone()),
+                                    )
+                                    .clicked()
+                                {
+                                    out.open = Some(dir.clone());
+                                    albums_on = false;
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(ab_id, false)
+                                    });
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Create Album")
+                                            .font(font.clone()),
+                                    )
+                                    .clicked()
+                                {
+                                    out.menu = Some(MiniMenu::CreateAlbum);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Rename Album")
+                                            .font(font.clone()),
+                                    )
+                                    .clicked()
+                                {
+                                    edit =
+                                        Some((dir.clone(), a.title.clone(), false));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Delete Album")
+                                            .font(font),
+                                    )
+                                    .clicked()
+                                {
+                                    // Pointing inside a multi-
+                                    // selection removes the whole set
+                                    // (the strip's export/delete
+                                    // rule); otherwise just this card.
+                                    let dirs: Vec<String> =
+                                        if sel_a && asel_set.len() > 1 {
+                                            albums
+                                                .iter()
+                                                .filter(|a| {
+                                                    asel_set.contains(
+                                                        a.dir
+                                                            .to_string_lossy()
+                                                            .as_ref(),
+                                                    )
+                                                })
+                                                .map(|a| {
+                                                    a.dir.to_string_lossy()
+                                                        .into_owned()
+                                                })
+                                                .collect()
+                                        } else {
+                                            vec![dir.clone()]
+                                        };
+                                    del = Some(crate::PendingDelete::Albums(dirs));
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(delsel_id, 1usize)
+                                    });
+                                    ui.close();
+                                }
+                            });
                         }
                         // Selected cards leave their slots and ride
                         // the pointer — they're painted below.
@@ -1740,6 +2031,7 @@ pub(crate) fn view(
                         if !card.intersects(list) {
                             continue;
                         }
+                        let has_artist = artist.is_some();
                         paint_card(
                             &lp,
                             card,
@@ -1749,6 +2041,85 @@ pub(crate) fn view(
                             sel_a,
                             live && resp.hovered(),
                         );
+                        // The editor overlays the title text (ui.put —
+                        // clicks inside reach it, not the card's hit
+                        // test). Enter/click-away commits, Esc cancels.
+                        if editing_this && interactive {
+                            let cov = card_h - 2.0 * pad;
+                            let tx = card.min.x + pad + cov + 0.12 * h;
+                            let cy = card.center().y;
+                            // Centered on the title's own baseline —
+                            // cy - 0.11h with an artist line, cy
+                            // without (paint_card's layout).
+                            let title_cy = if has_artist {
+                                cy - 0.11 * h
+                            } else {
+                                cy
+                            };
+                            let edit_rect = Rect::from_min_max(
+                                Pos2::new(tx - 0.04 * h, title_cy - 0.12 * h),
+                                Pos2::new(card.max.x - 0.55 * h, title_cy + 0.12 * h),
+                            );
+                            // Outer Some = the editor closed; inner is
+                            // the commit (None = Esc or empty title).
+                            let closed: Option<Option<(String, String)>> = {
+                                let (edir, etext, armed) = edit.as_mut().unwrap();
+                                let r = ui.put(
+                                    edit_rect,
+                                    egui::TextEdit::singleline(etext)
+                                        .font(tfont.clone())
+                                        .text_color(Color32::WHITE)
+                                        .vertical_align(egui::Align::Center),
+                                );
+                                if !*armed {
+                                    // Focus once with the whole title
+                                    // selected — typing replaces it.
+                                    let mut st =
+                                        egui::text_edit::TextEditState::load(
+                                            &ctx, r.id,
+                                        )
+                                        .unwrap_or_default();
+                                    st.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::two(
+                                            egui::text::CCursor::new(0),
+                                            egui::text::CCursor::new(
+                                                etext.chars().count(),
+                                            ),
+                                        ),
+                                    ));
+                                    st.store(&ctx, r.id);
+                                    r.request_focus();
+                                    *armed = true;
+                                }
+                                if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                                    && r.has_focus()
+                                {
+                                    Some(None)
+                                } else if r.lost_focus() {
+                                    Some(Some((
+                                        edir.clone(),
+                                        etext.trim().to_string(),
+                                    )))
+                                } else {
+                                    None
+                                }
+                            };
+                            match closed {
+                                Some(Some((d, t))) => {
+                                    if !t.is_empty() {
+                                        out.rename = Some((d, t));
+                                    }
+                                    edit = None;
+                                }
+                                Some(None) => edit = None,
+                                None => {}
+                            }
+                        }
+                    }
+                    // Release cleared the press marker — its swallow
+                    // job ended with the click (or a drag-away).
+                    if !ctx.input(|i| i.pointer.primary_down()) {
+                        press_sel = false;
                     }
                     // Dashed drop slots + the floating stack.
                     if let Some((grab, t)) = adrag {
@@ -1849,6 +2220,28 @@ pub(crate) fn view(
                         );
                     }
                 });
+            // Editor state back to temp — a gone album clears it.
+            ctx.data_mut(|d| match &edit {
+                Some(e)
+                    if albums
+                        .iter()
+                        .any(|a| a.dir.to_string_lossy() == e.0.as_str()) =>
+                {
+                    d.insert_temp(edit_id, e.clone());
+                    match &edit_seen {
+                        Some(v) => {
+                            d.insert_temp(edit_seen_id, v.clone());
+                        }
+                        None => {
+                            d.remove::<String>(edit_seen_id);
+                        }
+                    }
+                }
+                _ => {
+                    d.remove::<(String, String, bool)>(edit_id);
+                    d.remove::<String>(edit_seen_id);
+                }
+            });
         }
 
         // Albums drag commit — a released pointer lands the card at t
@@ -1890,6 +2283,7 @@ pub(crate) fn view(
             d.insert_temp(adisp_id, adisp);
             d.insert_temp(aselset_id, asel_set);
             d.insert_temp(asel_id, asel);
+            d.insert_temp(press_sel_id, press_sel);
             match adrag {
                 Some(v) => {
                     d.insert_temp(adrag_id, v);

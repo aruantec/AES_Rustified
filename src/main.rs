@@ -108,13 +108,23 @@ fn merge_virtual_albums(albums: &mut Vec<library::Album>, lib: &settings::Librar
 fn normalize_scanned_album(lib: &settings::Library, a: &mut library::Album) {
     let dir = a.dir.to_string_lossy().into_owned();
     let urls = lib.url_items.get(&dir).cloned().unwrap_or_default();
+    // "Add Files" extras — the scanner never saw them; mirror the
+    // persisted list so the tile's count/covers include them before
+    // the first persist_url_items of the session.
+    a.added = lib
+        .added_items
+        .get(&dir)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
     // Folder albums' scan covers carry no url thumbs — merge persisted
     // url items into the fan layers.
     let web: Vec<library::CoverSrc> = urls
         .iter()
         .filter_map(|u| library::CoverSrc::web_for(u))
         .collect();
-    a.sync_url_covers(web, urls.len());
     if let Some(t) = lib.album_titles.get(&dir) {
         a.title = t.clone();
     }
@@ -122,6 +132,8 @@ fn normalize_scanned_album(lib: &settings::Library, a: &mut library::Album) {
         a.tracks
             .retain(|t| !ex.iter().any(|s| s == t.to_string_lossy().as_ref()));
     }
+    // After the exclusions — the fan rebuild reads `a.tracks`.
+    a.sync_url_covers(web, urls.len());
 }
 
 /// Smoothstep ease-in-out: slow start and end, no hard velocity changes.
@@ -572,6 +584,9 @@ struct AesRustApp {
     fs_exit: FsExitPrompt,
     /// Item/album delete confirmation — same dialog style.
     del_prompt: DeletePrompt,
+    /// Transient bottom-of-content notice ("Album already added"
+    /// after an Open Folder re-pick) — (text, egui-time expiry).
+    notice: Option<(String, f64)>,
     /// "Close emulator?" confirmation — same dialog again.
     emu_close: EmuClosePrompt,
     /// "Exit application?" confirmation — the main menu's Esc.
@@ -965,14 +980,13 @@ fn run_url_prompt(
 }
 
 /// "Create Album" (Lacrima's AddUserAlbum) — append an empty virtual
-/// album with a unique title; the strip's inline title editor arms on
-/// the new tile (it only paints in the normal view — the mini shell
-/// skips the editor, rename happens back there).
+/// album with a unique title. Returns (dir, title) so the caller arms
+/// the right inline editor: the strip's tile editor in the normal
+/// view, the albums list's title editor in the mini shell.
 fn create_virtual_album(
     albums: &mut Vec<library::Album>,
-    album_row: &mut album_row::AlbumRow,
     settings: &mut settings::Settings,
-) {
+) -> (String, String) {
     let mut title = "New Album".to_string();
     let mut n = 2;
     while albums.iter().any(|a| a.title == title) {
@@ -997,7 +1011,45 @@ fn create_virtual_album(
     });
     lib.url_items.insert(dir.clone(), Vec::new());
     settings::save(settings);
-    album_row.edit_album(&dir, &title);
+    (dir, title)
+}
+
+/// Album rename — a display-title override keyed by dir: the folder
+/// on disk is never touched and the album's url_items/order/exclusion
+/// keys stay stable. Virtual albums' records update too. Shared by
+/// the strip's inline editor (`Action::Rename`) and the mini albums
+/// list's editor (`MiniOut::rename`).
+fn apply_album_rename(
+    dir: &str,
+    title: &str,
+    albums: &mut [library::Album],
+    carousel: &mut carousel::Carousel,
+    settings: &mut settings::Settings,
+) {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return;
+    }
+    if let Some(a) = albums.iter_mut().find(|a| a.dir.to_string_lossy() == dir) {
+        a.title = title.clone();
+    }
+    let lib = &mut settings.library;
+    lib.album_titles.insert(dir.to_string(), title.clone());
+    if let Some(ia) = lib.virtual_albums.iter_mut().find(|ia| ia.dir == dir) {
+        ia.title = title.clone();
+    }
+    if carousel.album_key() == Some(dir) {
+        carousel.set_album_title(&title);
+    }
+    settings::save(settings);
+}
+
+/// The "Open Folder" pick's outcome — `Duplicate` lets the caller
+/// surface an "already added" notice instead of silently rescanning.
+enum FolderPick {
+    Cancelled,
+    Added,
+    Duplicate,
 }
 
 /// "Open Folder" (Lacrima's OpenFolderCommand) — pick a music folder,
@@ -1006,19 +1058,81 @@ fn create_virtual_album(
 fn add_music_folder(
     settings: &mut settings::Settings,
     album_row: &mut album_row::AlbumRow,
+    albums: &[library::Album],
     scan_seen: &mut std::collections::HashSet<String>,
     album_rx: &mut Option<std::sync::mpsc::Receiver<library::Album>>,
-) {
-    if let Some(dir) = rfd::FileDialog::new()
+) -> FolderPick {
+    let Some(dir) = rfd::FileDialog::new()
         .set_title("Add music folder")
         .pick_folder()
+    else {
+        return FolderPick::Cancelled;
+    };
+    // Compare canonical paths — the same folder arrived through a
+    // different spelling still counts as already added. Checked
+    // against the roots AND the scanned album dirs (a root's child
+    // folder may already sit in the list as an album).
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let same = |p: &std::path::Path| {
+        p.canonicalize()
+            .map(|c| c == canon)
+            .unwrap_or_else(|_| p == dir.as_path())
+    };
+    if settings.library.music_roots.iter().any(|r| same(r))
+        || albums.iter().any(|a| same(&a.dir))
     {
-        settings.library.music_roots.push(dir);
-        settings::save(settings);
-        album_row.reset();
-        scan_seen.clear();
-        *album_rx = Some(library::spawn_scan(&settings.library.music_roots));
+        return FolderPick::Duplicate;
     }
+    settings.library.music_roots.push(dir);
+    settings::save(settings);
+    album_row.reset();
+    scan_seen.clear();
+    *album_rx = Some(library::spawn_scan(&settings.library.music_roots));
+    FolderPick::Added
+}
+
+/// A transient bottom-of-content pill — "Album already added" after
+/// an Open Folder re-pick. `notice.1` is the egui time it expires;
+/// fades in fast and out over its last ~0.4s. Painted from the frame
+/// closure so it overlays whichever shell is up (normal or mini).
+fn paint_notice(ui: &egui::Ui, content: Rect, notice: &mut Option<(String, f64)>, s: f32) {
+    let Some((text, until)) = notice else {
+        return;
+    };
+    let now = ui.ctx().input(|i| i.time);
+    let left = (*until - now) as f32;
+    if left <= 0.0 {
+        *notice = None;
+        return;
+    }
+    let alpha = ((2.5 - left) / 0.15)
+        .min(1.0)
+        .min(left / 0.4)
+        .clamp(0.0, 1.0);
+    let ctx = ui.ctx().clone();
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(14.0 * s.max(0.75));
+    let text_c = Color32::WHITE.gamma_multiply(alpha);
+    let galley = painter.layout_no_wrap(text.clone(), font, text_c);
+    let pad = egui::Vec2::new(14.0 * s, 8.0 * s);
+    let size = galley.size() + pad * 2.0;
+    let r = Rect::from_center_size(
+        Pos2::new(
+            content.center().x,
+            content.min.y + content.height() * 0.68,
+        ),
+        size,
+    );
+    let cr = CornerRadius::same((size.y * 0.5) as u8);
+    painter.rect_filled(r, cr, Color32::from_black_alpha((225.0 * alpha) as u8));
+    painter.rect_stroke(
+        r,
+        cr,
+        Stroke::new(1.0, Color32::from_white_alpha((50.0 * alpha) as u8)),
+        StrokeKind::Inside,
+    );
+    painter.galley(r.center() - galley.size() * 0.5, galley, text_c);
+    ctx.request_repaint();
 }
 
 /// What the transport play button should start when the player can't
@@ -1310,6 +1424,7 @@ impl AesRustApp {
             alt_clean: false,
             fs_exit: FsExitPrompt::default(),
             del_prompt: DeletePrompt::default(),
+            notice: None,
             emu_close: EmuClosePrompt::default(),
             app_exit: AppExitPrompt::default(),
             decomp: decomp::DecompView::new(),
@@ -2234,6 +2349,7 @@ impl eframe::App for AesRustApp {
             alt_clean,
             fs_exit,
             del_prompt,
+            notice,
             emu_close,
             app_exit,
             decomp,
@@ -2557,7 +2673,11 @@ impl eframe::App for AesRustApp {
                         .input(|i| i.pointer.latest_pos())
                         .map(|p| album_row_rect(content, s).contains(p))
                         .unwrap_or(false);
-                if !tag_editor.is_open() && !url_prompt.is_open() && !fs_exit.open {
+                if !settings.window.mini
+                    && !tag_editor.is_open()
+                    && !url_prompt.is_open()
+                    && !fs_exit.open
+                {
                     resp.context_menu(|ui| {
                         if !over_album_row {
                             widget_menu(
@@ -2705,6 +2825,11 @@ impl eframe::App for AesRustApp {
                                 );
                             }
                         }
+                        // The albums list's inline rename — the same
+                        // title override the strip's editor applies.
+                        if let Some((dir, title)) = mout.rename {
+                            apply_album_rename(&dir, &title, albums, carousel, settings);
+                        }
                         // The mini prompt's confirmed deletes apply
                         // through the same handlers the main view's
                         // delete flow uses.
@@ -2776,10 +2901,30 @@ impl eframe::App for AesRustApp {
                                     .open(url_prompt::Kind::Playlist, &ui.ctx().clone());
                             }
                             Some(mini::MiniMenu::CreateAlbum) => {
-                                create_virtual_album(albums, album_row, settings);
+                                let (dir, title) = create_virtual_album(albums, settings);
+                                // The strip's inline editor only
+                                // paints in the normal view — arm the
+                                // albums list's own title editor.
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(
+                                        egui::Id::new("mv-album-edit"),
+                                        (dir, title, false),
+                                    );
+                                });
                             }
                             Some(mini::MiniMenu::AddFolder) => {
-                                add_music_folder(settings, album_row, scan_seen, album_rx);
+                                if let FolderPick::Duplicate = add_music_folder(
+                                    settings,
+                                    album_row,
+                                    albums,
+                                    scan_seen,
+                                    album_rx,
+                                ) {
+                                    *notice = Some((
+                                        "Album already added".to_string(),
+                                        ui.ctx().input(|i| i.time) + 2.5,
+                                    ));
+                                }
                             }
                             None => {}
                         }
@@ -2796,6 +2941,7 @@ impl eframe::App for AesRustApp {
                             url_info_rx,
                             playlist_rx,
                         );
+                        paint_notice(ui, content, notice, s);
                         return;
                     }
                     let a = nav.alpha(View::Main);
@@ -3751,7 +3897,18 @@ impl eframe::App for AesRustApp {
                 }
                 match row_action {
                     album_row::Action::AddFolder => {
-                        add_music_folder(settings, album_row, scan_seen, album_rx);
+                        if let FolderPick::Duplicate = add_music_folder(
+                            settings,
+                            album_row,
+                            albums,
+                            scan_seen,
+                            album_rx,
+                        ) {
+                            *notice = Some((
+                                "Album already added".to_string(),
+                                ui.ctx().input(|i| i.time) + 2.5,
+                            ));
+                        }
                     }
                     album_row::Action::Rescan => {
                         album_row.reset();
@@ -3942,31 +4099,11 @@ impl eframe::App for AesRustApp {
                         }
                     }
                     album_row::Action::Create => {
-                        create_virtual_album(albums, album_row, settings);
+                        let (dir, title) = create_virtual_album(albums, settings);
+                        album_row.edit_album(&dir, &title);
                     }
                     album_row::Action::Rename(dir, title) => {
-                        // A display-title override keyed by dir — the
-                        // folder name on disk is never touched and the
-                        // album's url_items/order/exclusion keys stay
-                        // stable. Virtual albums' records update too.
-                        let title = title.trim().to_string();
-                        if !title.is_empty() {
-                            if let Some(a) =
-                                albums.iter_mut().find(|a| a.dir.to_string_lossy() == dir)
-                            {
-                                a.title = title.clone();
-                            }
-                            let lib = &mut settings.library;
-                            lib.album_titles.insert(dir.clone(), title.clone());
-                            if let Some(ia) = lib.virtual_albums.iter_mut().find(|ia| ia.dir == dir)
-                            {
-                                ia.title = title.clone();
-                            }
-                            if carousel.album_key() == Some(dir.as_str()) {
-                                carousel.set_album_title(&title);
-                            }
-                            settings::save(settings);
-                        }
+                        apply_album_rename(&dir, &title, albums, carousel, settings);
                     }
                     album_row::Action::Opened(dir) => {
                         // Double-click loads the album's tracks into the
@@ -4576,6 +4713,7 @@ impl eframe::App for AesRustApp {
                     }
                     ui.ctx().request_repaint();
                 }
+                paint_notice(ui, content, notice, s);
                 // Mode-switch veil — last thing painted over the
                 // content so the shell swap lands on black.
                 if switch_fade > 0.0 {
@@ -6114,26 +6252,34 @@ fn persist_url_items(
     };
     let urls = carousel.url_items();
     if let Some(a) = albums.iter_mut().find(|a| a.dir.to_string_lossy() == key) {
-        // Rebuilds the tile's web fan layers too — mirroring the
-        // loaded items' covers (resolved thumbs where they landed),
-        // so adds/removes/order changes propagate to the tile.
-        let covers = carousel.url_covers();
-        a.sync_url_covers(covers, urls.len());
         // "Add Files" items — non-url children that aren't part of
         // the album's scan — persist separately so reopen restores
-        // them (deletions drop out here automatically).
+        // them (deletions drop out here automatically). `a.added`
+        // mirrors them for the tile's count/covers BEFORE the fan
+        // rebuild below reads it.
         let scan: std::collections::HashSet<String> = a
             .tracks
             .iter()
             .map(|t| t.to_string_lossy().into_owned())
             .collect();
-        let added: Vec<String> = carousel
+        let added: Vec<std::path::PathBuf> = carousel
             .file_items()
             .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .filter(|p| !scan.contains(p))
+            .filter(|p| !scan.contains(&p.to_string_lossy().into_owned()))
             .collect();
-        settings.library.added_items.insert(key.clone(), added);
+        a.added = added.clone();
+        settings.library.added_items.insert(
+            key.clone(),
+            added
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        );
+        // Rebuilds the tile's fan layers too — mirroring the loaded
+        // items' covers (scan/added tag art + resolved web thumbs),
+        // so adds/removes/order changes propagate to the tile.
+        let covers = carousel.url_covers();
+        a.sync_url_covers(covers, urls.len());
     }
     settings.library.url_items.insert(key.clone(), urls);
     // The full item order (files + urls) persists too, so a drag
@@ -8630,6 +8776,7 @@ mod tests {
             tracks: Vec::new(),
             covers: Vec::new(),
             url_count,
+            added: Vec::new(),
         };
         let albums = vec![
             mk("apl://Mix", 3),

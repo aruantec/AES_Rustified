@@ -54,6 +54,11 @@ pub struct Album {
     /// caller — the scanner doesn't see settings). Gates the tile
     /// menu's "Export Playlist".
     pub url_count: usize,
+    /// "Add Files" extras mirrored from Settings.Library.AddedItems —
+    /// local files outside the scan. Kept OFF `tracks` so the
+    /// scan-vs-added split in persist_url_items survives; the tile's
+    /// count, cover fan and artist probe read them alongside tracks.
+    pub added: Vec<PathBuf>,
 }
 
 /// Scan `roots` on a background thread; each album is sent the moment
@@ -186,6 +191,7 @@ fn build_album(
         tracks,
         covers,
         url_count: 0,
+        added: Vec::new(),
     }
 }
 
@@ -221,48 +227,43 @@ impl Album {
             tracks: Vec::new(),
             covers: Vec::new(),
             url_count: 0,
+            added: Vec::new(),
         }
     }
 
-    /// Rebuild the web-derived fan layers after the album's url items
-    /// change — a created/imported album starts with no covers and the
-    /// tile must pick up thumbnails as items are added, dropped on
-    /// remove/clear, and refreshed as real thumbs resolve. Folder/tag
-    /// art is kept, and the tile's top cover keeps its position (web
-    /// layers fan in beneath it). `url_count` is the true url-item
-    /// count — `web` may be shorter when items have no thumb host.
+    /// Rebuild the presentation fan after items change — a created/
+    /// imported album starts with no covers and the tile must pick up
+    /// art as items are added, dropped on remove/clear, and refreshed
+    /// as real thumbs resolve. `self.added` must already mirror the
+    /// persisted AddedItems — its files' tag covers join the fan like
+    /// scan tracks' art (build_album puts the first items' tag art in
+    /// the fan, the folder cover file on top). `url_count` is the
+    /// true url-item count — `web` may be shorter when items have no
+    /// thumb host.
     pub fn sync_url_covers(&mut self, web: Vec<CoverSrc>, url_count: usize) {
-        let base: Vec<CoverSrc> = self
+        // Folder art file stays the top cover; item tag art (scan
+        // tracks, then Add Files extras) fans under it, then url
+        // thumbs fill the remaining fan slots. Nothing beats the
+        // first item's art — track, extra, or url thumb.
+        let folder = self
             .covers
             .iter()
-            .filter(|c| !matches!(c, CoverSrc::Web(_)))
-            .cloned()
+            .find(|c| matches!(c, CoverSrc::File(f) if f.starts_with(&self.dir)))
+            .cloned();
+        let tag_fan: Vec<CoverSrc> = self
+            .tracks
+            .iter()
+            .chain(&self.added)
+            .take(MAX_COVERS - 1)
+            .map(|p| CoverSrc::Tag(p.clone()))
             .collect();
-        let (fan, top) = match base.split_last() {
-            Some((t, rest)) => (rest.to_vec(), vec![t.clone()]),
-            None => (Vec::new(), Vec::new()),
-        };
-        if top.is_empty() {
-            // No folder/tag art — a url-only album leads with its
-            // first item: fan = the first MAX_COVERS-1 thumbs, top =
-            // the FIRST item's thumb (build_album puts the first
-            // child's art on top when there's no folder cover file;
-            // the same duplication keeps url albums identical).
-            self.covers = web
-                .iter()
-                .take(MAX_COVERS - 1)
-                .cloned()
-                .chain(web.first().cloned())
-                .collect();
-        } else {
-            // Folder art stays on top — web thumbs fan in beneath it.
-            let web_slots = MAX_COVERS.saturating_sub(fan.len() + top.len());
-            self.covers = fan
-                .into_iter()
-                .chain(web.into_iter().take(web_slots))
-                .chain(top)
-                .collect();
-        }
+        let top = folder.or_else(|| tag_fan.first().cloned().or_else(|| web.first().cloned()));
+        let web_slots = (MAX_COVERS - 1).saturating_sub(tag_fan.len());
+        self.covers = tag_fan
+            .into_iter()
+            .chain(web.iter().take(web_slots).cloned())
+            .chain(top)
+            .collect();
         self.url_count = url_count;
     }
 }
@@ -297,6 +298,7 @@ impl Album {
             tracks: Vec::new(),
             covers,
             url_count: urls.len(),
+            added: Vec::new(),
         }
     }
 }

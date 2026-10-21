@@ -784,6 +784,7 @@ impl EmuView {
                         .unwrap_or_default()
                 },
                 url_count: 0,
+                added: Vec::new(),
             })
             .collect();
         Self {
