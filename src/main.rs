@@ -4194,6 +4194,22 @@ impl eframe::App for AesRustApp {
                 let title_bar_before = settings.effects.show_album_title_bar;
                 let slide = overlay_slide;
                 if slide > 0.001 {
+                    // Freeze the overlay's own scale while it's open —
+                    // the Scaling slider lives inside this panel, so
+                    // laying it out with the live `s` resizes the
+                    // panel/track under the cursor and the drag value
+                    // feeds back into itself (jittery runaway). The
+                    // app behind still rescales live; the panel picks
+                    // up the new factor on reopen.
+                    let overlay_s = ui.ctx().data_mut(|d| {
+                        let id = egui::Id::new("settings-overlay-s");
+                        if slide <= 0.05 {
+                            d.insert_temp(id, s);
+                            s
+                        } else {
+                            d.get_temp::<f32>(id).unwrap_or(s)
+                        }
+                    });
                     settings_overlay(
                         ui,
                         content,
@@ -4206,7 +4222,7 @@ impl eframe::App for AesRustApp {
                         ytdlp,
                         emu,
                         shadertoy.as_ref().map(|t| t.names()).unwrap_or(&[]),
-                        s,
+                        overlay_s,
                     );
                 }
                 if *settings_open && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -6217,7 +6233,12 @@ fn settings_overlay(
     // The footer holds the 320*s directory button plus the right-anchored
     // version block; below ~480*s they overlap, which the old 240px floor
     // allowed in the mini shell.
-    let w = (content.width() * 0.38).clamp(520.0 * scale, content.width());
+    // min().max() order matters: on a window narrower than 520*s the
+    // floor exceeds the content width — clamp() would panic — so cap
+    // the floor at the content width and the panel fills the window.
+    let w = (content.width() * 0.38)
+        .max((520.0 * scale).min(content.width()))
+        .min(content.width());
     // The panel starts below the title-bar separator — sitting flush
     // would cover the stroke's lower half. In the mini shell the
     // separator sits on the raised chrome band, above content.min.y.

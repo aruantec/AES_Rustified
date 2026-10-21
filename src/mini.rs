@@ -113,6 +113,16 @@ pub(crate) fn view(
         ctx.data_mut(|d| d.get_temp(del_id)).unwrap_or_default();
     let interactive = interactive && del.is_none();
 
+    // Mini content scale: the shell is window-proportional (everything
+    // is a fraction of the bar height `h`), so the UI scale slider
+    // scales `h` rather than individual metrics. Anchored at
+    // ScaleFactor 2.0 — the factor the layout was tuned at — so 1.0
+    // zooms everything to 2x and 3.0 densifies to ~2/3, matching the
+    // normal shell's direction (higher factor = denser).
+    // Capped at half the window height so a big zoom factor can't
+    // push the rows below the bar off the bottom of a small window.
+    let h = (BAR_H * s * 2.0).min(content.height() * 0.5);
+
     // The header gradient is ONE continuous wash from the window top
     // (behind the title bar — its fill is transparent in mini mode)
     // through the now-playing bar, fading over ~two bar heights into
@@ -121,7 +131,7 @@ pub(crate) fn view(
     let title_h = crate::MINI_TITLE_BAR_HEIGHT * s;
     let header = Rect::from_min_max(
         Pos2::new(content.min.x, content.min.y - title_h),
-        Pos2::new(content.max.x, content.min.y + 2.0 * BAR_H),
+        Pos2::new(content.max.x, content.min.y + 2.0 * h),
     );
     let hp = painter.clone().with_clip_rect(header);
     // The zone under the title bar otherwise shows the bare window
@@ -152,8 +162,7 @@ pub(crate) fn view(
     // All metrics are fractions of the bar height `h` — cover fills
     // it edge-to-edge minus a small pad, controls keep the same
     // proportions, so the bar looks identical at every scale.
-    let bar_rect = Rect::from_min_size(content.min, Vec2::new(content.width(), BAR_H));
-    let h = bar_rect.height();
+    let bar_rect = Rect::from_min_size(content.min, Vec2::new(content.width(), h));
     // Lacrima insets the bar's content horizontally (~12px).
     let pad_x = 0.13 * h;
     let pad_y = 0.06 * h;
