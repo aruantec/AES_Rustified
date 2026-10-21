@@ -2770,6 +2770,7 @@ impl eframe::App for AesRustApp {
                             s,
                             settings.window.width / s,
                             settings.ui.progress_knob,
+                            settings.ui.mini_btn_scale,
                             search,
                             album_search,
                         );
@@ -4336,8 +4337,10 @@ impl eframe::App for AesRustApp {
                     settings.effects.lacrima_cover_color,
                 );
                 // Tuple PartialEq stops at 12 elements — the title-bar
-                // toggle compares separately instead of joining fx_before.
+                // toggle and the Ui tab's mini-shell options compare
+                // separately instead of joining fx_before.
                 let title_bar_before = settings.effects.show_album_title_bar;
+                let ui_before = (settings.ui.progress_knob, settings.ui.mini_btn_scale);
                 let slide = overlay_slide;
                 if slide > 0.001 {
                     // Freeze the overlay's own scale while it's open —
@@ -4446,6 +4449,7 @@ impl eframe::App for AesRustApp {
                         settings.effects.lacrima_cover_color,
                     )
                     || settings.effects.show_album_title_bar != title_bar_before
+                    || (settings.ui.progress_knob, settings.ui.mini_btn_scale) != ui_before
                     || settings.equalizer.bands != eq_before;
                 // Audio-tab changes apply live to the player — Lacrima
                 // mirrors the same set onto AudioPlayer and recomputes
@@ -6765,6 +6769,39 @@ fn ui_tab_effects(
         Color32::from_gray(225).gamma_multiply(t),
     );
     y += 43.0 * s;
+
+    // "Mini buttons" — the mini shell's media-controls scale on top
+    // of its bar-height sizing; only relevant (and only shown) while
+    // the mini shell is active. The 1.5 ceiling keeps the play button
+    // inside the bar: PLAY_BTN x CTRL_K x 1.5 = 82.5% of its height;
+    // 0.7 is the "slightly smaller than tuned" floor.
+    if settings.window.mini {
+        text(&painter, y, "Mini buttons");
+        y += 30.0 * s;
+        let btn_track = Rect::from_min_size(Pos2::new(x, y), Vec2::new(260.0 * s, 16.0 * s));
+        let mut bs = settings.ui.mini_btn_scale;
+        if pill_slider(
+            ui,
+            btn_track,
+            "mini-btn-scale",
+            &mut bs,
+            0.7,
+            1.5,
+            0.01,
+            t,
+            None,
+        ) {
+            settings.ui.mini_btn_scale = bs;
+        }
+        painter.text(
+            Pos2::new(btn_track.max.x + 8.0 * s, btn_track.center().y),
+            Align2::LEFT_CENTER,
+            format!("{:.2}X", settings.ui.mini_btn_scale),
+            label.clone(),
+            Color32::from_gray(225).gamma_multiply(t),
+        );
+        y += 43.0 * s;
+    }
 
     painter.text(
         Pos2::new(x, y),

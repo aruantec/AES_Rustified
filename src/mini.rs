@@ -107,6 +107,9 @@ pub(crate) fn view(
     norm_w: f32,
     // UI tab's "Show knob" — the pill bars' grab-knob affordance.
     progress_knob: bool,
+    // UI tab's "Mini buttons" — the media-controls scale on top of
+    // the bar-height sizing.
+    btn_scale: f32,
     // The footer-right search pill — one widget per filter so each
     // list keeps its own text: `search` filters the playlist's items
     // (the top-right pill's data), `album_search` the albums (the
@@ -183,8 +186,11 @@ pub(crate) fn view(
     let cy = bar_rect.center().y;
 
     // Media controls, right-packed at the bar's edge (the full
-    // band's center cluster at bar-relative scale).
-    let cs = h * CTRL_K;
+    // band's center cluster at bar-relative scale). The UI tab's
+    // "Mini buttons" slider scales them on top — clamped so the
+    // play button (PLAY_BTN x cs) can never exceed the bar height
+    // (0.55 x scale <= 1.0 -> scale <= ~1.8) and can't invert.
+    let cs = h * CTRL_K * btn_scale.clamp(0.5, 1.6);
     let ctrl_w = transport::MINI_CONTROLS_SPAN * cs;
     let ctrl_rect = Rect::from_min_max(
         Pos2::new(bar_rect.max.x - pad_x - ctrl_w, bar_rect.min.y),

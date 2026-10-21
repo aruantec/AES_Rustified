@@ -610,6 +610,11 @@ pub struct Ui {
     /// progress bars (carousel + mini seek/volume). Off keeps the
     /// plain fill look.
     pub progress_knob: bool,
+    /// "Mini buttons" (UI tab) — the mini shell's media-controls
+    /// scale on top of its bar-height sizing: 1.0 is the tuned look,
+    /// ~0.7 is the minimum, ~1.5 fills the bar without the play
+    /// button clipping its edges.
+    pub mini_btn_scale: f32,
 }
 
 impl Default for Ui {
@@ -618,6 +623,7 @@ impl Default for Ui {
             scale_factor: 1.0,
             scale_manual: None,
             progress_knob: false,
+            mini_btn_scale: 1.0,
         }
     }
 }
