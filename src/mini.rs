@@ -12,8 +12,8 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Vec2};
 use eframe::egui::epaint::{Mesh, Shape, Vertex};
 
 use crate::{
-    album_row, audio, carousel, ellipsize, equalizer, fmt_time, library, settings,
-    spectrum_bar, transport, waveform_bar,
+    album_row, audio, carousel, ellipsize, equalizer, fmt_time, library, search_pill,
+    settings, spectrum_bar, transport, waveform_bar,
 };
 
 /// The mini window's floor — below this the rows stop fitting.
@@ -57,6 +57,9 @@ pub(crate) struct MiniOut {
     /// Committed inline album-title edit — the owner applies the same
     /// rename path as the strip's `Action::Rename`.
     pub rename: Option<(String, String)>,
+    /// Playlist row's "Edit Metadata" — the owner opens the tag
+    /// editor modal (its compact layout paints over the mini shell).
+    pub edit: Option<PathBuf>,
 }
 
 /// The mini "+" menu's entries — mapped onto the same code the
@@ -104,6 +107,12 @@ pub(crate) fn view(
     norm_w: f32,
     // UI tab's "Show knob" — the pill bars' grab-knob affordance.
     progress_knob: bool,
+    // The footer-right search pill — one widget per filter so each
+    // list keeps its own text: `search` filters the playlist's items
+    // (the top-right pill's data), `album_search` the albums (the
+    // band pill's data). Only the active list's pill paints.
+    search: &mut search_pill::SearchPill,
+    album_search: &mut search_pill::SearchPill,
 ) -> MiniOut {
     let painter = ui.painter().clone();
     painter.rect_filled(content, 0, grid_bg);
@@ -774,6 +783,50 @@ pub(crate) fn view(
         });
     }
 
+    // Footer-right search — the expanding pill docked left of the
+    // resize dots (the normal view's top-right pill, h-scaled to the
+    // footer). It filters whichever list is active: the albums list
+    // shows `album_search`'s box, the playlist `search`'s — the same
+    // two filters the normal view keeps.
+    let s_pill = (footer_h * 0.62) / 35.0;
+    let pill = if albums_open {
+        &mut *album_search
+    } else {
+        &mut *search
+    };
+    pill.ui(
+        ui,
+        content.max.x - 30.0 * u,
+        foot_top + (footer_h - 35.0 * s_pill) * 0.5,
+        if albums_open { "Albums" } else { "Tracks" },
+        true,
+        false,
+        1.0,
+        interactive,
+        s_pill,
+    );
+    // Esc collapses an open pill — the shell's Esc ladder lives in
+    // the normal view stack mini returns before.
+    if interactive && (search.is_open() || album_search.is_open()) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            search.close(&ctx);
+            album_search.close(&ctx);
+        }
+    }
+    // Ctrl+F focuses the active list's pill — the normal view's
+    // binding.
+    if interactive
+        && !ctx.text_edit_focused()
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+    {
+        if albums_open {
+            album_search.open();
+        } else {
+            search.open();
+        }
+    }
+
     let list_top = iy + icon + 0.10 * h + h * ext_t + 0.06 * h;
     let list = Rect::from_min_max(
         Pos2::new(content.min.x + pad_x, list_top),
@@ -878,8 +931,23 @@ pub(crate) fn view(
         let mut revealed: Option<PathBuf> =
             ctx.data_mut(|d| d.get_temp(reveal_id)).unwrap_or(None);
 
+        // The footer-right search pill filters whichever list is
+        // active — `pq` maps onto the cover view's CoverItems filter,
+        // `aq` onto the strip's album filter. Reorders stay off while
+        // a filter hides rows (the cover view's reorderable rule).
+        let pq = search.text.trim().to_lowercase();
+        let pvis: HashSet<usize> = if pq.is_empty() {
+            HashSet::new()
+        } else {
+            carousel.visible(&search.text).into_iter().collect()
+        };
+        if !pq.is_empty() {
+            drag = None;
+        }
+
         let rows: Vec<(usize, PathBuf, String, String, Option<f64>)> = carousel
             .item_rows()
+            .filter(|(i, ..)| pq.is_empty() || pvis.contains(i))
             .map(|(i, p, t, a, d)| (i, p.to_path_buf(), t.to_string(), a.to_string(), d))
             .collect();
         let n = rows.len();
@@ -927,6 +995,22 @@ pub(crate) fn view(
             }
         }
 
+        // The active list's filter — `avis` carries REAL album
+        // indices so `asel`, the dir-keyed set and the reorder math
+        // all stay in album space; only the render loop and arrow nav
+        // walk it.
+        let aq = album_search.text.trim().to_lowercase();
+        let avis: Vec<usize> = if aq.is_empty() {
+            (0..albums.len()).collect()
+        } else {
+            albums
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.title.to_lowercase().contains(&aq))
+                .map(|(i, _)| i)
+                .collect()
+        };
+
         // Keyboard: plain arrows move the one-row selection like a
         // ListBox (collapse to the landing row, scrolled into view);
         // Shift+arrows move the selection block one row — album_row's
@@ -972,7 +1056,9 @@ pub(crate) fn view(
                 // (album_row's move_selection semantics — `to` counts
                 // positions in the list without the moved rows).
                 let an = albums.len();
-                if mv != 0 && an >= 2 {
+                // Reorders stay off while the filter hides cards — a
+                // shown-space move can't map back to album space.
+                if mv != 0 && an >= 2 && aq.is_empty() {
                     let from = album_sel_indices(albums, &asel_set, asel);
                     let m = from.len();
                     if m > 0 {
@@ -990,7 +1076,21 @@ pub(crate) fn view(
                         }
                     }
                 } else if nav != 0 && an > 0 {
-                    asel = (asel as i32 + nav).clamp(0, an as i32 - 1) as usize;
+                    // Arrow nav walks VISIBLE cards — `asel` stays a
+                    // real index; a filtered anchor lands on the next
+                    // card that survived the query.
+                    asel = if aq.is_empty() {
+                        (asel as i32 + nav).clamp(0, an as i32 - 1) as usize
+                    } else {
+                        let pos = avis.iter().position(|&i| i == asel).unwrap_or(0);
+                        avis.get(
+                            (pos as i32 + nav)
+                                .clamp(0, avis.len().saturating_sub(1) as i32)
+                                as usize,
+                        )
+                        .copied()
+                        .unwrap_or(asel)
+                    };
                     asel_set.clear();
                     asel_set
                         .insert(albums[asel].dir.to_string_lossy().into_owned());
@@ -1028,7 +1128,7 @@ pub(crate) fn view(
                         d.insert_temp(ui.id().with("mv-del-sel"), 1usize);
                     });
                 }
-            } else if mv != 0 && m > 0 && n >= 2 {
+            } else if mv != 0 && m > 0 && n >= 2 && pq.is_empty() {
                 let from: Vec<usize> = is_sel
                     .iter()
                     .enumerate()
@@ -1208,7 +1308,7 @@ pub(crate) fn view(
                 lp.set_opacity(1.0 - at);
 
                 let mut sel_dirty = false;
-                for (i, path, title, album, dur) in rows.iter() {
+                for (ri, (i, path, title, album, dur)) in rows.iter().enumerate() {
                     let (rect, resp) = ui.allocate_exact_size(
                         Vec2::new(w, row_h),
                         egui::Sense::click_and_drag(),
@@ -1235,7 +1335,7 @@ pub(crate) fn view(
                         if drag.is_none() {
                             sel.clear();
                             sel.insert(path.clone());
-                            anchor = *i;
+                            anchor = ri;
                             sel_dirty = true;
                         }
                     }
@@ -1250,9 +1350,11 @@ pub(crate) fn view(
                                     sel.insert(path.clone());
                                 }
                             } else if mods.shift {
-                                let (a, b) = (anchor.min(*i), anchor.max(*i));
-                                for (j, p2, ..) in rows.iter() {
-                                    if *j >= a && *j <= b {
+                                // Range over VISIBLE rows — a hidden
+                                // row can't join a shift-selection.
+                                let (a, b) = (anchor.min(ri), anchor.max(ri));
+                                for (j2, (_, p2, ..)) in rows.iter().enumerate() {
+                                    if (a..=b).contains(&j2) {
                                         sel.insert(p2.clone());
                                     }
                                 }
@@ -1260,21 +1362,24 @@ pub(crate) fn view(
                                 sel.clear();
                                 sel.insert(path.clone());
                             }
-                            anchor = *i;
+                            anchor = ri;
                             sel_dirty = true;
                         }
                         if resp.double_clicked() {
                             out.play = Some(path.clone());
                         }
-                        if resp.drag_started() {
+                        // Reorder drags stay off while the filter
+                        // hides rows — a shown-space drop can't map
+                        // back to item space.
+                        if pq.is_empty() && resp.drag_started() {
                             if let Some(pos) = resp.interact_pointer_pos() {
                                 if !selected {
                                     sel.clear();
                                     sel.insert(path.clone());
-                                    anchor = *i;
+                                    anchor = ri;
                                     sel_dirty = true;
                                 }
-                                drag = Some((pos.y - rect.min.y, *i));
+                                drag = Some((pos.y - rect.min.y, ri));
                             }
                         }
                         // Right-click a row — the footer "+" menu's
@@ -1301,6 +1406,19 @@ pub(crate) fn view(
                                 }
                             }
                             ui.separator();
+                            // The pointed row's own actions — the
+                            // tag editor modal like the cover view's
+                            // OpenMetadataCommand.
+                            if ui
+                                .button(
+                                    egui::RichText::new("Edit Metadata")
+                                        .font(font.clone()),
+                                )
+                                .clicked()
+                            {
+                                out.edit = Some(path.clone());
+                                ui.close();
+                            }
                             if ui
                                 .button(
                                     egui::RichText::new("Delete Item")
@@ -1330,14 +1448,14 @@ pub(crate) fn view(
                     // While dragging, selected rows leave their slots
                     // and ride the pointer stack — the gap is where
                     // the dashed holes are.
-                    if drag.is_some() && is_sel[*i] {
+                    if drag.is_some() && is_sel[ri] {
                         continue;
                     }
                     let slot = if let Some((_, t)) = drag {
-                        let p = *i - is_sel[..*i].iter().filter(|b| **b).count();
+                        let p = ri - is_sel[..ri].iter().filter(|b| **b).count();
                         (p + if p >= t { m } else { 0 }) as f32
                     } else {
-                        *i as f32
+                        ri as f32
                     };
                     let cur0 = disp.get(path).copied().unwrap_or(slot);
                     let cur = if (cur0 - slot).abs() < 0.02 {
@@ -1347,7 +1465,7 @@ pub(crate) fn view(
                         cur0 + (slot - cur0) * follow
                     };
                     disp.insert(path.clone(), cur);
-                    let r = rect.translate(Vec2::new(0.0, (cur - *i as f32) * row_h));
+                    let r = rect.translate(Vec2::new(0.0, (cur - ri as f32) * row_h));
                     if !r.intersects(list) {
                         continue;
                     }
@@ -1399,8 +1517,8 @@ pub(crate) fn view(
                     if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
                         let top = pos.y - grab;
                         let mut j = 0;
-                        for (i, path, title, album, dur) in rows.iter() {
-                            if !is_sel[*i] {
+                        for (ri, (i, path, title, album, dur)) in rows.iter().enumerate() {
+                            if !is_sel[ri] {
                                 continue;
                             }
                             // A timed blend sweeps the row from its
@@ -1410,7 +1528,7 @@ pub(crate) fn view(
                             // Past that the row is pinned — stack drags
                             // track the pointer with no lag.
                             let tgt = (top + j as f32 * row_h - content_y0) / row_h;
-                            let cur0 = disp.get(path).copied().unwrap_or(*i as f32);
+                            let cur0 = disp.get(path).copied().unwrap_or(ri as f32);
                             let e = ease_in_out_quad((drag_t / 0.5).min(1.0));
                             let cur = if e >= 1.0 {
                                 tgt
@@ -1501,6 +1619,11 @@ pub(crate) fn view(
         // The delete dialog's focused-button slot lives on the view
         // ui — grab its id here where `ui` still is that ui.
         let delsel_id = ui.id().with("mv-del-sel");
+        // A live album drag can't survive the filter hiding cards —
+        // the drop slot would be computed in shown space.
+        if !aq.is_empty() {
+            adrag = None;
+        }
         if at > 0.0 {
             // Artists resolve lazily — one worker pass fills the
             // whole map (dir → artist) so the list never blocks on
@@ -1795,7 +1918,12 @@ pub(crate) fn view(
                             Color32::from_gray(150),
                         );
                     };
-                    for (i, a) in albums.iter().enumerate() {
+                    // `avis` carries real album indices — the
+                    // selection set, `asel` and the drop math all
+                    // stay in album space while only matching cards
+                    // paint.
+                    for &i in &avis {
+                        let a = &albums[i];
                         let (rect, resp) = ui.allocate_exact_size(
                             Vec2::new(w, pitch),
                             egui::Sense::click_and_drag(),
@@ -1897,7 +2025,9 @@ pub(crate) fn view(
                                 albums_on = false;
                                 ctx.data_mut(|d| d.insert_temp(ab_id, false));
                             }
-                            if resp.drag_started() {
+                            // Like the playlist — no reorder drag
+                            // while a filter hides cards.
+                            if aq.is_empty() && resp.drag_started() {
                                 if let Some(pos) = resp.interact_pointer_pos() {
                                     // Grabbing an unselected card
                                     // selects just it — the playlist's

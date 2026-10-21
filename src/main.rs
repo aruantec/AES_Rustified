@@ -2770,6 +2770,8 @@ impl eframe::App for AesRustApp {
                             s,
                             settings.window.width / s,
                             settings.ui.progress_knob,
+                            search,
+                            album_search,
                         );
                         if let Some(t) = mout.seek {
                             seek_secs = Some(t);
@@ -2829,6 +2831,11 @@ impl eframe::App for AesRustApp {
                         // title override the strip's editor applies.
                         if let Some((dir, title)) = mout.rename {
                             apply_album_rename(&dir, &title, albums, carousel, settings);
+                        }
+                        // Playlist row's "Edit Metadata" — the tag
+                        // editor's compact overlay paints below.
+                        if let Some(p) = mout.edit {
+                            tag_editor.open(&ui.ctx().clone(), p);
                         }
                         // The mini prompt's confirmed deletes apply
                         // through the same handlers the main view's
@@ -2930,6 +2937,26 @@ impl eframe::App for AesRustApp {
                         }
                         // The prompt overlay paints in the normal view
                         // stack mini returns before — render it here.
+                        // Tag editor modal — the normal view's stack
+                        // is unreachable past the return, so the
+                        // compact layout paints here. Saves refresh
+                        // through the same path the main view drains.
+                        if tag_editor.is_open() {
+                            tag_editor.ui_compact(ui, content, s);
+                        }
+                        if let Some(saved) = tag_editor.take_saved() {
+                            on_tag_saved(
+                                &saved,
+                                album_row,
+                                carousel,
+                                url_info_rx,
+                                track_info_rx,
+                                playing_track.as_deref(),
+                                playing_cover,
+                                playing_cover_rx,
+                                ui.ctx(),
+                            );
+                        }
                         run_url_prompt(
                             ui,
                             content,
@@ -4267,65 +4294,19 @@ impl eframe::App for AesRustApp {
                 }
                 // A finished save: refresh the item labels, drop the
                 // cached cover so it re-decodes, and re-read the disc
-                // art if it's the playing track. Stream items edit the
-                // local meta cache — refresh goes through the url-info
-                // path and the cover override file.
+                // art if it's the playing track.
                 if let Some(saved) = tag_editor.take_saved() {
-                    if library::is_url(&saved) {
-                        let url = saved.to_string_lossy().into_owned();
-                        // Drop every texture keyed on cover sources this
-                        // item may use: the override file, the guessed
-                        // ladder, and the resolved thumb src.
-                        album_row.invalidate_cover(&library::CoverSrc::File(
-                            crate::meta_cache::cover_path(&url),
-                        ));
-                        if let Some(src) = library::CoverSrc::web_for(&url) {
-                            album_row.invalidate_cover(&src);
-                        }
-                        if let Some(t) = crate::meta_cache::load(&url).and_then(|m| m.thumb) {
-                            album_row.invalidate_cover(&library::CoverSrc::Web(vec![t]));
-                        }
-                        if let Some((tracks, title)) = carousel.info_refresh_args() {
-                            *url_info_rx = Some(library::spawn_url_info(tracks, title));
-                        }
-                        // Re-read the now-playing art off the UI thread —
-                        // without an override this is a remote fetch.
-                        if playing_track.as_deref() == Some(saved.as_path()) {
-                            let src = library::CoverSrc::File(crate::meta_cache::cover_path(&url));
-                            let src = if crate::meta_cache::cover_path(&url).exists() {
-                                Some(src)
-                            } else {
-                                library::CoverSrc::web_for(&url)
-                            };
-                            if let Some(src) = src {
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                let t = saved.clone();
-                                std::thread::Builder::new()
-                                    .name("aes-cover-fetch".into())
-                                    .spawn(move || {
-                                        let _ = tx.send((t, library::decode_cover(&src)));
-                                    })
-                                    .ok();
-                                *playing_cover_rx = Some(rx);
-                            }
-                        }
-                    } else {
-                        album_row.invalidate_cover(&library::CoverSrc::Tag(saved.clone()));
-                        if let Some((tracks, title)) = carousel.info_refresh_args() {
-                            *track_info_rx = Some(library::spawn_track_info(tracks, title));
-                        }
-                        if playing_track.as_deref() == Some(saved.as_path()) {
-                            if let Some(img) =
-                                library::decode_cover(&library::CoverSrc::Tag(saved.clone()))
-                            {
-                                *playing_cover = Some(ui.ctx().load_texture(
-                                    "playing-cover",
-                                    img,
-                                    egui::TextureOptions::LINEAR,
-                                ));
-                            }
-                        }
-                    }
+                    on_tag_saved(
+                        &saved,
+                        album_row,
+                        carousel,
+                        url_info_rx,
+                        track_info_rx,
+                        playing_track.as_deref(),
+                        playing_cover,
+                        playing_cover_rx,
+                        ui.ctx(),
+                    );
                 }
                 // The transport's cover-layout toggle persists
                 // CoverLayoutMode.
@@ -6292,6 +6273,81 @@ fn persist_url_items(
             .collect(),
     );
     settings::save(settings);
+}
+
+/// A finished metadata save — refresh the item labels, drop the
+/// cached cover so it re-decodes, and re-read the disc art if it's
+/// the playing track. Stream items edit the local meta cache —
+/// refresh goes through the url-info path and the cover override
+/// file. Shared by the normal view's tag editor and the mini shell's
+/// compact one.
+#[allow(clippy::too_many_arguments)]
+fn on_tag_saved(
+    saved: &std::path::Path,
+    album_row: &mut album_row::AlbumRow,
+    carousel: &carousel::Carousel,
+    url_info_rx: &mut Option<
+        std::sync::mpsc::Receiver<Vec<(std::path::PathBuf, library::TrackInfo)>>,
+    >,
+    track_info_rx: &mut Option<std::sync::mpsc::Receiver<Vec<library::TrackInfo>>>,
+    playing_track: Option<&std::path::Path>,
+    playing_cover: &mut Option<egui::TextureHandle>,
+    playing_cover_rx: &mut Option<
+        std::sync::mpsc::Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>,
+    >,
+    ctx: &egui::Context,
+) {
+    if library::is_url(saved) {
+        let url = saved.to_string_lossy().into_owned();
+        // Drop every texture keyed on cover sources this item may
+        // use: the override file, the guessed ladder, and the
+        // resolved thumb src.
+        album_row.invalidate_cover(&library::CoverSrc::File(crate::meta_cache::cover_path(&url)));
+        if let Some(src) = library::CoverSrc::web_for(&url) {
+            album_row.invalidate_cover(&src);
+        }
+        if let Some(t) = crate::meta_cache::load(&url).and_then(|m| m.thumb) {
+            album_row.invalidate_cover(&library::CoverSrc::Web(vec![t]));
+        }
+        if let Some((tracks, title)) = carousel.info_refresh_args() {
+            *url_info_rx = Some(library::spawn_url_info(tracks, title));
+        }
+        // Re-read the now-playing art off the UI thread — without an
+        // override this is a remote fetch.
+        if playing_track == Some(saved) {
+            let src = library::CoverSrc::File(crate::meta_cache::cover_path(&url));
+            let src = if crate::meta_cache::cover_path(&url).exists() {
+                Some(src)
+            } else {
+                library::CoverSrc::web_for(&url)
+            };
+            if let Some(src) = src {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let t = saved.to_path_buf();
+                std::thread::Builder::new()
+                    .name("aes-cover-fetch".into())
+                    .spawn(move || {
+                        let _ = tx.send((t, library::decode_cover(&src)));
+                    })
+                    .ok();
+                *playing_cover_rx = Some(rx);
+            }
+        }
+    } else {
+        album_row.invalidate_cover(&library::CoverSrc::Tag(saved.to_path_buf()));
+        if let Some((tracks, title)) = carousel.info_refresh_args() {
+            *track_info_rx = Some(library::spawn_track_info(tracks, title));
+        }
+        if playing_track == Some(saved) {
+            if let Some(img) = library::decode_cover(&library::CoverSrc::Tag(saved.to_path_buf())) {
+                *playing_cover = Some(ctx.load_texture(
+                    "playing-cover",
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+    }
 }
 
 /// "m:ss" / "h:mm:ss" (the waveform bar's TimeSpanConverter format).

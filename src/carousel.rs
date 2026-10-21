@@ -1226,7 +1226,7 @@ impl Carousel {
 
     /// Item indices passing `filter` (MusicView's CoverItems filter —
     /// matches title, artist or album, case-insensitive).
-    fn visible(&self, filter: &str) -> Vec<usize> {
+    pub(crate) fn visible(&self, filter: &str) -> Vec<usize> {
         let q = filter.trim().to_lowercase();
         if q.is_empty() {
             return (0..self.items.len()).collect();

@@ -366,6 +366,17 @@ impl TagEditor {
     /// Painted as the last content layer of the music view (above the
     /// carousel, below the window's rain/border effects).
     pub fn ui(&mut self, ui: &mut egui::Ui, content: Rect, s: f32) {
+        self.ui_inner(ui, content, s, false);
+    }
+
+    /// The mini shell's variant — same overlay, single-column layout:
+    /// the details fields and image cards share one scroll column so
+    /// the editor fits the small window's width.
+    pub fn ui_compact(&mut self, ui: &mut egui::Ui, content: Rect, s: f32) {
+        self.ui_inner(ui, content, s, true);
+    }
+
+    fn ui_inner(&mut self, ui: &mut egui::Ui, content: Rect, s: f32, compact: bool) {
         let ctx = ui.ctx().clone();
         // Lacrima's DoubleTransition: Opacity over 0.32s, eased.
         let fade = ctx.animate_bool_with_time_and_easing(
@@ -410,7 +421,13 @@ impl TagEditor {
                         UiBuilder::new()
                             .max_rect(area.with_min_x(area.min.x + 6.0 * s))
                             .layout(egui::Layout::top_down(egui::Align::Min)),
-                        |ui| self.header(ui, s),
+                        |ui| {
+                            if compact {
+                                self.header_compact(ui, s);
+                            } else {
+                                self.header(ui, s);
+                            }
+                        },
                     )
                     .response
                     .rect;
@@ -423,7 +440,11 @@ impl TagEditor {
                     egui::pos2(area.min.x, head.max.y + 12.0 * s),
                     egui::pos2(area.max.x, footer.min.y - 12.0 * s),
                 );
-                self.panel(ui, panel, s);
+                if compact {
+                    self.panel_compact(ui, panel, s);
+                } else {
+                    self.panel(ui, panel, s);
+                }
                 self.footer(ui, footer, s);
             },
         );
@@ -601,6 +622,77 @@ impl TagEditor {
         }
     }
 
+    /// The compact header — the small window can't afford the full
+    /// title banner, so it's a one-line title + a truncated
+    /// "title — artist" summary.
+    fn header_compact(&self, ui: &mut egui::Ui, s: f32) {
+        ui.spacing_mut().item_spacing.y = 2.0 * s;
+        ui.label(
+            egui::RichText::new("Metadata")
+                .size(26.0 * s)
+                .strong()
+                .color(egui::Color32::WHITE),
+        );
+        let or_unknown = |v: &str| {
+            if v.trim().is_empty() {
+                "Unknown".to_string()
+            } else {
+                v.to_string()
+            }
+        };
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "{} — {}",
+                    or_unknown(&self.title),
+                    or_unknown(&self.artist)
+                ))
+                .size(14.0 * s)
+                .color(SUBTEXT),
+            )
+            .truncate(),
+        );
+    }
+
+    /// Single-column panel for the mini shell — the details fields
+    /// and the image section stack inside one scroll column.
+    fn panel_compact(&mut self, ui: &mut egui::Ui, rect: Rect, s: f32) {
+        ui.painter().rect(
+            rect,
+            CornerRadius::same((10.0 * s).round() as u8),
+            PANEL_BG,
+            Stroke::new(1.0, PANEL_LINE),
+            egui::StrokeKind::Inside,
+        );
+        let inner = rect.shrink(13.0 * s);
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.set_clip_rect(inner.expand(2.0).intersect(ui.clip_rect()));
+                ui.spacing_mut().item_spacing.y = 8.0 * s;
+                egui::ScrollArea::vertical()
+                    .id_salt("meta_compact_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0 * s;
+                        ui.label(
+                            egui::RichText::new("Details")
+                                .size(20.0 * s)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        self.details_fields(ui, s);
+                        ui.add_space(6.0 * s);
+                        self.images_head(ui, s);
+                        self.cover_from_box(ui, s);
+                        self.image_cards(ui, s);
+                    });
+            },
+        );
+    }
+
     fn details(&mut self, ui: &mut egui::Ui, s: f32) {
         // RowDefinitions="Auto,*" RowSpacing="8".
         ui.spacing_mut().item_spacing.y = 8.0 * s;
@@ -613,34 +705,38 @@ impl TagEditor {
         egui::ScrollArea::vertical()
             .id_salt("meta_details_scroll")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0 * s;
-                let wide = ui.available_width();
-                let short = (120.0 * s).min(wide);
-                let d = &mut self.dirty;
-                Self::field(ui, s, "Title", &mut self.title, d, wide, 0.0);
-                Self::field(ui, s, "Album", &mut self.album, d, wide, 0.0);
-                Self::field(ui, s, "Artists", &mut self.artist, d, wide, 0.0);
-                Self::field(ui, s, "Track", &mut self.track, d, short, 0.0);
-                Self::field(ui, s, "Year", &mut self.year, d, short, 0.0);
-                Self::field(ui, s, "Genre", &mut self.genres, d, wide, 0.0);
-                Self::field(ui, s, "Comments", &mut self.comment, d, wide, 0.0);
-                Self::field(ui, s, "Lyrics", &mut self.lyrics, d, wide, 90.0 * s);
+            .show(ui, |ui| self.details_fields(ui, s));
+    }
 
-                // File Path (FontSize 14, wrapping) — read-only here.
-                ui.label(egui::RichText::new("File Path").size(14.0 * s).color(SUBTEXT));
-                let fp = self.path.to_string_lossy().to_string();
-                Self::text_box(
-                    ui,
-                    s,
-                    egui::Id::new("meta_file_path"),
-                    &mut fp.as_str(),
-                    wide,
-                    1.0,
-                    14.0,
-                    "",
-                );
-            });
+    /// The fields column's body — no scroll of its own so it can also
+    /// stack inside the compact panel's shared ScrollArea.
+    fn details_fields(&mut self, ui: &mut egui::Ui, s: f32) {
+        ui.spacing_mut().item_spacing.y = 4.0 * s;
+        let wide = ui.available_width();
+        let short = (120.0 * s).min(wide);
+        let d = &mut self.dirty;
+        Self::field(ui, s, "Title", &mut self.title, d, wide, 0.0);
+        Self::field(ui, s, "Album", &mut self.album, d, wide, 0.0);
+        Self::field(ui, s, "Artists", &mut self.artist, d, wide, 0.0);
+        Self::field(ui, s, "Track", &mut self.track, d, short, 0.0);
+        Self::field(ui, s, "Year", &mut self.year, d, short, 0.0);
+        Self::field(ui, s, "Genre", &mut self.genres, d, wide, 0.0);
+        Self::field(ui, s, "Comments", &mut self.comment, d, wide, 0.0);
+        Self::field(ui, s, "Lyrics", &mut self.lyrics, d, wide, 90.0 * s);
+
+        // File Path (FontSize 14, wrapping) — read-only here.
+        ui.label(egui::RichText::new("File Path").size(14.0 * s).color(SUBTEXT));
+        let fp = self.path.to_string_lossy().to_string();
+        Self::text_box(
+            ui,
+            s,
+            egui::Id::new("meta_file_path"),
+            &mut fp.as_str(),
+            wide,
+            1.0,
+            14.0,
+            "",
+        );
     }
 
     fn pick_image(&mut self) {
@@ -652,13 +748,10 @@ impl TagEditor {
         }
     }
 
-    fn images_ui(&mut self, ui: &mut egui::Ui, s: f32) {
-        // RowDefinitions="Auto,Auto,*" RowSpacing="8".
-        ui.spacing_mut().item_spacing.y = 8.0 * s;
+    /// Header row shared by both layouts: "Images" | kind ComboBox |
+    /// Add Image (Lacrima's ColumnSpacing 10).
+    fn images_head(&mut self, ui: &mut egui::Ui, s: f32) {
         let pad = egui::vec2(12.0, 6.0) * s;
-
-        // Header: "Images" | kind ComboBox (MinWidth 140) | Add Image,
-        // ColumnSpacing 10.
         let (row, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 30.0 * s),
             egui::Sense::hover(),
@@ -682,10 +775,13 @@ impl TagEditor {
                 Self::kind_combo(ui, s, "meta_add_kind", 140.0 * s, &mut self.add_kind);
             },
         );
+    }
 
-        // "Cover From …" box (Lacrima's URL/clipboard/search grid,
-        // ColumnDefinitions="*,104,104"; the file-path row is the offline
-        // equivalent).
+    /// "Cover From …" box (Lacrima's URL/clipboard/search grid,
+    /// ColumnDefinitions="*,104,104"; the file-path row is the offline
+    /// equivalent).
+    fn cover_from_box(&mut self, ui: &mut egui::Ui, s: f32) {
+        let pad = egui::vec2(12.0, 6.0) * s;
         egui::Frame::new()
             .fill(BOX_BG)
             .stroke(Stroke::new(1.0, BOX_LINE))
@@ -729,12 +825,28 @@ impl TagEditor {
                     }
                 });
             });
+    }
+
+    fn images_ui(&mut self, ui: &mut egui::Ui, s: f32) {
+        // RowDefinitions="Auto,Auto,*" RowSpacing="8".
+        ui.spacing_mut().item_spacing.y = 8.0 * s;
+        self.images_head(ui, s);
+        self.cover_from_box(ui, s);
 
         // Image cards: WrapPanel of 220px cards, Margin 0,0,8,8.
         egui::ScrollArea::vertical()
             .id_salt("meta_images_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.image_cards(ui, s);
+            });
+    }
+
+    /// The image-card wrap — no scroll of its own so the compact
+    /// panel's shared ScrollArea can host it too.
+    fn image_cards(&mut self, ui: &mut egui::Ui, s: f32) {
+        let pad = egui::vec2(12.0, 6.0) * s;
+        {
                 if self.placeholder.is_none() {
                     self.placeholder = Some(ui.ctx().load_texture(
                         "meta_cover_placeholder",
@@ -840,7 +952,7 @@ impl TagEditor {
                     dirty = true;
                 }
                 self.dirty |= dirty;
-            });
+        }
     }
 
     /// `Image Stretch=UniformToFill Height=160` — decodes the embedded
