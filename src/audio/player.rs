@@ -121,6 +121,12 @@ struct Shared {
     /// Bumped by the decoder on track change/seek; the output callback
     /// clears the PCM ring when it sees a new value.
     flush_seq: AtomicU64,
+    /// Bumped once a new source has probed in and entered the decode
+    /// loop — unlike `flush_seq` (which also bumps on seeks) this
+    /// means "the decoder owns a different source than at open()".
+    /// The UI snapshots it at open() and a change tells it the load
+    /// actually went through.
+    load_gen: AtomicU64,
     /// Position bookkeeping (output-rate frames).
     pos_base: AtomicU64,
     pos_consumed: AtomicU64,
@@ -209,6 +215,7 @@ impl AudioPlayer {
             seek: Mutex::new(None),
             buffering: AtomicBool::new(false),
             flush_seq: AtomicU64::new(0),
+            load_gen: AtomicU64::new(0),
             pos_base: AtomicU64::new(0),
             pos_consumed: AtomicU64::new(0),
             duration: AtomicU64::new(0),
@@ -480,6 +487,15 @@ impl AudioPlayer {
         self.shared.buffering.load(Ordering::Relaxed)
     }
 
+    /// Decode-loop generation: bumped once a new source probed in and
+    /// started decoding. Snapshotting this at open() and comparing
+    /// later tells callers the load actually applied (a failed probe
+    /// never bumps it). Acquire so the position reset that precedes
+    /// the bump is visible with it.
+    pub fn load_gen(&self) -> u64 {
+        self.shared.load_gen.load(Ordering::Acquire)
+    }
+
     pub fn position(&self) -> Duration {
         let frames = self.shared.pos_base.load(Ordering::Relaxed)
             + self.shared.pos_consumed.load(Ordering::Relaxed);
@@ -709,6 +725,10 @@ fn run_decoder(
     shared.pos_consumed.store(0, Ordering::Relaxed);
     shared.eof.store(false, Ordering::Relaxed);
     shared.flush_seq.fetch_add(1, Ordering::Relaxed);
+    // Release-ordered AFTER the position reset: an Acquire reader
+    // that sees the new generation also sees the zeroed position —
+    // never "new source applied, old track's position".
+    shared.load_gen.fetch_add(1, Ordering::Release);
 
     let mut decoder =
         get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default())?;

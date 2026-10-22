@@ -90,6 +90,14 @@ pub(crate) fn view(
     row: &mut album_row::AlbumRow,
     player: Option<&audio::AudioPlayer>,
     playing_track: Option<&Path>,
+    // The app's decoded now-playing art — the fallback when the
+    // playing item isn't in the loaded album (a stream playing on
+    // after an album switch has no `cover_for` row to resolve).
+    playing_cover: Option<&egui::TextureHandle>,
+    // A fresh track's art is staged until playback is audible —
+    // while set, the slot keeps `playing_cover` (the outgoing art)
+    // instead of resolving the new item's carousel cover.
+    cover_staged: bool,
     stream_loading: bool,
     _waveform: &[f32],
     _waveform_loading: bool,
@@ -212,53 +220,84 @@ pub(crate) fn view(
         .and_then(|c| c.first().copied())
         .unwrap_or_else(|| Color32::from_gray(34));
     painter.rect_filled(cover_rect, 0, slot_fill);
-    let art = playing_track
-        .and_then(|t| carousel.cover_for(t))
-        .and_then(|src| row.cover_tex(&ctx, &src));
+    let art = staged_cover(
+        cover_staged,
+        || {
+            playing_track
+                .and_then(|t| carousel.cover_for(t))
+                .and_then(|src| row.cover_tex(&ctx, &src))
+        },
+        playing_cover.cloned(),
+    );
+    // The displayed art's crossfade: every texture-id swap re-arms
+    // it — a stage promoting (outgoing → new art), a late cover_tex
+    // load (glyph → art), a no-art track (art → glyph). It runs on
+    // the palette fade's clock + easing so cover and recolor land
+    // together.
+    let art_last_id = ui.scope_id().with("mv-art-last");
+    let art_fade_id = ui.scope_id().with("mv-art-fade");
+    let prev_art: Option<egui::TextureHandle> =
+        ctx.data_mut(|d| d.get_temp(art_last_id)).unwrap_or_default();
+    if art.as_ref().map(|t| t.id()) != prev_art.as_ref().map(|t| t.id()) {
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                art_fade_id,
+                Some((prev_art.clone(), std::time::Instant::now())),
+            );
+            d.insert_temp(art_last_id, art.clone());
+        });
+    }
+    let art_fade: ArtFade =
+        ctx.data_mut(|d| d.get_temp(art_fade_id)).unwrap_or_default();
+    let fade_a = art_fade.as_ref().map_or(1.0, |(_, st)| {
+        crate::ease((st.elapsed().as_secs_f32() / crate::PALETTE_FADE_S).min(1.0))
+    });
+    if let Some((_, st)) = &art_fade {
+        if st.elapsed().as_secs_f32() >= crate::PALETTE_FADE_S {
+            ctx.data_mut(|d| {
+                d.insert_temp::<ArtFade>(art_fade_id, None);
+            });
+        } else {
+            ctx.request_repaint();
+        }
+    }
+    // Uniform fit — preserve the art's aspect, centered in the square
+    // slot (a 16:9 thumbnail letterboxes like Lacrima, never stretches).
+    let fit_rect = |tex: &egui::TextureHandle| {
+        let [tw, th] = tex.size();
+        let aspect = tw as f32 / (th as f32).max(1.0);
+        let fit = if aspect >= 1.0 {
+            Vec2::new(cover, cover / aspect)
+        } else {
+            Vec2::new(cover * aspect, cover)
+        };
+        Rect::from_center_size(cover_rect.center(), fit)
+    };
+    // The outgoing layer fades out underneath — the previous art, or
+    // the note glyph when the slot was empty.
+    if let Some((from, _)) = &art_fade {
+        match from {
+            Some(tex) => {
+                painter.image(
+                    tex.id(),
+                    fit_rect(tex),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::from_white_alpha(((1.0 - fade_a) * 255.0).round() as u8),
+                );
+            }
+            None => note_glyph(&painter, cover_rect, cover, 1.0 - fade_a),
+        }
+    }
     match &art {
         Some(tex) => {
-            // Uniform fit — preserve the art's aspect, centered in the
-            // square slot (a 16:9 thumbnail letterboxes like Lacrima,
-            // never stretches).
-            let [tw, th] = tex.size();
-            let aspect = tw as f32 / (th as f32).max(1.0);
-            let fit = if aspect >= 1.0 {
-                Vec2::new(cover, cover / aspect)
-            } else {
-                Vec2::new(cover * aspect, cover)
-            };
             painter.image(
                 tex.id(),
-                Rect::from_center_size(cover_rect.center(), fit),
+                fit_rect(tex),
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
+                Color32::from_white_alpha((fade_a * 255.0).round() as u8),
             );
         }
-        None => {
-            // Lacrima's mini default is a bare note glyph on the
-            // palette backdrop — not the textured placeholder tile.
-            // Same geometry as library::placeholder_image's note,
-            // authored on a 400x400 canvas.
-            let g = cover * 0.55;
-            let r = Rect::from_center_size(cover_rect.center(), Vec2::splat(g));
-            let k = g / 400.0;
-            let at = |u: f32, v: f32| Pos2::new(r.min.x + u * k, r.min.y + v * k);
-            // Light glyph — visible on the dark/colored backdrop
-            // (Lacrima's is dark only because its tile is light).
-            let col = Color32::from_gray(120);
-            // Stems.
-            painter.rect_filled(Rect::from_min_max(at(165.0, 110.0), at(180.0, 280.0)), 0, col);
-            painter.rect_filled(Rect::from_min_max(at(285.0, 90.0), at(300.0, 260.0)), 0, col);
-            // Note heads (ellipses).
-            painter.add(egui::Shape::ellipse_filled(at(140.0, 290.0), Vec2::new(40.0, 30.0) * k, col));
-            painter.add(egui::Shape::ellipse_filled(at(260.0, 270.0), Vec2::new(40.0, 30.0) * k, col));
-            // Beam.
-            painter.add(egui::Shape::convex_polygon(
-                vec![at(165.0, 110.0), at(300.0, 90.0), at(300.0, 140.0), at(165.0, 160.0)],
-                col,
-                egui::Stroke::NONE,
-            ));
-        }
+        None => note_glyph(&painter, cover_rect, cover, fade_a),
     }
 
     // Text lane between the cover and the controls.
@@ -283,9 +322,17 @@ pub(crate) fn view(
     }
 
     // Title — the carousel's marquee (hold, then scroll) when it
-    // overflows the lane, ellipsized otherwise.
+    // overflows the lane, ellipsized otherwise. A playing item the
+    // loaded album doesn't contain (stream playing on across an
+    // album switch) misses `display_for` → file-stem fallback shows
+    // the raw URL; meta_cache resolves those by their stream key.
     let title = playing_track
-        .map(|t| carousel.display_for(t).0)
+        .map(|t| {
+            let meta = (carousel.index_of(t).is_none() && library::is_url(t))
+                .then(|| crate::meta_cache::load(&t.to_string_lossy()))
+                .flatten();
+            now_playing_title(carousel.display_for(t).0, meta)
+        })
         .unwrap_or_default();
     if !title.is_empty() {
         let font = FontId::proportional(0.15 * h);
@@ -331,6 +378,14 @@ pub(crate) fn view(
                     .item_paths()
                     .find(|(_, p, _)| *p == t)
                     .and_then(|(_, _, d)| d)
+                    .or_else(|| {
+                        // Same cross-album gap as the title — the
+                        // stream meta carries its resolved duration.
+                        library::is_url(t)
+                            .then(|| crate::meta_cache::load(&t.to_string_lossy()))
+                            .flatten()
+                            .and_then(|m| m.duration)
+                    })
             })
         })
         .unwrap_or(0.0);
@@ -843,8 +898,9 @@ pub(crate) fn view(
     // under an opacity mask that fades it in from transparent at
     // the top to full by the 80% mark (LinearGradient 50%,1% →
     // 50%,80% in the XAML). Painted as a uv-mesh so the fill-crop
-    // and the fade live in the same vertices.
-    if let Some(tex) = &art {
+    // and the fade live in the same vertices. `scale` folds the
+    // slot's crossfade into the ramp so the backdrop swaps in step.
+    let art_backdrop = |tex: &egui::TextureHandle, scale: f32| {
         let bg = Rect::from_min_max(
             Pos2::new(content.min.x, list_top),
             Pos2::new(content.max.x, foot_top),
@@ -859,7 +915,7 @@ pub(crate) fn view(
             // Opacity-mask ramp: 0% alpha at the top edge, border
             // opacity from 80% height down — 0.2 (Lacrima's 0.4
             // toned down per user).
-            let a = 51u8;
+            let a = (51.0 * scale) as u8;
             let fy = bg.min.y + 0.8 * bg.height();
             let fv = v0 + 0.8 * hr;
             let mut mesh = Mesh::with_texture(tex.id());
@@ -879,6 +935,14 @@ pub(crate) fn view(
             mesh.indices.extend_from_slice(&[0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
             painter.add(Shape::mesh(mesh));
         }
+    };
+    // The outgoing cover fades out under the incoming one — same
+    // alpha the slot uses.
+    if let Some((Some(from), _)) = &art_fade {
+        art_backdrop(from, 1.0 - fade_a);
+    }
+    if let Some(tex) = &art {
+        art_backdrop(tex, fade_a);
     }
     // The busy pulse/spinner needs frames until the stream opens.
     if stream_loading {
@@ -2687,6 +2751,59 @@ fn strip_track_no(t: &str) -> &str {
 }
 
 /// QuadraticEaseInOut — the ExtensionArea drawer's 0.62s easing.
+/// The now-playing bar's title — the carousel's display text, or the
+/// stream meta's resolved title when the playing item isn't in the
+/// loaded album (play-then-switch left a raw "watch?v=…" stem up top).
+fn now_playing_title(
+    display: String,
+    meta: Option<crate::meta_cache::CachedMeta>,
+) -> String {
+    meta.filter(|m| !m.title.trim().is_empty())
+        .map(|m| m.title)
+        .unwrap_or(display)
+}
+
+/// Session-temp payload for the mini cover crossfade — the outgoing
+/// art (None = the note glyph was showing) and when the swap armed.
+type ArtFade = Option<(Option<egui::TextureHandle>, std::time::Instant)>;
+
+/// The mini slot's art while a fresh track's cover is staged for
+/// audible playback: the held (displayed) art stands in until the
+/// stage promotes; once unstaged the playing item's own art resolves
+/// with the displayed cover as fallback.
+fn staged_cover<T>(
+    staged: bool,
+    resolve: impl FnOnce() -> Option<T>,
+    held: Option<T>,
+) -> Option<T> {
+    if staged { held } else { resolve().or(held) }
+}
+
+/// Lacrima's mini default cover — a bare note glyph on the palette
+/// backdrop, authored on a 400x400 canvas. `alpha` fades it like the
+/// art layers during a crossfade.
+fn note_glyph(painter: &egui::Painter, slot: Rect, size: f32, alpha: f32) {
+    let g = size * 0.55;
+    let r = Rect::from_center_size(slot.center(), Vec2::splat(g));
+    let k = g / 400.0;
+    let at = |u: f32, v: f32| Pos2::new(r.min.x + u * k, r.min.y + v * k);
+    // Light glyph — visible on the dark/colored backdrop (Lacrima's
+    // is dark only because its tile is light).
+    let col = Color32::from_gray(120).gamma_multiply(alpha);
+    // Stems.
+    painter.rect_filled(Rect::from_min_max(at(165.0, 110.0), at(180.0, 280.0)), 0, col);
+    painter.rect_filled(Rect::from_min_max(at(285.0, 90.0), at(300.0, 260.0)), 0, col);
+    // Note heads (ellipses).
+    painter.add(egui::Shape::ellipse_filled(at(140.0, 290.0), Vec2::new(40.0, 30.0) * k, col));
+    painter.add(egui::Shape::ellipse_filled(at(260.0, 270.0), Vec2::new(40.0, 30.0) * k, col));
+    // Beam.
+    painter.add(egui::Shape::convex_polygon(
+        vec![at(165.0, 110.0), at(300.0, 90.0), at(300.0, 140.0), at(165.0, 160.0)],
+        col,
+        egui::Stroke::NONE,
+    ));
+}
+
 fn ease_in_out_quad(t: f32) -> f32 {
     if t < 0.5 {
         2.0 * t * t
@@ -2777,5 +2894,49 @@ mod tests {
         let mut c = vec![album("a"), album("b"), album("c")];
         move_albums_block(&mut c, &[0], 3);
         assert_eq!(dirs(&c), vec!["b", "c", "a"]);
+    }
+
+    /// A stream still playing after an album switch isn't in the
+    /// loaded carousel — its title must come from the resolved meta,
+    /// not the URL's file stem (the "watch?v=…" header regression).
+    #[test]
+    fn now_playing_title_prefers_stream_meta() {
+        let meta = crate::meta_cache::CachedMeta {
+            title: "Lost in 1989 — Synthwave Mix".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            now_playing_title("watch?v=Qa76lUQkoDw".to_string(), Some(meta)),
+            "Lost in 1989 — Synthwave Mix"
+        );
+        // No meta / blank meta title → the display fallback stands.
+        assert_eq!(now_playing_title("fallback".to_string(), None), "fallback");
+        let blank = crate::meta_cache::CachedMeta {
+            title: "  ".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            now_playing_title("fallback".to_string(), Some(blank)),
+            "fallback"
+        );
+    }
+
+    /// While a fresh track's cover is staged for audible playback the
+    /// mini slot must keep showing the outgoing art — resolving the
+    /// new item's carousel cover early was the pre-play leak the
+    /// stage gates. Once it promotes, the item's own art resolves
+    /// with the displayed cover still the cross-album fallback.
+    #[test]
+    fn staged_cover_holds_displayed_art() {
+        // Staged: the held (displayed) cover wins over the resolved.
+        assert_eq!(staged_cover(true, || Some(2), Some(1)), Some(1));
+        // Staged with nothing displayed → the empty slot, not the art.
+        assert_eq!(staged_cover(true, || Some(2), None), None);
+        // Unstaged: the playing item's own art resolves normally.
+        assert_eq!(staged_cover(false, || Some(2), Some(1)), Some(2));
+        // Unstaged, nothing resolvable → the displayed-cover fallback.
+        assert_eq!(staged_cover(false, || None, Some(1)), Some(1));
+        // Neither → empty.
+        assert_eq!(staged_cover(false, || None::<i32>, None), None);
     }
 }

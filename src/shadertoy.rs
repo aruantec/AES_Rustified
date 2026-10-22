@@ -598,6 +598,16 @@ impl Shadertoy {
         self.current = name.to_owned();
     }
 
+    /// Drop the cached pipelines for `names` — used after the startup
+    /// prompt rewrites disk copies so the next `pipeline_for` rebuilds
+    /// from the new sources.
+    pub fn invalidate(&mut self, names: &[String]) {
+        for n in names {
+            self.pipelines.remove(n.as_str());
+            self.building.remove(n.as_str());
+        }
+    }
+
     /// Upload a cover image for `iChannel1` (album art, any size — the
     /// texture is recreated when the dimensions change).
     pub fn set_cover(&mut self, pixels: &[u8], w: u32, h: u32) {
@@ -915,15 +925,27 @@ impl Shadertoy {
     }
 
     fn source(&self, name: &str) -> Option<String> {
+        let embedded = EMBEDDED
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| *s);
         if let Some(p) = self.disk.get(name) {
             if let Ok(s) = std::fs::read_to_string(p) {
+                // A pristine seed tracks the embedded source — a stale
+                // seed would shadow every shader update shipped in a
+                // build (the AnimatedBackground fog tuning shipped in
+                // the exe but the seeded copy still rendered the old
+                // look). Edited files always win.
+                if embedded
+                    .map(|e| is_pristine_seed(&s, e))
+                    .unwrap_or(false)
+                {
+                    return embedded.map(|e| e.to_string());
+                }
                 return Some(s);
             }
         }
-        EMBEDDED
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, s)| s.to_string())
+        embedded.map(|e| e.to_string())
     }
 
     /// GLSL -> naga module -> WGSL -> wgpu pipeline.
@@ -1181,9 +1203,54 @@ fn shaders_dir() -> Option<PathBuf> {
         .map(|d| d.join("AES_Rustified").join("Shaders").join("Shadertoys"))
 }
 
+/// First line of an app-seeded copy: `// aes-seed:<fnv1a64 of the
+/// body>`. Marks a file the app wrote so `source()` can tell a
+/// pristine seed (tracks embedded updates) from a user edit
+/// (authoritative) — content-equality alone can't rescue a seed
+/// that's stale relative to a NEW embedded source.
+const SEED_MARKER: &str = "// aes-seed:";
+
+/// Line-ending-insensitive compare — a seed that round-tripped a
+/// CRLF checkout or an editor must still count as untouched.
+fn norm_shader(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// FNV-1a64 — stable across builds (DefaultHasher's keys aren't).
+fn seed_hash(body: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in norm_shader(body).bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Is `s` an untouched seed of `embedded`? Marked files verify the
+/// recorded hash; legacy unmarked seeds compare content directly.
+fn is_pristine_seed(s: &str, embedded: &str) -> bool {
+    let n = norm_shader(s);
+    if let Some(rest) = n.strip_prefix(SEED_MARKER) {
+        if let Some((hex, body)) = rest.split_once('\n') {
+            return u64::from_str_radix(hex.trim(), 16)
+                .map(|h| h == seed_hash(body))
+                .unwrap_or(false);
+        }
+    }
+    n == norm_shader(embedded)
+}
+
+/// The file content `seed_shader_dir` writes for an embedded shader.
+fn seeded_source(src: &str) -> String {
+    format!("{SEED_MARKER}{:016x}\n{src}", seed_hash(src))
+}
+
 /// Seed the disk dir: embedded shaders land where they're missing
 /// (never overwriting user edits), and any .frag left in the old
 /// exe-side folder carries over so nothing is lost in the move.
+/// Seeds carry the `aes-seed` marker so later embedded updates can
+/// tell a pristine copy from a user edit; unmarked files that still
+/// match the embedded source get upgraded in place.
 fn seed_shader_dir(dir: &std::path::Path) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -1209,9 +1276,63 @@ fn seed_shader_dir(dir: &std::path::Path) {
     }
     for (name, src) in EMBEDDED {
         let dst = dir.join(format!("{name}.frag"));
-        if !dst.exists() {
-            let _ = std::fs::write(&dst, src);
+        match std::fs::read_to_string(&dst) {
+            Err(_) => {
+                let _ = std::fs::write(&dst, seeded_source(src));
+            }
+            Ok(disk) => {
+                // Pristine seeds get rewritten — marked files refresh
+                // to a new embedded version, legacy unmarked files
+                // that still match get the marker stamped on (the
+                // seed-then-stale regression: a seed must never
+                // shadow a shader update shipped in the exe).
+                if is_pristine_seed(&disk, src)
+                    && norm_shader(&disk) != norm_shader(&seeded_source(src))
+                {
+                    let _ = std::fs::write(&dst, seeded_source(src));
+                }
+            }
         }
+    }
+}
+
+/// Embedded shaders whose disk copies diverge and aren't provably
+/// app seeds — edited or unknown-origin files. Replacing them could
+/// clobber local work, so the startup prompt asks first. Pristine
+/// seeds never appear here (they refresh silently).
+fn pending_updates_in(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, src) in EMBEDDED {
+        if let Ok(disk) = std::fs::read_to_string(dir.join(format!("{name}.frag"))) {
+            if !is_pristine_seed(&disk, src) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub fn pending_updates() -> Vec<String> {
+    shaders_dir()
+        .map(|d| pending_updates_in(&d))
+        .unwrap_or_default()
+}
+
+/// Overwrite a disk copy with the marked embedded source — the
+/// startup prompt's confirmed path.
+fn write_embedded_in(dir: &std::path::Path, name: &str) {
+    if let Some(src) = EMBEDDED
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
+    {
+        let _ = std::fs::write(dir.join(format!("{name}.frag")), seeded_source(src));
+    }
+}
+
+pub fn write_embedded(name: &str) {
+    if let Some(dir) = shaders_dir() {
+        write_embedded_in(&dir, name);
     }
 }
 
@@ -1353,4 +1474,72 @@ fn cover_pixels() -> Vec<u8> {
         }
     }
     data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EMB: &str = "// shader v2\nfloat x = 1.0;\n";
+
+    #[test]
+    fn pristine_seed_tracks_embedded_updates() {
+        // Marked + untouched → pristine even when the embedded source
+        // moved on since seeding (the stale-fog regression case).
+        let seeded = seeded_source("// shader v1\nfloat x = 0.0;\n");
+        assert!(is_pristine_seed(&seeded, EMB));
+
+        // Legacy unmarked seed equal to embedded → pristine, and
+        // line-ending round-trips (CRLF) don't count as edits.
+        assert!(is_pristine_seed(EMB, EMB));
+        assert!(is_pristine_seed(&EMB.replace('\n', "\r\n"), EMB));
+
+        // Edited marked file (hash mismatch) or a stale unmarked seed
+        // vs a different embedded → user files, disk wins.
+        let edited = seeded_source("// shader v1\nfloat x = 0.0;\n")
+            .replace("0.0", "9.0");
+        assert!(!is_pristine_seed(&edited, EMB));
+        assert!(!is_pristine_seed("// totally custom\n", EMB));
+        assert!(!is_pristine_seed("// shader v1\nfloat x = 0.0;\n", EMB));
+    }
+
+    /// The startup update flow: marked-stale seeds refresh silently in
+    /// `seed_shader_dir`; ambiguous files surface in `pending_updates_in`
+    /// and only move when the prompt's confirm runs `write_embedded_in`.
+    #[test]
+    fn startup_update_refreshes_seeds_and_prompts_on_ambiguous() {
+        let dir = std::env::temp_dir().join(format!(
+            "aes-shader-upd-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = EMBEDDED[0].0;
+        let path = dir.join(format!("{name}.frag"));
+
+        // A marked seed from an older embedded version → seeding
+        // silently refreshes it, nothing to ask about.
+        std::fs::write(&path, seeded_source("// older embedded\n")).unwrap();
+        seed_shader_dir(&dir);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(is_pristine_seed(&disk, EMBEDDED[0].1));
+        // `norm_shader` on both sides — embedded sources may be CRLF.
+        assert!(norm_shader(&disk).contains(&norm_shader(EMBEDDED[0].1)));
+        assert!(!pending_updates_in(&dir).contains(&name.to_string()));
+
+        // An edited local copy (hash mismatch) stays untouched and is
+        // reported for the prompt.
+        std::fs::write(
+            &path,
+            seeded_source(EMBEDDED[0].1).replace("float", "// local tweak\nfloat"),
+        )
+        .unwrap();
+        assert!(pending_updates_in(&dir).contains(&name.to_string()));
+        write_embedded_in(&dir, name);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(is_pristine_seed(&disk, EMBEDDED[0].1));
+        assert!(!pending_updates_in(&dir).contains(&name.to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -541,7 +541,10 @@ struct AesRustApp {
     /// Lacrima's PlayerInfo widget — title/artist/album + the
     /// "position / duration" line, docked above the main menu.
     player_info: widgets::PlayerInfoWidget,
-    /// The playing track's cover as an egui texture — the vinyl label.
+    /// The playing track's cover as an egui texture — the vinyl label
+    /// and the mini slot's art. DISPLAYED art only: a fresh track's
+    /// cover stages in `palette_pending` and lands here at the same
+    /// promotion as its palette (playback actually audible).
     playing_cover: Option<egui::TextureHandle>,
     widget_edit: bool,
     settings: settings::Settings,
@@ -579,8 +582,19 @@ struct AesRustApp {
     spectrum: spectrum_bar::SpectrumBar,
     /// Dominant colors of the playing album's cover — the bar gradient
     /// when Spectrum.CoverColors is on (Lacrima's
-    /// UseMusicSpectrumCoverColors -> GetDominantColorGradient).
+    /// UseMusicSpectrumCoverColors -> GetDominantColorGradient). This
+    /// is the DISPLAYED palette — `palette_fade` eases it toward each
+    /// committed target so track changes fade instead of snap.
     spectrum_colors: Option<Vec<Color32>>,
+    /// A track palette staged for a track that isn't audibly playing
+    /// yet — promotes via `palette_promote`, then fades in.
+    palette_pending: Option<PendingPalette>,
+    /// `player.load_gen()` snapshot taken when `palette_pending` was
+    /// armed — the promote gate compares against it to know the
+    /// decode thread applied THIS open (not a stale one).
+    palette_gen: u64,
+    /// The running palette crossfade (see PaletteFade).
+    palette_fade: Option<PaletteFade>,
     search: search_pill::SearchPill,
     album_search: search_pill::SearchPill,
     /// The loaded album's track view (Lacrima's CoverItems +
@@ -651,6 +665,8 @@ struct AesRustApp {
     emu_close: EmuClosePrompt,
     /// "Exit application?" confirmation — the main menu's Esc.
     app_exit: AppExitPrompt,
+    /// "Update shadertoys?" — ambiguous disk/embedded diffs at launch.
+    shader_upd: ShaderUpdPrompt,
     /// Re/Decompilation catalog view — install/update state for the
     /// curated project list.
     decomp: emulation::decomp::DecompView,
@@ -790,6 +806,21 @@ impl AppExitPrompt {
     }
 }
 
+/// Startup prompt for ambiguous shadertoy diffs — files whose disk
+/// copies diverge from the embedded set without being provable app
+/// seeds (edited or unknown origin). Pristine seeds refresh silently
+/// inside `Shadertoy::new`; only these ask, since overwriting could
+/// clobber local shader work. Confirming rewrites the disk copies
+/// with the marked embedded sources and invalidates their pipelines;
+/// dismissing keeps the local files until the next launch re-asks.
+#[derive(Default)]
+struct ShaderUpdPrompt {
+    open: bool,
+    sel: usize,
+    vis: f32,
+    names: Vec<String>,
+}
+
 /// What a delete confirmation guards — re-injected as the original
 /// action on confirm so the handlers run unchanged. Clone: the mini
 /// prompt keeps the pending payload in egui temp storage.
@@ -845,6 +876,152 @@ fn or_row_action(pending: album_row::Action, frame: album_row::Action) -> album_
 /// `None` from the view leaves a pending value alone.
 fn or_pending<T>(pending: Option<T>, frame: Option<T>) -> Option<T> {
     frame.or(pending)
+}
+
+/// Whether a just-opened album's decoded top cover may drive the
+/// spectrum/shadertoy palette: only while no track is loaded. A
+/// playing (or restored-selected) item's own palette must survive
+/// album switches — start_track/playing_cover_rx own it until the
+/// next track starts.
+fn album_palette_applies(still_loaded: bool, track_loaded: bool) -> bool {
+    still_loaded && !track_loaded
+}
+
+/// Seconds a staged palette waits for audible frames before giving
+/// up — a failed open never produces any, and the UI must not sit on
+/// the previous track's colors forever.
+const PALETTE_WAIT_S: f32 = 10.0;
+
+/// Palette+art staged for a track that hasn't actually started
+/// playing — see `palette_pending`/`palette_gen` on the app.
+struct PendingPalette {
+    /// The track it belongs to — promotion is keyed by path so a
+    /// superseded stage (user clicked away meanwhile) can't land on
+    /// the wrong track.
+    path: std::path::PathBuf,
+    /// The decoded cover — the shadertoy's iChannel1 art rides the
+    /// same gate so a shader never mixes new art with the old
+    /// palette.
+    img: Option<egui::ColorImage>,
+    /// dominant_colors(img) — None for no-art tracks: clearing the
+    /// palette is gated on playback too.
+    colors: Option<Vec<Color32>>,
+    /// PlayerState::Playing observed while staged — distinguishes
+    /// "load attempted and died" (promote on Stopped) from a stale
+    /// Stopped that predates the stage (user stopped, then clicked a
+    /// url item whose resolve is still in flight).
+    saw_playing: bool,
+    armed: std::time::Instant,
+}
+
+/// Seconds the palette crossfade takes — long enough to read as a
+/// blend between covers, short enough to feel responsive.
+const PALETTE_FADE_S: f32 = 0.45;
+
+/// A running palette crossfade: `spectrum_colors` is lerped from → to
+/// each frame; on completion it lands on `end` (None when the new
+/// track has no art — `to` is the manual gradient then, so the fade
+/// still has a destination and the handoff is seamless).
+struct PaletteFade {
+    from: Vec<Color32>,
+    to: Vec<Color32>,
+    end: Option<Vec<Color32>>,
+    started: std::time::Instant,
+}
+
+/// Per-channel lerp between palettes; lengths may differ — the index
+/// clamps to the last stop like the shadertoy uniform mapping.
+fn lerp_palette(from: &[Color32], to: &[Color32], t: f32) -> Vec<Color32> {
+    if from.is_empty() {
+        return to.to_vec();
+    }
+    if to.is_empty() {
+        return from.to_vec();
+    }
+    let n = from.len().max(to.len());
+    (0..n)
+        .map(|i| {
+            let a = from[i.min(from.len() - 1)];
+            let b = to[i.min(to.len() - 1)];
+            Color32::from_rgb(
+                (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
+                (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t).round() as u8,
+                (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
+            )
+        })
+        .collect()
+}
+
+/// Commit a new palette: nothing playing → the colors land via the
+/// crossfade; `colors` = None fades out to the manual gradient and
+/// clears. The displayed palette keeps its own value so every
+/// consumer (spectrum, mini wash, EQ tint) slides together.
+fn commit_cover_palette(
+    spectrum_colors: &mut Option<Vec<Color32>>,
+    fade: &mut Option<PaletteFade>,
+    shadertoy: &mut Option<shadertoy::Shadertoy>,
+    gradient: &[[u8; 3]; 5],
+    cover: Option<egui::ColorImage>,
+) {
+    let colors = cover
+        .as_ref()
+        .map(|i| spectrum_bar::dominant_colors(i, 3))
+        .filter(|c| !c.is_empty());
+    if let (Some(toy), Some(img)) = (shadertoy.as_mut(), cover.as_ref()) {
+        toy.set_cover_image(img);
+    }
+    // Blend through the manual gradient whenever a side has no
+    // palette — fading to "nothing" would pop to defaults.
+    let to = colors.clone().unwrap_or_else(|| manual_gradient(gradient));
+    let from = spectrum_colors
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .cloned()
+        .unwrap_or_else(|| manual_gradient(gradient));
+    if from == to {
+        // No visible blend — land immediately (the per-frame fade
+        // driver pushes lerped palettes to the shader while running).
+        if let (Some(toy), Some(c)) = (shadertoy.as_mut(), colors.as_deref()) {
+            toy.set_palette(c);
+        }
+        *fade = None;
+        *spectrum_colors = colors;
+        return;
+    }
+    *fade = Some(PaletteFade {
+        from,
+        to,
+        end: colors,
+        started: std::time::Instant::now(),
+    });
+}
+
+/// The configured manual gradient as colors — the visible fallback
+/// whenever no cover palette applies, so fades from/to "no cover"
+/// blend through it instead of popping.
+fn manual_gradient(gradient: &[[u8; 3]; 5]) -> Vec<Color32> {
+    gradient
+        .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+        .to_vec()
+}
+
+/// Whether a staged palette may promote now. The primary gate: the
+/// decoder applied the staged track's source (`load_gen` advanced
+/// past the open-time snapshot) AND the output callback consumed real
+/// frames — audio is audible, not just open() called. The fallbacks:
+/// `saw_playing` + Stopped covers loads that died mid-flight, the
+/// armed timeout covers opens that never produce frames at all.
+fn palette_promote(
+    gen_snap: u64,
+    load_gen: u64,
+    pos_s: f64,
+    state: audio::PlayerState,
+    saw_playing: bool,
+    armed_s: f32,
+) -> bool {
+    (load_gen != gen_snap && pos_s > 0.0)
+        || (saw_playing && state == audio::PlayerState::Stopped)
+        || armed_s > PALETTE_WAIT_S
 }
 
 /// Multi-album .apl export: two albums can sanitize to the same file
@@ -1489,6 +1666,9 @@ impl AesRustApp {
             transport,
             spectrum: spectrum_bar::SpectrumBar::new(),
             spectrum_colors: None,
+            palette_pending: None,
+            palette_gen: 0,
+            palette_fade: None,
             search: search_pill::SearchPill::default(),
             album_search: search_pill::SearchPill::default(),
             carousel: carousel::Carousel::new(),
@@ -1513,6 +1693,15 @@ impl AesRustApp {
             notice: None,
             emu_close: EmuClosePrompt::default(),
             app_exit: AppExitPrompt::default(),
+            shader_upd: {
+                let names = shadertoy::pending_updates();
+                ShaderUpdPrompt {
+                    open: !names.is_empty(),
+                    names,
+                    sel: 1, // safe default: "Keep" focused
+                    ..Default::default()
+                }
+            },
             decomp: emulation::decomp::DecompView::new(),
             emu: emulation::EmuView::new(),
             started: std::time::Instant::now(),
@@ -1719,7 +1908,7 @@ impl AesRustApp {
     /// Begin playing `track` — double-click, transport step and queue
     /// advance all funnel here (Lacrima's OpenSelectedItem). URL items
     /// resolve their stream on a worker; local files open directly.
-    fn start_track(&mut self, ctx: &egui::Context, track: std::path::PathBuf) {
+    fn start_track(&mut self, _ctx: &egui::Context, track: std::path::PathBuf) {
         // The new playing item owns the selection and gets scrolled
         // into view (transport steps land here too).
         self.carousel.reveal(&track);
@@ -1795,9 +1984,11 @@ impl AesRustApp {
                 .ok();
             self.resolve_rx = Some(rx);
             // Remote cover fetch+decode off the UI thread.
-            if let Some(src) = self.carousel.cover_for(&track) {
+            let cover_src = self.carousel.cover_for(&track);
+            if let Some(src) = cover_src.as_ref() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let t = track.clone();
+                let src = src.clone();
                 std::thread::Builder::new()
                     .name("aes-cover-fetch".into())
                     .spawn(move || {
@@ -1806,6 +1997,20 @@ impl AesRustApp {
                     .ok();
                 self.playing_cover_rx = Some(rx);
             }
+            // Palette is staged until the stream is audibly playing —
+            // resolve + preroll can take seconds while the previous
+            // track still sounds. `img`/`colors` land via
+            // playing_cover_rx; the commit additionally waits for that
+            // rx to drain so a fetched cover isn't raced.
+            self.palette_gen =
+                self.player.as_ref().map(|p| p.load_gen()).unwrap_or(0);
+            self.palette_pending = Some(PendingPalette {
+                path: track.clone(),
+                img: None,
+                colors: None,
+                saw_playing: false,
+                armed: std::time::Instant::now(),
+            });
             self.playing_track = Some(track.clone());
             if let Some(c) = self.waveform_cancel.take() {
                 c.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1821,22 +2026,26 @@ impl AesRustApp {
             self.waveform_rx = None;
         } else {
             let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
-            self.spectrum_colors = img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
-            if let (Some(toy), Some(img)) = (self.shadertoy.as_mut(), img.as_ref()) {
-                toy.set_cover_image(img);
-                if let Some(c) = self.spectrum_colors.as_deref() {
-                    toy.set_palette(c);
-                }
-            }
-            // The turntable's vinyl label
-            // (PlaybackCoordinator.ActiveCoverBitmap).
-            if let Some(img) = &img {
-                self.playing_cover = Some(ctx.load_texture(
-                    "player-cover",
-                    img.clone(),
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
+            // The palette is staged until playback is audible — the
+            // gen snapshot must precede open() because the decode
+            // thread bumps load_gen the moment it applies the source;
+            // snapshotting after could miss the bump entirely.
+            self.palette_gen =
+                self.player.as_ref().map(|p| p.load_gen()).unwrap_or(0);
+            self.palette_pending = Some(PendingPalette {
+                path: track.clone(),
+                colors: img
+                    .as_ref()
+                    .map(|i| spectrum_bar::dominant_colors(i, 3)),
+                img: img.clone(),
+                saw_playing: false,
+                armed: std::time::Instant::now(),
+            });
+            // The turntable's vinyl label +
+            // (PlaybackCoordinator.ActiveCoverBitmap) and the mini
+            // slot art ride the same gate as the palette —
+            // `playing_cover` stays the outgoing track's art until
+            // the staged image promotes on audible playback.
             if self.player.is_none() {
                 self.player = audio::AudioPlayer::new().ok();
                 // A lazily created player starts at unity —
@@ -1908,14 +2117,16 @@ impl AesRustApp {
             self.playing_track = Some(track);
         } else if track.exists() {
             let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
-            self.spectrum_colors =
-                img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
-            if let (Some(toy), Some(img)) = (self.shadertoy.as_mut(), img.as_ref()) {
-                toy.set_cover_image(img);
-                if let Some(c) = self.spectrum_colors.as_deref() {
-                    toy.set_palette(c);
-                }
-            }
+            // The restored track is the loaded element — its palette
+            // applies immediately (through the fade), unlike album
+            // opens which must yield while a track is loaded.
+            commit_cover_palette(
+                &mut self.spectrum_colors,
+                &mut self.palette_fade,
+                &mut self.shadertoy,
+                &self.settings.spectrum.gradient,
+                img.clone(),
+            );
             if let Some(img) = &img {
                 self.playing_cover = Some(ctx.load_texture(
                     "player-cover",
@@ -2452,6 +2663,9 @@ impl eframe::App for AesRustApp {
             transport,
             spectrum,
             spectrum_colors,
+            palette_pending,
+            palette_gen,
+            palette_fade,
             search,
             album_search,
             carousel,
@@ -2477,6 +2691,7 @@ impl eframe::App for AesRustApp {
             notice,
             emu_close,
             app_exit,
+            shader_upd,
             decomp,
             emu,
             shadertoy,
@@ -2577,19 +2792,25 @@ impl eframe::App for AesRustApp {
         }
         // The opened album's top cover decoded on a worker — apply the
         // spectrum gradient + shadertoy palette, but only if that
-        // album is still the loaded one.
+        // album is still the loaded one AND nothing is playing: a
+        // track keeps its own palette across album switches until a
+        // new item starts (start_track/playing_cover_rx own it then).
         if let Some(rx) = album_cover_rx.as_ref() {
             match rx.try_recv() {
                 Ok((dir, img)) => {
-                    if carousel.album_key() == Some(dir.as_str()) {
-                        *spectrum_colors =
-                            img.as_ref().map(|i| spectrum_bar::dominant_colors(i, 3));
-                        if let (Some(toy), Some(img)) = (shadertoy.as_mut(), img.as_ref()) {
-                            toy.set_cover_image(img);
-                            if let Some(c) = spectrum_colors.as_deref() {
-                                toy.set_palette(c);
-                            }
-                        }
+                    if album_palette_applies(
+                        carousel.album_key() == Some(dir.as_str()),
+                        playing_track.is_some(),
+                    ) {
+                        // Idle palette change — commits through the
+                        // fade so the recolor eases in.
+                        commit_cover_palette(
+                            spectrum_colors,
+                            palette_fade,
+                            shadertoy,
+                            &settings.spectrum.gradient,
+                            img,
+                        );
                     }
                     *album_cover_rx = None;
                 }
@@ -2599,29 +2820,128 @@ impl eframe::App for AesRustApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
-        // The url item's remote cover decoded on a worker — apply it
-        // to the vinyl label + spectrum/shadertoy palette, but only
-        // if it's still the playing item.
+        // The url item's remote cover decoded on a worker. A
+        // start_track-armed `palette_pending` stages art + palette
+        // until playback is audible — they land together at promote;
+        // with no stage armed (a restored or tag-refreshed track)
+        // the cover + palette apply now.
         if let Some(rx) = playing_cover_rx.as_ref() {
-            if let Ok((path, img)) = rx.try_recv() {
-                if playing_track.as_ref() == Some(&path) {
-                    if let Some(img) = img {
-                        *spectrum_colors = Some(spectrum_bar::dominant_colors(&img, 3));
-                        if let Some(toy) = shadertoy.as_mut() {
-                            toy.set_cover_image(&img);
-                            if let Some(c) = spectrum_colors.as_deref() {
-                                toy.set_palette(c);
+            match rx.try_recv() {
+                Ok((path, img)) => {
+                    if playing_track.as_ref() == Some(&path) {
+                        // Fill the stage only when it's THIS track's —
+                        // a pending for another track is superseded
+                        // (the gate drops it), not filled by this cover.
+                        if palette_pending
+                            .as_ref()
+                            .is_some_and(|pp| pp.path == path)
+                        {
+                            if let Some(pp) = palette_pending.as_mut() {
+                                pp.colors = img
+                                    .as_ref()
+                                    .map(|i| spectrum_bar::dominant_colors(i, 3));
+                                pp.img = img.clone();
+                            }
+                        } else {
+                            commit_cover_palette(
+                                spectrum_colors,
+                                palette_fade,
+                                shadertoy,
+                                &settings.spectrum.gradient,
+                                img.clone(),
+                            );
+                            if let Some(img) = img {
+                                *playing_cover = Some(ui.ctx().load_texture(
+                                    "player-cover",
+                                    img,
+                                    egui::TextureOptions::LINEAR,
+                                ));
                             }
                         }
-                        *playing_cover = Some(ui.ctx().load_texture(
+                    }
+                    *playing_cover_rx = None;
+                }
+                // A dead worker must not hold the promote gate open —
+                // treat as "cover resolved to nothing".
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(pp) = palette_pending.as_mut() {
+                        if pp.img.is_none() {
+                            pp.colors = None;
+                        }
+                    }
+                    *playing_cover_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // Palette lifecycle, once per frame:
+        // 1. `palette_pending` — a freshly opened track's palette is
+        //    held until the decoder applied the source AND the output
+        //    consumed its first frame (load_gen bump + position > 0),
+        //    so colors never change while the previous song is still
+        //    audible. A cover fetch still in flight also holds it.
+        // 2. `palette_fade` — once released, the displayed palette
+        //    eases toward the new colors so the recolor crossfades.
+        if let Some(pp) = palette_pending.as_mut() {
+            if let Some(p) = player.as_ref() {
+                if p.state() == audio::PlayerState::Playing {
+                    pp.saw_playing = true;
+                }
+            }
+            // A stage superseded by a different loaded track is stale.
+            let current = Some(&pp.path) == playing_track.as_ref();
+            let promoted = player.as_ref().is_some_and(|p| {
+                palette_promote(
+                    *palette_gen,
+                    p.load_gen(),
+                    p.position().as_secs_f64(),
+                    p.state(),
+                    pp.saw_playing,
+                    pp.armed.elapsed().as_secs_f32(),
+                )
+            }) || player.is_none();
+            // A promoted stage also waits for its cover fetch to
+            // drain — promoting early would commit with img still
+            // None (read as "no art") and fade the palette out.
+            if !current || (promoted && playing_cover_rx.is_none()) {
+                let pp = palette_pending.take().unwrap();
+                // A stale stage just drops; a promoted one commits.
+                if current {
+                    commit_cover_palette(
+                        spectrum_colors,
+                        palette_fade,
+                        shadertoy,
+                        &settings.spectrum.gradient,
+                        pp.img.clone(),
+                    );
+                    // The displayed cover (vinyl label, mini slot)
+                    // lands with the palette — the mini view
+                    // crossfades the swap itself.
+                    *playing_cover = pp.img.map(|img| {
+                        ui.ctx().load_texture(
                             "player-cover",
                             img,
                             egui::TextureOptions::LINEAR,
-                        ));
-                    }
+                        )
+                    });
                 }
-                *playing_cover_rx = None;
             }
+        }
+        if let Some(f) = palette_fade.as_ref() {
+            // Spectrum, mini wash, EQ tint all read spectrum_colors —
+            // the shader gets the same blended step pushed per frame.
+            let t =
+                (f.started.elapsed().as_secs_f32() / PALETTE_FADE_S).min(1.0);
+            let cur = lerp_palette(&f.from, &f.to, ease(t));
+            if let Some(toy) = shadertoy.as_mut() {
+                toy.set_palette(&cur);
+            }
+            *spectrum_colors = Some(cur);
+            if t >= 1.0 {
+                *spectrum_colors = f.end.clone();
+                *palette_fade = None;
+            }
+            ui.ctx().request_repaint();
         }
         // Pump the spectrum tap once per frame (Lacrima's analyzer also
         // runs regardless of the visible view). Bars settling after a
@@ -2751,7 +3071,8 @@ impl eframe::App for AesRustApp {
             && !fs_exit.open
             && !del_prompt.open
             && !emu_close.open
-            && !app_exit.open;
+            && !app_exit.open
+            && !shader_upd.open;
         // The scrollbar grab zone owns the window's bottom edge in the
         // Music view: suppress the resize grip over the same rect so
         // presses reach the scrollbar instead of starting a resize.
@@ -2873,6 +3194,8 @@ impl eframe::App for AesRustApp {
                             album_row,
                             player.as_ref(),
                             playing_track.as_deref(),
+                            playing_cover.as_ref(),
+                            palette_pending.is_some(),
                             stream_loading,
                             waveform_shown,
                             *waveform_loading,
@@ -3080,6 +3403,7 @@ impl eframe::App for AesRustApp {
                                 playing_track.as_deref(),
                                 playing_cover,
                                 playing_cover_rx,
+                                palette_pending,
                                 ui.ctx(),
                             );
                         }
@@ -3845,7 +4169,7 @@ impl eframe::App for AesRustApp {
                 // own Esc handling runs while they're open —
                 // view_interactive gates this path then.
                 if view_interactive || fs_exit.open || del_prompt.open || emu_close.open
-                    || app_exit.open
+                    || app_exit.open || shader_upd.open
                 {
                     let esc = ui
                         .ctx()
@@ -3859,6 +4183,10 @@ impl eframe::App for AesRustApp {
                             emu_close.open = false;
                         } else if app_exit.open {
                             app_exit.open = false;
+                        } else if shader_upd.open {
+                            // Dismiss == keep the local shader copies;
+                            // next launch re-detects and re-asks.
+                            shader_upd.open = false;
                         } else if del_prompt.open {
                             del_prompt.dismiss();
                         } else if transport.overflow_open {
@@ -4431,6 +4759,7 @@ impl eframe::App for AesRustApp {
                         playing_track.as_deref(),
                         playing_cover,
                         playing_cover_rx,
+                        palette_pending,
                         ui.ctx(),
                     );
                 }
@@ -4824,6 +5153,75 @@ impl eframe::App for AesRustApp {
                             del_prompt.confirmed = del_prompt.pending.take();
                         }
                         DialogAction::Cancel => del_prompt.dismiss(),
+                        DialogAction::None => {}
+                    }
+                    ui.ctx().request_repaint();
+                }
+                // Shadertoy update prompt — the launch-detected set of
+                // disk copies that diverge from the embedded sources
+                // without being provable seeds. Confirm rewrites them
+                // with the marked embedded source and drops their
+                // pipelines; cancel keeps the local files (next launch
+                // re-asks).
+                if shader_upd.open || shader_upd.vis > 0.001 {
+                    // Mini mode skips the shared Esc ladder — the
+                    // consume here is its fallback (a no-op in the
+                    // normal view, which already consumed it).
+                    if shader_upd.open
+                        && ui
+                            .ctx()
+                            .input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                            })
+                    {
+                        shader_upd.open = false;
+                    }
+                    let dtu = ui.ctx().input(|i| i.stable_dt);
+                    shader_upd.vis = (shader_upd.vis
+                        + dtu / if shader_upd.open { 0.18 } else { -0.14 })
+                    .clamp(0.0, 1.0);
+                    let n = shader_upd.names.len();
+                    let title = if n == 1 {
+                        "Update shadertoy?".to_string()
+                    } else {
+                        format!("Update {n} shadertoys?")
+                    };
+                    let mut shown: Vec<&str> = shader_upd
+                        .names
+                        .iter()
+                        .take(4)
+                        .map(String::as_str)
+                        .collect();
+                    if n > shown.len() {
+                        shown.push("…");
+                    }
+                    let subtitle = format!(
+                        "{} differ from the built-in versions.",
+                        shown.join(", ")
+                    );
+                    match confirm_overlay(
+                        ui,
+                        content,
+                        &title,
+                        &subtitle,
+                        "Update",
+                        "Keep",
+                        &mut shader_upd.sel,
+                        s,
+                        shader_upd.vis,
+                        shader_upd.open,
+                        "shader-upd",
+                    ) {
+                        DialogAction::Confirm => {
+                            for name in &shader_upd.names {
+                                shadertoy::write_embedded(name);
+                            }
+                            if let Some(toy) = shadertoy.as_mut() {
+                                toy.invalidate(&shader_upd.names);
+                            }
+                            shader_upd.open = false;
+                        }
+                        DialogAction::Cancel => shader_upd.open = false,
                         DialogAction::None => {}
                     }
                     ui.ctx().request_repaint();
@@ -6429,6 +6827,7 @@ fn on_tag_saved(
     playing_cover_rx: &mut Option<
         std::sync::mpsc::Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>,
     >,
+    palette_pending: &mut Option<PendingPalette>,
     ctx: &egui::Context,
 ) {
     if library::is_url(saved) {
@@ -6474,11 +6873,22 @@ fn on_tag_saved(
         }
         if playing_track == Some(saved) {
             if let Some(img) = library::decode_cover(&library::CoverSrc::Tag(saved.to_path_buf())) {
-                *playing_cover = Some(ctx.load_texture(
-                    "playing-cover",
-                    img,
-                    egui::TextureOptions::LINEAR,
-                ));
+                // An armed stage owns this track's art — the refresh
+                // joins it and lands at promotion rather than being
+                // overwritten by the staged (stale) image.
+                if let Some(pp) = palette_pending
+                    .as_mut()
+                    .filter(|pp| pp.path.as_path() == saved)
+                {
+                    pp.colors = Some(spectrum_bar::dominant_colors(&img, 3));
+                    pp.img = Some(img);
+                } else {
+                    *playing_cover = Some(ctx.load_texture(
+                        "playing-cover",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
             }
         }
     }
@@ -8759,6 +9169,59 @@ fn ui_tab_libraries(ui: &mut egui::Ui, panel: Rect, t: f32, ytdlp: &mut ytdlp::Y
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged palette must promote only once the track is audibly
+    /// playing — not at open() (a stream spends seconds resolving and
+    /// buffering while the previous song still sounds).
+    #[test]
+    fn palette_promotes_only_when_audible() {
+        use audio::PlayerState::*;
+        // Load applied (gen bumped) but no frames consumed yet → hold.
+        assert!(!palette_promote(3, 4, 0.0, Playing, true, 0.5));
+        // Audible: gen advanced and the position moved past 0.
+        assert!(palette_promote(3, 4, 0.2, Playing, true, 0.5));
+        // Same gen → the new source hasn't been applied yet, even if
+        // the old track still reports a position.
+        assert!(!palette_promote(3, 3, 12.0, Playing, true, 0.5));
+        // Load attempted and died: Playing was seen, then Stopped.
+        assert!(palette_promote(3, 3, 0.0, Stopped, true, 1.0));
+        // A stale Stopped that predates the stage is not a release.
+        assert!(!palette_promote(3, 3, 0.0, Stopped, false, 1.0));
+        // The armed timeout eventually releases a silent open.
+        assert!(palette_promote(3, 3, 0.0, Playing, true, 11.0));
+    }
+
+    /// The palette crossfade lerps per channel, clamps mismatched
+    /// stop counts, and lands exactly on the target.
+    #[test]
+    fn palette_fade_lerps_and_lands() {
+        let a = vec![Color32::from_rgb(0, 0, 0)];
+        let b = vec![Color32::from_rgb(200, 100, 50), Color32::from_rgb(40, 40, 40)];
+        let mid = lerp_palette(&a, &b, 0.5);
+        // Shorter side clamps to its last stop (100,50 → a[0] = black).
+        assert_eq!(mid.len(), 2);
+        assert_eq!(mid[0], Color32::from_rgb(100, 50, 25));
+        // t=1 lands exactly on the target.
+        let end = lerp_palette(&a, &b, 1.0);
+        assert_eq!(end, b);
+        // Empty sides pass through.
+        assert_eq!(lerp_palette(&[], &b, 0.5), b);
+    }
+
+    /// Regression: opening a different album while a track plays used
+    /// to recolor the spectrum/mini header with the new album's first
+    /// cover — the loaded element's palette must own the UI until the
+    /// next track starts.
+    #[test]
+    fn album_open_palette_yields_to_loaded_track() {
+        // Album still loaded + no track → the album palette applies.
+        assert!(album_palette_applies(true, false));
+        // A loaded/playing track keeps its palette across switches.
+        assert!(!album_palette_applies(true, true));
+        assert!(!album_palette_applies(false, true));
+        // Stale worker result for a replaced album → never applies.
+        assert!(!album_palette_applies(false, false));
+    }
 
     /// Regression: `row_action = ra` used to overwrite the confirmed
     /// `DeleteAlbum` the delete prompt re-injected, because the view
