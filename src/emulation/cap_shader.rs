@@ -38,35 +38,35 @@ type ID3D12Fence = ();
 /// The shipped collection — `(name, source)`; the name is the file
 /// stem shown in the panel ComboBox ("None" is implicit, not a file).
 const EMBEDDED: &[(&str, &str)] = &[
-    ("Anime_HD", include_str!("../shaders/capture/Anime_HD.glsl")),
-    ("Anime_Soft", include_str!("../shaders/capture/Anime_Soft.glsl")),
-    ("Arcade_Clarity", include_str!("../shaders/capture/Arcade_Clarity.glsl")),
-    ("CRT_Phosphor", include_str!("../shaders/capture/CRT_Phosphor.glsl")),
-    ("CRT_TV", include_str!("../shaders/capture/CRT_TV.glsl")),
-    ("Cartoon", include_str!("../shaders/capture/Cartoon.glsl")),
-    ("Cell_Shade", include_str!("../shaders/capture/Cell_Shade.glsl")),
-    ("Demon_Vision", include_str!("../shaders/capture/Demon_Vision.glsl")),
-    ("Drunk_Vision", include_str!("../shaders/capture/Drunk_Vision.glsl")),
-    ("Eagle_2x", include_str!("../shaders/capture/Eagle_2x.glsl")),
-    ("GBA_Screen", include_str!("../shaders/capture/GBA_Screen.glsl")),
-    ("HDR_Pop", include_str!("../shaders/capture/HDR_Pop.glsl")),
-    ("HQ2x_Pixel", include_str!("../shaders/capture/HQ2x_Pixel.glsl")),
-    ("Lacrima_Glitch", include_str!("../shaders/capture/Lacrima_Glitch.glsl")),
-    ("LCD_Handheld", include_str!("../shaders/capture/LCD_Handheld.glsl")),
-    ("Neon_Cabinet", include_str!("../shaders/capture/Neon_Cabinet.glsl")),
-    ("NTSC_Composite", include_str!("../shaders/capture/NTSC_Composite.glsl")),
-    ("Night_Vision", include_str!("../shaders/capture/Night_Vision.glsl")),
-    ("PVM_Monitor", include_str!("../shaders/capture/PVM_Monitor.glsl")),
-    ("Phosphor", include_str!("../shaders/capture/Phosphor.glsl")),
-    ("Pixel_Retro", include_str!("../shaders/capture/Pixel_Retro.glsl")),
-    ("Psychedelic_Vision", include_str!("../shaders/capture/Psychedelic_Vision.glsl")),
-    ("Retro_Enhance", include_str!("../shaders/capture/Retro_Enhance.glsl")),
-    ("Retro_RPG_Menu", include_str!("../shaders/capture/Retro_RPG_Menu.glsl")),
-    ("Retro_Warm", include_str!("../shaders/capture/Retro_Warm.glsl")),
-    ("Scale2x_Enhance", include_str!("../shaders/capture/Scale2x_Enhance.glsl")),
-    ("Scanline_Arcade", include_str!("../shaders/capture/Scanline_Arcade.glsl")),
-    ("Sharp_Clean", include_str!("../shaders/capture/Sharp_Clean.glsl")),
-    ("VHS_Tape", include_str!("../shaders/capture/VHS_Tape.glsl")),
+    ("Anime_HD", include_str!("../../shaders/capture/Anime_HD.glsl")),
+    ("Anime_Soft", include_str!("../../shaders/capture/Anime_Soft.glsl")),
+    ("Arcade_Clarity", include_str!("../../shaders/capture/Arcade_Clarity.glsl")),
+    ("CRT_Phosphor", include_str!("../../shaders/capture/CRT_Phosphor.glsl")),
+    ("CRT_TV", include_str!("../../shaders/capture/CRT_TV.glsl")),
+    ("Cartoon", include_str!("../../shaders/capture/Cartoon.glsl")),
+    ("Cell_Shade", include_str!("../../shaders/capture/Cell_Shade.glsl")),
+    ("Demon_Vision", include_str!("../../shaders/capture/Demon_Vision.glsl")),
+    ("Drunk_Vision", include_str!("../../shaders/capture/Drunk_Vision.glsl")),
+    ("Eagle_2x", include_str!("../../shaders/capture/Eagle_2x.glsl")),
+    ("GBA_Screen", include_str!("../../shaders/capture/GBA_Screen.glsl")),
+    ("HDR_Pop", include_str!("../../shaders/capture/HDR_Pop.glsl")),
+    ("HQ2x_Pixel", include_str!("../../shaders/capture/HQ2x_Pixel.glsl")),
+    ("Lacrima_Glitch", include_str!("../../shaders/capture/Lacrima_Glitch.glsl")),
+    ("LCD_Handheld", include_str!("../../shaders/capture/LCD_Handheld.glsl")),
+    ("Neon_Cabinet", include_str!("../../shaders/capture/Neon_Cabinet.glsl")),
+    ("NTSC_Composite", include_str!("../../shaders/capture/NTSC_Composite.glsl")),
+    ("Night_Vision", include_str!("../../shaders/capture/Night_Vision.glsl")),
+    ("PVM_Monitor", include_str!("../../shaders/capture/PVM_Monitor.glsl")),
+    ("Phosphor", include_str!("../../shaders/capture/Phosphor.glsl")),
+    ("Pixel_Retro", include_str!("../../shaders/capture/Pixel_Retro.glsl")),
+    ("Psychedelic_Vision", include_str!("../../shaders/capture/Psychedelic_Vision.glsl")),
+    ("Retro_Enhance", include_str!("../../shaders/capture/Retro_Enhance.glsl")),
+    ("Retro_RPG_Menu", include_str!("../../shaders/capture/Retro_RPG_Menu.glsl")),
+    ("Retro_Warm", include_str!("../../shaders/capture/Retro_Warm.glsl")),
+    ("Scale2x_Enhance", include_str!("../../shaders/capture/Scale2x_Enhance.glsl")),
+    ("Scanline_Arcade", include_str!("../../shaders/capture/Scanline_Arcade.glsl")),
+    ("Sharp_Clean", include_str!("../../shaders/capture/Sharp_Clean.glsl")),
+    ("VHS_Tape", include_str!("../../shaders/capture/VHS_Tape.glsl")),
 ];
 
 /// std140 mirror of the `Globals` block — the shader uniforms plus the
@@ -417,7 +417,7 @@ impl CaptureShader {
     #[cfg(not(windows))]
     pub fn import_share(
         &mut self,
-        _share: &crate::wgc::GpuShare,
+        _share: &crate::emulation::wgc::GpuShare,
     ) -> Result<ImportedRing, String> {
         Err("zero-copy capture import requires the DX12 backend (Windows)".into())
     }
@@ -425,7 +425,7 @@ impl CaptureShader {
     #[cfg(windows)]
     pub fn import_share(
         &mut self,
-        share: &crate::wgc::GpuShare,
+        share: &crate::emulation::wgc::GpuShare,
     ) -> Result<ImportedRing, String> {
         unsafe {
             let hal = self

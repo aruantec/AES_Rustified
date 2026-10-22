@@ -107,7 +107,7 @@ use smithay::{
     },
 };
 
-use crate::{wgc, xenia::session_log as log};
+use crate::emulation::{wgc, xenia::session_log as log};
 
 /// Generated bindings for the vendored legacy `wl_drm` protocol
 /// (`protocols/wayland-drm.xml`). XWayland's glamor uses this global to

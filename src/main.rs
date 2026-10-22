@@ -3,48 +3,28 @@
 mod album_row;
 mod apl;
 mod audio;
-mod cap_shader;
 mod carousel;
-mod cemu_gpack;
-mod cemu_overlay;
-mod decomp;
 mod edge_border;
 mod emoji;
-mod emu_dl;
-mod emu_meta;
 mod emulation;
 mod equalizer;
 mod exe_icon;
 mod icons;
 mod library;
-mod libretro;
 mod logo;
 mod meta_cache;
 mod mini;
 mod paint;
 mod particles;
-mod pillarbox;
-mod rom_editor;
-mod rpcs3_overlay;
-mod rpcs3_patch;
 mod search_pill;
 mod settings;
 mod shadertoy;
-mod shadps4;
-mod shadps4_overlay;
 mod spectrum_bar;
 mod tag_editor;
 mod transport;
 mod url_prompt;
 mod waveform_bar;
-mod wgc;
 mod widgets;
-#[cfg(not(windows))]
-mod wlcomp;
-mod xenia;
-mod xenia_cfg;
-mod xenia_overlay;
-mod xenia_profile;
 // dead_code: a few query helpers (full -J metadata, extractor
 // profiles beyond Default) are the surface for future video-stream
 // selection — Lacrima's OnlineStreamSelector shape.
@@ -673,7 +653,7 @@ struct AesRustApp {
     app_exit: AppExitPrompt,
     /// Re/Decompilation catalog view — install/update state for the
     /// curated project list.
-    decomp: decomp::DecompView,
+    decomp: emulation::decomp::DecompView,
     /// Emulation view state — section strip, item search, active
     /// section (prototype; ROM items land later).
     emu: emulation::EmuView,
@@ -1523,7 +1503,7 @@ impl AesRustApp {
             notice: None,
             emu_close: EmuClosePrompt::default(),
             app_exit: AppExitPrompt::default(),
-            decomp: decomp::DecompView::new(),
+            decomp: emulation::decomp::DecompView::new(),
             emu: emulation::EmuView::new(),
             started: std::time::Instant::now(),
         };
@@ -1533,7 +1513,7 @@ impl AesRustApp {
         app.emu.cap_shader = cc
             .wgpu_render_state
             .as_ref()
-            .map(cap_shader::CaptureShader::new);
+            .map(emulation::cap_shader::CaptureShader::new);
         boot_mark("cap_shader ready");
         // Lacrima kicks off RefreshYtDlpInfo at startup so the
         // Libraries tab opens with populated state (worker thread).
@@ -3319,7 +3299,7 @@ impl eframe::App for AesRustApp {
                                     );
                                 }
                                 View::Recomp => {
-                                    decomp::view(ui, content, a, view_interactive, decomp, s)
+                                    emulation::decomp::view(ui, content, a, view_interactive, decomp, s)
                                 }
                                 _ => placeholder_view(ui, content, v.name(), s),
                             }

@@ -700,7 +700,7 @@ pub fn load() -> Settings {
     // Emulators/RetroArch — repoint a saved path still aimed at the
     // migrated tree so the settings card shows the live install.
     if let Some(cfg) = settings.emulation.emulators.get_mut("retroarch") {
-        if let Some(moved) = crate::emu_dl::retroarch_migrate_configured_path(cfg) {
+        if let Some(moved) = crate::emulation::emu_dl::retroarch_migrate_configured_path(cfg) {
             *cfg = moved;
         }
     }

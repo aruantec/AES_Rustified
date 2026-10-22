@@ -191,7 +191,7 @@ pub struct CoreInfo {
     pub info_path: PathBuf,
 }
 
-pub type CoreDownload = crate::emu_dl::Shared;
+pub type CoreDownload = crate::emulation::emu_dl::Shared;
 
 pub fn core_root(section: Section) -> Option<PathBuf> {
     crate::settings::data_root().map(|p| p.join("Emulators").join(section.dir()).join("Libretro"))
@@ -230,7 +230,7 @@ fn select_core(cores: &[CoreInfo], selected_id: &str) -> Option<CoreInfo> {
 /// Download every core the section's filter accepts — the N64
 /// section pulls only N64 cores, the 3DS section only 3DS cores.
 pub fn download_cores(section: Section) -> CoreDownload {
-    let progress = Arc::new(Mutex::new(crate::emu_dl::DlProgress {
+    let progress = Arc::new(Mutex::new(crate::emulation::emu_dl::DlProgress {
         stage: format!("Preparing {} core catalog…", section.label()),
         ..Default::default()
     }));
@@ -370,7 +370,7 @@ fn ensure_system_bundle(id: &str, progress: &CoreDownload) {
     let Some(&(_, stem)) = SYSTEM_BUNDLES.iter().find(|(k, _)| *k == id) else {
         return;
     };
-    let Some(system) = crate::emu_dl::retroarch_dir().map(|d| d.join("system")) else {
+    let Some(system) = crate::emulation::emu_dl::retroarch_dir().map(|d| d.join("system")) else {
         return;
     };
     if system.join(stem).is_dir() {

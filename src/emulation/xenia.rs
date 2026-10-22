@@ -66,11 +66,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 #[cfg(windows)]
 use eframe::egui;
 
-use crate::wgc;
+use crate::emulation::wgc;
 #[cfg(not(windows))]
-use crate::wlcomp;
+use crate::emulation::wlcomp;
 #[cfg(not(windows))]
-use crate::xenia_cfg;
+use crate::emulation::xenia_cfg;
 
 /// Launch/session diagnostics — one timestamped line per event to
 /// `<data_root>/session.log` (truncated at 256KB). The failure modes
@@ -311,16 +311,16 @@ impl Session {
             // transcript the worker scans for [Core.Linker] — Lacrima's
             // WaitForCoreLinkerOutput gate before capture resolution.
             Kind::Shadps4 => {
-                let user = crate::shadps4::user_dir(&work_dir);
+                let user = crate::emulation::shadps4::user_dir(&work_dir);
                 let _ = std::fs::create_dir_all(&user);
-                crate::shadps4::ensure_background_input(&work_dir);
+                crate::emulation::shadps4::ensure_background_input(&work_dir);
                 cmd.env("SHADPS4_USER_DIR", &user)
                     .env("APPDATA", &user)
                     .env("LOCALAPPDATA", &user)
                     .env("XDG_CONFIG_HOME", &user)
                     .env("XDG_DATA_HOME", &user);
                 cmd.arg("-g")
-                    .arg(crate::shadps4::resolve_game_path(game))
+                    .arg(crate::emulation::shadps4::resolve_game_path(game))
                     .arg("-f")
                     .arg("false");
                 let log_dir = user.join("log");

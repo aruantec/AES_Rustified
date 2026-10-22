@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::emu_dl::{self, DlProgress, Shared};
+use crate::emulation::emu_dl::{self, DlProgress, Shared};
 
 /// Repositories Lacrima lists (ShadPs4ContentRepository.All).
 #[derive(Clone, Copy, PartialEq, Eq)]

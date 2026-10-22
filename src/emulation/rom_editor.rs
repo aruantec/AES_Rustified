@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use crate::emu_meta;
+use crate::emulation::emu_meta;
 use crate::tag_editor::{cover_uv, scale_style, TagEditor as T};
 
 // Palette shared with tag_editor (MetadataOverlay.axaml colors).

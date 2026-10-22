@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{emu_dl, emu_meta};
+use crate::emulation::{emu_dl, emu_meta};
 
 pub const ACTIVE_CONFIG: &str = "xenia-canary.config.toml";
 pub const TEMPLATE_CONFIG: &str = "xenia-canary.config.toml.default";

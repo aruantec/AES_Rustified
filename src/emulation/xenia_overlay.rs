@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::tag_editor::{scale_style, TagEditor as T};
-use crate::xenia_cfg as xc;
-use crate::emu_dl;
+use crate::emulation::xenia_cfg as xc;
+use crate::emulation::emu_dl;
 
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(0xD8, 0xD8, 0xD8);
 const PANEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x1A, 0x1A, 0x1A, 0x1A);
@@ -1349,7 +1349,7 @@ impl ProfilePrompt {
         );
         let _ = ui.interact(content, ui.id().with("xenia-profile-scrim"), egui::Sense::click());
 
-        let valid = crate::xenia_profile::is_valid_gamertag(self.text.trim());
+        let valid = crate::emulation::xenia_profile::is_valid_gamertag(self.text.trim());
         let mut submit = false;
         let mut cancel = false;
 

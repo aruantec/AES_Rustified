@@ -11,9 +11,9 @@ use eframe::egui::{self, CornerRadius, Rect, Stroke, UiBuilder};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::cemu_gpack::{self, PackEntry};
-use crate::emu_dl::Shared;
-use crate::emu_meta;
+use crate::emulation::cemu_gpack::{self, PackEntry};
+use crate::emulation::emu_dl::Shared;
+use crate::emulation::emu_meta;
 use crate::tag_editor::{scale_style, TagEditor as T};
 
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(0xD8, 0xD8, 0xD8);

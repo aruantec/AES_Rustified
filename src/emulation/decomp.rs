@@ -332,7 +332,7 @@ pub struct DecompView {
     remote: HashMap<String, RemoteInfo>,
     check_rx: Option<mpsc::Receiver<(String, RemoteInfo)>>,
     check_running: bool,
-    downloads: HashMap<String, crate::emu_dl::Shared>,
+    downloads: HashMap<String, crate::emulation::emu_dl::Shared>,
     notice: Option<String>,
     /// One-shot session check — armed on first view.
     checked: bool,
@@ -383,7 +383,7 @@ impl DecompView {
         let (tx, rx) = mpsc::channel();
         self.check_rx = Some(rx);
         std::thread::spawn(move || {
-            let agent = crate::emu_dl::agent();
+            let agent = crate::emulation::emu_dl::agent();
             for (i, p) in PROJECTS.iter().enumerate() {
                 if i > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(350));
@@ -464,8 +464,8 @@ impl DecompView {
         if self.downloads.contains_key(p.slug) {
             return;
         }
-        let dl: crate::emu_dl::Shared = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::emu_dl::DlProgress {
+        let dl: crate::emulation::emu_dl::Shared = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::emulation::emu_dl::DlProgress {
                 stage: format!("Fetching {}…", p.name),
                 ..Default::default()
             },
@@ -608,7 +608,7 @@ fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
         {
             continue;
         }
-        if !crate::emu_dl::arch_ok(&n) {
+        if !crate::emulation::emu_dl::arch_ok(&n) {
             continue;
         }
         // An explicit windows marker is required — a linux x64
@@ -650,7 +650,7 @@ fn is_archive(name: &str) -> bool {
 /// Card label for the action button click path — kept separate so the
 /// click handler and Enter share `activate`'s decision.
 fn download_work(
-    dl: &crate::emu_dl::Shared,
+    dl: &crate::emulation::emu_dl::Shared,
     repo: &str,
     slug: &str,
 ) -> Result<String, String> {
@@ -661,8 +661,8 @@ fn download_work(
 
     // Repo info first — the marker stores the pushed_at we fetched
     // at download time, so the next check compares honestly.
-    crate::emu_dl::set(dl, "Checking remote…", 0.0);
-    let agent = crate::emu_dl::agent();
+    crate::emulation::emu_dl::set(dl, "Checking remote…", 0.0);
+    let agent = crate::emulation::emu_dl::agent();
     let info_url = format!("https://api.github.com/repos/{repo}");
     let pushed_at = agent
         .get(&info_url)
@@ -693,7 +693,7 @@ fn download_work(
         format!("{}\n{}", pushed_at.trim(), mode),
     );
     let _ = std::fs::remove_dir_all(&stage_dir);
-    crate::emu_dl::set(dl, "Done", 1.0);
+    crate::emulation::emu_dl::set(dl, "Done", 1.0);
     Ok(dest.to_string_lossy().into_owned())
 }
 
@@ -702,13 +702,13 @@ fn download_work(
 /// success; `None` on no-release, no-matching-asset, or any failure
 /// — the caller falls back to the source zipball either way.
 fn try_release(
-    dl: &crate::emu_dl::Shared,
+    dl: &crate::emulation::emu_dl::Shared,
     agent: &ureq::Agent,
     repo: &str,
     stage_dir: &Path,
     dest: &Path,
 ) -> Option<String> {
-    crate::emu_dl::set(dl, "Checking release…", 0.0);
+    crate::emulation::emu_dl::set(dl, "Checking release…", 0.0);
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let mut resp = agent
         .get(&url)
@@ -722,18 +722,18 @@ fn try_release(
     let asset = pick_os_asset(v.get("assets")?.as_array()?)?;
     let fname = asset.rsplit('/').next().unwrap_or("asset.bin");
     let file = stage_dir.join(fname);
-    crate::emu_dl::download(dl, &format!("Downloading {tag}…"), &asset, &file).ok()?;
+    crate::emulation::emu_dl::download(dl, &format!("Downloading {tag}…"), &asset, &file).ok()?;
 
-    crate::emu_dl::set(dl, "Installing…", 0.0);
+    crate::emulation::emu_dl::set(dl, "Installing…", 0.0);
     std::fs::create_dir_all(dest).ok()?;
     let ok = if is_archive(fname) {
         let extracted = stage_dir.join("extracted");
         let _ = std::fs::remove_dir_all(&extracted);
         std::fs::create_dir_all(&extracted).is_ok()
-            && crate::emu_dl::extract_archive(&file, &extracted).is_ok()
+            && crate::emulation::emu_dl::extract_archive(&file, &extracted).is_ok()
             && {
-                let src = crate::emu_dl::normalize_root(&extracted);
-                crate::emu_dl::copy_dir_contents(&src, dest, "").is_ok()
+                let src = crate::emulation::emu_dl::normalize_root(&extracted);
+                crate::emulation::emu_dl::copy_dir_contents(&src, dest, "").is_ok()
             }
     } else {
         std::fs::copy(&file, dest.join(fname)).is_ok()
@@ -743,29 +743,29 @@ fn try_release(
 
 /// The source path: repo zipball → extract → copy over `dest`.
 fn source_download(
-    dl: &crate::emu_dl::Shared,
+    dl: &crate::emulation::emu_dl::Shared,
     repo: &str,
     slug: &str,
     stage_dir: &Path,
     dest: &Path,
 ) -> Result<(), String> {
     let zip = stage_dir.join(format!("{slug}.zip"));
-    crate::emu_dl::download(
+    crate::emulation::emu_dl::download(
         dl,
         &format!("Downloading {slug} source…"),
         &format!("https://api.github.com/repos/{repo}/zipball"),
         &zip,
     )?;
 
-    crate::emu_dl::set(dl, "Extracting…", 0.0);
+    crate::emulation::emu_dl::set(dl, "Extracting…", 0.0);
     let extracted = stage_dir.join("extracted");
     let _ = std::fs::remove_dir_all(&extracted);
     std::fs::create_dir_all(&extracted).map_err(|e| format!("Extract failed: {e}"))?;
-    crate::emu_dl::extract_archive(&zip, &extracted)?;
-    let src = crate::emu_dl::normalize_root(&extracted);
+    crate::emulation::emu_dl::extract_archive(&zip, &extracted)?;
+    let src = crate::emulation::emu_dl::normalize_root(&extracted);
     std::fs::create_dir_all(dest).map_err(|e| format!("Install failed: {e}"))?;
     // Copy OVER the tree — baseroms and build output survive updates.
-    crate::emu_dl::copy_dir_contents(&src, dest, "")?;
+    crate::emulation::emu_dl::copy_dir_contents(&src, dest, "")?;
     Ok(())
 }
 
@@ -799,7 +799,7 @@ fn cover_work(tx: mpsc::Sender<(String, Option<egui::ColorImage>)>) {
             .filter(|f| f.is_file())
             .and_then(|f| std::fs::read(f).ok())
             .or_else(|| {
-                let b = crate::emu_meta::boxart_bytes(p.cover_q)?;
+                let b = crate::emulation::emu_meta::boxart_bytes(p.cover_q)?;
                 if let Some(f) = &cache {
                     if let Some(d) = f.parent() {
                         let _ = std::fs::create_dir_all(d);

@@ -2488,7 +2488,7 @@ pub fn wiiu_title_id(path: &Path) -> Option<String> {
         if let Some(xml_path) = wiiu_meta_xml(dir) {
             if let Ok(xml) = std::fs::read_to_string(xml_path) {
                 if let Some(v) = wiiu_tag(&xml, "title_id") {
-                    if let Some(tid) = crate::cemu_gpack::normalize_display_title_id(&v) {
+                    if let Some(tid) = crate::emulation::cemu_gpack::normalize_display_title_id(&v) {
                         return Some(tid);
                     }
                 }
@@ -2507,7 +2507,7 @@ pub fn wiiu_title_id(path: &Path) -> Option<String> {
 /// the live helper, persisted back into the `.meta` doc.
 pub fn wiiu_title_id_cached(rom: &Path) -> Option<String> {
     if let Some(doc) = load_meta(rom) {
-        if let Some(tid) = crate::cemu_gpack::normalize_display_title_id(&doc.wiiu_title_id) {
+        if let Some(tid) = crate::emulation::cemu_gpack::normalize_display_title_id(&doc.wiiu_title_id) {
             return Some(tid);
         }
     }
@@ -2551,7 +2551,7 @@ fn wiiu_title_id_in(text: &str) -> Option<String> {
                 _ => false,
             };
         if ok {
-            return crate::cemu_gpack::normalize_display_title_id(&hex);
+            return crate::emulation::cemu_gpack::normalize_display_title_id(&hex);
         }
     }
     None

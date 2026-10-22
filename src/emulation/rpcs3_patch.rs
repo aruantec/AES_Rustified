@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::emu_dl::{self, DlProgress, Shared};
+use crate::emulation::emu_dl::{self, DlProgress, Shared};
 
 /// RPCS3's patch engine version (Lacrima's PatchEngineVersion).
 pub const PATCH_ENGINE_VERSION: &str = "1.2";

@@ -21,7 +21,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::emu_dl::{DlProgress, Shared, USER_AGENT_PUBLIC};
+use crate::emulation::emu_dl::{DlProgress, Shared, USER_AGENT_PUBLIC};
 
 // ------------------------------------------------------------------
 // CemuPathsService

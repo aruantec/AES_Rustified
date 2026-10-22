@@ -1,10 +1,35 @@
-//! The Emulation view prototype — Lacrima's EmulationView chrome:
-//! `Grid RowDefinitions="*,Auto,Auto"` = the item view on top, the
-//! 140px control band (section-list toggle left, cover-layout toggle
-//! right), and the collapsible console-section strip at the bottom.
-//! The item area is a placeholder until ROM scanning lands; the
-//! settings tab renders the Emulation sections with the console cards
-//! expandable but no handler controls wired yet.
+//! Emulator subsystem: the Emulation/Decomp views plus the per-emulator
+//! handlers, config/profile/patch helpers, overlays, and the capture
+//! plumbing (WGC on Windows, the nested Wayland compositor elsewhere).
+
+pub mod cap_shader;
+pub mod cemu_gpack;
+pub mod cemu_overlay;
+pub mod decomp;
+pub mod emu_dl;
+pub mod emu_meta;
+pub mod libretro;
+pub mod pillarbox;
+pub mod rom_editor;
+pub mod rpcs3_overlay;
+pub mod rpcs3_patch;
+pub mod shadps4;
+pub mod shadps4_overlay;
+pub mod wgc;
+#[cfg(not(windows))]
+pub mod wlcomp;
+pub mod xenia;
+pub mod xenia_cfg;
+pub mod xenia_overlay;
+pub mod xenia_profile;
+
+// The Emulation view prototype — Lacrima's EmulationView chrome:
+// `Grid RowDefinitions="*,Auto,Auto"` = the item view on top, the
+// 140px control band (section-list toggle left, cover-layout toggle
+// right), and the collapsible console-section strip at the bottom.
+// The item area is a placeholder until ROM scanning lands; the
+// settings tab renders the Emulation sections with the console cards
+// expandable but no handler controls wired yet.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,11 +41,7 @@ use eframe::egui::{
     Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2,
 };
 
-use crate::{
-    album_row, carousel, cemu_overlay, emu_dl, emu_meta, library, libretro, paint, rom_editor,
-    rpcs3_overlay, search_pill, settings, shadps4, shadps4_overlay, transport, xenia, xenia_cfg,
-    xenia_overlay, xenia_profile,
-};
+use crate::{album_row, carousel, library, paint, search_pill, settings, transport};
 
 // The input tunnel only exists on Windows (PostMessage into the
 // hidden emulator window) — off-Windows the emulator runs in its own
@@ -368,30 +389,30 @@ const CONSOLES: &[(&str, &str, &str)] = &[
 /// referenced as `CoverSrc::File` — the row's decode/cache path then
 /// handles them like any folder cover.
 const ART: &[(&str, &[u8])] = &[
-    ("3DS", include_bytes!("../assets/consoles/3DS.png")),
-    ("Arcade", include_bytes!("../assets/consoles/Arcade.png")),
+    ("3DS", include_bytes!("../../assets/consoles/3DS.png")),
+    ("Arcade", include_bytes!("../../assets/consoles/Arcade.png")),
     (
         "Dreamcast",
-        include_bytes!("../assets/consoles/Dreamcast.png"),
+        include_bytes!("../../assets/consoles/Dreamcast.png"),
     ),
-    ("FBN", include_bytes!("../assets/consoles/FBN.png")),
-    ("GBA", include_bytes!("../assets/consoles/GBA.png")),
-    ("GC", include_bytes!("../assets/consoles/GC.png")),
-    ("Genesis", include_bytes!("../assets/consoles/Genesis.png")),
-    ("N64", include_bytes!("../assets/consoles/N64.png")),
-    ("NES", include_bytes!("../assets/consoles/NES.png")),
-    ("PS2", include_bytes!("../assets/consoles/PS2.png")),
-    ("PS3", include_bytes!("../assets/consoles/PS3.png")),
-    ("PS4", include_bytes!("../assets/consoles/PS4.png")),
-    ("PSP", include_bytes!("../assets/consoles/PSP.png")),
-    ("PSX", include_bytes!("../assets/consoles/PSX.png")),
-    ("SNES", include_bytes!("../assets/consoles/SNES.png")),
-    ("Saturn", include_bytes!("../assets/consoles/Saturn.png")),
-    ("Switch", include_bytes!("../assets/consoles/Switch.png")),
-    ("Wii", include_bytes!("../assets/consoles/Wii.png")),
-    ("WiiU", include_bytes!("../assets/consoles/WiiU.png")),
-    ("X360", include_bytes!("../assets/consoles/X360.png")),
-    ("Xbox", include_bytes!("../assets/consoles/Xbox.png")),
+    ("FBN", include_bytes!("../../assets/consoles/FBN.png")),
+    ("GBA", include_bytes!("../../assets/consoles/GBA.png")),
+    ("GC", include_bytes!("../../assets/consoles/GC.png")),
+    ("Genesis", include_bytes!("../../assets/consoles/Genesis.png")),
+    ("N64", include_bytes!("../../assets/consoles/N64.png")),
+    ("NES", include_bytes!("../../assets/consoles/NES.png")),
+    ("PS2", include_bytes!("../../assets/consoles/PS2.png")),
+    ("PS3", include_bytes!("../../assets/consoles/PS3.png")),
+    ("PS4", include_bytes!("../../assets/consoles/PS4.png")),
+    ("PSP", include_bytes!("../../assets/consoles/PSP.png")),
+    ("PSX", include_bytes!("../../assets/consoles/PSX.png")),
+    ("SNES", include_bytes!("../../assets/consoles/SNES.png")),
+    ("Saturn", include_bytes!("../../assets/consoles/Saturn.png")),
+    ("Switch", include_bytes!("../../assets/consoles/Switch.png")),
+    ("Wii", include_bytes!("../../assets/consoles/Wii.png")),
+    ("WiiU", include_bytes!("../../assets/consoles/WiiU.png")),
+    ("X360", include_bytes!("../../assets/consoles/X360.png")),
+    ("Xbox", include_bytes!("../../assets/consoles/Xbox.png")),
 ];
 
 /// Extract the embedded console art into `<data>/Assets/Consoles/`
@@ -704,11 +725,11 @@ pub struct EmuView {
     prev_first_cover: bool,
     /// GPU capture-shader pipelines (Lacrima's Shader file ComboBox)
     /// — `None` when the egui backend isn't wgpu.
-    pub cap_shader: Option<crate::cap_shader::CaptureShader>,
+    pub cap_shader: Option<crate::emulation::cap_shader::CaptureShader>,
     /// The imported zero-copy ring — frames are sampled straight from
     /// the D3D11 shared textures (Lacrima's GPU interop); `None` puts
     /// us on the CPU-mirror path (same as Lacrima's fallback).
-    gpu_cap: Option<crate::cap_shader::ImportedRing>,
+    gpu_cap: Option<crate::emulation::cap_shader::ImportedRing>,
     /// Generation whose import already failed — don't retry every
     /// frame; a new generation (size change) gets a fresh attempt.
     gpu_failed_gen: u64,
@@ -1595,7 +1616,7 @@ pub fn view(
             Ok(Ok(s)) => {
                 // ReloadArcadeLockedPillarboxCropFromMetadata — the
                 // per-ROM locked crop wins over auto-detection.
-                emu.pillar_lock = crate::emu_meta::locked_crop(&s.game);
+                emu.pillar_lock = crate::emulation::emu_meta::locked_crop(&s.game);
                 emu.aspect_applied = false;
                 // Fresh capture — the old ring/seqs belong to the
                 // dead session.
@@ -1978,7 +1999,7 @@ pub fn view(
                     .unwrap_or(0);
                 if let Some(session) = &emu.session {
                     if (l > 0 || r > 0) && fw > 0 {
-                        crate::emu_meta::save_locked_crop(&session.game, l, r, fw);
+                        crate::emulation::emu_meta::save_locked_crop(&session.game, l, r, fw);
                         emu.pillar_lock = Some((l, r, fw));
                     }
                 }
@@ -1993,7 +2014,7 @@ pub fn view(
             if emu.pillar_lock.is_some() {
                 if ui.button("Clear Saved Crop Size").clicked() {
                     if let Some(session) = &emu.session {
-                        crate::emu_meta::clear_locked_crop(&session.game);
+                        crate::emulation::emu_meta::clear_locked_crop(&session.game);
                     }
                     emu.pillar_lock = None;
                     ui.close();
@@ -3109,7 +3130,7 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
 /// (smithay's xkb updates and forwards wl_keyboard.modifiers itself).
 #[cfg(not(windows))]
 fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
-    use crate::wlcomp::WlInput;
+    use crate::emulation::wlcomp::WlInput;
     if !emu.input_tun || !active {
         return;
     }
@@ -3645,15 +3666,15 @@ fn draw_session(
                 // then the 6-stable-frame debounce before retargeting.
                 if pillar_active {
                     let det = if let Some((ll, lr, lfw)) = emu.pillar_lock {
-                        crate::pillarbox::scale_locked(ll, lr, lfw, w as u32)
+                        crate::emulation::pillarbox::scale_locked(ll, lr, lfw, w as u32)
                     } else {
-                        crate::pillarbox::resolve(
+                        crate::emulation::pillarbox::resolve(
                             w as u32,
-                            crate::pillarbox::detect(
+                            crate::emulation::pillarbox::detect(
                                 &emu.frame_buf,
                                 w,
                                 h,
-                                crate::pillarbox::Profile::Aggressive,
+                                crate::emulation::pillarbox::Profile::Aggressive,
                             ),
                         )
                     };
@@ -3914,7 +3935,7 @@ fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, al
         Some(
             emu.gpu_desc
                 .get_or_insert_with(|| {
-                    crate::wgc::gpu_desc()
+                    crate::emulation::wgc::gpu_desc()
                         .map(|(n, v)| format!("{n} ({v})"))
                         .unwrap_or_else(|| "Unknown".into())
                 })

@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::emu_dl::{DlProgress, Shared};
-use crate::emu_meta;
-use crate::shadps4::{self, Repo};
+use crate::emulation::emu_dl::{DlProgress, Shared};
+use crate::emulation::emu_meta;
+use crate::emulation::shadps4::{self, Repo};
 use crate::tag_editor::{scale_style, TagEditor as T};
 
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(0xD8, 0xD8, 0xD8);
