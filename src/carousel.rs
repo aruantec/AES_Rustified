@@ -1867,7 +1867,7 @@ impl Carousel {
             // filter hides every item (Lacrima's menu lives on the
             // cover view itself, not on items).
             if interactive && self.album_key.is_some() {
-                let resp = ui.interact(rect, ui.id().with("cover-view-empty"), Sense::click());
+                let resp = ui.interact(rect, ui.scope_id().with("cover-view-empty"), Sense::click());
                 resp.context_menu(|ui| {
                     if self.rom_mode {
                         if ui.button("Add Roms").clicked() {
@@ -2073,7 +2073,7 @@ impl Carousel {
                 // block every later press).
                 let grip_press = ctx
                     .data(|d| {
-                        d.get_temp::<u64>(egui::Id::new("resize_grip_press"))
+                        d.get_temp::<u64>(egui::Id::unique("resize_grip_press"))
                     })
                     .map(|f| f == ctx.cumulative_frame_nr())
                     .unwrap_or(false);
@@ -2229,7 +2229,7 @@ impl Carousel {
 
         // Click / double-click on items (egui suppresses the click when
         // the press moved past its threshold, so a scroll never selects).
-        let resp = ui.interact(rect, ui.id().with("cover-view"), Sense::click());
+        let resp = ui.interact(rect, ui.scope_id().with("cover-view"), Sense::click());
         // Right-click an item -> context menu with "Edit Metadata"
         // (MusicView's OpenMetadataCommand, gated on IsItemPointed).
         if interactive && resp.secondary_clicked() {
@@ -3205,7 +3205,7 @@ impl Carousel {
         if inner.width() <= 1.0 {
             return;
         }
-        let resp = ui.interact(rect, ui.id().with("carousel-pill"), Sense::click_and_drag());
+        let resp = ui.interact(rect, ui.scope_id().with("carousel-pill"), Sense::click_and_drag());
         if interactive {
             // Only while actually dragging — a bare hover must not
             // preview titles (the text tracks the carousel itself).
@@ -3257,7 +3257,7 @@ impl Carousel {
             // instead of popping between sizes.
             let hot_t = ui
                 .ctx()
-                .animate_bool_with_time(ui.id().with("carousel-pill-hot"), hot, 0.12);
+                .animate_bool_with_time(ui.scope_id().with("carousel-pill-hot"), hot, 0.12);
             let kr = track_h * (0.57 + 0.11 * hot_t);
             // Clamp inside the capsule ends — at pct 0/1 the
             // edge-placed knob would hang half outside the track.

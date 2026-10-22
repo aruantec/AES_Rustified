@@ -71,7 +71,7 @@ impl WaveformBar {
         painter.rect_filled(rect, 0.0, BG.gamma_multiply(alpha));
 
         // --- Scrub interaction ----------------------------------------
-        let resp = ui.interact(rect, ui.id().with("waveform-bar"), Sense::click_and_drag());
+        let resp = ui.interact(rect, ui.scope_id().with("waveform-bar"), Sense::click_and_drag());
         let pointer = ui.ctx().input(|i| i.pointer.latest_pos());
         if interactive {
             if resp.is_pointer_button_down_on() {
@@ -252,7 +252,7 @@ impl WaveformBar {
     /// Each `mini_ui` call site owns its scrub slot keyed by `id`.
     pub fn mini_scrubbing(&self, ctx: &egui::Context, id: &str) -> bool {
         ctx.data_mut(|d| {
-            d.get_temp::<f64>(egui::Id::new(("mini-bar-scrub", id)))
+            d.get_temp::<f64>(egui::Id::unique(("mini-bar-scrub", id)))
                 .is_some()
         })
     }
@@ -274,9 +274,9 @@ impl WaveformBar {
         knob: bool,
     ) -> Option<f64> {
         let mut seek = None;
-        let resp = ui.interact(rect, ui.id().with(id), Sense::click_and_drag());
-        let sid = egui::Id::new(("mini-bar-scrub", id));
-        let pid = egui::Id::new(("mini-bar-pending", id));
+        let resp = ui.interact(rect, ui.scope_id().with(id), Sense::click_and_drag());
+        let sid = egui::Id::unique(("mini-bar-scrub", id));
+        let pid = egui::Id::unique(("mini-bar-pending", id));
         let mut scrub: Option<f64> = ui.ctx().data_mut(|d| d.get_temp(sid));
         let mut pending: Option<(f64, std::time::Instant)> =
             ui.ctx().data_mut(|d| d.get_temp(pid));
@@ -356,7 +356,7 @@ impl WaveformBar {
             // instead of popping between sizes.
             let hot_t = ui
                 .ctx()
-                .animate_bool_with_time(ui.id().with((id, "knob-hot")), hot, 0.12);
+                .animate_bool_with_time(ui.scope_id().with((id, "knob-hot")), hot, 0.12);
             let kr = rect.height() * (0.57 + 0.11 * hot_t);
             let kx = (rect.min.x + rect.width() * progress)
                 .clamp(rect.min.x + kr, rect.max.x - kr);

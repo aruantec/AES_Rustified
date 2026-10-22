@@ -1026,7 +1026,7 @@ impl AlbumRow {
         }
 
         // --- Input ---------------------------------------------------
-        let resp = ui.interact(rect, ui.id().with("album-row"), Sense::click());
+        let resp = ui.interact(rect, ui.scope_id().with("album-row"), Sense::click());
         let pointer = ui.ctx().input(|i| i.pointer.latest_pos());
         let scroll_delta = if pointer.map(|p| rect.contains(p)).unwrap_or(false) {
             ui.ctx().input(|i| i.smooth_scroll_delta)
@@ -1064,7 +1064,7 @@ impl AlbumRow {
         let hit_rect = Self::scroll_zone(rect, s);
         let sb_resp = ui.interact(
             hit_rect,
-            ui.id().with("album-row-scrollbar"),
+            ui.scope_id().with("album-row-scrollbar"),
             Sense::drag(),
         );
         let mut scrollbar_hover = false;

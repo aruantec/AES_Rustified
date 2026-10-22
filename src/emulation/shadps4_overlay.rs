@@ -43,7 +43,7 @@ fn overlay_frame(
     let ctx = ui.ctx().clone();
     let mut shown = shown;
     let fade = ctx.animate_bool_with_time_and_easing(
-        egui::Id::new(id),
+        egui::Id::unique(id),
         shown,
         0.32,
         egui::emath::easing::quadratic_in_out,
@@ -59,7 +59,7 @@ fn overlay_frame(
     );
     let _ = ui.interact(
         content,
-        egui::Id::new(format!("{id}_scrim")),
+        egui::Id::unique(format!("{id}_scrim")),
         egui::Sense::click(),
     );
     let area = Rect::from_min_max(
@@ -190,7 +190,7 @@ fn entry_card(
     ty += name_h + 4.0 * s;
     ui.painter()
         .galley(egui::pos2(cr.min.x + 12.0 * s, ty), desc_g, DIM);
-    toggle(ui, egui::Id::new(id).with(i), s, cr, &mut en);
+    toggle(ui, egui::Id::unique(id).with(i), s, cr, &mut en);
     ui.add_space(8.0 * s);
     en
 }

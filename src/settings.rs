@@ -401,6 +401,9 @@ pub struct Audio {
     /// VolumeKnobColor (Rustified-only): accent color of the volume
     /// knob's level arc in the transport band.
     pub volume_knob_color: [u8; 3],
+    /// The transport's RepeatMode — 0 Off / 1 All / 2 One. Mirrored
+    /// from `transport.repeat` so the last mode survives relaunch.
+    pub repeat_mode: u8,
 }
 
 impl Default for Audio {
@@ -422,6 +425,7 @@ impl Default for Audio {
             silence_advance_delay_ms: 500,
             ai_noise_reduction: false,
             volume_knob_color: [0x3F, 0xD8, 0xE8],
+            repeat_mode: 0,
         }
     }
 }

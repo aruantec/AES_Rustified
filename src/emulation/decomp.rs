@@ -1079,9 +1079,9 @@ pub fn view(
             }
         } else {
             let r = if interactive {
-                ui.interact(btn, ui.id().with(("decomp-act", p.slug)), Sense::click())
+                ui.interact(btn, ui.scope_id().with(("decomp-act", p.slug)), Sense::click())
             } else {
-                ui.interact(btn, ui.id().with(("decomp-act", p.slug)), Sense::hover())
+                ui.interact(btn, ui.scope_id().with(("decomp-act", p.slug)), Sense::hover())
             }
             .on_hover_text(match act {
                 Action::Install => "Download the latest release (or source)",
@@ -1129,9 +1129,9 @@ pub fn view(
 
         // Whole-card click selects (double-click runs the action).
         let cr = if interactive {
-            ui.interact(card, ui.id().with(("decomp-card", p.slug)), Sense::click())
+            ui.interact(card, ui.scope_id().with(("decomp-card", p.slug)), Sense::click())
         } else {
-            ui.interact(card, ui.id().with(("decomp-card", p.slug)), Sense::hover())
+            ui.interact(card, ui.scope_id().with(("decomp-card", p.slug)), Sense::hover())
         };
         if cr.clicked() {
             view.selected = i as i32;
@@ -1237,9 +1237,9 @@ pub fn view(
     let rsz = Vec2::splat(60.0 * s);
     let rrect = Rect::from_center_size(Pos2::new(right_x, cy), rsz);
     let rr = if interactive {
-        ui.interact(rrect, ui.id().with("decomp-refresh"), Sense::click())
+        ui.interact(rrect, ui.scope_id().with("decomp-refresh"), Sense::click())
     } else {
-        ui.interact(rrect, ui.id().with("decomp-refresh"), Sense::hover())
+        ui.interact(rrect, ui.scope_id().with("decomp-refresh"), Sense::hover())
     }
     .on_hover_text(if view.check_running {
         "Checking…"
@@ -1257,9 +1257,9 @@ pub fn view(
     right_x -= 64.0 * s;
     let orect = Rect::from_center_size(Pos2::new(right_x, cy), rsz);
     let orr = if interactive {
-        ui.interact(orect, ui.id().with("decomp-open"), Sense::click())
+        ui.interact(orect, ui.scope_id().with("decomp-open"), Sense::click())
     } else {
-        ui.interact(orect, ui.id().with("decomp-open"), Sense::hover())
+        ui.interact(orect, ui.scope_id().with("decomp-open"), Sense::hover())
     }
     .on_hover_text("Open Decomps folder");
     if orr.hovered() {

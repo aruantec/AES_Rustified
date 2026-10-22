@@ -121,7 +121,7 @@ impl SearchPill {
         s: f32,
     ) {
         let spec = &PILL;
-        let id = ui.id().with("search-pill").with(hint);
+        let id = ui.scope_id().with("search-pill").with(hint);
         let avail =
             ui.ctx().animate_bool_with_time(id.with("act"), active, FADE_SECS);
         if avail < 0.01 {
@@ -162,7 +162,7 @@ impl SearchPill {
         s: f32,
     ) {
         let spec = &BAND;
-        let id = ui.id().with("search-pill").with(hint);
+        let id = ui.scope_id().with("search-pill").with(hint);
         let avail =
             ui.ctx().animate_bool_with_time(id.with("act"), active, FADE_SECS);
         if avail < 0.01 {

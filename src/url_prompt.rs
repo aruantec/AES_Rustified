@@ -50,7 +50,7 @@ impl UrlPrompt {
         self.want_focus = true;
         // animate_bool jumps to its target on first call — seed the id
         // at 0 so the first painted frame actually fades in.
-        ctx.animate_bool(egui::Id::new("url-prompt-fade"), false);
+        ctx.animate_bool(egui::Id::unique("url-prompt-fade"), false);
     }
 
     /// Hit-test gating: nothing behind the scrim may receive input
@@ -79,7 +79,7 @@ impl UrlPrompt {
         let ctx = ui.ctx().clone();
         // Same 0.45s CubicEaseOut as Lacrima's popup opacity
         // transition.
-        let id = egui::Id::new("url-prompt-fade");
+        let id = egui::Id::unique("url-prompt-fade");
         let fade = ctx.animate_bool_with_time_and_easing(
             id,
             self.shown,
@@ -102,7 +102,7 @@ impl UrlPrompt {
             egui::CornerRadius::ZERO,
             Color32::from_black_alpha(230).gamma_multiply(fade),
         );
-        let _ = ui.interact(content, ui.id().with("url-prompt-scrim"), egui::Sense::click());
+        let _ = ui.interact(content, ui.scope_id().with("url-prompt-scrim"), egui::Sense::click());
 
         // Centered column: "Enter Url" + the rounded textbox.
         let (title, hint, icon_list) = match self.kind {

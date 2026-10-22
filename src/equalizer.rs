@@ -134,7 +134,7 @@ pub fn panel(
     // band under the pointer.
     let mut changed = false;
     let mut active_band: Option<usize> = None;
-    let resp = ui.interact(rect, ui.id().with("eq-drawer"), Sense::click_and_drag());
+    let resp = ui.interact(rect, ui.scope_id().with("eq-drawer"), Sense::click_and_drag());
     if interactive {
         let pointer = ui.ctx().input(|i| i.pointer.interact_pos());
         if resp.is_pointer_button_down_on() {

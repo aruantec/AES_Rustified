@@ -1503,7 +1503,7 @@ pub fn view(
     // Section-strip collapse — Lacrima's MaxHeightToggleBehavior
     // (0.55s CubicEaseInOut), the same animation the music strip uses.
     let list_t = crate::ease_in_out_cubic(ui.ctx().animate_bool_with_time(
-        ui.id().with("emu-sections-open"),
+        ui.scope_id().with("emu-sections-open"),
         emu.list_open,
         0.55,
     ));
@@ -1929,7 +1929,7 @@ pub fn view(
     // click opens the session menu. The interact region also stops
     // clicks from reaching the cards underneath.
     if emu.session.is_some() && cap_a > 0.5 {
-        let cap = ui.interact(pres_rect, ui.id().with("emu-capture-layer"), Sense::click());
+        let cap = ui.interact(pres_rect, ui.scope_id().with("emu-capture-layer"), Sense::click());
         if cap.double_clicked() && !emu.input_tun {
             emu.toggle_fullscreen();
         }
@@ -2082,9 +2082,9 @@ pub fn view(
             Vec2::splat(60.0 * s),
         );
         let r = if interactive {
-            ui.interact(btn, ui.id().with("emu-list-toggle"), Sense::click())
+            ui.interact(btn, ui.scope_id().with("emu-list-toggle"), Sense::click())
         } else {
-            ui.interact(btn, ui.id().with("emu-list-toggle"), Sense::hover())
+            ui.interact(btn, ui.scope_id().with("emu-list-toggle"), Sense::hover())
         }
         .on_hover_text(if emu.list_open {
             "Hide Albums"
@@ -2176,9 +2176,9 @@ pub fn view(
         if !sliders_x.is_nan() {
             let rb = Rect::from_center_size(Pos2::new(sliders_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
-                ui.interact(rb, ui.id().with("emu-render"), Sense::click())
+                ui.interact(rb, ui.scope_id().with("emu-render"), Sense::click())
             } else {
-                ui.interact(rb, ui.id().with("emu-render"), Sense::hover())
+                ui.interact(rb, ui.scope_id().with("emu-render"), Sense::hover())
             }
             .on_hover_text("Capture Settings");
             if r.clicked() {
@@ -2203,9 +2203,9 @@ pub fn view(
         if tun_ok && !tun_x.is_nan() {
             let tb = Rect::from_center_size(Pos2::new(tun_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
-                ui.interact(tb, ui.id().with("emu-tun"), Sense::click())
+                ui.interact(tb, ui.scope_id().with("emu-tun"), Sense::click())
             } else {
-                ui.interact(tb, ui.id().with("emu-tun"), Sense::hover())
+                ui.interact(tb, ui.scope_id().with("emu-tun"), Sense::hover())
             }
             .on_hover_text(if emu.input_tun {
                 "Stop Controlling Emulator (Esc)"
@@ -2227,9 +2227,9 @@ pub fn view(
         if !upd_x.is_nan() {
             let ub = Rect::from_center_size(Pos2::new(upd_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
-                ui.interact(ub, ui.id().with("emu-update"), Sense::click())
+                ui.interact(ub, ui.scope_id().with("emu-update"), Sense::click())
             } else {
-                ui.interact(ub, ui.id().with("emu-update"), Sense::hover())
+                ui.interact(ub, ui.scope_id().with("emu-update"), Sense::hover())
             }
             .on_hover_text(upd_sub.clone().unwrap_or_else(|| "Update available".into()));
             if r.clicked() {
@@ -2270,9 +2270,9 @@ pub fn view(
         if !setup_x.is_nan() {
             let sb = Rect::from_center_size(Pos2::new(setup_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive && setup_ok {
-                ui.interact(sb, ui.id().with("emu-setup"), Sense::click())
+                ui.interact(sb, ui.scope_id().with("emu-setup"), Sense::click())
             } else {
-                ui.interact(sb, ui.id().with("emu-setup"), Sense::hover())
+                ui.interact(sb, ui.scope_id().with("emu-setup"), Sense::hover())
             }
             .on_hover_text(if setup_ok {
                 "Open Emulator Settings".to_string()
@@ -2347,9 +2347,9 @@ pub fn view(
             // clamped off the pause zone above.
             let vp = Rect::from_center_size(Pos2::new(vp_cx, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
-                ui.interact(vp, ui.id().with("emu-viewport"), Sense::click())
+                ui.interact(vp, ui.scope_id().with("emu-viewport"), Sense::click())
             } else {
-                ui.interact(vp, ui.id().with("emu-viewport"), Sense::hover())
+                ui.interact(vp, ui.scope_id().with("emu-viewport"), Sense::hover())
             }
             .on_hover_text(if emu.viewport_dismissed {
                 "Back to Game"
@@ -2366,9 +2366,9 @@ pub fn view(
             // glyph is Lacrima's circled bars/triangle.
             let pp = pause;
             let r = if interactive {
-                ui.interact(pp, ui.id().with("emu-pause"), Sense::click())
+                ui.interact(pp, ui.scope_id().with("emu-pause"), Sense::click())
             } else {
-                ui.interact(pp, ui.id().with("emu-pause"), Sense::hover())
+                ui.interact(pp, ui.scope_id().with("emu-pause"), Sense::hover())
             }
             .on_hover_text(if session.is_paused() {
                 "Resume Emulator"
@@ -2386,9 +2386,9 @@ pub fn view(
             // slides one slot left to make room.
             let pw = Rect::from_center_size(Pos2::new(pw_x, cy), Vec2::splat(60.0 * s));
             let r = if interactive {
-                ui.interact(pw, ui.id().with("emu-close"), Sense::click())
+                ui.interact(pw, ui.scope_id().with("emu-close"), Sense::click())
             } else {
-                ui.interact(pw, ui.id().with("emu-close"), Sense::hover())
+                ui.interact(pw, ui.scope_id().with("emu-close"), Sense::hover())
             }
             .on_hover_text("Close Emulator");
             close_emu = r.clicked();
@@ -2418,9 +2418,9 @@ pub fn view(
         let right_x = layout_x;
         let btn = Rect::from_center_size(Pos2::new(right_x, cy), Vec2::splat(60.0 * s));
         let r = if interactive {
-            ui.interact(btn, ui.id().with("emu-layout"), Sense::click())
+            ui.interact(btn, ui.scope_id().with("emu-layout"), Sense::click())
         } else {
-            ui.interact(btn, ui.id().with("emu-layout"), Sense::hover())
+            ui.interact(btn, ui.scope_id().with("emu-layout"), Sense::hover())
         }
         .on_hover_text("Cover Layout");
         if r.clicked() {
@@ -2741,7 +2741,7 @@ fn upd_progress_overlay(
             Pos2::new(dlg.center().x, dlg.min.y + 126.0 * s * pop),
             Vec2::new(140.0 * s, 38.0 * s),
         );
-        let resp = ui.interact(b, ui.id().with("emu-upd-close"), Sense::click());
+        let resp = ui.interact(b, ui.scope_id().with("emu-upd-close"), Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
@@ -4318,7 +4318,7 @@ pub fn settings_tab(
         Pos2::new(panel.min.x, panel.min.y + 78.0 * s),
         Pos2::new(panel.max.x, panel.max.y - 74.0 * s),
     );
-    let scroll_id = ui.id().with("emu-scroll");
+    let scroll_id = ui.scope_id().with("emu-scroll");
     let mut scroll = ui
         .ctx()
         .data_mut(|d| d.get_persisted::<f32>(scroll_id).unwrap_or(0.0));
@@ -4527,7 +4527,7 @@ pub fn settings_tab(
             StrokeKind::Inside,
         );
         let head = Rect::from_min_size(card.min, Vec2::new(card.width(), head_h));
-        let resp = cui.interact(head, cui.id().with(("emu-section", key)), Sense::click());
+        let resp = cui.interact(head, cui.scope_id().with(("emu-section", key)), Sense::click());
         if resp.clicked() {
             if open {
                 emu.expanded.remove(key);
@@ -4726,7 +4726,7 @@ pub fn settings_tab(
                         .unwrap_or_else(|| "No cores installed".to_string());
                     let response = cui2.interact(
                         combo_rect,
-                        cui2.id().with(format!("{key}-libretro-core")),
+                        cui2.scope_id().with(format!("{key}-libretro-core")),
                         Sense::click(),
                     );
                     let popup_id = egui::Popup::default_response_id(&response);
@@ -5183,7 +5183,7 @@ fn render_panel(
     // back over the content.
     let slide =
         ui.ctx()
-            .animate_bool_with_time(ui.id().with("render-panel-slide"), emu.render_open, 0.3);
+            .animate_bool_with_time(ui.scope_id().with("render-panel-slide"), emu.render_open, 0.3);
     let t = crate::ease_out_cubic(slide);
     if t <= 0.001 {
         return;
@@ -5205,12 +5205,12 @@ fn render_panel(
     // the panel itself swallows clicks (settings overlay pattern).
     let outside = Rect::from_min_max(area.min, Pos2::new(panel.min.x, area.max.y));
     if ui
-        .interact(outside, ui.id().with("render-scrim"), Sense::click())
+        .interact(outside, ui.scope_id().with("render-scrim"), Sense::click())
         .clicked()
     {
         emu.render_open = false;
     }
-    let _ = ui.interact(panel, ui.id().with("render-panel"), Sense::click());
+    let _ = ui.interact(panel, ui.scope_id().with("render-panel"), Sense::click());
 
     // Contents live in a FIXED-WIDTH rect anchored at panel.min
     // and extending past the screen edge (settings-overlay style:

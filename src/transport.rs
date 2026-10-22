@@ -207,7 +207,7 @@ impl Transport {
         let compact = compact_needed(rect.width(), s);
         let ct = ui
             .ctx()
-            .animate_bool_with_time(ui.id().with("t-compact"), compact, COMPACT_SECS);
+            .animate_bool_with_time(ui.scope_id().with("t-compact"), compact, COMPACT_SECS);
         self.compact_t = ct;
         if !compact {
             self.overflow_open = false;
@@ -258,9 +258,9 @@ impl Transport {
         let cy = rect.center().y;
         let hit = |r: Rect, id: &str, tip: &str| {
             if interactive {
-                ui.interact(r, ui.id().with(id), Sense::click())
+                ui.interact(r, ui.scope_id().with(id), Sense::click())
             } else {
-                ui.interact(r, ui.id().with(id), Sense::hover())
+                ui.interact(r, ui.scope_id().with(id), Sense::hover())
             }
             .on_hover_text(tip)
         };
@@ -436,9 +436,9 @@ impl Transport {
         let cs = s * (rect.width() / need).min(1.0);
         let hit = |r: Rect, id: &str, tip: &str| {
             if interactive {
-                ui.interact(r, ui.id().with(id), Sense::click())
+                ui.interact(r, ui.scope_id().with(id), Sense::click())
             } else {
-                ui.interact(r, ui.id().with(id), Sense::hover())
+                ui.interact(r, ui.scope_id().with(id), Sense::hover())
             }
             .on_hover_text(tip)
         };
@@ -548,9 +548,9 @@ impl Transport {
         let cy = rect.center().y;
         let hit = |r: Rect, id: &str, tip: &str| {
             if interactive {
-                ui.interact(r, ui.id().with(id), Sense::click())
+                ui.interact(r, ui.scope_id().with(id), Sense::click())
             } else {
-                ui.interact(r, ui.id().with(id), Sense::hover())
+                ui.interact(r, ui.scope_id().with(id), Sense::hover())
             }
             .on_hover_text(tip)
         };
@@ -689,9 +689,9 @@ impl Transport {
         let hit = |ui: &egui::Ui, r: Rect, id: &str, tip: &str| {
             let r = r.intersect(clip);
             if interactive {
-                ui.interact(r, ui.id().with(id), Sense::click())
+                ui.interact(r, ui.scope_id().with(id), Sense::click())
             } else {
-                ui.interact(r, ui.id().with(id), Sense::hover())
+                ui.interact(r, ui.scope_id().with(id), Sense::hover())
             }
             .on_hover_text(tip)
         };
@@ -721,7 +721,7 @@ impl Transport {
         // grows LEFTWARD on hover/focus like the top-right SearchPill
         // (PILL spec behavior, BAND metrics), bounded left by the
         // buttons row. `x` still points just past the last button.
-        let pill_id = ui.id().with("ovf-filter");
+        let pill_id = ui.scope_id().with("ovf-filter");
         let open_t = ease_out_cubic(ui.ctx().animate_bool_with_time(
             pill_id.with("open"),
             self.filter_expanded,
@@ -939,7 +939,7 @@ impl Transport {
         let mut vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
         if interactive {
             let resp = ui
-                .interact(rect, ui.id().with(id), Sense::click_and_drag())
+                .interact(rect, ui.scope_id().with(id), Sense::click_and_drag())
                 .on_hover_text("Volume — drag to adjust, click the cap to mute");
             // Cap press/release edges handled manually: egui's
             // clicked() dies the moment drag_started fires (a couple
@@ -1044,7 +1044,7 @@ impl Transport {
         let muted = self.muted_vol.is_some();
         let mute_t = ui
             .ctx()
-            .animate_bool_with_time(ui.id().with("t-vol-mute"), muted, 0.3);
+            .animate_bool_with_time(ui.scope_id().with("t-vol-mute"), muted, 0.3);
         let accent = {
             let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * mute_t) as u8;
             Color32::from_rgb(
@@ -1061,7 +1061,7 @@ impl Transport {
         // Cap squash while held — deflates ~10% with a quick ease.
         let cap_t = ui
             .ctx()
-            .animate_bool_with_time(ui.id().with("t-vol-cap"), self.cap_down, 0.12);
+            .animate_bool_with_time(ui.scope_id().with("t-vol-cap"), self.cap_down, 0.12);
         let cap_r = cap_r * (1.0 - 0.10 * cap_t);
         let painter = ui.painter();
         let arc_r = r * 0.845;

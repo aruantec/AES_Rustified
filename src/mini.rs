@@ -125,7 +125,7 @@ pub(crate) fn view(
     // Mini-local delete confirm — the shell's DeletePrompt paints in
     // the normal view stack, which mini mode returns before reaching.
     // While a prompt is pending it owns all input.
-    let del_id = ui.id().with("mv-del");
+    let del_id = ui.scope_id().with("mv-del");
     let mut del: Option<crate::PendingDelete> =
         ctx.data_mut(|d| d.get_temp(del_id)).unwrap_or_default();
     let interactive = interactive && del.is_none();
@@ -379,9 +379,9 @@ pub(crate) fn view(
             Vec2::splat(icon),
         );
         let resp = if interactive {
-            ui.interact(r, ui.id().with(id), egui::Sense::click())
+            ui.interact(r, ui.scope_id().with(id), egui::Sense::click())
         } else {
-            ui.interact(r, ui.id().with(id), egui::Sense::hover())
+            ui.interact(r, ui.scope_id().with(id), egui::Sense::hover())
         };
         if resp.hovered() {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -468,7 +468,7 @@ pub(crate) fn view(
     let slider_w = 1.1 * h;
     let w_max = ph + 6.0 + slider_w + 6.0;
     let t = crate::search_pill::ease_out_cubic(ctx.animate_bool_with_time(
-        ui.id().with("mv-vol-pill"),
+        ui.scope_id().with("mv-vol-pill"),
         transport.mini_vol_open,
         0.35,
     ));
@@ -542,8 +542,8 @@ pub(crate) fn view(
     } else {
         0
     };
-    let p_id = egui::Id::new("mv-ext-p");
-    let shown_id = egui::Id::new("mv-ext-shown");
+    let p_id = egui::Id::unique("mv-ext-p");
+    let shown_id = egui::Id::unique("mv-ext-shown");
     let mut p: f32 = ctx.data_mut(|d| d.get_temp(p_id)).unwrap_or(0.0);
     let mut shown: u8 = ctx.data_mut(|d| d.get_temp(shown_id)).unwrap_or(0);
     // Content only swaps at p==0; a mismatched request drives it shut.
@@ -694,7 +694,7 @@ pub(crate) fn view(
         Pos2::new(content.min.x + 0.16 * h, fbtn_cy),
         Vec2::splat(0.1615 * h),
     );
-    let presp = ui.interact(pb, ui.id().with("mv-plus"), egui::Sense::click());
+    let presp = ui.interact(pb, ui.scope_id().with("mv-plus"), egui::Sense::click());
     painter.rect_stroke(
         pb,
         0.037 * h,
@@ -717,7 +717,7 @@ pub(crate) fn view(
         );
     }
     let albums_open: bool = ctx
-        .data_mut(|d| d.get_temp(ui.id().with("mv-albums")))
+        .data_mut(|d| d.get_temp(ui.scope_id().with("mv-albums")))
         .unwrap_or(false);
     if interactive {
         let menu_font = FontId::proportional(0.13 * h);
@@ -758,7 +758,7 @@ pub(crate) fn view(
         Pos2::new(pb.max.x + 0.16 * h, pb.center().y),
         Vec2::splat(0.19 * h),
     );
-    let gresp = ui.interact(gb, ui.id().with("mv-grid"), egui::Sense::click());
+    let gresp = ui.interact(gb, ui.scope_id().with("mv-grid"), egui::Sense::click());
     let (cell, gap) = (0.031 * h, 0.016 * h);
     let span = cell * 3.0 + gap * 2.0;
     let on_col = if albums_open {
@@ -785,7 +785,7 @@ pub(crate) fn view(
     }
     if gresp.clicked() && interactive {
         ctx.data_mut(|d| {
-            d.insert_temp(ui.id().with("mv-albums"), !albums_open);
+            d.insert_temp(ui.scope_id().with("mv-albums"), !albums_open);
         });
     }
 
@@ -907,19 +907,19 @@ pub(crate) fn view(
         let follow = 1.0 - (-dt * 18.0).exp();
 
         // List state — session-temp, keyed off this ui.
-        let sel_id = ui.id().with("mv-sel");
-        let anchor_id = ui.id().with("mv-sel-anchor");
-        let drag_id = ui.id().with("mv-list-drag");
-        let disp_id = ui.id().with("mv-list-disp");
-        let pal_id = ui.id().with("mv-sel-pal");
-        let palkey_id = ui.id().with("mv-sel-pal-key");
-        let palcol_id = ui.id().with("mv-sel-pal-col");
+        let sel_id = ui.scope_id().with("mv-sel");
+        let anchor_id = ui.scope_id().with("mv-sel-anchor");
+        let drag_id = ui.scope_id().with("mv-list-drag");
+        let disp_id = ui.scope_id().with("mv-list-disp");
+        let pal_id = ui.scope_id().with("mv-sel-pal");
+        let palkey_id = ui.scope_id().with("mv-sel-pal-key");
+        let palcol_id = ui.scope_id().with("mv-sel-pal-col");
         // Seconds into the current drag — drives the stack gather.
-        let dragt_id = ui.id().with("mv-drag-t");
+        let dragt_id = ui.scope_id().with("mv-drag-t");
         // The track the list last scrolled to — used to scroll the
         // playing item into view once per track change (the restored
         // session track included).
-        let reveal_id = ui.id().with("mv-reveal");
+        let reveal_id = ui.scope_id().with("mv-reveal");
 
         let mut sel: HashSet<PathBuf> =
             ctx.data_mut(|d| d.get_temp(sel_id)).unwrap_or_default();
@@ -964,22 +964,22 @@ pub(crate) fn view(
         // Tab swaps the playlist for the albums list — `albums_on`
         // persists, `at` eases the crossfade (0 = playlist,
         // 1 = albums).
-        let ab_id = ui.id().with("mv-albums");
+        let ab_id = ui.scope_id().with("mv-albums");
         let mut albums_on: bool =
             ctx.data_mut(|d| d.get_temp(ab_id)).unwrap_or(false);
-        let asel_id = ui.id().with("mv-asel");
+        let asel_id = ui.scope_id().with("mv-asel");
         let mut asel: usize =
             ctx.data_mut(|d| d.get_temp(asel_id)).unwrap_or(0);
         // Dir-keyed selection set + `asel` as anchor — the playlist's
         // sel/anchor pair, keyed by dir so reorder/deletes can't
         // desync it.
-        let aselset_id = ui.id().with("mv-asel-set");
+        let aselset_id = ui.scope_id().with("mv-asel-set");
         let mut asel_set: HashSet<String> =
             ctx.data_mut(|d| d.get_temp(aselset_id)).unwrap_or_default();
         // Eased + a touch longer than the raw bool animation — the
         // eased value drives both opacities and the slide offsets.
         let at = egui::emath::easing::quadratic_in_out(
-            ctx.animate_bool_with_time(ui.id().with("mv-albums-t"), albums_on, 0.3),
+            ctx.animate_bool_with_time(ui.scope_id().with("mv-albums-t"), albums_on, 0.3),
         );
 
         // Reseed when the set can't map to a live album (fresh state,
@@ -1122,7 +1122,7 @@ pub(crate) fn view(
                     if !dirs.is_empty() {
                         del = Some(crate::PendingDelete::Albums(dirs));
                         ctx.data_mut(|d| {
-                            d.insert_temp(ui.id().with("mv-del-sel"), 1usize);
+                            d.insert_temp(ui.scope_id().with("mv-del-sel"), 1usize);
                         });
                     }
                 }
@@ -1131,7 +1131,7 @@ pub(crate) fn view(
                 if !paths.is_empty() {
                     del = Some(crate::PendingDelete::Items(paths));
                     ctx.data_mut(|d| {
-                        d.insert_temp(ui.id().with("mv-del-sel"), 1usize);
+                        d.insert_temp(ui.scope_id().with("mv-del-sel"), 1usize);
                     });
                 }
             } else if mv != 0 && m > 0 && n >= 2 && pq.is_empty() {
@@ -1187,7 +1187,7 @@ pub(crate) fn view(
         if interactive && at < 0.5 {
             let bg = ui.interact(
                 list,
-                ui.id().with("mv-playlist-bg"),
+                ui.scope_id().with("mv-playlist-bg"),
                 egui::Sense::click(),
             );
             bg.context_menu(|ui| {
@@ -1603,28 +1603,28 @@ pub(crate) fn view(
         // worker per dir) and pointer drags reorder through a floating
         // card + dashed slot (`adrag`, `adisp` glide map, `adrag_t`
         // gather blend).
-        let apal_id = ui.id().with("mv-album-pal");
+        let apal_id = ui.scope_id().with("mv-album-pal");
         let mut apal: HashMap<String, Option<Vec<Color32>>> =
             ctx.data_mut(|d| d.get_temp(apal_id)).unwrap_or_default();
-        let adrag_id = ui.id().with("mv-album-drag");
+        let adrag_id = ui.scope_id().with("mv-album-drag");
         let mut adrag: Option<(f32, usize)> =
             ctx.data_mut(|d| d.get_temp(adrag_id));
-        let adisp_id = ui.id().with("mv-album-disp");
+        let adisp_id = ui.scope_id().with("mv-album-disp");
         let mut adisp: HashMap<String, f32> =
             ctx.data_mut(|d| d.get_temp(adisp_id)).unwrap_or_default();
-        let adragt_id = ui.id().with("mv-album-drag-t");
+        let adragt_id = ui.scope_id().with("mv-album-drag-t");
         let adrag_t: f32 =
             ctx.data_mut(|d| d.get_temp(adragt_id)).unwrap_or(0.0);
         // Press-edge selection bookkeeping — `clicked` fires on
         // release and loses to micro-drags; press-select keeps
         // selection immediate and this flag swallows the release
         // click that would re-run it.
-        let press_sel_id = ui.id().with("mv-album-press-sel");
+        let press_sel_id = ui.scope_id().with("mv-album-press-sel");
         let mut press_sel: bool =
             ctx.data_mut(|d| d.get_temp(press_sel_id)).unwrap_or(false);
         // The delete dialog's focused-button slot lives on the view
         // ui — grab its id here where `ui` still is that ui.
-        let delsel_id = ui.id().with("mv-del-sel");
+        let delsel_id = ui.scope_id().with("mv-del-sel");
         // A live album drag can't survive the filter hiding cards —
         // the drop slot would be computed in shown space.
         if !aq.is_empty() {
@@ -1634,7 +1634,7 @@ pub(crate) fn view(
             // Artists resolve lazily — one worker pass fills the
             // whole map (dir → artist) so the list never blocks on
             // tag reads.
-            let art_id = ui.id().with("mv-artists");
+            let art_id = ui.scope_id().with("mv-artists");
             let artists: HashMap<String, Option<String>> =
                 ctx.data_mut(|d| d.get_temp(art_id)).unwrap_or_default();
             let missing: Vec<(String, PathBuf)> = albums
@@ -1725,14 +1725,14 @@ pub(crate) fn view(
             // view; here it overlays the card's title text. A global
             // Id — the owner's Create Album handler arms it without
             // knowing the scroll ui's id space.
-            let edit_id = egui::Id::new("mv-album-edit");
+            let edit_id = egui::Id::unique("mv-album-edit");
             let mut edit: Option<(String, String, bool)> =
                 ctx.data_mut(|d| d.get_temp(edit_id));
             // Dir this edit session already scrolled to — the
             // strip's pending_reveal is one-shot; a per-frame
             // scroll_to_me while the editor can't paint would pin
             // the list's scroll.
-            let edit_seen_id = egui::Id::new("mv-album-edit-seen");
+            let edit_seen_id = egui::Id::unique("mv-album-edit-seen");
             let mut edit_seen: Option<String> =
                 ctx.data_mut(|d| d.get_temp(edit_seen_id));
 
@@ -1742,7 +1742,7 @@ pub(crate) fn view(
             if interactive && at > 0.5 {
                 let bg = ui.interact(
                     list,
-                    ui.id().with("mv-albums-bg"),
+                    ui.scope_id().with("mv-albums-bg"),
                     egui::Sense::click(),
                 );
                 bg.context_menu(|ui| {
@@ -2205,7 +2205,7 @@ pub(crate) fn view(
                                     egui::TextEdit::singleline(etext)
                                         .font(tfont.clone())
                                         .text_color(Color32::WHITE)
-                                        .vertical_align(egui::Align::Center),
+                                        .align(egui::Align2::LEFT_CENTER),
                                 );
                                 if !*armed {
                                     // Focus once with the whole title
@@ -2560,8 +2560,8 @@ pub(crate) fn view(
     // view stack mini returns before reaching, so the dialog lives
     // here (same Switch-style widget, same labels).
     {
-        let vis_id = ui.id().with("mv-del-vis");
-        let sel_id = ui.id().with("mv-del-sel");
+        let vis_id = ui.scope_id().with("mv-del-vis");
+        let sel_id = ui.scope_id().with("mv-del-sel");
         let mut vis: f32 = ctx.data_mut(|d| d.get_temp(vis_id)).unwrap_or(0.0);
         let mut psel: usize = ctx.data_mut(|d| d.get_temp(sel_id)).unwrap_or(1);
         let open = del.is_some();

@@ -194,7 +194,7 @@ impl Rpcs3PatchesOverlay {
 
         let ctx = ui.ctx().clone();
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("rpcs3_patches"),
+            egui::Id::unique("rpcs3_patches"),
             self.shown,
             0.32,
             egui::emath::easing::quadratic_in_out,
@@ -210,7 +210,7 @@ impl Rpcs3PatchesOverlay {
         );
         let _ = ui.interact(
             content,
-            egui::Id::new("rpcs3_patches_scrim"),
+            egui::Id::unique("rpcs3_patches_scrim"),
             egui::Sense::click(),
         );
 
@@ -483,7 +483,7 @@ impl Rpcs3PatchesOverlay {
                                     );
                                     let resp = ui.interact(
                                         tr,
-                                        egui::Id::new("rpcs3_patch_toggle").with(i),
+                                        egui::Id::unique("rpcs3_patch_toggle").with(i),
                                         egui::Sense::click(),
                                     );
                                     if resp.clicked() {

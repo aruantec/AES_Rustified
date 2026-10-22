@@ -417,7 +417,7 @@ fn render_emoji(c: char) -> Option<egui::ColorImage> {
 /// `c`'s emoji texture — cached per char (`None` is cached too so a
 /// non-color char doesn't re-parse the font every frame).
 fn emoji_tex(ctx: &egui::Context, c: char) -> Option<egui::TextureHandle> {
-    let id = egui::Id::new(("emoji", c));
+    let id = egui::Id::unique(("emoji", c));
     if let Some(hit) = ctx.data_mut(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
         return hit;
     }

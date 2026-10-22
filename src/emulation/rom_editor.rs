@@ -374,7 +374,7 @@ impl RomEditor {
         self.shown = true;
         self.path = path;
         self.platform = platform;
-        ctx.animate_bool(egui::Id::new("rom_editor").with(&self.path), false);
+        ctx.animate_bool(egui::Id::unique("rom_editor").with(&self.path), false);
 
         self.title = self
             .path
@@ -594,7 +594,7 @@ impl RomEditor {
         self.search_drain(&ctx);
 
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("rom_editor").with(&self.path),
+            egui::Id::unique("rom_editor").with(&self.path),
             self.shown,
             0.32,
             egui::emath::easing::quadratic_in_out,
@@ -608,7 +608,7 @@ impl RomEditor {
             0.0,
             egui::Color32::from_black_alpha((230.0 * fade) as u8),
         );
-        let _ = ui.interact(content, egui::Id::new("rom_scrim"), egui::Sense::click());
+        let _ = ui.interact(content, egui::Id::unique("rom_scrim"), egui::Sense::click());
 
         let area = Rect::from_min_max(
             content.min + egui::vec2(24.0, 16.0) * s,
@@ -703,7 +703,7 @@ impl RomEditor {
             T::text_box(
                 ui,
                 s,
-                egui::Id::new(("romf", label)),
+                egui::Id::unique(("romf", label)),
                 &mut v.as_str(),
                 wide,
                 min_h,
@@ -715,7 +715,7 @@ impl RomEditor {
             T::text_box(
                 ui,
                 s,
-                egui::Id::new(("romf", label)),
+                egui::Id::unique(("romf", label)),
                 v,
                 wide,
                 min_h,
@@ -773,7 +773,7 @@ impl RomEditor {
                 T::text_box(
                     ui,
                     s,
-                    egui::Id::new("rom_file_path"),
+                    egui::Id::unique("rom_file_path"),
                     &mut fp.as_str(),
                     wide,
                     0.0,
@@ -930,7 +930,7 @@ impl RomEditor {
                     let resp = T::text_box(
                         ui,
                         s,
-                        egui::Id::new("rom_add_url"),
+                        egui::Id::unique("rom_add_url"),
                         &mut self.add_url,
                         tw,
                         0.0,
@@ -961,7 +961,7 @@ impl RomEditor {
                     let resp = T::text_box(
                         ui,
                         s,
-                        egui::Id::new("rom_search_q"),
+                        egui::Id::unique("rom_search_q"),
                         &mut self.search_q,
                         tw,
                         0.0,
@@ -1299,7 +1299,7 @@ impl RomEditor {
             .rect_filled(content, 0.0, egui::Color32::from_rgb(0x10, 0x10, 0x10));
         let _ = ui.interact(
             content,
-            egui::Id::new("rom_search_scrim"),
+            egui::Id::unique("rom_search_scrim"),
             egui::Sense::click(),
         );
         let area = Rect::from_min_max(

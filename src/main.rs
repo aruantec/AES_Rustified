@@ -1334,6 +1334,11 @@ impl AesRustApp {
         boot_mark("fonts loaded");
         let mut transport = transport::Transport::new();
         transport.cover_layout = settings.carousel.layout_mode.min(2);
+        transport.repeat = match settings.audio.repeat_mode {
+            1 => transport::RepeatMode::All,
+            2 => transport::RepeatMode::One,
+            _ => transport::RepeatMode::Off,
+        };
 
         // Seed the row from the persisted manifest (last session's
         // display order incl. virtual keys): virtual albums build for
@@ -2732,7 +2737,7 @@ impl eframe::App for AesRustApp {
         // pointer paths that bypass egui's widget hit routing.
         let overlay_slide =
             ui.ctx()
-                .animate_bool_with_time(egui::Id::new("settings-overlay"), *settings_open, 0.3);
+                .animate_bool_with_time(egui::Id::unique("settings-overlay"), *settings_open, 0.3);
         let view_interactive = interactive
             && self.mode_switch.is_none()
             && overlay_slide < 0.001
@@ -2781,7 +2786,7 @@ impl eframe::App for AesRustApp {
             |ui| {
                 // Right-click menu like Lacrima's view context menu —
                 // suppressed over the albums strip, which has its own.
-                let resp = ui.interact(content, egui::Id::new("content-area"), Sense::click());
+                let resp = ui.interact(content, egui::Id::unique("content-area"), Sense::click());
                 let over_album_row = nav.target() == View::Music
                     && ui
                         .ctx()
@@ -3030,7 +3035,7 @@ impl eframe::App for AesRustApp {
                                 // albums list's own title editor.
                                 ui.ctx().data_mut(|d| {
                                     d.insert_temp(
-                                        egui::Id::new("mv-album-edit"),
+                                        egui::Id::unique("mv-album-edit"),
                                         (dir, title, false),
                                     );
                                 });
@@ -4466,7 +4471,7 @@ impl eframe::App for AesRustApp {
                     // app behind still rescales live; the panel picks
                     // up the new factor on reopen.
                     let overlay_s = ui.ctx().data_mut(|d| {
-                        let id = egui::Id::new("settings-overlay-s");
+                        let id = egui::Id::unique("settings-overlay-s");
                         if slide <= 0.05 {
                             d.insert_temp(id, s);
                             s
@@ -4549,6 +4554,10 @@ impl eframe::App for AesRustApp {
                     );
                     ui.ctx().request_repaint();
                 }
+                // Mirror the transport's live RepeatMode into
+                // settings — the audio clone in the tuple below
+                // catches the change and saves it.
+                settings.audio.repeat_mode = transport.repeat as u8;
                 let fx_changed = fx_before
                     != (
                         settings.effects.show_lacrima,
@@ -5064,7 +5073,7 @@ fn lacrima_window_frame(
                     // inside the write lock deadlocks.
                     let frame = ctx.cumulative_frame_nr();
                     ctx.data_mut(|d| {
-                        d.insert_temp(egui::Id::new("resize_grip_press"), frame)
+                        d.insert_temp(egui::Id::unique("resize_grip_press"), frame)
                     });
                 }
             }
@@ -5108,7 +5117,7 @@ fn lacrima_window_frame(
                 // otherwise steal window drags from the bar's dead zones.
                 let title_bar_response = ui.interact(
                     title_bar_rect,
-                    ui.id().with("title_bar"),
+                    ui.scope_id().with("title_bar"),
                     Sense::click_and_drag(),
                 );
                 if resize_dir.is_none()
@@ -5195,14 +5204,14 @@ fn lacrima_window_frame(
                     panel_rect.min,
                     Vec2::splat(chrome_rect.max.y - panel_rect.min.y),
                 );
-                let back_resp = ui.interact(btn, ui.id().with("back"), Sense::click());
+                let back_resp = ui.interact(btn, ui.scope_id().with("back"), Sense::click());
                 if back_resp.hovered() {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
                 }
                 // Push feedback: the face+icon scale down ~6% while
                 // held (animated), like a physical key travel.
                 let press = ctx.animate_bool_with_time(
-                    ui.id().with("back_press"),
+                    ui.scope_id().with("back_press"),
                     back_resp.is_pointer_button_down_on(),
                     0.1,
                 );
@@ -5307,7 +5316,7 @@ fn lacrima_window_frame(
                     // Rotate the gear 90° while the overlay slides in (same
                     // 0.3s easeOutCubic), back to 0° as it closes.
                     let rot =
-                        ctx.animate_bool_with_time(ui.id().with("gear-rot"), settings_active, 0.3);
+                        ctx.animate_bool_with_time(ui.scope_id().with("gear-rot"), settings_active, 0.3);
                     let angle = ease_out_cubic(rot) * std::f32::consts::FRAC_PI_2;
                     egui::Image::new(egui::load::SizedTexture::new(
                         settings_icon,
@@ -5510,7 +5519,7 @@ fn main_menu(
 
     // Gear spin, same 0.3s easeOutCubic as the top-bar gear and the panel.
     let gear_angle = ease_out_cubic(ctx.animate_bool_with_time(
-        egui::Id::new("menu-gear-rot"),
+        egui::Id::unique("menu-gear-rot"),
         settings_active,
         0.3,
     )) * std::f32::consts::FRAC_PI_2;
@@ -5527,7 +5536,7 @@ fn main_menu(
         );
         let center_x = item_rect.center().x;
 
-        let response = ui.interact(item_rect, ui.id().with(("main_menu", i)), Sense::click());
+        let response = ui.interact(item_rect, ui.scope_id().with(("main_menu", i)), Sense::click());
         if response.hovered() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
         }
@@ -5660,7 +5669,7 @@ fn music_view(
     // The toggle button collapses the menu band — Lacrima's
     // MaxHeightToggleBehavior animates it over 0.55s CubicEaseInOut.
     let list_t = ease_in_out_cubic(ui.ctx().animate_bool_with_time(
-        ui.id().with("albumlist-open"),
+        ui.scope_id().with("albumlist-open"),
         transport.album_list_open,
         0.55,
     ));
@@ -5673,7 +5682,7 @@ fn music_view(
     // asymptotic settle — symmetric on open/close and continuous when
     // toggled mid-flight (a reversed ease curve would pop).
     let eq_t = {
-        let id = ui.id().with("eq-drawer");
+        let id = ui.scope_id().with("eq-drawer");
         let mut t = ui.ctx().data_mut(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
         let target = if transport.equalizer_open { 1.0 } else { 0.0 };
         let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
@@ -5691,7 +5700,7 @@ fn music_view(
     // The compact strip's overflow drawer reveals between the band
     // and the EQ drawer — same damped lift as the EQ panel.
     let ovf_t = {
-        let id = ui.id().with("ovf-drawer");
+        let id = ui.scope_id().with("ovf-drawer");
         let mut t = ui.ctx().data_mut(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
         let target = if transport.overflow_open { 1.0 } else { 0.0 };
         let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
@@ -5957,7 +5966,7 @@ fn music_view(
     // In compact mode it gives way to the narrow top bar below.
     let meta_t =
         ui.ctx()
-            .animate_bool_with_time(ui.id().with("trackinfo"), playing_track.is_some(), 0.6);
+            .animate_bool_with_time(ui.scope_id().with("trackinfo"), playing_track.is_some(), 0.6);
     if meta_t > 0.001 && cct < 0.999 {
         if let Some(tp) = playing_track {
             let (title, artist, album) = carousel.display_for(tp);
@@ -6623,12 +6632,12 @@ fn settings_overlay(
     // itself swallows clicks so they don't reach the view underneath.
     let outside = Rect::from_min_max(content.min, Pos2::new(panel.min.x, content.max.y));
     if ui
-        .interact(outside, ui.id().with("settings-outside"), Sense::click())
+        .interact(outside, ui.scope_id().with("settings-outside"), Sense::click())
         .clicked()
     {
         *open = false;
     }
-    ui.interact(panel, ui.id().with("settings-panel"), Sense::click());
+    ui.interact(panel, ui.scope_id().with("settings-panel"), Sense::click());
 
     // In the mini shell the panel sits over the cover-color gradient, so
     // keep it translucent enough for that tint to bleed through.
@@ -6685,7 +6694,7 @@ fn settings_overlay(
             let i = vis_tabs[vi];
             let text_w = vis_widths[vi];
             let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(text_w, row_h));
-            let resp = ui.interact(rect, ui.id().with(("settings-tab", i)), Sense::click());
+            let resp = ui.interact(rect, ui.scope_id().with(("settings-tab", i)), Sense::click());
             let color = if i == *tab {
                 Color32::WHITE
             } else if resp.hovered() {
@@ -6764,7 +6773,7 @@ fn settings_overlay(
         Pos2::new(panel.min.x + 15.0 * scale, panel.max.y - 60.0 * scale),
         Vec2::new(320.0 * scale, 48.0 * scale),
     );
-    let btn = ui.interact(btn_rect, ui.id().with("open-aes-dir"), Sense::click());
+    let btn = ui.interact(btn_rect, ui.scope_id().with("open-aes-dir"), Sense::click());
     let hot = btn.hovered();
     painter.rect_filled(
         btn_rect,
@@ -7123,7 +7132,7 @@ fn ui_tab_audio(ui: &mut egui::Ui, panel: Rect, t: f32, settings: &mut settings:
         Pos2::new(panel.min.x, panel.min.y + 78.0 * s),
         Pos2::new(panel.max.x, panel.max.y - 74.0 * s),
     );
-    let scroll_id = ui.id().with("audio-scroll");
+    let scroll_id = ui.scope_id().with("audio-scroll");
     let mut scroll = ui
         .ctx()
         .data_mut(|d| d.get_persisted::<f32>(scroll_id).unwrap_or(0.0));
@@ -7608,7 +7617,7 @@ fn ui_tab_audio(ui: &mut egui::Ui, panel: Rect, t: f32, settings: &mut settings:
         FontId::proportional(16.0 * s),
         Color32::from_gray(225).gamma_multiply(t),
     );
-    let text_id = ui.id().with("audio-silence-ms");
+    let text_id = ui.scope_id().with("audio-silence-ms");
     let mut text = ui.ctx().data_mut(|d| {
         d.get_persisted::<String>(text_id)
             .unwrap_or_else(|| audio.silence_advance_delay_ms.to_string())
@@ -7961,7 +7970,7 @@ fn radio_button(
 ) -> bool {
     let resp = ui.interact(
         rect,
-        ui.id().with(("cover-mode-radio", salt)),
+        ui.scope_id().with(("cover-mode-radio", salt)),
         Sense::click(),
     );
     let painter = ui.painter();
@@ -7995,7 +8004,7 @@ fn radio_button(
 /// Small Avalonia-style ToggleSwitch: a pill track with a sliding knob,
 /// cyan accent when on.
 fn toggle_switch(ui: &mut egui::Ui, rect: Rect, salt: &str, on: &mut bool, fade: f32) {
-    let resp = ui.interact(rect, ui.id().with(salt), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with(salt), Sense::click());
     if resp.clicked() {
         *on = !*on;
     }
@@ -8055,7 +8064,7 @@ fn check_box(
         Pos2::new(brect.min.x - 3.0 * s, brect.min.y - 4.0 * s),
         Pos2::new(brect.max.x + 10.0 * s + lw, brect.max.y + 4.0 * s),
     );
-    let resp = ui.interact(hit, ui.id().with(salt), Sense::click());
+    let resp = ui.interact(hit, ui.scope_id().with(salt), Sense::click());
     let mut changed = false;
     if resp.clicked() {
         *checked = !*checked;
@@ -8125,7 +8134,7 @@ fn pill_slider(
         track.center(),
         Vec2::new(track.width(), track.height() * 1.75),
     );
-    let resp = ui.interact(hit, ui.id().with(salt), Sense::click_and_drag());
+    let resp = ui.interact(hit, ui.scope_id().with(salt), Sense::click_and_drag());
     // Pointer-down reacts immediately — value + focus on press, not on
     // the drag threshold/release, so the slider feels instant.
     let pressed = resp.is_pointer_button_down_on();
@@ -8364,7 +8373,7 @@ fn confirm_overlay(
         let cx = dlg.center().x + (i as f32 - 0.5) * (bw + 20.0 * s) * pop;
         let b = Rect::from_center_size(Pos2::new(cx, by + bh * 0.5), Vec2::new(bw, bh));
         if interactive {
-            let resp = ui.interact(b, ui.id().with((salt, "btn", i)), Sense::click());
+            let resp = ui.interact(b, ui.scope_id().with((salt, "btn", i)), Sense::click());
             if resp.hovered() {
                 *sel = i;
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
@@ -8379,7 +8388,7 @@ fn confirm_overlay(
         }
         // The focused button's glow lerps in — reads as the selection
         // flash moving between buttons.
-        let hot = ctx.animate_bool_with_time(ui.id().with((salt, "sel", i)), *sel == i, 0.15);
+        let hot = ctx.animate_bool_with_time(ui.scope_id().with((salt, "sel", i)), *sel == i, 0.15);
         let br = CornerRadius::same((8.0 * s).round() as u8);
         painter.rect_filled(
             b,
@@ -8524,7 +8533,7 @@ fn flat_button(
         .rect
         .width();
     let rect = Rect::from_min_size(origin, Vec2::new(tw + 30.0 * s, 30.0 * s));
-    let resp = ui.interact(rect, ui.id().with(("tool-btn", label)), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with(("tool-btn", label)), Sense::click());
     let fill = if !enabled {
         bg.gamma_multiply(0.35)
     } else if resp.is_pointer_button_down_on() {

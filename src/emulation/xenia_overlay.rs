@@ -224,7 +224,7 @@ impl PatchesOverlay {
 
         let ctx = ui.ctx().clone();
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("xenia_patches"),
+            egui::Id::unique("xenia_patches"),
             self.shown,
             0.32,
             egui::emath::easing::quadratic_in_out,
@@ -240,7 +240,7 @@ impl PatchesOverlay {
         );
         let _ = ui.interact(
             content,
-            egui::Id::new("xenia_patches_scrim"),
+            egui::Id::unique("xenia_patches_scrim"),
             egui::Sense::click(),
         );
 
@@ -625,7 +625,7 @@ impl PatchesOverlay {
                                     );
                                     let resp = ui.interact(
                                         tr,
-                                        egui::Id::new("xenia_patch_toggle").with(i),
+                                        egui::Id::unique("xenia_patch_toggle").with(i),
                                         egui::Sense::click(),
                                     );
                                     if resp.clicked() {
@@ -862,7 +862,7 @@ impl ConfigOverlay {
 
         let ctx = ui.ctx().clone();
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("xenia_cfg"),
+            egui::Id::unique("xenia_cfg"),
             self.shown,
             0.32,
             egui::emath::easing::quadratic_in_out,
@@ -878,7 +878,7 @@ impl ConfigOverlay {
         );
         let _ = ui.interact(
             content,
-            egui::Id::new("xenia_cfg_scrim"),
+            egui::Id::unique("xenia_cfg_scrim"),
             egui::Sense::click(),
         );
 
@@ -1181,7 +1181,7 @@ impl ConfigOverlay {
                     );
                     let resp = ui.interact(
                         tr,
-                        egui::Id::new("xenia_cfg_bool").with(i),
+                        egui::Id::unique("xenia_cfg_bool").with(i),
                         egui::Sense::click(),
                     );
                     if resp.clicked() {
@@ -1242,7 +1242,7 @@ impl ConfigOverlay {
                         .position(|v| v.eq_ignore_ascii_case(fs.val.trim()))
                         .unwrap_or(0);
                     let mut sel = cur;
-                    egui::ComboBox::from_id_salt(egui::Id::new("xenia_cfg_choice").with(i))
+                    egui::ComboBox::from_id_salt(egui::Id::unique("xenia_cfg_choice").with(i))
                         .selected_text(labels.get(sel).copied().unwrap_or(""))
                         .width(ctrl.width())
                         .show_ui(ui, |ui| {
@@ -1260,7 +1260,7 @@ impl ConfigOverlay {
                     let cur = gpus.iter().position(|(id, _)| *id == cur_id).unwrap_or(0);
                     let mut sel = cur;
                     let cur_label = gpus.get(cur).map(|(_, l)| l.clone()).unwrap_or_default();
-                    egui::ComboBox::from_id_salt(egui::Id::new("xenia_cfg_gpu").with(i))
+                    egui::ComboBox::from_id_salt(egui::Id::unique("xenia_cfg_gpu").with(i))
                         .selected_text(cur_label)
                         .width(ctrl.width())
                         .show_ui(ui, |ui| {
@@ -1313,7 +1313,7 @@ impl ProfilePrompt {
         self.shown = true;
         self.want_focus = true;
         self.result = None;
-        ctx.animate_bool(egui::Id::new("xenia-profile-fade"), false);
+        ctx.animate_bool(egui::Id::unique("xenia-profile-fade"), false);
     }
 
     pub fn is_open(&self) -> bool {
@@ -1329,7 +1329,7 @@ impl ProfilePrompt {
         }
         let ctx = ui.ctx().clone();
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("xenia-profile-fade"),
+            egui::Id::unique("xenia-profile-fade"),
             self.shown,
             0.35,
             egui::emath::easing::cubic_out,
@@ -1347,7 +1347,7 @@ impl ProfilePrompt {
             CornerRadius::ZERO,
             egui::Color32::from_black_alpha(230).gamma_multiply(fade),
         );
-        let _ = ui.interact(content, ui.id().with("xenia-profile-scrim"), egui::Sense::click());
+        let _ = ui.interact(content, ui.scope_id().with("xenia-profile-scrim"), egui::Sense::click());
 
         let valid = crate::emulation::xenia_profile::is_valid_gamertag(self.text.trim());
         let mut submit = false;

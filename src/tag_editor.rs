@@ -163,7 +163,7 @@ impl TagEditor {
         self.stream = crate::library::is_url(&self.path);
         // animate_bool jumps to its target on the first call — seed the
         // id at 0 so the first painted frame actually fades in.
-        ctx.animate_bool(egui::Id::new("meta_editor").with(&self.path), false);
+        ctx.animate_bool(egui::Id::unique("meta_editor").with(&self.path), false);
         if self.stream {
             self.open_stream(ctx);
             return;
@@ -243,7 +243,7 @@ impl TagEditor {
         let Some(src) = crate::library::CoverSrc::web_for(&url) else {
             return;
         };
-        let key = egui::Id::new("meta-stream-img").with(&self.path);
+        let key = egui::Id::unique("meta-stream-img").with(&self.path);
         let ctx2 = ctx.clone();
         let _ = std::thread::Builder::new()
             .name("aes-meta-cover".into())
@@ -399,7 +399,7 @@ impl TagEditor {
         let ctx = ui.ctx().clone();
         // Lacrima's DoubleTransition: Opacity over 0.32s, eased.
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("meta_editor").with(&self.path),
+            egui::Id::unique("meta_editor").with(&self.path),
             self.shown,
             0.32,
             egui::emath::easing::quadratic_in_out,
@@ -416,7 +416,7 @@ impl TagEditor {
         // fetched thumbnail bytes over here (Option so "tried and
         // failed" also clears the wait).
         if self.stream {
-            let key = egui::Id::new("meta-stream-img").with(&self.path);
+            let key = egui::Id::unique("meta-stream-img").with(&self.path);
             if let Some(bytes) =
                 ctx.data_mut(|d| d.get_temp::<Option<Vec<u8>>>(key))
             {
@@ -444,7 +444,7 @@ impl TagEditor {
             0.0,
             egui::Color32::from_black_alpha((230.0 * fade) as u8),
         );
-        let _ = ui.interact(content, egui::Id::new("meta_scrim"), egui::Sense::click());
+        let _ = ui.interact(content, egui::Id::unique("meta_scrim"), egui::Sense::click());
 
         // Root grid: Margin 24,16,24,20 — rows Auto (header) / * (panel) /
         // Auto (footer). Header and footer share the panel's edges.
@@ -626,7 +626,7 @@ impl TagEditor {
         min_h: f32,
     ) {
         ui.label(egui::RichText::new(label).size(14.0 * s).color(SUBTEXT));
-        let id = egui::Id::new(("meta_field", label));
+        let id = egui::Id::unique(("meta_field", label));
         if Self::text_box(ui, s, id, value, width, min_h, 16.0, "").changed() {
             *dirty = true;
         }
@@ -774,7 +774,7 @@ impl TagEditor {
         Self::text_box(
             ui,
             s,
-            egui::Id::new("meta_file_path"),
+            egui::Id::unique("meta_file_path"),
             &mut fp.as_str(),
             wide,
             1.0,
@@ -846,7 +846,7 @@ impl TagEditor {
                     let resp = Self::text_box(
                         ui,
                         s,
-                        egui::Id::new("meta_add_path"),
+                        egui::Id::unique("meta_add_path"),
                         &mut self.add_path,
                         tw,
                         0.0,

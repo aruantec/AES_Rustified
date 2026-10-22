@@ -220,7 +220,7 @@ impl CemuGraphicPacksOverlay {
 
         let ctx = ui.ctx().clone();
         let fade = ctx.animate_bool_with_time_and_easing(
-            egui::Id::new("cemu_gpacks"),
+            egui::Id::unique("cemu_gpacks"),
             self.shown,
             0.32,
             egui::emath::easing::quadratic_in_out,
@@ -236,7 +236,7 @@ impl CemuGraphicPacksOverlay {
         );
         let _ = ui.interact(
             content,
-            egui::Id::new("cemu_gpacks_scrim"),
+            egui::Id::unique("cemu_gpacks_scrim"),
             egui::Sense::click(),
         );
 
@@ -538,7 +538,7 @@ impl CemuGraphicPacksOverlay {
         );
         let resp = ui.interact(
             tr,
-            egui::Id::new("cemu_gpack_toggle").with(i),
+            egui::Id::unique("cemu_gpack_toggle").with(i),
             egui::Sense::click(),
         );
         if resp.clicked() {

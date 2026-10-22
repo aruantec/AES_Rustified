@@ -256,7 +256,7 @@ impl WidgetFrame {
 
         let move_resp = ui.interact(
             outer,
-            ui.id().with((self.id, "move")),
+            ui.scope_id().with((self.id, "move")),
             Sense::click_and_drag(),
         );
         if move_resp.drag_started() {
@@ -291,7 +291,7 @@ impl WidgetFrame {
             CornerRadius::same(3),
             Color32::from_white_alpha(170),
         );
-        let grip_resp = ui.interact(grip, ui.id().with((self.id, "resize")), Sense::drag());
+        let grip_resp = ui.interact(grip, ui.scope_id().with((self.id, "resize")), Sense::drag());
         if grip_resp.drag_started() {
             self.drag_from = Some(self.rect);
         }
