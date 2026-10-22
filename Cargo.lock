@@ -163,6 +163,7 @@ dependencies = [
  "lofty",
  "md-5",
  "naga",
+ "raw-window-handle",
  "read-fonts 0.45.1",
  "resvg",
  "rfd",

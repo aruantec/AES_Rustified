@@ -376,6 +376,11 @@ fn main() -> eframe::Result<()> {
                 ));
             }
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            // Defer WM_DPICHANGED while a size/move is in progress —
+            // winit's mid-drag SetWindowPos is what stalls the window
+            // when crossing differently-scaled monitors.
+            #[cfg(windows)]
+            win_dpi_defer::install(cc);
             // Lacrima's first-run default (MainWindow.axaml.cs): when no
             // ScaleFactor was ever persisted, seed it from the display
             // DPI scale, clamped to 1.0..=2.0.
@@ -432,6 +437,81 @@ fn work_area_rect(ctx: &egui::Context) -> Option<Rect> {
     }
     ctx.input(|i| i.viewport().monitor_size)
         .map(|m| Rect::from_min_size(Pos2::ZERO, m))
+}
+
+/// Win32 WM_DPICHANGED deferral. winit's handler answers a DPI change
+/// with `SetWindowPos` to preserve the window's LOGICAL size — inside
+/// the OS move modal loop that resize fights the drag (the jerky or
+/// hard-stopped monitor crossing, with the window visibly growing and
+/// shrinking as the majority monitor flips). This subclass swallows
+/// WM_DPICHANGED while a size/move is in progress and replays the
+/// latest one on WM_EXITSIZEMOVE, so the DPI rescale + winit resize
+/// land right after the drop instead of mid-drag.
+#[cfg(windows)]
+mod win_dpi_defer {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    };
+
+    // Single root window — process-wide state is fine.
+    static IN_MOVE: AtomicBool = AtomicBool::new(false);
+    /// The stashed DPICHANGED wparam (new DPI); the message's suggested
+    /// rect is intentionally NOT kept — winit anchors the resize to it,
+    /// and the stashed top-left would teleport the window back to
+    /// wherever the mid-drag flip fired. The replay builds a rect at
+    /// the window's settled position instead.
+    static PENDING: Mutex<Option<WPARAM>> = Mutex::new(None);
+
+    unsafe extern "system" fn proc(
+        hwnd: HWND,
+        umsg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _uidsubclass: usize,
+        _dwrefdata: usize,
+    ) -> LRESULT {
+        match umsg {
+            WM_ENTERSIZEMOVE => IN_MOVE.store(true, Ordering::Relaxed),
+            WM_EXITSIZEMOVE => {
+                IN_MOVE.store(false, Ordering::Relaxed);
+                // Forward the exit first so winit clears its own
+                // in-size-move marker (its DPI handler applies a
+                // cursor-bias while that marker is set), then inject
+                // the stashed DPI change at the settled rect.
+                let out = unsafe { DefSubclassProc(hwnd, umsg, wparam, lparam) };
+                if let Some(wp) = PENDING.lock().unwrap().take() {
+                    let mut rc = RECT::default();
+                    let _ = unsafe { GetWindowRect(hwnd, &mut rc) };
+                    unsafe {
+                        DefSubclassProc(hwnd, WM_DPICHANGED, wp, LPARAM(&mut rc as *mut RECT as isize));
+                    }
+                }
+                return out;
+            }
+            WM_DPICHANGED if IN_MOVE.load(Ordering::Relaxed) => {
+                *PENDING.lock().unwrap() = Some(wparam);
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+        unsafe { DefSubclassProc(hwnd, umsg, wparam, lparam) }
+    }
+
+    /// Subclass the root winit window — `SetWindowSubclass` keeps
+    /// winit's own proc untouched and forwards through it.
+    pub fn install(cc: &eframe::CreationContext<'_>) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = cc.window_handle() else { return };
+        let RawWindowHandle::Win32(win) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = HWND(win.hwnd.get() as *mut core::ffi::c_void);
+        let _ = unsafe { SetWindowSubclass(hwnd, Some(proc), 0xA25_0DF1, 0) };
+    }
 }
 
 /// Toggle borderless fullscreen. `Fullscreen` alone leaves the
@@ -598,6 +678,17 @@ struct AesRustApp {
     /// section (prototype; ROM items land later).
     emu: emulation::EmuView,
     started: std::time::Instant,
+    /// Debounced monitor-DPI base for the global UI scale. Crossing
+    /// differently-scaled monitors flips `native_pixels_per_point`
+    /// (repeatedly while the window straddles the boundary) at the
+    /// same time as winit resizes the window — re-densifying on every
+    /// flip fought the OS window drag. A new base only commits after
+    /// the value and the window position both stay put for a beat.
+    dpi_base: f32,
+    dpi_base_pending: Option<(f32, std::time::Instant)>,
+    /// `outer_rect` last frame — a change re-arms `dpi_base_pending`
+    /// so the commit also waits for the window to go quiet.
+    last_outer_rect: Option<Rect>,
 }
 
 /// Selection owner for Delete-key routing — set by whichever view
@@ -1245,14 +1336,16 @@ impl AesRustApp {
         // matched the display maps to 1.0 (pure auto); anything else
         // keeps the same effective value on this monitor and follows
         // the base on others.
+        // The monitor DPI base the UI scale multiplies — also the
+        // debounce's starting point (the live base at launch).
+        let dpi_base = cc
+            .egui_ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0)
+            .clamp(1.0, 2.0);
         if settings.ui.scale_manual.is_none() {
-            let base = cc
-                .egui_ctx
-                .input(|i| i.viewport().native_pixels_per_point)
-                .unwrap_or(1.0)
-                .clamp(1.0, 2.0);
             settings.ui.scale_manual =
-                Some((settings.ui.scale_factor / base).clamp(0.3, 3.0));
+                Some((settings.ui.scale_factor / dpi_base).clamp(0.3, 3.0));
         }
         let defs = app_font_definitions();
         let have_font = defs.font_data.contains_key("consolas-bold");
@@ -1304,6 +1397,9 @@ impl AesRustApp {
             } else {
                 settings.window.x.is_some() && settings.window.y.is_some()
             },
+            dpi_base,
+            dpi_base_pending: None,
+            last_outer_rect: None,
             mode_switch: None,
             restore_album: settings.library.last_album.clone(),
             shadertoy: cc.wgpu_render_state.as_ref().map(|rs| {
@@ -2013,11 +2109,50 @@ impl eframe::App for AesRustApp {
         // so scaled font sizes stay bounded while the slider drags.
         // Effective = live monitor DPI base x the manual slider offset —
         // moving the window across displays re-densifies on its own.
-        let base = ui
+        // Debounced DPI base: `native_pixels_per_point` flips each time
+        // a dragged window's majority monitor changes (possibly several
+        // times while straddling the boundary), and winit resizes the
+        // window in the same breath. Rebasing the whole UI scale on
+        // every flip re-laid out and re-persisted mid-OS-drag — the
+        // jerky/stuck move and the size jumps. A new base commits only
+        // after the value AND the window rect have both been quiet for
+        // ~300ms, so the re-densify lands after the move finishes.
+        const DPI_SETTLE_MS: u128 = 300;
+        let raw_base = ui
             .ctx()
             .input(|i| i.viewport().native_pixels_per_point)
             .unwrap_or(1.0)
             .clamp(1.0, 2.0);
+        let outer = ui.ctx().input(|i| i.viewport().outer_rect);
+        if outer != self.last_outer_rect {
+            self.last_outer_rect = outer;
+            if let Some((v, _)) = self.dpi_base_pending {
+                self.dpi_base_pending = Some((v, std::time::Instant::now()));
+            }
+        }
+        match self.dpi_base_pending {
+            Some((v, _)) if (v - raw_base).abs() > 0.001 => {
+                self.dpi_base_pending = Some((raw_base, std::time::Instant::now()));
+            }
+            None if (raw_base - self.dpi_base).abs() > 0.001 => {
+                self.dpi_base_pending = Some((raw_base, std::time::Instant::now()));
+            }
+            _ => {}
+        }
+        if let Some((v, at)) = self.dpi_base_pending {
+            if (raw_base - self.dpi_base).abs() <= 0.001 {
+                // Flapped back to the live base — nothing to commit.
+                self.dpi_base_pending = None;
+            } else if at.elapsed().as_millis() >= DPI_SETTLE_MS {
+                self.dpi_base = v;
+                self.dpi_base_pending = None;
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+                    (DPI_SETTLE_MS - at.elapsed().as_millis()) as u64,
+                ));
+            }
+        }
+        let base = self.dpi_base;
         let scale = (((base * self.settings.ui.scale_manual.unwrap_or(1.0))
             .clamp(1.0, 3.0)
             * 20.0)
@@ -4372,6 +4507,7 @@ impl eframe::App for AesRustApp {
                         emu,
                         shadertoy.as_ref().map(|t| t.names()).unwrap_or(&[]),
                         overlay_s,
+                        base,
                     );
                 }
                 if *settings_open && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -6463,6 +6599,9 @@ fn settings_overlay(
     emu: &mut emulation::EmuView,
     toy_names: &[String],
     scale: f32,
+    // The debounced monitor-DPI base — the Scaling slider's
+    // manual-offset math must use the same base the live `s` does.
+    dpi_base: f32,
 ) {
     // The footer holds the 320*s directory button plus the right-anchored
     // version block; below ~480*s they overlap, which the old 240px floor
@@ -6610,7 +6749,7 @@ fn settings_overlay(
 
     // Body content per tab.
     if *tab == 0 {
-        ui_tab_effects(ui, body_panel, t, settings, toy_names, scale);
+        ui_tab_effects(ui, body_panel, t, settings, toy_names, scale, dpi_base);
     } else if *tab == 1 {
         emulation::settings_tab(ui, body_panel, t, emu, &mut settings.emulation, scale);
     } else if *tab == 3 {
@@ -6709,6 +6848,9 @@ fn ui_tab_effects(
     settings: &mut settings::Settings,
     toy_names: &[String],
     s: f32,
+    // The debounced monitor-DPI base behind `s` — the Scaling
+    // slider's manual-offset math works against the same value.
+    dpi_base: f32,
 ) {
     let painter = ui.painter().clone();
     // TabControl margin-left 15 + StackPanel margin 15,20 (75px header).
@@ -6753,12 +6895,7 @@ fn ui_tab_effects(
         // The slider edits the effective factor — persist the offset
         // from this monitor's DPI base so the auto scale still applies
         // when the window lands on a differently-scaled display.
-        let base = ui
-            .ctx()
-            .input(|i| i.viewport().native_pixels_per_point)
-            .unwrap_or(1.0)
-            .clamp(1.0, 2.0);
-        settings.ui.scale_manual = Some((factor / base).clamp(0.3, 3.0));
+        settings.ui.scale_manual = Some((factor / dpi_base).clamp(0.3, 3.0));
         settings.ui.scale_factor = factor;
     }
     painter.text(
