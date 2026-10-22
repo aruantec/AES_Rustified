@@ -165,7 +165,7 @@ impl TagEditor {
         // id at 0 so the first painted frame actually fades in.
         ctx.animate_bool(egui::Id::new("meta_editor").with(&self.path), false);
         if self.stream {
-            self.open_stream();
+            self.open_stream(ctx);
             return;
         }
         match Probe::open(&self.path).and_then(|p| p.read()) {
@@ -206,7 +206,7 @@ impl TagEditor {
     /// store `read_track_info` reads), the cover card from the edited
     /// local cover or the cached remote thumbnail, so the editor shows
     /// exactly what the item displays.
-    fn open_stream(&mut self) {
+    fn open_stream(&mut self, ctx: &egui::Context) {
         let url = self.path.to_string_lossy().into_owned();
         let meta = crate::meta_cache::load(&url);
         if let Some(m) = &meta {
@@ -232,7 +232,26 @@ impl TagEditor {
                 tex: None,
                 tex_failed: false,
             });
+            return;
         }
+        // Nothing cached — but the carousel still shows a cover via
+        // `CoverSrc::web_for`'s candidate ladder (the guessed
+        // img.youtube.com URLs don't need a saved meta entry). Fetch
+        // the same source on a worker so open() never blocks on the
+        // network; `ui_inner` picks the bytes up when they land.
+        // `None` is stored on failure too so the lookup runs once.
+        let Some(src) = crate::library::CoverSrc::web_for(&url) else {
+            return;
+        };
+        let key = egui::Id::new("meta-stream-img").with(&self.path);
+        let ctx2 = ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("aes-meta-cover".into())
+            .spawn(move || {
+                let bytes = crate::library::cover_bytes(&src);
+                ctx2.data_mut(|d| d.insert_temp(key, bytes));
+                ctx2.request_repaint();
+            });
     }
 
     fn add_image_file(&mut self, path: &Path) {
@@ -391,6 +410,31 @@ impl TagEditor {
             // (elapsed=0); that must not kill the overlay.
             self.open = self.shown;
             return;
+        }
+
+        // Stream items: the cover worker from open_stream hands the
+        // fetched thumbnail bytes over here (Option so "tried and
+        // failed" also clears the wait).
+        if self.stream {
+            let key = egui::Id::new("meta-stream-img").with(&self.path);
+            if let Some(bytes) =
+                ctx.data_mut(|d| d.get_temp::<Option<Vec<u8>>>(key))
+            {
+                ctx.data_mut(|d| d.remove::<Option<Vec<u8>>>(key));
+                // A cover added while the fetch was in flight stays
+                // the active one (one CoverFront at a time).
+                if let Some(data) = bytes {
+                    if !self.images.iter().any(|i| i.kind == PictureType::CoverFront) {
+                        self.images.push(ImageEntry {
+                            kind: PictureType::CoverFront,
+                            data,
+                            desc: String::new(),
+                            tex: None,
+                            tex_failed: false,
+                        });
+                    }
+                }
+            }
         }
 
         // Scrim (#E6000000) + click swallow so nothing under the overlay
