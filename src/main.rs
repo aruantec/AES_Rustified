@@ -1306,6 +1306,11 @@ fn app_font_definitions() -> egui::FontDefinitions {
             }
         }
     }
+    // Hand seguiemj's FontData to the color-emoji rasterizer — the
+    // face bytes then exist once instead of a second copy.
+    if let Some(fd) = defs.font_data.get("segoe-emoji").cloned() {
+        emoji::set_font_data(fd);
+    }
     defs
 }
 

@@ -24,6 +24,11 @@ use std::time::Instant;
 /// Lacrima's audio texture: 512 float bins, GL_RED.
 const SPEC_BINS: usize = 512;
 
+/// The offscreen the .frag pipelines render into — raw Rgba8Unorm like
+/// the GL side's FBO. On an sRGB surface the blit pass applies the
+/// decode so the final encode lands on the same bytes GL produced.
+const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 /// Accent palette used until a cover provides dominant colors.
 const PRIMARY: [f32; 3] = [0.118, 0.812, 1.000];
 const SECONDARY: [f32; 3] = [0.431, 0.243, 1.000];
@@ -194,6 +199,49 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// sRGB-surface variant: the offscreen holds the shader's raw
+/// display-space values; writing the sRGB-DECODED value lets the
+/// hardware's store-encode land back on those same bytes, matching
+/// the non-sRGB GL path (without this the fog lifts ~1/2.2 and
+/// washes out).
+const BLIT_WGSL_SRGB: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VOut {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+    var out: VOut;
+    let p = positions[idx];
+    out.pos = vec4<f32>(p, 0.0, 1.0);
+    out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    return out;
+}
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_sam: sampler;
+
+fn srgb_decode(c: f32) -> f32 {
+    if c <= 0.04045 {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    let c = textureSample(src_tex, src_sam, in.uv);
+    return vec4<f32>(
+        srgb_decode(c.r), srgb_decode(c.g), srgb_decode(c.b), c.a);
+}
+"#;
+
 struct Shared {
     bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
@@ -205,7 +253,6 @@ struct Shared {
 pub struct Shadertoy {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    format: wgpu::TextureFormat,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     cover_tex: wgpu::Texture,
@@ -261,7 +308,6 @@ pub struct ShadertoyCallback {
     blit_pipe: Arc<wgpu::RenderPipeline>,
     blit_bgl: Arc<wgpu::BindGroupLayout>,
     sampler: wgpu::Sampler,
-    format: wgpu::TextureFormat,
 }
 
 /// f32 -> IEEE 754 half bits (round half-up); spectrum values are
@@ -433,7 +479,14 @@ impl Shadertoy {
         ));
         let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadertoy_blit"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                if render_state.target_format.is_srgb() {
+                    BLIT_WGSL_SRGB
+                } else {
+                    BLIT_WGSL
+                }
+                .into(),
+            ),
         });
         let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadertoy_blit_pl"),
@@ -499,7 +552,6 @@ impl Shadertoy {
         Self {
             device: device.clone(),
             queue: queue.clone(),
-            format: render_state.target_format,
             bgl,
             sampler,
             cover_tex,
@@ -767,7 +819,6 @@ impl Shadertoy {
             blit_pipe: self.blit_pipe.clone(),
             blit_bgl: self.blit_bgl.clone(),
             sampler: self.sampler.clone(),
-            format: self.format,
         }
     }
 
@@ -843,18 +894,17 @@ impl Shadertoy {
             return;
         };
         self.building.insert(name.to_owned());
-        let (device, bgl, vs, format, tx) = (
+        let (device, bgl, vs, tx) = (
             self.device.clone(),
             self.bgl.clone(),
             self.vs.clone(),
-            self.format,
             self.build_tx.clone(),
         );
         let name = name.to_owned();
         std::thread::spawn(move || {
             crate::boot_mark(&format!("shader '{name}' build start"));
             let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Self::build_pipeline(&device, &bgl, &vs, format, &src)
+                Self::build_pipeline(&device, &bgl, &vs, OFFSCREEN_FORMAT, &src)
             }))
             .ok()
             .flatten()
@@ -1041,7 +1091,7 @@ impl egui_wgpu::CallbackTrait for ShadertoyCallback {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.format,
+                format: OFFSCREEN_FORMAT,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],

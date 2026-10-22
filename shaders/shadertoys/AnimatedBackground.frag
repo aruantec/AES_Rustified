@@ -111,8 +111,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     ) - 0.5;
     vec2 q = p + warp * 0.18;
 
-    // Extra motion energy in the lower half so movement is visible near the bottom controls.
-    float bottomMotion = smoothstep(-0.15, -0.95, q.y);
+    // Extra motion energy in the lower half — scaled to q.y's real
+    // [-0.5, 0.5] range so the fog reaches FULL density at the floor
+    // (a -0.92 bound would cap it at ~50% at the bottom edge).
+    float bottomMotion = smoothstep(0.10, -0.50, q.y);
     q += vec2(
         sin((q.y + 0.8) * 11.0 + t * 2.9),
         cos((q.x - 0.1) * 10.0 - t * 2.5)
@@ -151,18 +153,41 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     color = mix(color, warmBand,        bandMask(q.y, wave2, 0.21, 0.11) * 0.96);
     color = mix(color, coverPaletteC,   bandMask(q.y, wave3, 0.30, 0.13) * 0.96);
     color = mix(color, dynamicAccent,   bandMask(q.y, wave4, 0.34, 0.16) * 0.72);
-    color = mix(color, deepBand, smoothstep(-0.42, -0.96, q.y) * 0.96);
+    // Softer bottom darkening so the fog bank's bright mist survives
+    // to the window edge instead of being swallowed by the floor shade.
+    color = mix(color, deepBand, smoothstep(-0.35, -0.50, q.y) * 0.45);
+
+    // Vertical mist profile — the haze is compressed into the bottom
+    // third: the region above the fog line stays dark and calm while
+    // everything below it keeps the drifting mist.
+    float topShade = smoothstep(-0.15, 0.55, q.y);
+    color = mix(color, deepBand, topShade * 0.88);
 
     float floorDrift = fbm(vec2(q.x * 3.8 + t * 1.7, q.y * 5.2 - t * 1.5));
     vec3 floorTone = mix(warmBand, coolBand, floorDrift);
-    color = mix(color, floorTone, bottomMotion * 0.34);
+    color = mix(color, floorTone, bottomMotion * 0.55);
 
     // Smooth drifting smoke from layered FBM, similar to the first version.
+    // The influence ramps with bottomMotion so the haze thickens
+    // downward instead of sitting uniformly over the frame.
     float smoke1 = fbm(q * 3.2 + vec2(t * 0.85, -t * 0.55));
     float smoke2 = fbm(q * 4.9 + vec2(-t * 0.72, t * 0.78));
     float smoke = smoothstep(0.34, 0.86, mix(smoke1, smoke2, 0.5));
     vec3 smokeTint = vec3(0.10, 0.06, 0.08);
-    color = mix(color, color + smokeTint, smoke * 0.46);
+    color = mix(color, color + smokeTint, smoke * mix(0.30, 0.95, bottomMotion));
+
+    // Dense fog bank — two FBM sheets hugging the bottom edge at
+    // different scales and drift speeds, so the bank reads as deep
+    // rolling mist rather than a single blurry veil. A soft gradient
+    // underneath guarantees density even where the noise runs quiet.
+    vec3 mistCol = mix(lightBand, vec3(0.92, 0.95, 1.0), 0.30);
+    float bank = fbm(vec2(q.x * 2.4 + t * 0.55, q.y * 4.6 - t * 0.32));
+    float bank2 = fbm(vec2(q.x * 1.4 - t * 0.35, q.y * 3.1 + t * 0.25));
+    float bankAmt = bottomMotion * max(
+        smoothstep(0.28, 0.85, bank),
+        smoothstep(0.30, 0.80, bank2) * 0.8);
+    color = mix(color, mistCol, bankAmt * 0.95);
+    color = mix(color, mistCol, bottomMotion * bottomMotion * 0.55);
 
     float highlight = smoothstep(0.38, 0.90, fbm(q * 4.0 + vec2(-t * 0.7, t * 0.4)));
     color += vec3(0.045, 0.03, 0.022) * highlight;

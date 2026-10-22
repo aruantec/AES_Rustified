@@ -11,7 +11,7 @@ use skrifa::color::{Brush, ColorPainter, CompositeMode, Extend};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::{FontRef, GlyphId, MetadataProvider};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tiny_skia as ts;
 
 /// Emoji texture raster size — big enough to stay crisp at the
@@ -31,17 +31,40 @@ fn is_emoji(c: char) -> bool {
         || matches!(u, 0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139)
 }
 
-/// seguiemj's face — table dir parsed once per render (it's cheap);
-/// the backing bytes are leaked so the `FontRef` is 'static.
+/// seguiemj's FontData — the same Arc egui rasterizes its glyph
+/// fallback chain with, handed over by the font-loader so this module
+/// doesn't keep its own copy of the ~10MB font.
+static FONT_DATA: OnceLock<Arc<egui::FontData>> = OnceLock::new();
+
+/// Install seguiemj's FontData (from `app_font_definitions`) — must
+/// run before the first emoji render; idempotent.
+pub(crate) fn set_font_data(fd: Arc<egui::FontData>) {
+    let _ = FONT_DATA.set(fd);
+}
+
+/// The 'static font bytes + face index for `font()`: a leaked
+/// reference into the Arc'd FontData (a process-lifetime singleton),
+/// or the fs::read fallback when egui's copy didn't load.
+fn font_bytes() -> Option<(&'static [u8], u32)> {
+    static BYTES: OnceLock<Option<(&'static [u8], u32)>> = OnceLock::new();
+    static READ: OnceLock<Vec<u8>> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        if let Some(fd) = FONT_DATA.get() {
+            let fd: &'static egui::FontData = unsafe { &*Arc::into_raw(fd.clone()) };
+            Some((fd.font.as_ref().as_ref(), fd.index))
+        } else {
+            let v = READ.get_or_init(|| {
+                std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf").unwrap_or_default()
+            });
+            (!v.is_empty()).then_some((v.as_slice(), 0))
+        }
+    })
+}
+
+/// seguiemj's face — table dir parsed once per render (it's cheap).
 fn font() -> Option<FontRef<'static>> {
-    static DATA: OnceLock<Vec<u8>> = OnceLock::new();
-    let data = DATA.get_or_init(|| {
-        std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf").unwrap_or_default()
-    });
-    if data.is_empty() {
-        return None;
-    }
-    skrifa::FontRef::from_index(Box::leak(data.clone().into_boxed_slice()), 0).ok()
+    let (bytes, index) = font_bytes()?;
+    skrifa::FontRef::from_index(bytes, index).ok()
 }
 
 // --- COLR painting ----------------------------------------------------
