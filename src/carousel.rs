@@ -926,9 +926,10 @@ impl Carousel {
     pub fn apply_info(&mut self, path: &Path, info: &TrackInfo) {
         if let Some(i) = self.index_of(path) {
             let item = &mut self.items[i];
+            let title = crate::library::strip_leading_track_no(&info.title, info.number);
             item.title = match info.number {
-                Some(n) => format!("{:02}. {}", n, info.title),
-                None => info.title.clone(),
+                Some(n) => format!("{:02}. {}", n, title),
+                None => title.to_string(),
             };
             item.artist = info.artist.clone();
             item.album = info.album.clone();
@@ -954,12 +955,15 @@ impl Carousel {
 
     /// Tag metadata arrived from the worker — upgrade item labels
     /// (same order the paths were spawned with). A tagged track number
-    /// prefixes the title the way music players display it.
+    /// prefixes the title the way music players display it — with any
+    /// number the title itself already carried stripped first, so
+    /// "05 Renegade" tagged as track 5 doesn't render "05. 05 …".
     pub fn set_info(&mut self, infos: Vec<TrackInfo>) {
         for (item, info) in self.items.iter_mut().zip(infos) {
+            let title = crate::library::strip_leading_track_no(&info.title, info.number);
             item.title = match info.number {
-                Some(n) => format!("{:02}. {}", n, info.title),
-                None => info.title,
+                Some(n) => format!("{:02}. {}", n, title),
+                None => title.to_string(),
             };
             item.artist = info.artist;
             item.album = info.album;

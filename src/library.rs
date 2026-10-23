@@ -673,6 +673,23 @@ fn read_track_info(path: &Path, album_title: &str) -> TrackInfo {
     }
 }
 
+/// Drop a leading track number embedded in a title ("05 Renegade",
+/// "05. Renegade", "05 - Renegade") — but only when it equals the
+/// track's real number, so genuinely numeric titles ("99 Problems",
+/// "505") survive. Numbered stems/tag titles otherwise double up
+/// against the "{number}. {title}" display prefix.
+pub fn strip_leading_track_no(title: &str, number: Option<u32>) -> &str {
+    let Some(n) = number else { return title };
+    let t = title.trim_start();
+    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || t[..digits].parse::<u32>() != Ok(n) {
+        return title;
+    }
+    let rest = t[digits..]
+        .trim_start_matches(|c: char| matches!(c, '.' | '-' | '_' | ' '));
+    if rest.is_empty() { title } else { rest }
+}
+
 /// Leading "07 - Name" / "07_Name" style track numbers in filenames.
 fn filename_track_number(stem: &str) -> Option<u32> {
     let digits: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -784,5 +801,23 @@ mod tests {
         assert_eq!(cover_bytes(&CoverSrc::File(p.clone())), Some(bytes));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(cover_bytes(&CoverSrc::File(p)), None);
+    }
+
+    /// Titles carrying their own track number ("05 Renegade") must
+    /// not double up against the "{number}. {title}" prefix the
+    /// carousel adds — but only when the embedded number matches the
+    /// real track number, or legit numeric titles get mangled.
+    #[test]
+    fn strip_leading_track_no_strips_only_matching() {
+        assert_eq!(strip_leading_track_no("05 Renegade - Terrorist", Some(5)), "Renegade - Terrorist");
+        assert_eq!(strip_leading_track_no("05. Renegade", Some(5)), "Renegade");
+        assert_eq!(strip_leading_track_no("05 - Renegade", Some(5)), "Renegade");
+        assert_eq!(strip_leading_track_no("5 Renegade", Some(5)), "Renegade");
+        // Mismatched or absent number → title untouched.
+        assert_eq!(strip_leading_track_no("99 Problems", Some(3)), "99 Problems");
+        assert_eq!(strip_leading_track_no("99 Problems", None), "99 Problems");
+        assert_eq!(strip_leading_track_no("505", Some(505)), "505");
+        assert_eq!(strip_leading_track_no("05", Some(5)), "05");
+        assert_eq!(strip_leading_track_no("Renegade", Some(5)), "Renegade");
     }
 }
