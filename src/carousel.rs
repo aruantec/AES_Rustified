@@ -144,6 +144,9 @@ pub enum Action {
     Download(PathBuf),
     /// Re/Decomp menu: "Open install folder".
     OpenFolder(PathBuf),
+    /// Re/Decomp menu: "Uninstall" — the view confirms via the
+    /// delete prompt before the install tree is deleted.
+    Uninstall(PathBuf),
 }
 
 /// One carousel/grid item = one track of the loaded album.
@@ -349,6 +352,10 @@ pub struct Carousel {
     /// (Refresh catalog / Install·Update / Play / Open install
     /// folder) and no "add games" empty-state hint.
     pub decomp_menu: bool,
+    /// Re/Decomp catalog mode: slugs (item paths) whose install
+    /// marker exists — gates the menu's "Uninstall" entry. The
+    /// view refreshes it per frame from its stamp cache.
+    pub decomp_installed: BTreeSet<PathBuf>,
     /// Row floor for the horizontal card grid — compact transport
     /// mode sets 2 so the shrunken cover area still shows two rows
     /// (cards shrink to fit); normal layouts leave it at 1.
@@ -409,6 +416,7 @@ impl Carousel {
             shadps4_menu: false,
             cemu_menu: false,
             decomp_menu: false,
+            decomp_installed: BTreeSet::new(),
             h_min_rows: 1,
             marquee_title: false,
             marquee_off: 0.0,
@@ -2432,6 +2440,13 @@ impl Carousel {
                         }
                         if ui.button("Open install folder").clicked() {
                             action = Action::OpenFolder(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                        if self.decomp_installed.contains(&p)
+                            && ui.button("Uninstall").clicked()
+                        {
+                            action = Action::Uninstall(p.clone());
                             self.menu_item = None;
                             ui.close();
                         }

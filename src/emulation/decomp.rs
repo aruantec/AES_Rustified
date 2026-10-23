@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -25,6 +26,7 @@ use eframe::egui::{
 use crate::album_row::AlbumRow;
 use crate::carousel::{self, Mode};
 use crate::emulation::catalog::{self, Entry, Kind};
+use crate::emulation::{cap_shader, xenia};
 use crate::library::CoverSrc;
 use crate::search_pill::SearchPill;
 use crate::settings;
@@ -459,6 +461,126 @@ pub struct DecompView {
     /// The band's layout toggle wrote a persisted setting — the app
     /// consumes this and saves.
     pub settings_dirty: bool,
+
+    // ---- Game capture session ------------------------------------
+    // The same machinery the emulation view drives: a `xenia::Session`
+    // with `Kind::Decomp` resolves the game's HWND (launcher-aware),
+    // hides the real window and feeds WGC frames into the same
+    // opaque presentation layer — list ⇄ capture switch, fullscreen,
+    // pause/power controls.
+    /// The running game session — WGC frames land in `frame_tex`
+    /// (CPU mirror) or `gpu_cap` (zero-copy ring).
+    pub session: Option<xenia::Session>,
+    /// Install dir of the running/launching game — Play on the same
+    /// card un-dismisses instead of relaunching.
+    session_dir: Option<PathBuf>,
+    /// Display name for the launch/status line.
+    session_name: String,
+    /// Spawn runs on a worker (CreateProcess + job setup) — the
+    /// session lands here.
+    launch_rx: Option<mpsc::Receiver<Result<xenia::Session, String>>>,
+    /// Play on a different card while a session runs — queued until
+    /// the running game closes (Lacrima's pending-launch shape).
+    pending_launch: Option<(PathBuf, String)>,
+    /// ⇄ list/capture switch — the grid stays live while the
+    /// capture runs underneath (Lacrima's dismissed viewport).
+    pub viewport_dismissed: bool,
+    /// Game-fullscreen — the capture covers the whole view (the app
+    /// window itself goes fullscreen via the F12 path).
+    pub game_fs: bool,
+    /// Whether WE put the window into fullscreen for `game_fs` —
+    /// leaving restores the previous windowed/maximized state.
+    fs_drove: bool,
+    fs_seen: bool,
+    fs_prev_max: bool,
+    /// OS cursor hidden while the game owns the screen.
+    cursor_hidden: bool,
+    /// Presentation-rect tween state — fullscreen transitions glide
+    /// between `upper` and `content` over a fixed 0.45s cubic.
+    pres_anim: Rect,
+    pres_from: Rect,
+    pres_t: f32,
+    pres_fs: bool,
+    /// The opaque capture layer's fade over the grid (0.3s like
+    /// Lacrima's DoubleTransition).
+    cap_t: f32,
+    /// egui texture captured frames upload into (CPU mirror path).
+    frame_tex: Option<egui::TextureHandle>,
+    /// Last frame seq consumed — ring seq on the zero-copy path,
+    /// slot seq on the CPU mirror.
+    frame_seq: u64,
+    slot_seq: u64,
+    /// Persistent frame staging buffer — swapped with the capture
+    /// slot so neither side allocates per frame.
+    frame_buf: Vec<u8>,
+    /// GPU capture pipelines — assigned at boot when the backend is
+    /// wgpu (same `CaptureShader` the emulation view uses).
+    pub cap_shader: Option<cap_shader::CaptureShader>,
+    /// The imported zero-copy ring; `None` puts us on the CPU mirror.
+    gpu_cap: Option<cap_shader::ImportedRing>,
+    /// Generation whose import already failed — don't retry per frame.
+    gpu_failed_gen: u64,
+    gpu_err: Option<String>,
+    /// Aspect-fill blend — 0 = Uniform (fit), 1 = cover crop; the
+    /// tween glides instead of snapping near the fill threshold.
+    crop_t: f32,
+    crop_from: f32,
+    crop_target: f32,
+    crop_prog: f32,
+    /// UI close request parked for the caller — it owns the confirm
+    /// prompt that guards every session stop.
+    close_req: bool,
+    /// Live capture render options — the "DECOMP" slot in the
+    /// shared `cfg.render` map; the settings panel edits this copy
+    /// and view() writes it through per change (AutoSave shape).
+    render: settings::RenderOpts,
+    /// One-shot load flag — `render` hydrates from cfg on the first
+    /// view() pass (DecompView::new runs before cfg is in scope).
+    render_loaded: bool,
+    /// Capture-settings panel open — the same RenderOptionsOverlay
+    /// the emulation view shows.
+    pub render_open: bool,
+    /// Set when `render` changed so view() writes it into cfg.
+    render_dirty: bool,
+    /// Stats-overlay + pillarbox state — the same bundle the
+    /// emulation capture draw uses.
+    fx: crate::emulation::CapFx,
+    /// Whether the saved aspect_key was applied to this session's
+    /// window (the HWND resolves asynchronously after launch).
+    aspect_applied: bool,
+    /// Uninstall request parked for the caller's delete prompt —
+    /// `(slug, name)` so the dialog can name the project.
+    uninstall_req: Option<(String, String)>,
+    /// Uninstall asked for the RUNNING game — armed behind the close
+    /// prompt, re-fires as `uninstall_req` once the session (or its
+    /// in-flight launch) is fully gone.
+    pending_uninstall: Option<(String, String)>,
+    /// Input tunnel — pointer/keys over the capture PostMessage into
+    /// the hidden game window so its own UI (launcher menus, option
+    /// dialogs) is reachable. Esc or the band button releases it.
+    pub input_tun: bool,
+    /// The live frame mapping the tunnel needs — `(dest, uv)` —
+    /// refreshed every frame the capture draw computes it.
+    tun_map: Option<(Rect, Rect)>,
+    /// Held mouse-button mask + tracked modifier state so tunneled
+    /// events carry correct key flags.
+    tun_buttons: u8,
+    tun_mods: u8,
+    /// Diagnostics — forwarded-event count + last post result, shown
+    /// in the capture's bottom-right badge.
+    pub tun_sent: u32,
+    pub tun_dbg: Option<String>,
+}
+
+/// Where a card's Play goes (same shape as the emulation view's
+/// PlayRoute): the running game only un-dismisses the capture
+/// viewport; a different game queues behind a session close; no
+/// session launches straight away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecompPlayRoute {
+    UnDismiss,
+    QueuePending,
+    Launch,
 }
 
 impl Default for DecompView {
@@ -499,6 +621,49 @@ impl Default for DecompView {
             cover_res_rx: res_rx,
             cover_res_tx: res_tx,
             settings_dirty: false,
+            session: None,
+            session_dir: None,
+            session_name: String::new(),
+            launch_rx: None,
+            pending_launch: None,
+            viewport_dismissed: false,
+            game_fs: false,
+            fs_drove: false,
+            fs_seen: false,
+            fs_prev_max: false,
+            cursor_hidden: false,
+            pres_anim: Rect::NOTHING,
+            pres_from: Rect::NOTHING,
+            pres_t: 1.0,
+            pres_fs: false,
+            cap_t: 0.0,
+            frame_tex: None,
+            frame_seq: 0,
+            slot_seq: 0,
+            frame_buf: Vec::new(),
+            cap_shader: None,
+            gpu_cap: None,
+            gpu_failed_gen: 0,
+            gpu_err: None,
+            crop_t: 0.0,
+            crop_from: 0.0,
+            crop_target: 0.0,
+            crop_prog: 1.0,
+            close_req: false,
+            uninstall_req: None,
+            pending_uninstall: None,
+            render: settings::RenderOpts::default(),
+            render_loaded: false,
+            render_open: false,
+            render_dirty: false,
+            fx: crate::emulation::CapFx::default(),
+            aspect_applied: false,
+            input_tun: false,
+            tun_map: None,
+            tun_buttons: 0,
+            tun_mods: 0,
+            tun_sent: 0,
+            tun_dbg: None,
         }
     }
 }
@@ -693,6 +858,183 @@ impl DecompView {
         std::mem::take(&mut self.settings_dirty)
     }
 
+    /// Where a card's Play goes — same routing the emulation view
+    /// uses: the running game only un-dismisses the capture
+    /// viewport; a different game queues a pending launch behind a
+    /// close; no session launches straight away.
+    fn play_route(&self, dir: &Path) -> DecompPlayRoute {
+        if self.session.is_some() || self.launch_rx.is_some() {
+            if self.session_dir.as_deref() == Some(dir) {
+                DecompPlayRoute::UnDismiss
+            } else {
+                DecompPlayRoute::QueuePending
+            }
+        } else {
+            DecompPlayRoute::Launch
+        }
+    }
+
+    /// Card/pane "Play": launch the installed game as a captured
+    /// session (or route through the running one).
+    pub fn play_dir(&mut self, dir: &Path, name: String) {
+        match self.play_route(dir) {
+            DecompPlayRoute::UnDismiss => self.viewport_dismissed = false,
+            DecompPlayRoute::QueuePending => {
+                self.pending_launch = Some((dir.to_path_buf(), name));
+                self.request_close();
+            }
+            DecompPlayRoute::Launch => self.launch(dir, name),
+        }
+    }
+
+    /// Find the game's exe and spawn the capture session on a
+    /// worker — the process + resolve worker land via `launch_rx`.
+    fn launch(&mut self, dir: &Path, name: String) {
+        self.notice = None;
+        xenia::session_log(&format!("decomp launch dir={} exe=find", dir.display()));
+        match find_exe(dir) {
+            Some(exe) => {
+                let root = dir.to_path_buf();
+                let exe_s = exe.to_string_lossy().into_owned();
+                let (tx, rx) = mpsc::channel();
+                // LowLatencyCapture → the capture pool depth for the
+                // session about to start (the panel has no row for
+                // it; the DECOMP render slot carries the default).
+                let low_latency = self.render.low_latency;
+                std::thread::spawn(move || {
+                    let _ = tx.send(xenia::Session::start(
+                        &exe_s,
+                        &exe,
+                        low_latency,
+                        None,
+                        xenia::Kind::Decomp,
+                        None,
+                        Some(root),
+                    ));
+                });
+                self.launch_rx = Some(rx);
+                self.session_dir = Some(dir.to_path_buf());
+                self.session_name = name.clone();
+                self.notice = Some(format!("Launching {name}…"));
+            }
+            None => {
+                self.notice = Some("No executable found — opening the folder".into());
+                open_in_file_manager(dir);
+            }
+        }
+    }
+
+    /// Ask the running session to stop the game — or cancel a
+    /// launch still in flight: dropping the receiver fails the
+    /// spawn worker's send and the orphaned `Session` reaps the
+    /// process it just started (Drop kills the child + job tree).
+    pub fn stop_session(&mut self) {
+        if let Some(s) = &self.session {
+            s.stop();
+        } else if self.launch_rx.is_some() {
+            self.launch_rx = None;
+            self.session_dir = None;
+        }
+    }
+
+    /// Flag a close request — the caller turns it into the
+    /// Switch-style "Close game?" confirm instead of stopping
+    /// directly.
+    pub fn request_close(&mut self) {
+        self.close_req = true;
+    }
+
+    /// Consume a parked close request — once, so a stale flag can't
+    /// reopen the prompt after it's been answered.
+    pub fn take_close_request(&mut self) -> bool {
+        std::mem::replace(&mut self.close_req, false)
+    }
+
+    /// Card/pane "Uninstall" — parks a `(slug, name)` request the
+    /// caller routes through the delete-confirm prompt (same shape
+    /// as `request_close`). Uninstalling the RUNNING game goes
+    /// through the close prompt first — its install dir can't be
+    /// deleted mid-session — then re-arms once teardown lands.
+    fn request_uninstall(&mut self, e: &Entry) {
+        let req = (e.slug.clone(), e.name.clone());
+        if self.session_dir == install_dir(&e.slug) {
+            self.pending_uninstall = Some(req);
+            self.request_close();
+        } else {
+            self.uninstall_req = Some(req);
+        }
+    }
+
+    /// Consume a parked uninstall request — once, same reason as
+    /// `take_close_request`.
+    pub fn take_uninstall_request(&mut self) -> Option<(String, String)> {
+        self.uninstall_req.take()
+    }
+
+    /// The pending_uninstall → uninstall_req handoff once the dir
+    /// frees (session torn down, launch canceled or failed). Called
+    /// by view() right after each spot that clears `session_dir`.
+    fn settle_uninstall(&mut self) {
+        if self.session_dir.is_none() && self.launch_rx.is_none() {
+            if let Some(req) = self.pending_uninstall.take() {
+                self.uninstall_req = Some(req);
+            }
+        }
+    }
+
+    /// Confirmed uninstall — drop the install tree, drop a queued
+    /// Play for it, and refresh the stamp cache so cards and the
+    /// pane flip back to Install. Refuses while the game still owns
+    /// a session or in-flight launch (the running path re-arms after
+    /// teardown instead, so this can't race the filesystem locks).
+    pub fn uninstall(&mut self, slug: &str) {
+        let Some(dir) = install_dir(slug) else {
+            return;
+        };
+        if self.session_dir.as_deref() == Some(dir.as_path()) {
+            return;
+        }
+        if self
+            .pending_launch
+            .as_ref()
+            .is_some_and(|(d, _)| d == &dir)
+        {
+            self.pending_launch = None;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        self.refresh_installed();
+    }
+
+    /// The ⇄ switch — dismissing also drops game-fullscreen and the
+    /// input tunnel so the app window comes back; un-dismiss is the
+    /// toggle's other half.
+    pub fn toggle_viewport(&mut self) {
+        if self.viewport_dismissed {
+            self.viewport_dismissed = false;
+        } else {
+            self.viewport_dismissed = true;
+            self.game_fs = false;
+            self.input_tun = false;
+        }
+    }
+
+    /// The input-tunnel toggle — the band's pointer icon and Ctrl+M:
+    /// while lit, clicks/keys over the capture PostMessage into the
+    /// game's hidden window.
+    pub fn toggle_input_tunnel(&mut self) {
+        self.input_tun = !self.input_tun;
+    }
+
+    /// Entering also un-dismisses the viewport: `game_fs` alone is a
+    /// request — the capture layer must be up for it to mean
+    /// anything.
+    pub fn toggle_fullscreen(&mut self) {
+        self.game_fs = !self.game_fs;
+        if self.game_fs {
+            self.viewport_dismissed = false;
+        }
+    }
+
     /// Count of items the shared list currently shows (subset + text
     /// filter applied) — the band's "n of m shown".
     fn shown_count(&self) -> usize {
@@ -838,13 +1180,7 @@ impl DecompView {
             Action::Install | Action::Update => self.download(e),
             Action::Open => {
                 if let Some(dir) = install_dir(&e.slug) {
-                    if let Some(exe) = find_exe(&dir) {
-                        let _ = std::process::Command::new(&exe)
-                            .current_dir(&dir)
-                            .spawn();
-                    } else {
-                        open_in_file_manager(&dir);
-                    }
+                    self.play_dir(&dir, e.name.clone());
                 }
             }
         }
@@ -1285,6 +1621,234 @@ pub fn view(
 
     painter.rect_filled(upper, 0.0, Color32::BLACK.gamma_multiply(alpha));
 
+    // --- Capture session housekeeping (the emulation view's form) --
+    // The spawn worker hands the session over; the game lands on the
+    // capture layer — the presentation fades in over the grid.
+    if let Some(rx) = &view.launch_rx {
+        match rx.try_recv() {
+            Ok(Ok(s)) => {
+                // Fresh capture — the old ring/seqs belong to the
+                // dead session.
+                view.gpu_cap = None;
+                view.gpu_failed_gen = 0;
+                view.gpu_err = None;
+                view.slot_seq = 0;
+                view.frame_seq = 0;
+                view.aspect_applied = false;
+                view.session = Some(s);
+                view.launch_rx = None;
+                view.notice = None;
+                view.viewport_dismissed = false;
+            }
+            Ok(Err(e)) => {
+                xenia::session_log(&format!("decomp launch failed: {e}"));
+                view.notice = Some(e);
+                view.launch_rx = None;
+                view.session_dir = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                xenia::session_log("decomp launch worker died before producing a session");
+                view.notice = Some("Launch failed (worker died — see session.log)".into());
+                view.launch_rx = None;
+                view.session_dir = None;
+            }
+        }
+    }
+    // Session teardown once the game reports exit — the last
+    // captured frame stays mounted so the layer can fade out over
+    // the grid instead of snapping away.
+    if view.session.as_mut().is_some_and(|s| s.finished()) {
+        view.session = None;
+        view.session_dir = None;
+        view.viewport_dismissed = false;
+        view.game_fs = false;
+        view.input_tun = false;
+        // An uninstall requested for this game re-arms now that its
+        // install dir is free — BEFORE a queued Play can re-park a
+        // session on it for another stretch.
+        view.settle_uninstall();
+        // The queued Play fires only once the replaced session is
+        // fully reaped (TryLaunchPendingEmulatorRequest).
+        if let Some((dir, name)) = view.pending_launch.take() {
+            view.launch(&dir, name);
+        }
+    }
+    // A stopped/canceled/failed launch frees the install dir the
+    // same way teardown does — the armed uninstall surfaces now.
+    view.settle_uninstall();
+    // A confirmed close during an in-flight launch cleared the rx
+    // (stop_session) — the queued game fires now that nothing is
+    // running or starting. A canceled prompt leaves the session
+    // (or its launch) alive, which blocks this arm.
+    if view.session.is_none() && view.launch_rx.is_none() {
+        if let Some((dir, name)) = view.pending_launch.take() {
+            view.launch(&dir, name);
+        }
+    }
+
+    // The view's render options — a fixed "DECOMP" slot in the same
+    // per-section `cfg.render` map the emulation view uses (loaded
+    // once; the settings panel edits the live copy afterwards).
+    if !view.render_loaded {
+        view.render_loaded = true;
+        view.render = emu_cfg
+            .render
+            .get("DECOMP")
+            .cloned()
+            .unwrap_or_default();
+    }
+    // Live render options → the capture thread's swizzle reads these
+    // atomics each frame, so panel edits land on the very next
+    // captured frame (same push the emulation view does).
+    if let Some(session) = &view.session {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = session.render();
+        r.brightness.store(view.render.brightness.to_bits(), Relaxed);
+        r.saturation.store(view.render.saturation.to_bits(), Relaxed);
+        let [tr, tg, tb] = view.render.tint;
+        r.tint
+            .store((tr as u32) << 16 | (tg as u32) << 8 | tb as u32, Relaxed);
+    }
+    // Write-through — the DECOMP slot persists like the per-section
+    // SectionSettings do.
+    if view.render_dirty {
+        view.render_dirty = false;
+        emu_cfg.render.insert("DECOMP".into(), view.render.clone());
+        view.settings_dirty = true;
+    }
+    // DisableVSync — the presentation is repaint-driven, so the
+    // equivalent is a continuous repaint while the capture shows:
+    // frames present at display rate regardless of arrival timing.
+    if view.render.disable_vsync && view.session.is_some() && !view.viewport_dismissed {
+        ui.ctx().request_repaint();
+    }
+
+    // SelectedCaptureAspectRatio — once the session resolves its
+    // render window, resize it to the saved aspect ("handler"
+    // leaves the game's own; the context menu re-picks live).
+    #[cfg(windows)]
+    if !view.aspect_applied {
+        if let Some(session) = &view.session {
+            let hwnd = session.hwnd();
+            if !hwnd.is_invalid() {
+                if let Some(ratio) = crate::emulation::aspect_ratio_of(&view.render.aspect_key) {
+                    xenia::apply_aspect_ratio(hwnd, ratio);
+                }
+                view.aspect_applied = true;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        view.aspect_applied = true;
+    }
+    // The opaque capture layer fades in/out over the grid — 0.3s,
+    // same duration as the emulation view.
+    let cap_target = view.session.is_some() && !view.viewport_dismissed;
+    let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+    let before = view.cap_t;
+    view.cap_t = (view.cap_t + if cap_target { dt / 0.3 } else { -dt / 0.3 }).clamp(0.0, 1.0);
+    let cap_a = crate::ease_in_out_cubic(view.cap_t);
+    if view.cap_t > 0.0 || view.cap_t != before {
+        ui.ctx().request_repaint();
+    } else if view.session.is_some() {
+        // Hidden session — only poll occasionally for exit.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(250));
+    }
+    if view.session.is_none() && view.cap_t <= 0.0 {
+        view.frame_tex = None;
+        view.gpu_cap = None;
+        view.frame_seq = 0;
+        view.slot_seq = 0;
+        view.frame_buf = Vec::new();
+    }
+
+    // Game-fullscreen rides on the app's real fullscreen window mode
+    // (same contract as the emulation view): entering sends
+    // Fullscreen(true), leaving restores the previous
+    // windowed/maximized state — but only when we drove it.
+    let (win_fs, win_max) = ui.ctx().input(|i| {
+        (
+            i.viewport().fullscreen.unwrap_or(false),
+            i.viewport().maximized.unwrap_or(false),
+        )
+    });
+    if view.game_fs && !win_fs && !view.fs_drove {
+        view.fs_drove = true;
+        view.fs_seen = false;
+        view.fs_prev_max = win_max;
+        // set_fullscreen pairs Fullscreen with Decorations(false) —
+        // the bare command leaves winit's 1px shadow inset.
+        crate::set_fullscreen(ui.ctx(), true);
+    }
+    if view.fs_drove && win_fs {
+        view.fs_seen = true;
+    }
+    if view.fs_drove && view.fs_seen && !win_fs {
+        view.fs_drove = false;
+        view.fs_seen = false;
+        view.game_fs = false;
+    }
+    if !view.game_fs && view.fs_drove && win_fs {
+        view.fs_drove = false;
+        view.fs_seen = false;
+        crate::set_fullscreen(ui.ctx(), false);
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(view.fs_prev_max));
+    }
+    let fs = view.game_fs && win_fs && view.session.is_some() && !view.viewport_dismissed;
+    let pres_target = if fs { content } else { upper };
+    // Presentation motion: the rect follows its target 1:1; a
+    // fullscreen flip engages a fixed 0.45s cubic tween (same
+    // profile the emulation view uses).
+    {
+        if !view.pres_anim.is_finite() {
+            view.pres_anim = pres_target;
+            view.pres_fs = fs;
+            view.pres_t = 1.0;
+        }
+        if fs != view.pres_fs {
+            view.pres_fs = fs;
+            view.pres_from = view.pres_anim;
+            view.pres_t = 0.0;
+        }
+        if view.pres_t < 1.0 {
+            view.pres_t = (view.pres_t + dt / 0.45).min(1.0);
+            let e = crate::ease_in_out_cubic(view.pres_t);
+            view.pres_anim = if view.pres_t < 1.0 {
+                crate::emulation::lerp_rect(view.pres_from, pres_target, e)
+            } else {
+                pres_target
+            };
+            ui.ctx().request_repaint();
+        } else {
+            view.pres_anim = pres_target;
+        }
+    }
+    let pres_rect = view.pres_anim;
+    // Hide the OS cursor while the game owns the screen — except
+    // while the input tunnel needs a pointer to aim with.
+    let want_hidden = fs && !view.input_tun;
+    if want_hidden != view.cursor_hidden {
+        view.cursor_hidden = want_hidden;
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::CursorVisible(!want_hidden));
+    }
+    // The grid/pane stay mounted under the capture layer — painted
+    // only while the layer is translucent, interactive only once
+    // it's mostly faded out.
+    let covered = cap_a >= 0.999;
+    let content_interactive = interactive && cap_a < 0.5;
+    // In game-fullscreen the chrome (band, search, tabs) is not
+    // painted at all.
+    let chrome_hidden = fs && cap_a > 0.5;
+    // A pill left open when Play fired would keep eating keys under
+    // the capture layer — close it as the layer takes over.
+    if covered && view.search.is_open() {
+        view.search.close(ui.ctx());
+    }
 
     // --- Kind tabs (settings-overlay style) ------------------------
     // Text tabs in a row — active is white with an underline,
@@ -1304,60 +1868,62 @@ pub fn view(
     let mut tab_x = upper.min.x + 40.0 * s;
     let tab_y = upper.min.y + 12.0 * s;
     let tabs_right = content.max.x - 300.0 * s; // keep clear of the search pill
-    for (this, label, n) in &tabs {
-        let lg = painter.layout_no_wrap(label.clone(), tab_font.clone(), Color32::WHITE);
-        let ng = painter.layout_no_wrap(
-            format!(" {n}"),
-            FontId::proportional(13.0 * s),
-            Color32::WHITE,
-        );
-        let w = lg.size().x + ng.size().x + 4.0 * s;
-        if tab_x + w > tabs_right {
-            break;
-        }
-        let rect = Rect::from_min_size(Pos2::new(tab_x, tab_y), Vec2::new(w, tab_row_h));
-        let resp = if interactive {
-            ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::click())
-        } else {
-            ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::hover())
-        };
-        let active = view.filter == *this;
-        let color = if active {
-            Color32::WHITE
-        } else if resp.hovered() {
-            Color32::from_gray(200)
-        } else {
-            Color32::from_gray(140)
-        };
-        painter.galley(
-            Pos2::new(rect.min.x, rect.min.y + 4.0 * s),
-            lg,
-            color.gamma_multiply(alpha),
-        );
-        painter.galley(
-            Pos2::new(rect.min.x + rect.width() - ng.size().x - 2.0 * s, rect.min.y + 10.0 * s),
-            ng,
-            Color32::from_gray(120).gamma_multiply(alpha),
-        );
-        if active {
-            painter.line_segment(
-                [
-                    Pos2::new(rect.min.x, rect.max.y - 2.0 * s),
-                    Pos2::new(rect.min.x + rect.width(), rect.max.y - 2.0 * s),
-                ],
-                Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(alpha)),
+    if !covered {
+        for (this, label, n) in &tabs {
+            let lg = painter.layout_no_wrap(label.clone(), tab_font.clone(), Color32::WHITE);
+            let ng = painter.layout_no_wrap(
+                format!(" {n}"),
+                FontId::proportional(13.0 * s),
+                Color32::WHITE,
             );
+            let w = lg.size().x + ng.size().x + 4.0 * s;
+            if tab_x + w > tabs_right {
+                break;
+            }
+            let rect = Rect::from_min_size(Pos2::new(tab_x, tab_y), Vec2::new(w, tab_row_h));
+            let resp = if content_interactive {
+                ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::click())
+            } else {
+                ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::hover())
+            };
+            let active = view.filter == *this;
+            let color = if active {
+                Color32::WHITE
+            } else if resp.hovered() {
+                Color32::from_gray(200)
+            } else {
+                Color32::from_gray(140)
+            };
+            painter.galley(
+                Pos2::new(rect.min.x, rect.min.y + 4.0 * s),
+                lg,
+                color.gamma_multiply(alpha),
+            );
+            painter.galley(
+                Pos2::new(rect.min.x + rect.width() - ng.size().x - 2.0 * s, rect.min.y + 10.0 * s),
+                ng,
+                Color32::from_gray(120).gamma_multiply(alpha),
+            );
+            if active {
+                painter.line_segment(
+                    [
+                        Pos2::new(rect.min.x, rect.max.y - 2.0 * s),
+                        Pos2::new(rect.min.x + rect.width(), rect.max.y - 2.0 * s),
+                    ],
+                    Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(alpha)),
+                );
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                set_filter = Some(*this);
+            }
+            tab_x += w + tab_gap;
         }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        if let Some(f) = set_filter {
+            view.set_kind_filter(f);
         }
-        if resp.clicked() {
-            set_filter = Some(*this);
-        }
-        tab_x += w + tab_gap;
-    }
-    if let Some(f) = set_filter {
-        view.set_kind_filter(f);
     }
 
     // --- The shared item list ---------------------------------------
@@ -1458,21 +2024,36 @@ pub fn view(
     // The focused card wears the pulsing selection ring and feeds
     // the info pane — the same item the overlay labels describe.
     let focused = view.cards.focused_path(&view.search.text);
-    let action = view.cards.ui(
-        ui,
-        grid,
-        grid,
-        &mut view.row,
-        focused.as_deref(),
-        false,
-        &view.search.text,
-        cfg,
-        mode,
-        alpha,
-        interactive,
-        false,
-        s,
-    );
+    // The card menu's "Uninstall" shows only on installed slugs —
+    // the stamp cache is already fresh enough for menu state.
+    view.cards.decomp_installed = view
+        .installed
+        .iter()
+        .filter(|(_, s)| s.is_some())
+        .map(|(slug, _)| PathBuf::from(slug))
+        .collect();
+    // An opaque capture layer owns `upper` — skip the list draw and
+    // its input entirely (it still runs underneath via `cap_t`'s
+    // fade, same as the emulation view).
+    let action = if !covered {
+        view.cards.ui(
+            ui,
+            grid,
+            grid,
+            &mut view.row,
+            focused.as_deref(),
+            false,
+            &view.search.text,
+            cfg,
+            mode,
+            alpha,
+            content_interactive,
+            false,
+            s,
+        )
+    } else {
+        carousel::Action::None
+    };
     match action {
         // Double-click / "Play" and "Install / Update" both resolve
         // to the entry's card action — Install→download, Update→
@@ -1483,6 +2064,13 @@ pub fn view(
         carousel::Action::OpenFolder(p) => {
             if let Some(dir) = install_dir(&p.to_string_lossy()) {
                 open_in_file_manager(&dir);
+            }
+        }
+        carousel::Action::Uninstall(p) => {
+            let slug = p.to_string_lossy().into_owned();
+            if let Some(&i) = view.slug_idx.get(&slug) {
+                let e = view.entries[i].clone();
+                view.request_uninstall(&e);
             }
         }
         // The catalog menu's "Refresh catalog" reuses the ROM menu's
@@ -1501,41 +2089,170 @@ pub fn view(
     }
 
     // --- Selected-entry info pane (always docked at the bottom) ------
-    let sel_idx = focused
-        .as_deref()
-        .and_then(|p| view.slug_idx.get(&*p.to_string_lossy()).copied());
-    info_pane(ui, pane, view, sel_idx, alpha, interactive, s);
+    if !covered {
+        let sel_idx = focused
+            .as_deref()
+            .and_then(|p| view.slug_idx.get(&*p.to_string_lossy()).copied());
+        info_pane(ui, pane, view, sel_idx, alpha, content_interactive, s);
 
-    // The drawer paints last, over the pane — it slides up from the
-    // footer separator and covers whatever sits behind it.
-    if filter_t > 0.001 {
-        painter.rect_filled(drawer, 0.0, Color32::BLACK.gamma_multiply(alpha));
-        painter.hline(
-            drawer.min.x..=drawer.max.x,
-            drawer.min.y,
-            Stroke::new(
-                s.max(1.0),
-                Color32::from_white_alpha((51.0 * alpha) as u8),
-            ),
-        );
-        filter_drawer(ui, &painter, drawer, drawer_full, view, alpha, interactive, s);
+        // The drawer paints last, over the pane — it slides up from the
+        // footer separator and covers whatever sits behind it.
+        if filter_t > 0.001 {
+            painter.rect_filled(drawer, 0.0, Color32::BLACK.gamma_multiply(alpha));
+            painter.hline(
+                drawer.min.x..=drawer.max.x,
+                drawer.min.y,
+                Stroke::new(
+                    s.max(1.0),
+                    Color32::from_white_alpha((51.0 * alpha) as u8),
+                ),
+            );
+            filter_drawer(ui, &painter, drawer, drawer_full, view, alpha, content_interactive, s);
+        }
+
+        // The item search pill — docked in the top-right corner with a
+        // small top/right margin so the cards never slide under it.
+        if !chrome_hidden {
+            view.search.ui(
+                ui,
+                content.max.x - 18.0 * s,
+                upper.min.y + 10.0 * s,
+                "Search",
+                true,
+                false,
+                alpha,
+                content_interactive,
+                s,
+            );
+        }
     }
 
-    // The item search pill — docked in the top-right corner with a
-    // small top/right margin so the cards never slide under it.
-    view.search.ui(
+    // --- Capture layer ---------------------------------------------
+    // The same presentation the emulation view uses: an opaque black
+    // backing fading in over the grid, the newest WGC frame inside
+    // (aspect-fit with the near-fill crop glide), a centered status
+    // line until the first frame lands. In game-fullscreen the rect
+    // glides from `upper` to `content`.
+    if view.cap_t > 0.0 {
+        draw_capture(ui, &painter, pres_rect, pres_target, view, alpha * cap_a, s);
+    }
+    // The input tunnel — while it owns the session, pointer/key
+    // events inside the frame rect PostMessage to the hidden game
+    // window so its own UI is reachable. Esc releases it (the global
+    // chain runs after — the forward loop never sends Escape).
+    crate::emulation::tunnel_input(
         ui,
-        content.max.x - 18.0 * s,
-        upper.min.y + 10.0 * s,
-        "Search",
-        true,
-        false,
-        alpha,
-        interactive,
-        s,
+        view.session.as_ref(),
+        crate::emulation::TunIo {
+            on: &mut view.input_tun,
+            map: view.tun_map,
+            frame: view
+                .frame_tex
+                .as_ref()
+                .map(|t| (t.size()[0] as f64, t.size()[1] as f64)),
+            buttons: &mut view.tun_buttons,
+            mods: &mut view.tun_mods,
+            sent: &mut view.tun_sent,
+            dbg: &mut view.tun_dbg,
+        },
+        interactive && cap_a > 0.5,
     );
+    // Click/double-click/context gestures ride the capture rect — a
+    // double-click toggles game-fullscreen, the right-click menu
+    // mirrors the band's session controls (same shape as the
+    // emulation view's capture gestures).
+    if view.session.is_some() && cap_a > 0.5 {
+        let cap =
+            ui.interact(pres_rect, ui.scope_id().with("decomp-capture"), Sense::click());
+        if cap.double_clicked() && !view.input_tun {
+            view.toggle_fullscreen();
+        }
+        let mut close_game = false;
+        cap.context_menu(|ui| {
+            if ui
+                .button(if view.game_fs {
+                    "Exit Fullscreen"
+                } else {
+                    "Fullscreen"
+                })
+                .clicked()
+            {
+                view.toggle_fullscreen();
+                ui.close();
+            }
+            // SetCaptureAspectRatio — resizes the game window so the
+            // capture's native aspect changes; saved to the DECOMP
+            // render slot like the per-section emu one.
+            ui.menu_button("Aspect Ratio", |ui| {
+                for (key, label) in [
+                    ("handler", "Handler Default"),
+                    ("4:3", "4:3"),
+                    ("16:9", "16:9"),
+                    ("21:9", "21:9"),
+                    ("32:9", "32:9"),
+                    ("1:1", "1:1"),
+                ] {
+                    if ui
+                        .selectable_label(view.render.aspect_key == key, label)
+                        .clicked()
+                    {
+                        if view.render.aspect_key != key {
+                            view.render.aspect_key = key.to_string();
+                            view.render_dirty = true;
+                            #[cfg(windows)]
+                            if let Some(session) = &view.session {
+                                let hwnd = session.hwnd();
+                                if !hwnd.is_invalid() {
+                                    if let Some(ratio) =
+                                        crate::emulation::aspect_ratio_of(key)
+                                    {
+                                        xenia::apply_aspect_ratio(hwnd, ratio);
+                                    }
+                                    view.aspect_applied = true;
+                                }
+                            }
+                        }
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button("Close Game").clicked() {
+                close_game = true;
+                ui.close();
+            }
+        });
+        if close_game {
+            view.request_close();
+        }
+    }
+
+    // --- Capture render-options panel (the settings overlay) ------
+    // Same RenderOptionsOverlay the emulation view shows — slides in
+    // from the right over the item area; band + pane chrome stay.
+    if !chrome_hidden {
+        let item_area = Rect::from_min_max(content.min, Pos2::new(content.max.x, band.min.y));
+        if crate::emulation::render_panel(
+            ui,
+            &mut view.render_open,
+            &mut view.render,
+            view.session.is_some(),
+            view.cap_shader.as_ref(),
+            item_area,
+            alpha,
+            interactive,
+            s,
+        ) {
+            view.render_dirty = true;
+        }
+    }
 
     // --- Bottom band -----------------------------------------------
+    if !chrome_hidden {
+    painter.rect_filled(
+        band,
+        0.0,
+        Color32::from_black_alpha((230.0 * alpha) as u8),
+    );
     painter.rect_filled(
         band,
         0.0,
@@ -1600,7 +2317,9 @@ pub fn view(
         Pos2::new(band.max.x - 110.0 * s, cy),
         Vec2::splat(60.0 * s),
     );
-    let fr = if interactive {
+    // List controls — dead while the capture owns the screen (the
+    // session controls stay live; they're the escape hatch).
+    let fr = if content_interactive {
         ui.interact(frect, ui.scope_id().with("decomp-filter"), Sense::click())
     } else {
         ui.interact(frect, ui.scope_id().with("decomp-filter"), Sense::hover())
@@ -1624,7 +2343,7 @@ pub fn view(
     // persists Emulation.DecompLayoutMode — independent of the
     // emulation view's own CoverLayoutMode.
     let trect = Rect::from_center_size(Pos2::new(band.max.x - 50.0 * s, cy), Vec2::splat(60.0 * s));
-    let tr = if interactive {
+    let tr = if content_interactive {
         ui.interact(trect, ui.scope_id().with("decomp-layout"), Sense::click())
     } else {
         ui.interact(trect, ui.scope_id().with("decomp-layout"), Sense::hover())
@@ -1647,8 +2366,532 @@ pub fn view(
         emu_cfg.decomp_layout_mode = (emu_cfg.decomp_layout_mode.min(2) + 1) % 3;
         view.settings_dirty = true;
     }
+
+    // Session controls — Lacrima's IsEmulatorRunning set, same form
+    // as the emulation band's center cluster: the ⇄ list/capture
+    // switch left of the pause zone, pause/play (process suspend/
+    // resume) dead-center, the input tunnel right — 110px pitch with
+    // the 80px pause slot. The power glyph stays in the right
+    // cluster next to the filter icon (close-confirm via the
+    // caller's prompt).
+    let mut toggle_viewport = false;
+    let mut toggle_pause = false;
+    let mut toggle_tun = false;
+    let mut close_game = false;
+    if let Some(session) = &view.session {
+        let pc = band.center();
+
+        let vp = Rect::from_center_size(
+            Pos2::new(pc.x - 110.0 * s, cy),
+            Vec2::splat(60.0 * s),
+        );
+        let r = if interactive {
+            ui.interact(vp, ui.scope_id().with("decomp-viewport"), Sense::click())
+        } else {
+            ui.interact(vp, ui.scope_id().with("decomp-viewport"), Sense::hover())
+        }
+        .on_hover_text(if view.viewport_dismissed {
+            "Back to Game"
+        } else {
+            "Switch to List"
+        });
+        toggle_viewport = r.clicked();
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        crate::transport::icon_viewport(&painter, vp, !view.viewport_dismissed, alpha);
+
+        let pp = Rect::from_center_size(pc, Vec2::splat(80.0 * s));
+        let r = if interactive {
+            ui.interact(pp, ui.scope_id().with("decomp-pause"), Sense::click())
+        } else {
+            ui.interact(pp, ui.scope_id().with("decomp-pause"), Sense::hover())
+        }
+        .on_hover_text(if session.is_paused() {
+            "Resume Game"
+        } else {
+            "Pause Game"
+        });
+        toggle_pause = r.clicked();
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        crate::transport::icon_play(&painter, pp, !session.is_paused(), alpha);
+
+        // Input tunnel — while lit, clicks/keys inside the frame
+        // reach the game's hidden window so its own dialogs are
+        // usable in the captured stream. On Linux the same applies
+        // when the session runs embedded in the nested compositor —
+        // an external-window fallback owns its input itself.
+        let tun_ok = if cfg!(windows) {
+            true
+        } else {
+            session.embedded()
+        };
+        if tun_ok {
+            let tb = Rect::from_center_size(
+                Pos2::new(pc.x + 110.0 * s, cy),
+                Vec2::splat(60.0 * s),
+            );
+            let r = if interactive {
+                ui.interact(tb, ui.scope_id().with("decomp-tun"), Sense::click())
+            } else {
+                ui.interact(tb, ui.scope_id().with("decomp-tun"), Sense::hover())
+            }
+            .on_hover_text(if view.input_tun {
+                "Stop Controlling Game (Esc)"
+            } else {
+                "Control Game — clicks and keys reach the game"
+            });
+            toggle_tun = r.clicked();
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            crate::transport::icon_pointer(&painter, tb, view.input_tun, alpha);
+        }
+
+        let pw = Rect::from_center_size(
+            Pos2::new(band.max.x - 230.0 * s, cy),
+            Vec2::splat(60.0 * s),
+        );
+        let r = if interactive {
+            ui.interact(pw, ui.scope_id().with("decomp-close"), Sense::click())
+        } else {
+            ui.interact(pw, ui.scope_id().with("decomp-close"), Sense::hover())
+        }
+        .on_hover_text("Close Game");
+        close_game = r.clicked();
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        // Same 10px inset the filter/layout glyphs get — the power
+        // arc fills its canvas edge-to-edge, so an unshrunk box
+        // reads oversized next to them.
+        crate::transport::icon_power(&painter, pw.shrink(10.0 * s), alpha);
+
+        // Capture-settings toggle (Lacrima's ToggleRenderOptions) —
+        // the sliders glyph between close and the filter icon,
+        // same cluster order as the emulation band.
+        let rb = Rect::from_center_size(
+            Pos2::new(band.max.x - 170.0 * s, cy),
+            Vec2::splat(60.0 * s),
+        );
+        let r = if interactive {
+            ui.interact(rb, ui.scope_id().with("decomp-render"), Sense::click())
+        } else {
+            ui.interact(rb, ui.scope_id().with("decomp-render"), Sense::hover())
+        }
+        .on_hover_text("Capture Settings");
+        if r.clicked() {
+            view.render_open = !view.render_open;
+        }
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        crate::transport::icon_sliders(
+            &painter,
+            rb.shrink(10.0 * s),
+            view.render_open,
+            alpha,
+        );
+    }
+    if toggle_viewport {
+        view.toggle_viewport();
+    }
+    if toggle_pause {
+        if let Some(session) = &view.session {
+            session.set_paused(!session.is_paused());
+        }
+    }
+    if toggle_tun {
+        view.toggle_input_tunnel();
+    }
+    if close_game {
+        view.request_close();
+    }
+    }
 }
 
+
+// ---- Capture presentation --------------------------------------------------
+
+/// The capture presentation layer — the same form the emulation
+/// view's `draw_session` uses: an opaque black backing (never a
+/// compositor hole), the newest WGC frame aspect-fit with the
+/// near-fill crop glide, and a centered status line while the game
+/// window resolves. No letterbox art, pillar crop, stretch setting
+/// or tunnel — decomp games render at the window's own aspect.
+fn draw_capture(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    target: Rect,
+    view: &mut DecompView,
+    alpha: f32,
+    s: f32,
+) {
+    painter.rect_filled(rect, 0.0, Color32::BLACK.gamma_multiply(alpha));
+
+    let Some(session) = &view.session else {
+        view.tun_map = None;
+        // Session ended — the last frame (if any) still fades out.
+        // The imported GPU ring stays alive (its wgpu textures hold
+        // the shared allocation) so the zero-copy path fades too.
+        let (fw, fh) = if let Some(g) = &view.gpu_cap {
+            (g.size[0] as usize, g.size[1] as usize)
+        } else if let Some(t) = &view.frame_tex {
+            (t.size()[0], t.size()[1])
+        } else {
+            return;
+        };
+        let (dest, uv) = crate::emulation::frame_dest_uv(
+            rect,
+            fw,
+            fh,
+            view.crop_t,
+            view.render.stretch,
+            view.fx.pillar_cur,
+        );
+        let seq = view.frame_seq;
+        let adjust = crate::emulation::render_adjust(&view.render);
+        let cb = view
+            .gpu_cap
+            .as_ref()
+            .map(|gc| {
+                (
+                    gc.bgs[(seq % 3) as usize].clone(),
+                    gc.fence.clone(),
+                    gc.size,
+                )
+            })
+            .and_then(|(bg, fence, size)| {
+                view.cap_shader.as_mut().and_then(|cs| {
+                    cs.callback_gpu(
+                        &view.render.shader,
+                        dest,
+                        uv,
+                        alpha,
+                        size,
+                        seq as f32,
+                        ui.ctx().pixels_per_point(),
+                        bg,
+                        // The writer is gone — the fence was already
+                        // signaled, but the wait is cheap + strictly
+                        // correct cross-API ordering.
+                        Some((fence, seq)),
+                        adjust,
+                    )
+                })
+            });
+        match cb {
+            Some(cb) => {
+                painter.add(eframe::egui_wgpu::Callback::new_paint_callback(dest, cb));
+            }
+            None => {
+                if let Some(tex) = &view.frame_tex {
+                    painter.image(tex.id(), dest, uv, Color32::WHITE.gamma_multiply(alpha));
+                }
+            }
+        }
+        return;
+    };
+    let status = session.status();
+    let game_name = view.session_name.clone();
+    // Remove-side-pillars gates the frame's bar detection (no
+    // letterbox-art fill here — decomp entries have no .meta art).
+    let pillar_active = view.render.remove_pillars;
+
+    // Zero-copy import — the capture publishes a new ring generation
+    // on every size change; a failed import pins the session to the
+    // CPU mirror until a new generation appears. The capture side's
+    // own failure (no ring at all) surfaces the same way.
+    if view.gpu_err.is_none() {
+        if let Some(e) = session
+            .gpu_state()
+            .err
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            view.gpu_err = Some(e);
+        }
+    }
+    if view.cap_shader.is_some() {
+        let share = session
+            .gpu_state()
+            .share
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(share) = share {
+            if view.gpu_cap.as_ref().map(|g| g.generation) != Some(share.generation)
+                && view.gpu_failed_gen != share.generation
+            {
+                match view.cap_shader.as_mut().map(|cs| cs.import_share(&share)) {
+                    Some(Ok(r)) => {
+                        view.gpu_cap = Some(r);
+                        view.gpu_failed_gen = 0;
+                        view.gpu_err = None;
+                    }
+                    Some(Err(e)) => {
+                        view.gpu_failed_gen = share.generation;
+                        view.gpu_err = Some(e);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    // The capture's CPU readback only earns its keep when something
+    // actually needs pixels there — display on the mirror path, or
+    // pillarbox detection.
+    session
+        .render()
+        .want_cpu
+        .store(pillar_active || view.gpu_cap.is_none(), Ordering::Relaxed);
+
+    // Pull the newest captured frame — on the zero-copy path only
+    // the ring seq matters (stats + shader FrameCount); on the CPU
+    // mirror the slot's pixels are swapped in and uploaded. Skipped
+    // while the layer is fully faded out so a dismissed capture
+    // doesn't burn uploads.
+    if alpha > 0.02 {
+        let gpu_live = view.gpu_cap.is_some();
+        let mut new_seq: Option<u64> = None;
+        // The CPU slot is consumed when the display needs its pixels
+        // (mirror path) or pillarbox detection does.
+        if !gpu_live || pillar_active {
+            // Swap the frame into `frame_buf` — the slot gets the old
+            // buffer back so the capture thread's scratch<->slot
+            // ping-pong stays allocation-free.
+            let mut slot = session.frames().lock().unwrap_or_else(|p| p.into_inner());
+            if slot.seq != view.slot_seq
+                && slot.w > 0
+                && slot.h > 0
+                && slot.rgba.len() == slot.w * slot.h * 4
+            {
+                let (w, h) = (slot.w, slot.h);
+                std::mem::swap(&mut slot.rgba, &mut view.frame_buf);
+                let seq = slot.seq;
+                drop(slot);
+                view.slot_seq = seq;
+                if !gpu_live {
+                    let img = egui::ColorImage {
+                        size: [w, h],
+                        source_size: Vec2::new(w as f32, h as f32),
+                        // Opaque frames — premult == unmult.
+                        pixels: bytemuck::cast_slice::<u8, egui::Color32>(&view.frame_buf)
+                            .to_vec(),
+                    };
+                    match &mut view.frame_tex {
+                        Some(tex) if tex.size() == [w, h] => {
+                            tex.set(img, egui::TextureOptions::LINEAR)
+                        }
+                        _ => {
+                            view.frame_tex = Some(ui.ctx().load_texture(
+                                "decomp-capture",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
+                    // The GPU shader path samples its own texture —
+                    // upload the same frame straight from the staging
+                    // buffer (dedup'd by seq inside).
+                    if !view.render.shader.is_empty() {
+                        if let Some(cs) = &mut view.cap_shader {
+                            cs.upload_frame(seq, &view.frame_buf, w as u32, h as u32);
+                        }
+                    }
+                    new_seq = Some(seq);
+                }
+                // Remove-side-pillars: bar detection on the mirrored
+                // pixels + the 6-stable-frame debounce (no locked
+                // per-ROM crop — decomp entries have no .meta).
+                if pillar_active {
+                    crate::emulation::fx_pillar_detect(&mut view.fx, &view.frame_buf, w, h);
+                }
+            }
+        }
+        // Zero-copy path — the ring's signaled seq IS the frame
+        // counter (and the fence value to wait on before sampling).
+        if gpu_live {
+            let seq = session.gpu_state().seq.load(Ordering::Acquire);
+            if seq != view.frame_seq {
+                new_seq = Some(seq);
+            }
+        }
+        if let Some(seq) = new_seq {
+            view.frame_seq = seq;
+            // Stats-overlay bookkeeping — capture fps + the rolling
+            // frametime ring.
+            crate::emulation::fx_stats_tick(&mut view.fx);
+        }
+    }
+
+    // Ease the aspect-fill blend — the crop/letterbox glides instead
+    // of snapping when the destination aspect crosses the ~12% fill
+    // threshold (band resizes, fullscreen transitions).
+    let frame_dims = if let Some(g) = &view.gpu_cap {
+        Some((g.size[0] as usize, g.size[1] as usize))
+    } else {
+        view.frame_tex.as_ref().map(|t| (t.size()[0], t.size()[1]))
+    };
+    if let Some((fw, fh)) = frame_dims {
+        // The pillar crop replaces the frame's aspect with the
+        // measured content's — the fill decision uses the debounced
+        // TARGET insets so it can't flip mid-tween (crop_t bounce).
+        let eff =
+            ((fw as f32 - view.fx.pillar_tgt.0 as f32 - view.fx.pillar_tgt.1 as f32).max(1.0))
+                / fh as f32;
+        // `want` uses the TARGET aspect, not the animating rect's —
+        // otherwise it flips as the easing aspect sweeps through the
+        // fill band mid-transition and crop_t reverses.
+        let dst = target.width() / target.height();
+        let want = match view.render.stretch {
+            1 | 2 => 1.0, // UniformToFill / Fill always cover
+            _ => ((eff / dst - 1.0).abs() < 0.12) as u8 as f32,
+        };
+        let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+        // Tween the pillar insets toward the debounced target — off
+        // tweens back to (0,0) so the bars slide back in.
+        crate::emulation::fx_pillar_tween(&mut view.fx, pillar_active, dt, ui.ctx());
+        if want != view.crop_target {
+            view.crop_from = view.crop_t;
+            view.crop_target = want;
+            view.crop_prog = 0.0;
+        }
+        if view.crop_prog < 1.0 {
+            view.crop_prog = (view.crop_prog + dt / 0.55).min(1.0);
+            let e = crate::ease_in_out_cubic(view.crop_prog);
+            view.crop_t = view.crop_from + (view.crop_target - view.crop_from) * e;
+            if view.crop_prog < 1.0 {
+                ui.ctx().request_repaint();
+            } else {
+                view.crop_t = view.crop_target;
+            }
+        }
+        let (dest, uv) = crate::emulation::frame_dest_uv(
+            rect,
+            fw,
+            fh,
+            view.crop_t,
+            view.render.stretch,
+            view.fx.pillar_cur,
+        );
+        // The tunnel maps screen → frame → client through this same
+        // transform — refresh it wherever the draw moved to.
+        view.tun_map = Some((dest, uv));
+        // The zero-copy ring drives the draw when imported — the
+        // newest signaled slot is sampled in place after the D3D12
+        // queue waits on the cross-API fence. Otherwise the CPU
+        // mirror path: named shader via PaintCallback or plain blit.
+        let seq = view.frame_seq;
+        let adjust = crate::emulation::render_adjust(&view.render);
+        let cb = match view.gpu_cap.as_ref().map(|gc| {
+            (
+                gc.bgs[(seq % 3) as usize].clone(),
+                gc.fence.clone(),
+                gc.size,
+            )
+        }) {
+            Some((bg, fence, size)) => view.cap_shader.as_mut().and_then(|cs| {
+                cs.callback_gpu(
+                    &view.render.shader,
+                    dest,
+                    uv,
+                    alpha,
+                    size,
+                    seq as f32,
+                    ui.ctx().pixels_per_point(),
+                    bg,
+                    Some((fence, seq)),
+                    adjust,
+                )
+            }),
+            _ => view.cap_shader.as_mut().and_then(|cs| {
+                cs.callback(
+                    &view.render.shader,
+                    dest,
+                    uv,
+                    alpha,
+                    [fw as u32, fh as u32],
+                    view.frame_seq as f32,
+                    ui.ctx().pixels_per_point(),
+                )
+            }),
+        };
+        match cb {
+            Some(cb) => {
+                // Must be the egui_wgpu::Callback wrapper — the
+                // renderer downcasts the Arc to that exact type.
+                painter.add(eframe::egui_wgpu::Callback::new_paint_callback(dest, cb));
+            }
+            None => {
+                if let Some(tex) = &view.frame_tex {
+                    painter.image(tex.id(), dest, uv, Color32::WHITE.gamma_multiply(alpha));
+                } else if view.gpu_cap.is_some() {
+                    // The interop path is live but its pipeline failed
+                    // — surface it instead of a silent black frame.
+                    view.gpu_err = Some("capture pipeline build failed".to_string());
+                }
+            }
+        }
+    }
+
+    // Centered status — the launch gate while resolving, failure/
+    // exit notices; nothing overlays a live capture.
+    let msg = match &status {
+        xenia::Status::Resolving => Some(format!("Launching {game_name}…")),
+        xenia::Status::Failed(e) => Some(format!("Capture failed: {e}")),
+        xenia::Status::Exited => Some("Game exited".into()),
+        xenia::Status::Capturing => {
+            (view.frame_seq == 0).then(|| format!("Waiting for frames — {game_name}"))
+        }
+    };
+    if let Some(msg) = msg {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            msg,
+            FontId::proportional(24.0 * s),
+            Color32::from_gray(160).gamma_multiply(alpha),
+        );
+    }
+
+    // Statistics overlay (Lacrima's PortalCaptureStatsOverlay) —
+    // the same bottom-left panel the emulation capture draws.
+    if view.render.stats_overlay && matches!(&status, xenia::Status::Capturing) {
+        crate::emulation::draw_stats_overlay(
+            painter,
+            rect,
+            &mut view.fx,
+            &view.render,
+            view.gpu_cap.is_some(),
+            &view.gpu_err,
+            alpha,
+            s,
+        );
+    }
+
+    // Input-tunnel state badge — bottom-right, doubles as the
+    // diagnostic (the counter must rise on input; if it doesn't, our
+    // side is dead; if it does, the game side ignores them).
+    if view.input_tun {
+        let label = match &view.tun_dbg {
+            Some(e) => format!("INPUT → GAME — {e}"),
+            None => format!("INPUT → GAME — {} msgs", view.tun_sent),
+        };
+        let pos = Pos2::new(rect.max.x - 16.0 * s, rect.max.y - 16.0 * s);
+        painter.text(
+            pos,
+            Align2::RIGHT_BOTTOM,
+            label,
+            FontId::proportional(15.0 * s),
+            Color32::from_rgb(0x60, 0xD8, 0x80).gamma_multiply(alpha),
+        );
+    }
+}
 
 /// `painter.layout_job` equivalent — the card painter doesn't carry
 /// a Ui, so lay the title job out through the painter's context.
@@ -2074,6 +3317,7 @@ fn info_pane(
             });
             if installed {
                 ops.push(("Open folder", PaneOp::OpenFolder, true));
+                ops.push(("Uninstall", PaneOp::Uninstall, true));
             }
             if act == Action::Update {
                 ops.push(("Update", PaneOp::Download, true));
@@ -2111,6 +3355,7 @@ enum PaneOp {
     Download,
     Play,
     OpenFolder,
+    Uninstall,
 }
 
 // ---- Filter drawer -------------------------------------------------------
@@ -2484,16 +3729,7 @@ fn run_pane_op(view: &mut DecompView, e: &Entry, dir: &Option<PathBuf>, op: Pane
         PaneOp::Download => view.activate(e),
         PaneOp::Play => {
             if let Some(d) = dir {
-                match find_exe(d) {
-                    Some(exe) => {
-                        let _ = std::process::Command::new(&exe).current_dir(d).spawn();
-                    }
-                    None => {
-                        view.notice =
-                            Some("No executable found — opening the folder".into());
-                        open_in_file_manager(d);
-                    }
-                }
+                view.play_dir(d, e.name.clone());
             }
         }
         PaneOp::OpenFolder => {
@@ -2501,6 +3737,7 @@ fn run_pane_op(view: &mut DecompView, e: &Entry, dir: &Option<PathBuf>, op: Pane
                 open_in_file_manager(d);
             }
         }
+        PaneOp::Uninstall => view.request_uninstall(e),
     }
 }
 
@@ -2697,5 +3934,155 @@ mod tests {
             pick_os_asset(&single).as_deref(),
             Some("https://x/port-windows.zip")
         );
+    }
+
+    /// Play routing mirrors the emulation view: no session launches
+    /// straight away, the running game's own card only un-dismisses
+    /// the capture viewport, a different card queues behind a close
+    /// request (the caller's confirm prompt).
+    #[test]
+    fn play_route_launch_undismiss_queue() {
+        let mut v = DecompView::default();
+        let dir_a = Path::new("C:/Decomps/a");
+        let dir_b = Path::new("C:/Decomps/b");
+        assert_eq!(v.play_route(dir_a), DecompPlayRoute::Launch);
+        // A launch already in flight (rx parked) counts as live —
+        // same dir un-dismisses, a different dir queues.
+        let (_tx, rx) = mpsc::channel();
+        v.launch_rx = Some(rx);
+        v.session_dir = Some(dir_a.to_path_buf());
+        v.viewport_dismissed = true;
+        assert_eq!(v.play_route(dir_a), DecompPlayRoute::UnDismiss);
+        assert_eq!(v.play_route(dir_b), DecompPlayRoute::QueuePending);
+        v.play_dir(dir_a, "Same".into());
+        assert!(!v.viewport_dismissed);
+        v.play_dir(dir_b, "Other".into());
+        assert_eq!(
+            v.pending_launch.as_ref().map(|(d, _)| d.as_path()),
+            Some(dir_b)
+        );
+        // The close request is parked for the caller's confirm —
+        // consumed exactly once.
+        assert!(v.take_close_request());
+        assert!(!v.take_close_request());
+    }
+
+    /// The ⇄ switch: dismissing the capture drops game-fullscreen
+    /// so the app window comes back; toggling again un-dismisses.
+    #[test]
+    fn viewport_toggle_round_trip() {
+        let mut v = DecompView::default();
+        v.game_fs = true;
+        v.toggle_viewport();
+        assert!(v.viewport_dismissed);
+        assert!(!v.game_fs);
+        v.toggle_viewport();
+        assert!(!v.viewport_dismissed);
+    }
+
+    /// Dismissing the capture also releases the input tunnel —
+    /// neither fullscreen nor the tunnel has anything to drive once
+    /// the list is back (same contract as the emulation view).
+    #[test]
+    fn dismiss_viewport_drops_fullscreen_and_tunnel() {
+        let mut v = DecompView::default();
+        v.game_fs = true;
+        v.input_tun = true;
+        v.toggle_viewport();
+        assert!(v.viewport_dismissed);
+        assert!(!v.game_fs);
+        assert!(!v.input_tun);
+    }
+
+    /// The input-tunnel switch round-trips — the band's pointer
+    /// icon and Ctrl+M share it.
+    #[test]
+    fn input_tunnel_toggles() {
+        let mut v = DecompView::default();
+        v.toggle_input_tunnel();
+        assert!(v.input_tun);
+        v.toggle_input_tunnel();
+        assert!(!v.input_tun);
+    }
+
+    /// Entering game-fullscreen un-dismisses the viewport — the
+    /// request alone can't mean fullscreen without the capture
+    /// layer up.
+    #[test]
+    fn fullscreen_undismisses_viewport() {
+        let mut v = DecompView::default();
+        v.viewport_dismissed = true;
+        v.toggle_fullscreen();
+        assert!(v.game_fs);
+        assert!(!v.viewport_dismissed);
+        v.toggle_fullscreen();
+        assert!(!v.game_fs);
+    }
+
+    /// find_exe picks the game binary — uninstallers are skipped
+    /// and the shallowest executable wins (a launcher in a subdir
+    /// loses to the game exe at the root).
+    #[test]
+    fn find_exe_skips_uninstaller_prefers_shallow() {
+        let dir = std::env::temp_dir().join(format!("decomp_findexe_{}", std::process::id()));
+        let sub = dir.join("bin");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("uninstall.exe"), b"x").unwrap();
+        std::fs::write(sub.join("game.exe"), b"yy").unwrap();
+        assert_eq!(
+            find_exe(&dir).as_deref(),
+            Some(sub.join("game.exe").as_path())
+        );
+        std::fs::write(dir.join("game.exe"), b"zzz").unwrap();
+        assert_eq!(
+            find_exe(&dir).as_deref(),
+            Some(dir.join("game.exe").as_path())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uninstall routing: an idle game surfaces a direct request
+    /// (one-shot); the running game parks behind the close prompt
+    /// and re-arms as a request only once its dir frees.
+    #[test]
+    fn uninstall_request_routes_and_settles() {
+        let mut v = DecompView::default();
+        let e = v.entries[0].clone();
+        // Idle → direct request, consumed exactly once.
+        v.request_uninstall(&e);
+        assert_eq!(
+            v.take_uninstall_request().map(|r| r.0),
+            Some(e.slug.clone())
+        );
+        assert!(v.take_uninstall_request().is_none());
+        // Running (or in-flight launch — session_dir is set at
+        // launch start) → parked + close prompt instead.
+        v.session_dir = install_dir(&e.slug);
+        v.request_uninstall(&e);
+        assert!(v.take_uninstall_request().is_none());
+        assert!(v.pending_uninstall.is_some());
+        assert!(v.take_close_request());
+        // Dir still owned → no re-arm yet.
+        v.settle_uninstall();
+        assert!(v.take_uninstall_request().is_none());
+        // Dir freed → the request surfaces for the delete prompt.
+        v.session_dir = None;
+        v.settle_uninstall();
+        assert_eq!(
+            v.take_uninstall_request().map(|r| r.0),
+            Some(e.slug.clone())
+        );
+    }
+
+    /// A confirmed uninstall drops a queued Play for the same dir —
+    /// launching a deleted tree would just fail into the folder.
+    #[test]
+    fn uninstall_drops_queued_launch() {
+        let mut v = DecompView::default();
+        let e = v.entries[0].clone();
+        let dir = install_dir(&e.slug).unwrap_or_else(|| PathBuf::from("decomp-noop"));
+        v.pending_launch = Some((dir.clone(), e.name.clone()));
+        v.uninstall(&e.slug);
+        assert!(v.pending_launch.is_none());
     }
 }

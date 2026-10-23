@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use std::os::windows::io::AsRawHandle;
 
 #[cfg(windows)]
-use windows::core::BOOL;
+use windows::core::{BOOL, PWSTR};
 #[cfg(windows)]
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HWND, LPARAM, POINT, RECT, WAIT_TIMEOUT, WPARAM,
@@ -51,9 +51,10 @@ use windows::Win32::System::JobObjects::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    TerminateProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -205,6 +206,13 @@ pub enum Kind {
     Cemu,
     Eden,
     RetroArch,
+    /// A re/decomp PC port — a native game exe spawned bare (no CLI
+    /// args, cwd = the install dir). Window resolution spans the
+    /// spawned pid, its descendants (launcher → game handoffs) and
+    /// any process whose image path lives under the install root —
+    /// a detached relaunch (ShellExecute, a store bootstrapper) is
+    /// never a child of the launcher.
+    Decomp,
 }
 
 /// A running Xenia launch: owns the child process, the
@@ -258,6 +266,10 @@ impl Session {
     /// in without the (unclickable through capture) NoProfileDialog.
     /// `retroarch_core` (RetroArch kind only) is the selected
     /// Libretro core library RetroArch loads via `-L`.
+    /// `match_root` (Decomp kind only) is the install root — also the
+    /// working dir — and the path scope the window resolver matches
+    /// process images against (launchers spawn the game outside the
+    /// spawned pid's tree).
     /// On non-Windows the emulator runs in its own window — no WGC
     /// capture, no window hiding, no input tunnel.
     #[cfg_attr(not(windows), allow(unused_variables))]
@@ -268,16 +280,26 @@ impl Session {
         profile_xuid: Option<u64>,
         kind: Kind,
         retroarch_core: Option<PathBuf>,
+        match_root: Option<PathBuf>,
     ) -> Result<Self, String> {
         session_log(&format!(
             "Session::start kind={kind:?} exe={exe} game={}",
             game.display()
         ));
         let exe_path = eden_cli_sibling(exe, kind);
-        let work_dir = exe_path
-            .parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_default();
+        let work_dir = if kind == Kind::Decomp {
+            match_root.clone().unwrap_or_else(|| {
+                exe_path
+                    .parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_default()
+            })
+        } else {
+            exe_path
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_default()
+        };
         // shadPS4's stdout goes to a launch transcript the worker
         // scans for [Core.Linker] before resolving the render window
         // (WaitForCoreLinkerOutputAsync).
@@ -540,6 +562,9 @@ impl Session {
                 }
                 cmd.arg(game);
             }
+            // Decomp ports launch bare — the discovered exe IS the
+            // game (or its launcher); no CLI args, no config writes.
+            Kind::Decomp => {}
             _ => {
                 cmd.arg(game);
             }
@@ -706,6 +731,7 @@ impl Session {
                             kind,
                             transcript,
                             app_hwnd,
+                            match_root,
                         )
                     }))
                     .is_err()
@@ -1657,8 +1683,10 @@ fn worker_main(
     kind: Kind,
     transcript: Option<PathBuf>,
     app_hwnd: usize,
+    match_root: Option<PathBuf>,
 ) {
     let app_hwnd = HWND(app_hwnd as _);
+    let match_root = match_root.as_deref();
     let set_status = |s: Status| {
         session_log(&format!("pid={pid} status -> {s:?}"));
         status.lock().unwrap_or_else(|p| p.into_inner()).status = s;
@@ -1733,6 +1761,7 @@ fn worker_main(
             | Kind::Cemu
             | Kind::Eden
             | Kind::RetroArch
+            | Kind::Decomp
     ) {
         25
     } else {
@@ -1740,9 +1769,17 @@ fn worker_main(
     };
     let mut waited = 0u64;
     while waited < delay {
-        sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
+        sweep_hide(
+            &win_pids(pid, kind, match_root),
+            HWND::default(),
+            &mut hidden,
+            kind,
+            app_hwnd,
+        );
         if stop.load(Ordering::Relaxed)
-            || (!alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)))
+            || (!alive(proc)
+                && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid))
+                && !(kind == Kind::Decomp && decomp_rehome(&mut proc, &mut pid, match_root)))
         {
             break;
         }
@@ -1763,7 +1800,13 @@ fn worker_main(
                 if stop.load(Ordering::Relaxed) || !alive(proc) {
                     break;
                 }
-                sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
+                sweep_hide(
+                    &win_pids(pid, kind, match_root),
+                    HWND::default(),
+                    &mut hidden,
+                    kind,
+                    app_hwnd,
+                );
                 if let Ok(meta) = std::fs::metadata(tp) {
                     if meta.len() < pos {
                         pos = 0;
@@ -1803,7 +1846,13 @@ fn worker_main(
                 if stop.load(Ordering::Relaxed) || !alive(proc) {
                     break;
                 }
-                sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
+                sweep_hide(
+                    &win_pids(pid, kind, match_root),
+                    HWND::default(),
+                    &mut hidden,
+                    kind,
+                    app_hwnd,
+                );
                 let ready = logs.iter().any(|p| {
                     std::fs::read_to_string(p)
                         .map(|t| t.to_lowercase().contains("run title"))
@@ -1840,6 +1889,7 @@ fn worker_main(
             | Kind::Dolphin
             | Kind::Cemu
             | Kind::Eden
+            | Kind::Decomp
     ) {
         25
     } else {
@@ -1847,12 +1897,23 @@ fn worker_main(
     };
     // Dolphin/Cemu get Lacrima's 400×50ms resolve budget — their
     // render windows appear late after a long Qt boot (Cemu's
-    // resolve runs after the log-ready gate anyway).
+    // resolve runs after the log-ready gate anyway). Decomp ports
+    // get the same 20s at the 25ms sweep — a launcher can bootstrap
+    // the game through a store frontend before any window appears.
     let attempts = if matches!(kind, Kind::Dolphin | Kind::Cemu) {
         400
+    } else if kind == Kind::Decomp {
+        800
     } else {
         240
     };
+    // Decomp resolver state — `others_since` is when a second
+    // matched process first appeared (a launcher's child or a
+    // detached in-dir sibling); while it owns no windows the bind
+    // holds so the launcher menu can't win. `tops` tracks the whole
+    // visible window set so a handoff resets stability.
+    let mut decomp_others_since: Option<Instant> = None;
+    let mut decomp_tops: Vec<HWND> = Vec::new();
     for _ in 0..attempts {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1860,11 +1921,37 @@ fn worker_main(
         if kind == Kind::Xenia {
             dismiss_warning_dialogs(pid);
         }
-        if !alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)) {
+        if !alive(proc)
+            && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid))
+            && !(kind == Kind::Decomp && decomp_rehome(&mut proc, &mut pid, match_root))
+        {
             break;
         }
-        sweep_hide(pid, HWND::default(), &mut hidden, kind, app_hwnd);
-        hwnd = resolve_capture_target(pid, kind);
+        let pids = win_pids(pid, kind, match_root);
+        sweep_hide(&pids, HWND::default(), &mut hidden, kind, app_hwnd);
+        if kind == Kind::Decomp {
+            let others: Vec<u32> = pids.iter().copied().filter(|&p| p != pid).collect();
+            if others.is_empty() {
+                decomp_others_since = None;
+            } else {
+                let since = decomp_others_since.get_or_insert(Instant::now());
+                if since.elapsed() < Duration::from_secs(4)
+                    && process_windows_of(&others, true).is_empty()
+                {
+                    // The launcher spawned (or will spawn) the game
+                    // under another pid — binding the launcher's own
+                    // window now would stick the capture on the menu.
+                    // Headless helpers (crashpad et al.) never open
+                    // windows, so the hold expires after ~4s and the
+                    // spawned process's surface can still bind.
+                    stable_count = 0;
+                    stable_hwnd = HWND::default();
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+            }
+        }
+        hwnd = resolve_capture_target(&pids, pid, kind);
         if !hwnd.is_invalid() {
             if kind == Kind::Xemu {
                 stable_count = if hwnd == stable_hwnd {
@@ -2084,6 +2171,50 @@ fn worker_main(
                 });
                 prepare_window_for_capture(hwnd);
             }
+            if kind == Kind::Decomp {
+                // Dolphin-style gate, retuned for arbitrary game
+                // windows: not minimized, ≥480×270 client (decomp
+                // ports can run small native windows), the same hwnd
+                // at the same size for 8 consecutive polls — AND the
+                // whole top-level set stays quiet: a launcher still
+                // spawning/resizing windows resets the countdown so
+                // its menu can't bind while the game surfaces.
+                let (w, h) = client_size(hwnd).unwrap_or((0, 0));
+                if w < 480 || h < 270 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                if unsafe { IsIconic(hwnd) }.as_bool() {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                let tops_now = process_windows_of(&pids, true);
+                if tops_now != decomp_tops {
+                    decomp_tops = tops_now;
+                    stable_hwnd = HWND::default();
+                    stable_count = 0;
+                }
+                stable_count = if hwnd == stable_hwnd && (w, h) == stable_size {
+                    stable_count + 1
+                } else {
+                    stable_hwnd = hwnd;
+                    stable_size = (w, h);
+                    1
+                };
+                if stable_count < 8 {
+                    std::thread::sleep(Duration::from_millis(poll));
+                    continue;
+                }
+                // Cloak + strip like every captured target — the
+                // window stays composited (DWM) but never on-screen.
+                hidden.entry(hwnd.0 as usize).or_insert_with(|| {
+                    let s = snapshot_window(hwnd);
+                    set_cloaked(hwnd, true);
+                    s
+                });
+                prepare_window_for_capture(hwnd);
+                std::thread::sleep(Duration::from_millis(120));
+            }
             hwnd_out.store(hwnd.0 as usize, Ordering::Relaxed);
             break;
         }
@@ -2110,6 +2241,23 @@ fn worker_main(
             Status::Failed("no render window found".into())
         };
         set_status(failure);
+        if kind == Kind::Decomp {
+            // Matched processes outside the spawned pid can hold
+            // cloaked windows (a launcher's menu, an already-spawned
+            // game) — restore them all, then kill the set so a
+            // half-launched title doesn't linger invisible.
+            for (h, s) in hidden.drain() {
+                restore_window(HWND(h as *mut _), &s);
+            }
+            for dp in win_pids(pid, kind, match_root) {
+                if let Ok(h) = unsafe { OpenProcess(PROCESS_TERMINATE, false, dp) } {
+                    unsafe {
+                        let _ = TerminateProcess(h, 0);
+                        let _ = CloseHandle(h);
+                    }
+                }
+            }
+        }
         if !proc.is_invalid() {
             unsafe {
                 let _ = TerminateProcess(proc, 0);
@@ -2136,7 +2284,7 @@ fn worker_main(
             prepare_window_for_capture(hwnd)
         }
     });
-    if matches!(kind, Kind::Dolphin | Kind::Cemu | Kind::Eden) {
+    if matches!(kind, Kind::Dolphin | Kind::Cemu | Kind::Eden | Kind::Decomp) {
         // hide_window's WS_EX_LAYERED + 0-alpha can stall Vulkan/
         // OpenGL presentation (why Lacrima no-ops Dolphin's and
         // Cemu's window prep). Park offscreen under the cloak instead
@@ -2179,12 +2327,20 @@ fn worker_main(
     // it's busy) — the menubar goes away under RemoveWindow-
     // Decorations + the game render anyway. RetroArch has no HMENU;
     // sending SetMenu/DrawMenuBar into its busy window thread mid-
-    // boot is the same blocking hazard.
-    if !matches!(kind, Kind::Cemu | Kind::RetroArch) {
+    // boot is the same blocking hazard. Decomp games skip it for the
+    // same reason — an arbitrary game's window thread can stall
+    // under load, and game windows carry no HMENU anyway.
+    if !matches!(kind, Kind::Cemu | Kind::RetroArch | Kind::Decomp) {
         strip_menu(hwnd);
     }
     // Catch anything that appeared since the last poll.
-    sweep_hide(pid, hwnd, &mut hidden, kind, app_hwnd);
+    sweep_hide(
+        &win_pids(pid, kind, match_root),
+        hwnd,
+        &mut hidden,
+        kind,
+        app_hwnd,
+    );
 
     if kind == Kind::RetroArch {
         // The sweep has had the whole process cloaked since spawn —
@@ -2226,11 +2382,19 @@ fn worker_main(
     let mut capture_err: Option<String> = None;
     loop {
         if stop.load(Ordering::Relaxed)
-            || (!alive(proc) && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid)))
+            || (!alive(proc)
+                && !(kind == Kind::Eden && eden_rehome(&mut proc, &mut pid))
+                && !(kind == Kind::Decomp && decomp_rehome(&mut proc, &mut pid, match_root)))
         {
             break;
         }
-        sweep_hide(pid, hwnd, &mut hidden, kind, app_hwnd);
+        sweep_hide(
+            &win_pids(pid, kind, match_root),
+            hwnd,
+            &mut hidden,
+            kind,
+            app_hwnd,
+        );
         if kind == Kind::RetroArch {
             retroarch_watchdog(
                 pid,
@@ -2245,9 +2409,10 @@ fn worker_main(
         }
         // The capture target isn't swept — strip its menu too so a
         // late-attached menu bar can't leak into the captured frame.
-        // (Skipped for Cemu and RetroArch — SetMenu/DrawMenuBar can
-        // block on their busy window threads.)
-        if !matches!(kind, Kind::Cemu | Kind::RetroArch) {
+        // (Skipped for Cemu, RetroArch and Decomp — SetMenu/
+        // DrawMenuBar can block on their busy window threads, and
+        // game windows carry no HMENU anyway.)
+        if !matches!(kind, Kind::Cemu | Kind::RetroArch | Kind::Decomp) {
             strip_menu(hwnd);
         }
         if let Some(err) = frames.lock().unwrap_or_else(|p| p.into_inner()).err.clone() {
@@ -2271,7 +2436,7 @@ fn worker_main(
         } else {
             // RA's windows were cloaked since spawn — uncloak them
             // all so the user can see and close the emulator.
-            for w in process_windows_of(&win_pids(pid, kind), true) {
+            for w in process_windows_of(&win_pids(pid, kind, match_root), true) {
                 set_cloaked(w, false);
             }
         }
@@ -2322,6 +2487,18 @@ fn worker_main(
         if alive(proc) && !proc.is_invalid() {
             unsafe {
                 let _ = TerminateProcess(proc, 0);
+            }
+        }
+    }
+    // Decomp matches a process SET, not a tree — kill every matched
+    // pid still standing (the launcher's game, in-dir siblings).
+    if kind == Kind::Decomp {
+        for dp in win_pids(pid, kind, match_root) {
+            if let Ok(h) = unsafe { OpenProcess(PROCESS_TERMINATE, false, dp) } {
+                unsafe {
+                    let _ = TerminateProcess(h, 0);
+                    let _ = CloseHandle(h);
+                }
             }
         }
     }
@@ -2405,15 +2582,88 @@ fn process_windows_of(pids: &[u32], include_hidden: bool) -> Vec<HWND> {
 /// The pids whose windows belong to this launch — `pid` alone for
 /// every emulator except Eden, which can render on a child process
 /// (ResolveRuntimeProcessAsync walks descendants for the same
-/// reason): pid + every live descendant.
+/// reason): pid + every live descendant. Decomp ports widen the set
+/// further: a launcher can spawn the game detached (ShellExecute,
+/// a store bootstrapper), so every process whose image path lives
+/// under the install root is a candidate too.
 #[cfg(windows)]
-fn win_pids(pid: u32, kind: Kind) -> Vec<u32> {
-    if kind != Kind::Eden {
-        return vec![pid];
+fn win_pids(pid: u32, kind: Kind, match_root: Option<&Path>) -> Vec<u32> {
+    match kind {
+        Kind::Eden => {
+            let mut v = vec![pid];
+            v.extend(descendant_pids(pid));
+            v
+        }
+        Kind::Decomp => {
+            let mut v = vec![pid];
+            v.extend(descendant_pids(pid));
+            if let Some(root) = match_root {
+                v.extend(dir_pids(root));
+            }
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+        _ => vec![pid],
     }
-    let mut v = vec![pid];
-    v.extend(descendant_pids(pid));
-    v
+}
+
+/// Every pid whose main-module image path lives under `root` —
+/// catches the game binary a launcher spawns outside its own
+/// process tree (ShellExecute reparents it to the shell, and a
+/// store-mediated relaunch isn't a descendant of anything we own).
+#[cfg(windows)]
+fn dir_pids(root: &Path) -> Vec<u32> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root_s = root.to_string_lossy().to_lowercase();
+    let root_s = root_s.trim_end_matches('\\').to_string();
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                if let Some(img) = process_image_path(e.th32ProcessID) {
+                    let img_s = img.to_string_lossy().to_lowercase();
+                    if img_s.len() > root_s.len()
+                        && img_s.starts_with(&root_s)
+                        && img_s.as_bytes()[root_s.len()] == b'\\'
+                    {
+                        out.push(e.th32ProcessID);
+                    }
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+/// A pid's main-module image path (QueryFullProcessImageName) —
+/// the install-dir match key for Decomp resolution.
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<PathBuf> {
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    let r = unsafe {
+        QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+    };
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    r.ok()?;
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buf[..len as usize],
+    )))
 }
 
 /// Lacrima's EnumerateDescendantProcesses — a Toolhelp32 snapshot
@@ -2453,13 +2703,15 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     out
 }
 
-/// EdenHandler.ResolveRuntimeProcessAsync → TryResolveChildProcess —
-/// when the spawned eden.exe/eden-cli.exe hands off to a child and
-/// exits, re-home the tracked handle to a live descendant so window
-/// enumeration, the alive check, and teardown keep working.
+/// TryResolveChildProcess — re-home the tracked handle to the first
+/// live pid in `candidates` so window enumeration, the alive check,
+/// and teardown keep working after the spawned process hands off.
 #[cfg(windows)]
-fn eden_rehome(proc: &mut HANDLE, pid: &mut u32) -> bool {
-    for dp in descendant_pids(*pid) {
+fn rehome(proc: &mut HANDLE, pid: &mut u32, candidates: &[u32]) -> bool {
+    for &dp in candidates {
+        if dp == *pid {
+            continue;
+        }
         let Ok(h) = (unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
@@ -2484,6 +2736,24 @@ fn eden_rehome(proc: &mut HANDLE, pid: &mut u32) -> bool {
         }
     }
     false
+}
+
+/// EdenHandler.ResolveRuntimeProcessAsync → TryResolveChildProcess —
+/// when the spawned eden.exe/eden-cli.exe hands off to a child and
+/// exits, re-home the tracked handle to a live descendant.
+#[cfg(windows)]
+fn eden_rehome(proc: &mut HANDLE, pid: &mut u32) -> bool {
+    let c = descendant_pids(*pid);
+    rehome(proc, pid, &c)
+}
+
+/// Same re-home for Decomp, over the whole matched set — a launcher
+/// that exits after spawning the game leaves a live descendant or
+/// in-dir sibling to track.
+#[cfg(windows)]
+fn decomp_rehome(proc: &mut HANDLE, pid: &mut u32, match_root: Option<&Path>) -> bool {
+    let c = win_pids(*pid, Kind::Decomp, match_root);
+    rehome(proc, pid, &c)
 }
 
 #[cfg(windows)]
@@ -3261,6 +3531,7 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
         Kind::Cemu => return is_likely_cemu_window(hwnd, main),
         Kind::Eden => return is_likely_eden_window(hwnd, main),
         Kind::RetroArch => return is_likely_retroarch_window(hwnd, main),
+        Kind::Decomp => return is_likely_game_window(hwnd),
         Kind::Xenia => {}
     }
     if hwnd.is_invalid() {
@@ -3309,6 +3580,32 @@ fn is_likely_render_window(hwnd: HWND, main: HWND, kind: Kind) -> bool {
     !is_main && (!has_caption || !title.trim().is_empty())
 }
 
+/// The Decomp window predicate — no per-kind class heuristics exist
+/// for arbitrary games, so anything that isn't obviously a console
+/// or utility surface is a candidate; the launcher-vs-game split is
+/// handled by pid ownership in resolve_capture_target, not titles.
+#[cfg(windows)]
+fn is_likely_game_window(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let class = class_name(hwnd).to_lowercase();
+    for bad in ["console", "tooltip", "ime", "msctfime"] {
+        if class.contains(bad) {
+            return false;
+        }
+    }
+    let t = window_title(hwnd).trim().to_lowercase();
+    if !t.is_empty() {
+        for bad in ["console", "debug", "crash", "error", "warning", "updater"] {
+            if t.contains(bad) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// ScoreProcessWindowCandidate (base) restricted to render windows.
 #[cfg(windows)]
 fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
@@ -3339,8 +3636,14 @@ fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
     // Flycast/xemu require a real client area before assign
     // (IsStableCaptureCandidate — the UI settles at ≥640×360).
     // RetroArch has no size floor — its predicate accepts the
-    // process's main window at any size.
-    if !matches!(kind, Kind::Xenia | Kind::RetroArch) && (w < 640 || h < 360) {
+    // process's main window at any size. Decomp ports get a lower
+    // 480×270 floor — pixel-art ports run small native windows.
+    let (mw, mh) = match kind {
+        Kind::Xenia | Kind::RetroArch => (0, 0),
+        Kind::Decomp => (480, 270),
+        _ => (640, 360),
+    };
+    if w < mw || h < mh {
         return i64::MIN;
     }
     let mut score = w as i64 * h as i64 * 10;
@@ -3364,10 +3667,22 @@ fn score_top_level(hwnd: HWND, pids: &[u32], main: HWND, kind: Kind) -> i64 {
 /// One poll of ResolveCaptureTargetAsync: best render child, else
 /// best render-like top-level window. `main` ≈ the biggest titled
 /// visible top-level (Process.MainWindowHandle approximation).
+/// `pid` is the spawned root — Decomp scoring prefers windows owned
+/// by the OTHER matched pids (the launcher's game), falling back to
+/// the root's own windows only while no other pid has surfaced one.
 #[cfg(windows)]
-fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
-    let pids = win_pids(pid, kind);
-    let tops = process_windows_of(&pids, true);
+fn resolve_capture_target(pids: &[u32], pid: u32, kind: Kind) -> HWND {
+    let mut tops = process_windows_of(pids, true);
+    if kind == Kind::Decomp {
+        let (other, own): (Vec<HWND>, Vec<HWND>) = tops.into_iter().partition(|&h| {
+            let mut wp = 0u32;
+            unsafe {
+                GetWindowThreadProcessId(h, Some(&mut wp));
+            }
+            wp != pid
+        });
+        tops = if other.is_empty() { own } else { other };
+    }
     if tops.is_empty() {
         return HWND::default();
     }
@@ -3393,7 +3708,7 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
         let top = tops
             .iter()
             .copied()
-            .map(|h| (h, score_top_level(h, &pids, main, kind)))
+            .map(|h| (h, score_top_level(h, pids, main, kind)))
             .filter(|(_, s)| *s > i64::MIN)
             .max_by_key(|(_, s)| *s)
             .map(|(h, _)| h)
@@ -3448,7 +3763,7 @@ fn resolve_capture_target(pid: u32, kind: Kind) -> HWND {
 
     tops.iter()
         .copied()
-        .map(|h| (h, score_top_level(h, &pids, main, kind)))
+        .map(|h| (h, score_top_level(h, pids, main, kind)))
         .filter(|(_, s)| *s > i64::MIN)
         .max_by_key(|(_, s)| *s)
         .map(|(h, _)| h)
@@ -3922,7 +4237,7 @@ fn retroarch_watchdog(
             hide_console_window(w);
         }
         if !IsWindow(Some(*hwnd)).as_bool() {
-            let new = resolve_capture_target(pid, Kind::RetroArch);
+            let new = resolve_capture_target(&win_pids(pid, Kind::RetroArch, None), pid, Kind::RetroArch);
             if retroarch_needs_retarget(*hwnd, new) {
                 // Same order as the initial attach — park before
                 // uncloak so a retargeted window can't flash either.
@@ -4008,13 +4323,12 @@ fn restore_window(hwnd: HWND, saved: &SavedWindow) {
 /// once the window proves stable.
 #[cfg(windows)]
 fn sweep_hide(
-    pid: u32,
+    pids: &[u32],
     skip: HWND,
     hidden: &mut std::collections::HashMap<usize, SavedWindow>,
     kind: Kind,
     app: HWND,
 ) {
-    let pids = win_pids(pid, kind);
     // RetroArchHandler.PrepareProcessForCapture is a NO-OP:
     // "RetroArch uses Vulkan/DX and can fail to render if its window
     // is hidden before capture." That refers to SW_HIDE/ShowWindow
@@ -4028,7 +4342,7 @@ fn sweep_hide(
     // windows report the owner's pid on Win11) — those get SW_HIDE,
     // the reliable console hide.
     if kind == Kind::RetroArch {
-        for hwnd in process_windows_of(&pids, false) {
+        for hwnd in process_windows_of(pids, false) {
             if hwnd == skip || hwnd.is_invalid() {
                 continue;
             }
@@ -4038,10 +4352,10 @@ fn sweep_hide(
                 set_cloaked(hwnd, true);
             }
         }
-        reclaim_app_focus(app, &pids);
+        reclaim_app_focus(app, pids);
         return;
     }
-    for hwnd in process_windows_of(&pids, false) {
+    for hwnd in process_windows_of(pids, false) {
         if hwnd == skip || hwnd.is_invalid() {
             continue;
         }
@@ -4053,11 +4367,11 @@ fn sweep_hide(
         // busy through boot/shader compile — the send blocks, the
         // sweep freezes, and nothing ever gets cloaked. CemuHandler's
         // Prepare*ForCapture are no-ops for the same reason.
-        if kind != Kind::Cemu {
+        if kind != Kind::Cemu && kind != Kind::Decomp {
             strip_menu(hwnd);
         }
-        // RPCS3/shadPS4/DuckStation/PCSX2/Dolphin/Cemu/Eden: cloak
-        // EVERY window — a DWM cloak hides instantly with no
+        // RPCS3/shadPS4/DuckStation/PCSX2/Dolphin/Cemu/Eden/Decomp:
+        // cloak EVERY window — a DWM cloak hides instantly with no
         // geometry/style change for Qt/SDL to race, so nothing
         // flashes between spawn and capture. (PCSX2's and Dolphin's
         // Lacrima handlers no-op window prep because park/restyle
@@ -4073,6 +4387,7 @@ fn sweep_hide(
                 | Kind::Dolphin
                 | Kind::Cemu
                 | Kind::Eden
+                | Kind::Decomp
         );
         hidden.entry(hwnd.0 as usize).or_insert_with(|| {
             if cloak {
@@ -4090,7 +4405,7 @@ fn sweep_hide(
     // parked/cloaked window never gives it back, so every app
     // shortcut (and the input tunnel's event source) goes dead for
     // the session. Hand it back to the app window.
-    reclaim_app_focus(app, &pids);
+    reclaim_app_focus(app, pids);
 }
 
 /// Lacrima's TrySendControlS — RPCS3's graceful stop shortcut. Focus
@@ -4610,6 +4925,7 @@ mod tests {
                 None,
                 super::Kind::RetroArch,
                 Some(core.clone()),
+                None,
             )
             .expect("session start");
             for i in 0..60 {

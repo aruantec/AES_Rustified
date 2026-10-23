@@ -712,13 +712,9 @@ pub struct EmuView {
     /// filesystem every frame.
     setup_exe_key: String,
     setup_exe: Option<PathBuf>,
-    /// Stats-overlay state — capture fps/frametime tracking and the
-    /// rolling frametime ring for the graph.
-    stats_instant: Option<std::time::Instant>,
-    stats_fps: f32,
-    stats_ft_ms: f32,
-    frametimes: std::collections::VecDeque<f32>,
-    gpu_desc: Option<String>,
+    /// Stats-overlay + pillarbox state — the same bundle the
+    /// Re/Decomp capture draw uses (`CapFx`).
+    fx: CapFx,
     /// Extracted console-art dir — the strip tiles' fallback cover.
     art_dir: Option<PathBuf>,
     /// Last-seen `use_first_item_cover` — a settings flip re-themes
@@ -740,19 +736,6 @@ pub struct EmuView {
     /// Last CPU frame-slot seq consumed — separate from `frame_seq`,
     /// which tracks the GPU ring on the zero-copy path.
     slot_seq: u64,
-    /// Pillarbox auto-crop (Remove side pillars) — measured bar
-    /// insets in frame px. `cur` tweens toward `tgt`; `tgt` only
-    /// moves after `stable` consecutive identical detections
-    /// (Lacrima's 6-frame debounce).
-    pillar_cur: (f32, f32),
-    pillar_tgt: (u32, u32),
-    pillar_last: (u32, u32),
-    pillar_stable: u32,
-    pillar_from: (f32, f32),
-    pillar_prog: f32,
-    /// User-locked crop from the ROM's `.meta` — wins over detection
-    /// (Lacrima's ArcadePillarboxCropResolver.IsLocked).
-    pillar_lock: Option<(u32, u32, u32)>,
     /// "Reboot" context-menu request — relaunches the running game at
     /// the view level where `cfg` is in scope.
     reboot: bool,
@@ -881,11 +864,7 @@ impl EmuView {
             handler_icon: None,
             setup_exe_key: String::new(),
             setup_exe: None,
-            stats_instant: None,
-            stats_fps: 0.0,
-            stats_ft_ms: 0.0,
-            frametimes: std::collections::VecDeque::new(),
-            gpu_desc: None,
+            fx: CapFx::default(),
             art_dir,
             prev_first_cover: false,
             cap_shader: None,
@@ -893,13 +872,6 @@ impl EmuView {
             gpu_failed_gen: 0,
             gpu_err: None,
             slot_seq: 0,
-            pillar_cur: (0.0, 0.0),
-            pillar_tgt: (0, 0),
-            pillar_last: (0, 0),
-            pillar_stable: 0,
-            pillar_from: (0.0, 0.0),
-            pillar_prog: 1.0,
-            pillar_lock: None,
             reboot: false,
             close_req: false,
             pending_launch: None,
@@ -1366,6 +1338,7 @@ impl EmuView {
             xenia::Kind::Cemu => "Cemu",
             xenia::Kind::Eden => "Eden",
             xenia::Kind::RetroArch => "RetroArch",
+            xenia::Kind::Decomp => "game",
         };
         let Some(exe) = self.setup_exe(cfg) else {
             self.notice = Some(format!(
@@ -1457,6 +1430,7 @@ impl EmuView {
                 xuid,
                 kind,
                 retroarch_core,
+                None,
             ));
         });
         self.launch_rx = Some(rx);
@@ -1617,7 +1591,7 @@ pub fn view(
             Ok(Ok(s)) => {
                 // ReloadArcadeLockedPillarboxCropFromMetadata — the
                 // per-ROM locked crop wins over auto-detection.
-                emu.pillar_lock = crate::emulation::emu_meta::locked_crop(&s.game);
+                emu.fx.pillar_lock = crate::emulation::emu_meta::locked_crop(&s.game);
                 emu.aspect_applied = false;
                 // Fresh capture — the old ring/seqs belong to the
                 // dead session.
@@ -1629,8 +1603,8 @@ pub fn view(
                 emu.session = Some(s);
                 emu.launch_rx = None;
                 emu.notice = None;
-                emu.stats_instant = None;
-                emu.frametimes.clear();
+                emu.fx.stats_instant = None;
+                emu.fx.frametimes.clear();
                 // A fresh launch always opens on the game — the
                 // presentation fades in over the carousel.
                 emu.viewport_dismissed = false;
@@ -1924,7 +1898,23 @@ pub fn view(
     // emulator window so its own UI is reachable. Esc releases it
     // (handled in the global Esc chain, which runs after this — the
     // forward loop just never sends Escape).
-    tunnel_input(ui, emu, interactive && cap_a > 0.5);
+    tunnel_input(
+        ui,
+        emu.session.as_ref(),
+        TunIo {
+            on: &mut emu.input_tun,
+            map: emu.tun_map,
+            frame: emu
+                .frame_tex
+                .as_ref()
+                .map(|t| (t.size()[0] as f64, t.size()[1] as f64)),
+            buttons: &mut emu.tun_buttons,
+            mods: &mut emu.tun_mods,
+            sent: &mut emu.tun_sent,
+            dbg: &mut emu.tun_dbg,
+        },
+        interactive && cap_a > 0.5,
+    );
     // Gestures on the capture layer (Lacrima's CaptureContextMenuLayer
     // + double-click): double-click toggles game-fullscreen, right-
     // click opens the session menu. The interact region also stops
@@ -1982,12 +1972,12 @@ pub fn view(
                 // _cropRight): the debounced target once detected —
                 // which is also what a live lock resolves to — with
                 // the animating value as the mid-tween fallback.
-                let (l, r) = if emu.pillar_tgt != (0, 0) {
-                    emu.pillar_tgt
+                let (l, r) = if emu.fx.pillar_tgt != (0, 0) {
+                    emu.fx.pillar_tgt
                 } else {
                     (
-                        emu.pillar_cur.0.round() as u32,
-                        emu.pillar_cur.1.round() as u32,
+                        emu.fx.pillar_cur.0.round() as u32,
+                        emu.fx.pillar_cur.1.round() as u32,
                     )
                 };
                 // Frame width: the GPU ring on the zero-copy path —
@@ -2001,7 +1991,7 @@ pub fn view(
                 if let Some(session) = &emu.session {
                     if (l > 0 || r > 0) && fw > 0 {
                         crate::emulation::emu_meta::save_locked_crop(&session.game, l, r, fw);
-                        emu.pillar_lock = Some((l, r, fw));
+                        emu.fx.pillar_lock = Some((l, r, fw));
                     }
                 }
                 if !emu.render.remove_pillars {
@@ -2012,12 +2002,12 @@ pub fn view(
             }
             // Clear Saved Crop Size — drop the locked crop; detection
             // resumes next frame (ClearArcadeLockedPillarboxCrop).
-            if emu.pillar_lock.is_some() {
+            if emu.fx.pillar_lock.is_some() {
                 if ui.button("Clear Saved Crop Size").clicked() {
                     if let Some(session) = &emu.session {
                         crate::emulation::emu_meta::clear_locked_crop(&session.game);
                     }
-                    emu.pillar_lock = None;
+                    emu.fx.pillar_lock = None;
                     ui.close();
                 }
             }
@@ -2504,7 +2494,19 @@ pub fn view(
         // item area only; the icon band and section strip stay
         // visible like the global settings overlay keeps its chrome.
         let item_area = Rect::from_min_max(content.min, Pos2::new(content.max.x, band.min.y));
-        render_panel(ui, emu, item_area, alpha, interactive, s);
+        if render_panel(
+            ui,
+            &mut emu.render_open,
+            &mut emu.render,
+            emu.session.is_some(),
+            emu.cap_shader.as_ref(),
+            item_area,
+            alpha,
+            interactive,
+            s,
+        ) {
+            emu.render_dirty = true;
+        }
     } // !chrome_hidden
 
     // The ROM metadata editor paints last — above the cards, the
@@ -2882,7 +2884,7 @@ fn cemu_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
 /// RemoveArcadePillarboxBars: measured left/right black-bar insets
 /// in frame px (0,0 when off or none detected) — the sampled window
 /// shrinks to the content between them.
-fn frame_dest_uv(
+pub(crate) fn frame_dest_uv(
     rect: Rect,
     fw: usize,
     fh: usize,
@@ -2919,6 +2921,23 @@ fn frame_dest_uv(
     (dest, uv)
 }
 
+/// Per-view tunnel state the shared forwarder reads/writes — the
+/// emulation and re/decomp views carry the same fields, so the
+/// bundle hands them over without duplicating the message plumbing.
+pub(crate) struct TunIo<'a> {
+    pub on: &'a mut bool,
+    /// `(dest, uv)` — the frame's draw mapping, refreshed per draw.
+    pub map: Option<(Rect, Rect)>,
+    /// Frame pixel size — the Linux coord space; Windows uses the
+    /// window's client rect instead.
+    #[allow(dead_code)] // read only in the cfg(not(windows)) tunnel
+    pub frame: Option<(f64, f64)>,
+    pub buttons: &'a mut u8,
+    pub mods: &'a mut u8,
+    pub sent: &'a mut u32,
+    pub dbg: &'a mut Option<String>,
+}
+
 /// The input tunnel — the emulator window is parked invisible and
 /// offscreen, so focus-based input can't reach it. While
 /// `input_tun` is on, every pointer/key event over the frame rect is
@@ -2929,26 +2948,31 @@ fn frame_dest_uv(
 /// app context menu and Esc releases the tunnel (it never reaches
 /// the game — see the Esc chain in main.rs).
 #[cfg(windows)]
-fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
-    if !emu.input_tun || !active {
+pub(crate) fn tunnel_input(
+    ui: &egui::Ui,
+    session: Option<&xenia::Session>,
+    io: TunIo<'_>,
+    active: bool,
+) {
+    if !*io.on || !active {
         return;
     }
-    let Some((dest, uv)) = emu.tun_map else {
-        emu.input_tun = false;
+    let Some((dest, uv)) = io.map else {
+        *io.on = false;
         return;
     };
-    let Some(session) = &emu.session else {
-        emu.input_tun = false;
+    let Some(session) = session else {
+        *io.on = false;
         return;
     };
     if !matches!(session.status(), xenia::Status::Capturing) {
         return;
     }
     let Some((cw, ch)) = session.client_size() else {
-        emu.tun_dbg = Some("no client rect".into());
+        *io.dbg = Some("no client rect".into());
         return;
     };
-    emu.tun_dbg = None;
+    *io.dbg = None;
     // egui point → emulator client pixel. `uv` is the sampled frame
     // window (pillar crops included) normalized 0..1, so a fraction
     // of the client size lands on the right texel without needing
@@ -2970,9 +2994,9 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
             ((uv.min.y + ty * uv.height()) * ch as f32).round() as i32,
         ))
     };
-    let btns = &mut emu.tun_buttons;
-    let mods = &mut emu.tun_mods;
-    let sent = &mut emu.tun_sent;
+    let btns = io.buttons;
+    let mods = io.mods;
+    let sent = io.sent;
     ui.input(|i| {
         // MK_* wParam flags (stable Win32 values — MK_SHIFT=0x04,
         // MK_CONTROL=0x08; the held-button bits match MK_LBUTTON/
@@ -3130,17 +3154,22 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
 /// ModifiersChanged, so their key events are synthesized on edges
 /// (smithay's xkb updates and forwards wl_keyboard.modifiers itself).
 #[cfg(not(windows))]
-fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
+pub(crate) fn tunnel_input(
+    ui: &egui::Ui,
+    session: Option<&xenia::Session>,
+    io: TunIo<'_>,
+    active: bool,
+) {
     use crate::emulation::wlcomp::WlInput;
-    if !emu.input_tun || !active {
+    if !*io.on || !active {
         return;
     }
-    let Some((dest, uv)) = emu.tun_map else {
-        emu.input_tun = false;
+    let Some((dest, uv)) = io.map else {
+        *io.on = false;
         return;
     };
-    let Some(session) = &emu.session else {
-        emu.input_tun = false;
+    let Some(session) = session else {
+        *io.on = false;
         return;
     };
     if !session.embedded() || !matches!(session.status(), xenia::Status::Capturing) {
@@ -3148,15 +3177,11 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
     }
     // Surface-local coords equal captured pixels at buffer scale 1 —
     // the frame texture size is the client coordinate space.
-    let Some((cw, ch)) = emu
-        .frame_tex
-        .as_ref()
-        .map(|t| (t.size()[0] as f64, t.size()[1] as f64))
-    else {
-        emu.tun_dbg = Some("no frame yet".into());
+    let Some((cw, ch)) = io.frame else {
+        *io.dbg = Some("no frame yet".into());
         return;
     };
-    emu.tun_dbg = None;
+    *io.dbg = None;
     let map = |p: Pos2| -> Option<(f64, f64)> {
         if dest.width() <= 0.0 || dest.height() <= 0.0 {
             return None;
@@ -3172,9 +3197,9 @@ fn tunnel_input(ui: &egui::Ui, emu: &mut EmuView, active: bool) {
             (uv.min.y + ty * uv.height()) as f64 * ch,
         ))
     };
-    let btns = &mut emu.tun_buttons;
-    let mods = &mut emu.tun_mods;
-    let sent = &mut emu.tun_sent;
+    let btns = io.buttons;
+    let mods = io.mods;
+    let sent = io.sent;
     // Synthesized modifier keys — ModifiersChanged only carries the
     // *new* state, so edges are detected against our shadow bitmask.
     // Bit layout mirrors the Windows tunnel (bit0 shift, bit1 ctrl,
@@ -3388,13 +3413,127 @@ fn key_evdev(key: egui::Key) -> Option<u32> {
     })
 }
 
+/// Capture-side presentation state shared by the Emulation and
+/// Re/Decomp views — stats-overlay bookkeeping plus the pillarbox
+/// detect/crop state, so `draw_session`, `draw_capture`,
+/// `draw_stats_overlay` and the pillar helpers run against either.
+pub(crate) struct CapFx {
+    /// Stats overlay — capture fps/frametime tracking and the
+    /// rolling frametime ring for the graph.
+    pub stats_instant: Option<std::time::Instant>,
+    pub stats_fps: f32,
+    pub stats_ft_ms: f32,
+    pub frametimes: std::collections::VecDeque<f32>,
+    pub gpu_desc: Option<String>,
+    /// Pillarbox auto-crop ("Remove side pillars") — measured bar
+    /// insets in frame px. `cur` tweens toward `tgt`; `tgt` only
+    /// moves after `stable` consecutive identical detections
+    /// (Lacrima's 6-frame debounce).
+    pub pillar_cur: (f32, f32),
+    pub pillar_tgt: (u32, u32),
+    pub pillar_last: (u32, u32),
+    pub pillar_stable: u32,
+    pub pillar_from: (f32, f32),
+    pub pillar_prog: f32,
+    /// User-locked crop — wins over detection (Lacrima's
+    /// ArcadePillarboxCropResolver.IsLocked).
+    pub pillar_lock: Option<(u32, u32, u32)>,
+}
+
+impl Default for CapFx {
+    fn default() -> Self {
+        Self {
+            stats_instant: None,
+            stats_fps: 0.0,
+            stats_ft_ms: 0.0,
+            frametimes: std::collections::VecDeque::new(),
+            gpu_desc: None,
+            pillar_cur: (0.0, 0.0),
+            pillar_tgt: (0, 0),
+            pillar_last: (0, 0),
+            pillar_stable: 0,
+            pillar_from: (0.0, 0.0),
+            pillar_prog: 1.0,
+            pillar_lock: None,
+        }
+    }
+}
+
+/// Stats bookkeeping on a new captured seq — capture fps and the
+/// rolling frametime ring (Lacrima's PortalCaptureFps /
+/// PortalFrametimeGraphGeometry).
+pub(crate) fn fx_stats_tick(fx: &mut CapFx) {
+    let now = std::time::Instant::now();
+    if let Some(last) = fx.stats_instant.replace(now) {
+        let ms = now.duration_since(last).as_secs_f32() * 1000.0;
+        fx.frametimes.push_back(ms);
+        while fx.frametimes.len() > 240 {
+            fx.frametimes.pop_front();
+        }
+        fx.stats_ft_ms += (ms - fx.stats_ft_ms) * 0.15;
+        fx.stats_fps += (1000.0 / ms.max(0.01) - fx.stats_fps) * 0.15;
+    }
+}
+
+/// Pillarbox detect + 6-frame debounce on a CPU-mirror frame —
+/// a locked crop wins outright (EnforceLockedArcadeCrop), otherwise
+/// the bars are measured (PillarboxBarDetector, aggressive profile)
+/// and resolved before the debounce retargets the tween.
+pub(crate) fn fx_pillar_detect(fx: &mut CapFx, buf: &[u8], w: usize, h: usize) {
+    let det = if let Some((ll, lr, lfw)) = fx.pillar_lock {
+        pillarbox::scale_locked(ll, lr, lfw, w as u32)
+    } else {
+        pillarbox::resolve(
+            w as u32,
+            pillarbox::detect(buf, w, h, pillarbox::Profile::Aggressive),
+        )
+    };
+    let locked = fx.pillar_lock.is_some();
+    if det == fx.pillar_last {
+        fx.pillar_stable = fx.pillar_stable.saturating_add(1).min(60);
+    } else {
+        fx.pillar_last = det;
+        fx.pillar_stable = 1;
+    }
+    if (locked || fx.pillar_stable >= 6) && det != fx.pillar_tgt {
+        fx.pillar_tgt = det;
+        fx.pillar_from = fx.pillar_cur;
+        fx.pillar_prog = 0.0;
+    }
+}
+
+/// The eased insets tween (`cur` → `tgt`, PillarboxCropAnimator)
+/// plus the off-reset — disabling the option tweens the bars back
+/// in instead of snapping the frame.
+pub(crate) fn fx_pillar_tween(fx: &mut CapFx, active: bool, dt: f32, ctx: &egui::Context) {
+    if fx.pillar_prog < 1.0 {
+        fx.pillar_prog = (fx.pillar_prog + dt / 0.3).min(1.0);
+        let e = crate::ease_out_cubic(fx.pillar_prog);
+        let (fl, fr) = fx.pillar_from;
+        fx.pillar_cur = (
+            fl + (fx.pillar_tgt.0 as f32 - fl) * e,
+            fr + (fx.pillar_tgt.1 as f32 - fr) * e,
+        );
+        if fx.pillar_prog < 1.0 {
+            ctx.request_repaint();
+        }
+    }
+    if !active && (fx.pillar_tgt != (0, 0) || fx.pillar_cur != (0.0, 0.0)) {
+        fx.pillar_from = fx.pillar_cur;
+        fx.pillar_tgt = (0, 0);
+        fx.pillar_last = (0, 0);
+        fx.pillar_stable = 0;
+        fx.pillar_prog = 0.0;
+    }
+}
+
 /// Live render adjustments for the zero-copy path — the GPU-side
 /// shader/passthrough applies these since no CPU swizzle ran.
-fn render_adjust(emu: &EmuView) -> (f32, f32, [f32; 4]) {
-    let [r, g, b] = emu.render.tint;
+fn render_adjust(render: &settings::RenderOpts) -> (f32, f32, [f32; 4]) {
+    let [r, g, b] = render.tint;
     (
-        emu.render.brightness,
-        emu.render.saturation,
+        render.brightness,
+        render.saturation,
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
     )
 }
@@ -3402,7 +3541,7 @@ fn render_adjust(emu: &EmuView) -> (f32, f32, [f32; 4]) {
 /// SelectedCaptureAspectRatioKey → ratio — "handler" (or anything
 /// unrecognized) means the emulator's own, no resize.
 #[cfg(windows)]
-fn aspect_ratio_of(key: &str) -> Option<f64> {
+pub(crate) fn aspect_ratio_of(key: &str) -> Option<f64> {
     match key {
         "4:3" => Some(4.0 / 3.0),
         "16:9" => Some(16.0 / 9.0),
@@ -3413,7 +3552,7 @@ fn aspect_ratio_of(key: &str) -> Option<f64> {
     }
 }
 
-fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
+pub(crate) fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
     let l = |x: f32, y: f32| x + (y - x) * t;
     Rect::from_min_max(
         Pos2::new(l(a.min.x, b.min.x), l(a.min.y, b.min.y)),
@@ -3505,9 +3644,9 @@ fn draw_session(
             return;
         };
         let (dest, uv) =
-            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.pillar_cur);
+            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.fx.pillar_cur);
         let seq = emu.frame_seq;
-        let adjust = render_adjust(emu);
+        let adjust = render_adjust(&emu.render);
         let cb = emu
             .gpu_cap
             .as_ref()
@@ -3666,33 +3805,9 @@ fn draw_session(
                 // RemoveArcadePillarboxBars there) + the arcade resolver,
                 // then the 6-stable-frame debounce before retargeting.
                 if pillar_active {
-                    let det = if let Some((ll, lr, lfw)) = emu.pillar_lock {
-                        crate::emulation::pillarbox::scale_locked(ll, lr, lfw, w as u32)
-                    } else {
-                        crate::emulation::pillarbox::resolve(
-                            w as u32,
-                            crate::emulation::pillarbox::detect(
-                                &emu.frame_buf,
-                                w,
-                                h,
-                                crate::emulation::pillarbox::Profile::Aggressive,
-                            ),
-                        )
-                    };
-                    let locked = emu.pillar_lock.is_some();
-                    if det == emu.pillar_last {
-                        emu.pillar_stable = emu.pillar_stable.saturating_add(1).min(60);
-                    } else {
-                        emu.pillar_last = det;
-                        emu.pillar_stable = 1;
-                    }
                     // Locked crops enforce immediately — detection
                     // doesn't run on a locked resolver either.
-                    if (locked || emu.pillar_stable >= 6) && det != emu.pillar_tgt {
-                        emu.pillar_tgt = det;
-                        emu.pillar_from = emu.pillar_cur;
-                        emu.pillar_prog = 0.0;
-                    }
+                    fx_pillar_detect(&mut emu.fx, &emu.frame_buf, w, h);
                 }
             }
         }
@@ -3707,18 +3822,8 @@ fn draw_session(
         if let Some(seq) = new_seq {
             emu.frame_seq = seq;
             // Stats-overlay bookkeeping — capture-side fps and the
-            // rolling frametime ring (Lacrima's PortalCaptureFps /
-            // PortalFrametimeGraphGeometry).
-            let now = std::time::Instant::now();
-            if let Some(last) = emu.stats_instant.replace(now) {
-                let ms = now.duration_since(last).as_secs_f32() * 1000.0;
-                emu.frametimes.push_back(ms);
-                while emu.frametimes.len() > 240 {
-                    emu.frametimes.pop_front();
-                }
-                emu.stats_ft_ms += (ms - emu.stats_ft_ms) * 0.15;
-                emu.stats_fps += (1000.0 / ms.max(0.01) - emu.stats_fps) * 0.15;
-            }
+            // rolling frametime ring.
+            fx_stats_tick(&mut emu.fx);
         }
     }
 
@@ -3736,7 +3841,7 @@ fn draw_session(
         // measured content's — the fill decision uses the debounced
         // TARGET insets so it can't flip mid-tween (crop_t bounce).
         let eff =
-            ((fw as f32 - emu.pillar_tgt.0 as f32 - emu.pillar_tgt.1 as f32).max(1.0)) / fh as f32;
+            ((fw as f32 - emu.fx.pillar_tgt.0 as f32 - emu.fx.pillar_tgt.1 as f32).max(1.0)) / fh as f32;
         // `want` uses the TARGET aspect, not the animating rect's —
         // otherwise it flips as the easing aspect sweeps through the
         // fill band mid-transition and crop_t reverses (the bounce).
@@ -3747,27 +3852,8 @@ fn draw_session(
         };
         let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
         // Tween the pillar insets toward the debounced target — off
-        // tweens back to (0,0) so the bars slide back in (Lacrima's
-        // PillarboxCropAnimator).
-        if emu.pillar_prog < 1.0 {
-            emu.pillar_prog = (emu.pillar_prog + dt / 0.3).min(1.0);
-            let e = crate::ease_out_cubic(emu.pillar_prog);
-            let (fl, fr) = emu.pillar_from;
-            emu.pillar_cur = (
-                fl + (emu.pillar_tgt.0 as f32 - fl) * e,
-                fr + (emu.pillar_tgt.1 as f32 - fr) * e,
-            );
-            if emu.pillar_prog < 1.0 {
-                ui.ctx().request_repaint();
-            }
-        }
-        if !pillar_active && (emu.pillar_tgt != (0, 0) || emu.pillar_cur != (0.0, 0.0)) {
-            emu.pillar_from = emu.pillar_cur;
-            emu.pillar_tgt = (0, 0);
-            emu.pillar_last = (0, 0);
-            emu.pillar_stable = 0;
-            emu.pillar_prog = 0.0;
-        }
+        // tweens back to (0,0) so the bars slide back in.
+        fx_pillar_tween(&mut emu.fx, pillar_active, dt, ui.ctx());
         // Fixed-duration cubic tween — same easing + duration as the
         // strip slide so the blend and the rect move in concert
         // (an exponential ease races ahead mid-transition and reads
@@ -3792,7 +3878,7 @@ fn draw_session(
 
     if let Some((fw, fh)) = frame_dims {
         let (dest, uv) =
-            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.pillar_cur);
+            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.fx.pillar_cur);
         // The tunnel maps screen → frame → client through this same
         // transform — refresh it wherever the draw moved to.
         emu.tun_map = Some((dest, uv));
@@ -3801,7 +3887,7 @@ fn draw_session(
         // queue waits on the cross-API fence. Otherwise the CPU
         // mirror path: named shader via PaintCallback or plain blit.
         let seq = emu.frame_seq;
-        let adjust = render_adjust(emu);
+        let adjust = render_adjust(&emu.render);
         let cb = match emu.gpu_cap.as_ref().map(|gc| {
             (
                 gc.bgs[(seq % 3) as usize].clone(),
@@ -3900,7 +3986,16 @@ fn draw_session(
     // bottom-left panel at RenderOverlayOpacity with capture fps /
     // frametime, optional GPU info, and the frametime graph.
     if emu.render.stats_overlay && matches!(session.status(), xenia::Status::Capturing) {
-        draw_stats_overlay(painter, rect, emu, alpha, s);
+        draw_stats_overlay(
+            painter,
+            rect,
+            &mut emu.fx,
+            &emu.render,
+            emu.gpu_cap.is_some(),
+            &emu.gpu_err,
+            alpha,
+            s,
+        );
     }
 
     // Input-tunnel state badge — bottom-right, doubles as the
@@ -3926,15 +4021,25 @@ fn draw_session(
 /// anchored bottom-left of the capture (Margin 16,16,16,24), whole
 /// panel at RenderOverlayOpacity. Content: capture fps + frametime,
 /// a status line, optional GPU renderer/vendor, and the 520x40
-/// frametime polyline with 16.7/33.3 ms guides.
-fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, alpha: f32, s: f32) {
-    let op = (emu.render.overlay_opacity * alpha).clamp(0.0, 1.0);
+/// frametime polyline with 16.7/33.3 ms guides. Shared by the
+/// Emulation and Re/Decomp capture draws via `CapFx`.
+pub(crate) fn draw_stats_overlay(
+    painter: &egui::Painter,
+    rect: Rect,
+    fx: &mut CapFx,
+    render: &settings::RenderOpts,
+    gpu_live: bool,
+    gpu_err: &Option<String>,
+    alpha: f32,
+    s: f32,
+) {
+    let op = (render.overlay_opacity * alpha).clamp(0.0, 1.0);
     if op <= 0.01 {
         return;
     }
-    let gpu = if emu.render.gpu_info {
+    let gpu = if render.gpu_info {
         Some(
-            emu.gpu_desc
+            fx.gpu_desc
                 .get_or_insert_with(|| {
                     crate::emulation::wgc::gpu_desc()
                         .map(|(n, v)| format!("{n} ({v})"))
@@ -3948,7 +4053,7 @@ fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, al
     let fid = FontId::monospace(15.0 * s);
     let line_h = 21.0 * s;
     let lines = 3 + gpu.is_some() as usize;
-    let graph = emu.render.frametime_graph;
+    let graph = render.frametime_graph;
     let gw = 330.0 * s;
     let gh = 44.0 * s;
     let w = gw.max(200.0 * s) + 20.0 * s;
@@ -3973,21 +4078,21 @@ fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, al
     };
     line(
         painter,
-        format!("Capture FPS: {:.1}", emu.stats_fps),
+        format!("Capture FPS: {:.1}", fx.stats_fps),
         white,
         &mut y,
     );
     line(
         painter,
-        format!("Capture frame time: {:.2} ms", emu.stats_ft_ms),
+        format!("Capture frame time: {:.2} ms", fx.stats_ft_ms),
         white,
         &mut y,
     );
     line(
         painter,
-        if emu.gpu_cap.is_some() {
+        if gpu_live {
             "WGC — DX12 interop".to_string()
-        } else if let Some(e) = &emu.gpu_err {
+        } else if let Some(e) = gpu_err {
             format!("WGC — CPU capture ({e})")
         } else {
             "WGC — CPU capture".to_string()
@@ -3998,7 +4103,7 @@ fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, al
     if let Some(g) = gpu {
         line(painter, format!("GPU: {g}"), gray, &mut y);
     }
-    if graph && !emu.frametimes.is_empty() {
+    if graph && !fx.frametimes.is_empty() {
         let gr = Rect::from_min_size(Pos2::new(x, y + 4.0 * s), Vec2::new(gw, gh));
         // 16.7/33.3 ms guide lines (60/30 fps marks on a 0..50ms span).
         for ms in [16.7_f32, 33.3] {
@@ -4009,8 +4114,8 @@ fn draw_stats_overlay(painter: &egui::Painter, rect: Rect, emu: &mut EmuView, al
                 Stroke::new(1.0, Color32::from_white_alpha((40.0 * op) as u8)),
             );
         }
-        let n = emu.frametimes.len();
-        let ft: Vec<f32> = emu.frametimes.iter().copied().collect();
+        let n = fx.frametimes.len();
+        let ft: Vec<f32> = fx.frametimes.iter().copied().collect();
         // 2-tap smoothing — a raw per-frame polyline visibly
         // flickers; Lacrima's geometry is smoothed the same way.
         let sm = |i: usize| -> f32 {
@@ -5163,31 +5268,35 @@ pub fn settings_tab(
 /// Lacrima's RenderOptionsOverlay — a right-side panel covering the
 /// item area only (the band and section strip stay visible). Only
 /// the first ("Rendering") tab is implemented; every control writes
-/// the loaded section's RenderOpts, which view() writes through to
-/// `cfg.render[section]` per change — Lacrima's SectionSettings
-/// AutoSave.
-fn render_panel(
+/// the live RenderOpts, which the caller writes through to its
+/// `cfg.render` slot per change — Lacrima's SectionSettings
+/// AutoSave. Shared by the Emulation and Re/Decomp views; returns
+/// true when the opts changed (the caller owns the dirty flag).
+pub(crate) fn render_panel(
     ui: &mut egui::Ui,
-    emu: &mut EmuView,
+    open: &mut bool,
+    render: &mut settings::RenderOpts,
+    live: bool,
+    cap_shader: Option<&cap_shader::CaptureShader>,
     area: Rect,
     alpha: f32,
     interactive: bool,
     s: f32,
-) {
+) -> bool {
     // The panel only exists while a capture runs — a session ending
     // slides it closed instead of leaving a floating settings slab.
-    if emu.session.is_none() {
-        emu.render_open = false;
+    if !live {
+        *open = false;
     }
     // Same slide as the global settings overlay — 0.3s wall-clock
     // animate_bool + ease_out_cubic; the panel just slides out and
     // back over the content.
     let slide =
         ui.ctx()
-            .animate_bool_with_time(ui.scope_id().with("render-panel-slide"), emu.render_open, 0.3);
+            .animate_bool_with_time(ui.scope_id().with("render-panel-slide"), *open, 0.3);
     let t = crate::ease_out_cubic(slide);
     if t <= 0.001 {
-        return;
+        return false;
     }
     // The view scale `s` shrinks with the window — panel contents
     // stay readable via a floor; geometry matches the settings
@@ -5209,7 +5318,7 @@ fn render_panel(
         .interact(outside, ui.scope_id().with("render-scrim"), Sense::click())
         .clicked()
     {
-        emu.render_open = false;
+        *open = false;
     }
     let _ = ui.interact(panel, ui.scope_id().with("render-panel"), Sense::click());
 
@@ -5233,7 +5342,7 @@ fn render_panel(
         pui.disable();
     }
 
-    let before = emu.render.clone();
+    let before = render.clone();
     let accent = Color32::from_rgb(0x12, 0xC0, 0xF0);
 
     // Header — the tab name at title size + a painted X close
@@ -5280,7 +5389,7 @@ fn render_panel(
         });
     });
     if close {
-        emu.render_open = false;
+        *open = false;
     }
     pui.add_space(6.0 * ps);
     ui.painter().hline(
@@ -5294,27 +5403,30 @@ fn render_panel(
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(&mut pui, |pui| {
-            render_panel_rows(pui, emu, ps);
+            render_panel_rows(pui, render, cap_shader, ps);
         });
 
-    if emu.render != before {
-        emu.render_dirty = true;
-    }
+    *render != before
 }
 
-fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
+fn render_panel_rows(
+    pui: &mut egui::Ui,
+    render: &mut settings::RenderOpts,
+    cap_shader: Option<&cap_shader::CaptureShader>,
+    ps: f32,
+) {
     // SelectedStretch — Uniform / UniformToFill / Fill.
     pui.horizontal(|ui| {
         row_label(ui, "Stretch", ps);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             egui::ComboBox::from_id_salt("render-stretch")
                 .selected_text(
-                    ["Uniform", "Uniform to Fill", "Fill"][emu.render.stretch.min(2) as usize],
+                    ["Uniform", "Uniform to Fill", "Fill"][render.stretch.min(2) as usize],
                 )
                 .width(170.0 * ps)
                 .show_ui(ui, |ui| {
                     for (i, n) in ["Uniform", "Uniform to Fill", "Fill"].iter().enumerate() {
-                        ui.selectable_value(&mut emu.render.stretch, i as u8, *n);
+                        ui.selectable_value(&mut render.stretch, i as u8, *n);
                     }
                 });
         });
@@ -5324,7 +5436,7 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
     render_slider(
         pui,
         "Brightness",
-        &mut emu.render.brightness,
+        &mut render.brightness,
         0.25,
         2.0,
         1.0,
@@ -5333,7 +5445,7 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
     render_slider(
         pui,
         "Saturation",
-        &mut emu.render.saturation,
+        &mut render.saturation,
         0.0,
         2.0,
         1.0,
@@ -5342,29 +5454,29 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
     render_slider(
         pui,
         "Overlay Opacity",
-        &mut emu.render.overlay_opacity,
+        &mut render.overlay_opacity,
         0.05,
         1.0,
         0.55,
         ps,
     );
 
-    render_toggle(pui, "Disable VSync", &mut emu.render.disable_vsync, ps);
+    render_toggle(pui, "Disable VSync", &mut render.disable_vsync, ps);
     render_toggle(
         pui,
         "Remove side pillars",
-        &mut emu.render.remove_pillars,
+        &mut render.remove_pillars,
         ps,
     );
     pui.add_space(6.0 * ps);
-    render_toggle(pui, "Show Stats Overlay", &mut emu.render.stats_overlay, ps);
+    render_toggle(pui, "Show Stats Overlay", &mut render.stats_overlay, ps);
     render_toggle(
         pui,
         "Show Frametime Graph",
-        &mut emu.render.frametime_graph,
+        &mut render.frametime_graph,
         ps,
     );
-    render_toggle(pui, "Show GPU Info", &mut emu.render.gpu_info, ps);
+    render_toggle(pui, "Show GPU Info", &mut render.gpu_info, ps);
     pui.add_space(6.0 * ps);
 
     // PortalCaptureTint — an RGB multiply over the capture.
@@ -5376,12 +5488,12 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
                 .on_hover_text("Reset to white (no tint)")
                 .clicked()
             {
-                emu.render.tint = [255, 255, 255];
+                render.tint = [255, 255, 255];
             }
-            let [r, g, b] = emu.render.tint;
+            let [r, g, b] = render.tint;
             let mut c = Color32::from_rgb(r, g, b);
             if ui.color_edit_button_srgba(&mut c).changed() {
-                emu.render.tint = [c.r(), c.g(), c.b()];
+                render.tint = [c.r(), c.g(), c.b()];
             }
         });
     });
@@ -5390,24 +5502,22 @@ fn render_panel_rows(pui: &mut egui::Ui, emu: &mut EmuView, ps: f32) {
     // SelectedShaderPath — the bundled capture post-process shaders
     // (Lacrima's "Shader file" ComboBox); hidden when the GPU path
     // isn't available.
-    if emu.cap_shader.is_some() {
+    if let Some(cs) = cap_shader {
         pui.horizontal(|ui| {
             row_label(ui, "Shader", ps);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let selected = if emu.render.shader.is_empty() {
+                let selected = if render.shader.is_empty() {
                     "None".to_string()
                 } else {
-                    emu.render.shader.clone()
+                    render.shader.clone()
                 };
                 egui::ComboBox::from_id_salt("render-shader")
                     .selected_text(selected)
                     .width(170.0 * ps)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut emu.render.shader, String::new(), "None");
-                        if let Some(cs) = &emu.cap_shader {
-                            for n in cs.names() {
-                                ui.selectable_value(&mut emu.render.shader, n.clone(), n.clone());
-                            }
+                        ui.selectable_value(&mut render.shader, String::new(), "None");
+                        for n in cs.names() {
+                            ui.selectable_value(&mut render.shader, n.clone(), n.clone());
                         }
                     });
             });
@@ -5708,5 +5818,75 @@ mod tests {
         emu.request_close();
         assert!(emu.take_close_request());
         assert!(!emu.take_close_request());
+    }
+
+    /// The shared pillar bundle (now used by both capture draws): a
+    /// locked crop enforces immediately — no debounce — and the
+    /// tween glides `cur` to `tgt`; disabling the option resets the
+    /// bars back to full-frame instead of snapping.
+    #[test]
+    fn capfx_locked_crop_enforces_and_tween_resets() {
+        let ctx = egui::Context::default();
+        let mut fx = CapFx::default();
+        fx.pillar_lock = Some((10, 20, 100));
+        let buf = vec![0u8; 200 * 50 * 4];
+        fx_pillar_detect(&mut fx, &buf, 200, 50);
+        let want = pillarbox::scale_locked(10, 20, 100, 200);
+        assert_eq!(fx.pillar_tgt, want);
+        // The tween runs `cur` toward the target and lands exactly.
+        for _ in 0..10 {
+            fx_pillar_tween(&mut fx, true, 0.1, &ctx);
+        }
+        assert_eq!(fx.pillar_prog, 1.0);
+        assert_eq!(fx.pillar_cur, (want.0 as f32, want.1 as f32));
+        // Off → the insets reset and `cur` glides back toward
+        // full-frame (the off-reset re-arms the tween each call, so
+        // it converges asymptotically instead of snapping to zero).
+        for _ in 0..10 {
+            fx_pillar_tween(&mut fx, false, 0.1, &ctx);
+        }
+        assert_eq!(fx.pillar_tgt, (0, 0));
+        assert!(fx.pillar_cur.0.abs() < 0.5 && fx.pillar_cur.1.abs() < 0.5);
+    }
+
+    /// Unlocked detection debounces: one stable result doesn't
+    /// retarget the crop — six consecutive identical reads do.
+    #[test]
+    fn capfx_detect_debounces_six_frames() {
+        let mut fx = CapFx::default();
+        // A frame with solid black side bars — detect resolves the
+        // same insets every call.
+        let (w, h) = (100usize, 50usize);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 20..80 {
+                let i = (y * w + x) * 4;
+                buf[i] = 200;
+                buf[i + 1] = 200;
+                buf[i + 2] = 200;
+                buf[i + 3] = 255;
+            }
+        }
+        for _ in 0..5 {
+            fx_pillar_detect(&mut fx, &buf, w, h);
+            assert_eq!(fx.pillar_tgt, (0, 0));
+        }
+        fx_pillar_detect(&mut fx, &buf, w, h);
+        assert_eq!(fx.pillar_tgt, fx.pillar_last);
+        assert_ne!(fx.pillar_tgt, (0, 0));
+    }
+
+    /// The stats tick seeds on the first frame, then rolls capture
+    /// fps + the frametime ring the overlay/graph read.
+    #[test]
+    fn capfx_stats_tick_rolls_frametimes() {
+        let mut fx = CapFx::default();
+        fx_stats_tick(&mut fx);
+        assert!(fx.frametimes.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fx_stats_tick(&mut fx);
+        assert_eq!(fx.frametimes.len(), 1);
+        assert!(fx.stats_ft_ms > 0.0);
+        assert!(fx.stats_fps > 0.0);
     }
 }

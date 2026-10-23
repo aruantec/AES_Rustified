@@ -802,14 +802,24 @@ struct EmuClosePrompt {
     vis: f32,
     /// Close confirmed — the session stops once the fade completes.
     pending_stop: bool,
+    /// The Re/Decomp view's session prompted instead of the
+    /// emulator's — same dialog, different owner + label.
+    decomp: bool,
 }
 
 impl EmuClosePrompt {
     fn begin(&mut self, ctx: &egui::Context) {
+        self.decomp = false;
         self.sel = 1; // safe default: Cancel focused
         self.open = true;
         self.pending_stop = false;
         ctx.request_repaint();
+    }
+
+    /// Same prompt, aimed at the running re/decomp game session.
+    fn begin_decomp(&mut self, ctx: &egui::Context) {
+        self.begin(ctx);
+        self.decomp = true;
     }
 }
 
@@ -863,6 +873,8 @@ enum PendingDelete {
     Albums(Vec<String>),
     /// Emulation ROM items (the rom-mode card menu / Delete key).
     Roms(Vec<std::path::PathBuf>),
+    /// Re/Decomp install — slug for the delete, name for the title.
+    Decomp { slug: String, name: String },
 }
 
 /// The same Switch-style confirm dialog for deletes — the request is
@@ -1739,6 +1751,12 @@ impl AesRustApp {
         // Capture-shader pipelines live on the GPU — created once with
         // the wgpu render state like the shadertoy background.
         app.emu.cap_shader = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(emulation::cap_shader::CaptureShader::new);
+        // The Re/Decomp capture path owns a second instance — same
+        // pipelines, its own done-fence + frame texture.
+        app.decomp.cap_shader = cc
             .wgpu_render_state
             .as_ref()
             .map(emulation::cap_shader::CaptureShader::new);
@@ -3163,6 +3181,9 @@ impl eframe::App for AesRustApp {
                     Some(PendingDelete::Roms(p)) => {
                         emu.remove_games(&mut settings.emulation, &p);
                     }
+                    Some(PendingDelete::Decomp { slug, .. }) => {
+                        decomp.uninstall(&slug);
+                    }
                     None => {}
                 }
                 // ROM-item removals from the card menu wait on the
@@ -3700,6 +3721,18 @@ impl eframe::App for AesRustApp {
                 if emu.take_close_request() {
                     emu_close.begin(ui.ctx());
                 }
+                // The Re/Decomp band's power button + capture menu's
+                // "Close Game" park the same request — one prompt
+                // serves both session kinds.
+                if decomp.take_close_request() {
+                    emu_close.begin_decomp(ui.ctx());
+                }
+                // Card/pane "Uninstall" rides the same confirm dialog
+                // the item deletes use — parked like the close
+                // request above so the prompt's Cancel still wins.
+                if let Some((slug, name)) = decomp.take_uninstall_request() {
+                    del_prompt.request(PendingDelete::Decomp { slug, name }, ui.ctx());
+                }
                 // The Emulation view owns the keys while it's up —
                 // the section strip and the game cards take the same
                 // shortcuts as the audio view's album strip and cover
@@ -3921,34 +3954,80 @@ impl eframe::App for AesRustApp {
                 // The Re/Decompilation catalog — arrows navigate the
                 // card grid (vertical steps use the stamped column
                 // count), Enter runs the card's action
-                // (Install/Update/Open).
+                // (Install/Update/Open). While the capture viewport
+                // owns the pane the keys belong to the game — the ⇄
+                // switch, Ctrl+E (fullscreen) and Ctrl+Q (close) stay
+                // reachable, same as the emulation view's set.
                 if view_interactive
                     && nav.target() == View::Recomp
+                    && !decomp.render_open
                     && !ui.ctx().text_edit_focused()
                 {
-                    let (mut dx, mut dy) = (0i32, 0i32);
-                    ui.ctx().input_mut(|i| {
-                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-                            dx -= 1;
-                        }
-                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-                            dx += 1;
-                        }
-                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                            dy -= 1;
-                        }
-                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                            dy += 1;
-                        }
-                    });
-                    if dx != 0 || dy != 0 {
-                        decomp.move_selection(dx, dy);
-                    }
-                    if ui
-                        .ctx()
-                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                    let dcap_up =
+                        decomp.session.is_some() && !decomp.viewport_dismissed;
+                    // Ctrl+M — the input tunnel (mouse emulation):
+                    // pointer/keys over the capture PostMessage into
+                    // the game's hidden window. Checked before the
+                    // nav gate — it must stay reachable while lit,
+                    // and it's the release key too.
+                    let dtun_gate = dcap_up
+                        && if cfg!(windows) {
+                            true
+                        } else {
+                            decomp.session.as_ref().is_some_and(|s| s.embedded())
+                        };
+                    if dtun_gate
+                        && ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M))
                     {
-                        decomp.activate_selected();
+                        decomp.toggle_input_tunnel();
+                    }
+                    if !dcap_up {
+                        let (mut dx, mut dy) = (0i32, 0i32);
+                        ui.ctx().input_mut(|i| {
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                                dx -= 1;
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                                dx += 1;
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                                dy -= 1;
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                                dy += 1;
+                            }
+                        });
+                        if dx != 0 || dy != 0 {
+                            decomp.move_selection(dx, dy);
+                        }
+                        if ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                        {
+                            decomp.activate_selected();
+                        }
+                    }
+                    if decomp.session.is_some() {
+                        if ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E))
+                        {
+                            decomp.toggle_fullscreen();
+                        }
+                        if ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S))
+                        {
+                            decomp.toggle_viewport();
+                        }
+                        if ui
+                            .ctx()
+                            .input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Q))
+                        {
+                            emu_close.begin_decomp(ui.ctx());
+                        }
                     }
                 }
                 // egui's own focus navigation (begin_pass reads raw Tab/
@@ -4218,10 +4297,11 @@ impl eframe::App for AesRustApp {
                             emu.search.close(ui.ctx());
                         } else if nav.target() == View::Recomp && decomp.search.is_open() {
                             decomp.search.close(ui.ctx());
-                        } else if emu.render_open {
+                        } else if emu.render_open || decomp.render_open {
                             // The capture render-options panel closes
-                            // like the other overlays.
+                            // like the other overlays — either view's.
                             emu.render_open = false;
+                            decomp.render_open = false;
                         } else if nav.target() == View::Emulation && emu.input_tun {
                             // Esc is the tunnel's release key — it
                             // returns control to the app without ever
@@ -4242,6 +4322,21 @@ impl eframe::App for AesRustApp {
                             // confirm, same as Ctrl+Q and the power
                             // button.
                             emu_close.begin(ui.ctx());
+                        } else if nav.target() == View::Recomp && decomp.input_tun {
+                            // Esc is the tunnel's release key — it
+                            // returns control to the app without ever
+                            // reaching the game (the forward loop
+                            // never sends Escape).
+                            decomp.input_tun = false;
+                        } else if nav.target() == View::Recomp
+                            && decomp.session.is_some()
+                            && decomp.game_fs
+                        {
+                            // Same order as the emulation view — Esc
+                            // backs out of game-fullscreen first.
+                            decomp.game_fs = false;
+                        } else if nav.target() == View::Recomp && decomp.session.is_some() {
+                            emu_close.begin_decomp(ui.ctx());
                         } else if !ui.ctx().text_edit_focused() {
                             if ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                                 fs_exit.begin(ui.ctx());
@@ -5052,7 +5147,12 @@ impl eframe::App for AesRustApp {
                 // game that exits on its own while the prompt is up
                 // resolves the question by itself.
                 if emu_close.open || emu_close.vis > 0.001 {
-                    if emu.session.is_none() {
+                    let sess_gone = if emu_close.decomp {
+                        decomp.session.is_none()
+                    } else {
+                        emu.session.is_none()
+                    };
+                    if sess_gone {
                         emu_close.open = false;
                         emu_close.pending_stop = false;
                     }
@@ -5063,7 +5163,11 @@ impl eframe::App for AesRustApp {
                     match confirm_overlay(
                         ui,
                         content,
-                        "Close emulator?",
+                        if emu_close.decomp {
+                            "Close game?"
+                        } else {
+                            "Close emulator?"
+                        },
                         "Unsaved progress in the running game will be lost.",
                         "Close",
                         "Cancel",
@@ -5083,7 +5187,11 @@ impl eframe::App for AesRustApp {
                     ui.ctx().request_repaint();
                     if emu_close.pending_stop && emu_close.vis <= 0.001 {
                         emu_close.pending_stop = false;
-                        emu.stop_session();
+                        if emu_close.decomp {
+                            decomp.stop_session();
+                        } else {
+                            emu.stop_session();
+                        }
                     }
                 }
                 // "Exit application?" — same dialog again; the window
@@ -5151,6 +5259,10 @@ impl eframe::App for AesRustApp {
                                 format!("Remove {} items?", p.len())
                             },
                             "Removed from the section — the files stay on disk.".to_string(),
+                        ),
+                        Some(PendingDelete::Decomp { name, .. }) => (
+                            format!("Uninstall {name}?"),
+                            "Deletes the installed tree — the catalog entry stays.".to_string(),
                         ),
                         None => ("Delete?".to_string(), String::new()),
                     };
@@ -6599,7 +6711,8 @@ fn music_view(
         | carousel::Action::Cheats(_)
         | carousel::Action::GraphicPacks(_)
         | carousel::Action::Download(_)
-        | carousel::Action::OpenFolder(_) => None,
+        | carousel::Action::OpenFolder(_)
+        | carousel::Action::Uninstall(_) => None,
         carousel::Action::None => None,
     };
     // Transport prev/next resolve against the loaded album's items
