@@ -189,10 +189,12 @@ impl WidgetFrame {
                 (Some(off), Some(size)) => {
                     // Offset is the widget FOCUS as a fraction of the
                     // whole window, so a widget keeps its screen spot
-                    // in any mode; size is absolute virtual units —
-                    // fullscreen must not inflate widgets.
+                    // in any mode; size is absolute virtual units
+                    // (logical ÷ s at save, × s at restore) — neither
+                    // fullscreen nor a differently-scaled monitor
+                    // inflates widgets.
                     let restored =
-                        self.rect_at_focus(frame.min + off * frame.size(), size);
+                        self.rect_at_focus(frame.min + off * frame.size(), size * s);
                     (fit_inside(restored, content.shrink(EDIT_MARGIN)), restored)
                 }
                 _ => {
@@ -204,12 +206,15 @@ impl WidgetFrame {
             self.anchor = Some(self.anchor_of(intent, frame));
         }
         // The widget lives inside the ScalableDecorator: on a UI-scale
-        // change the rect rescales once, then the anchor re-derives.
+        // change the rect rescales once; the anchor stays canonical —
+        // re-deriving it here would read a rect still positioned for
+        // the OLD frame (a DPI flip and the window's logical resize
+        // land in the same frame; so does a shell switch), permanently
+        // dragging the widget off its spot. The placement below
+        // re-projects through the live frame anyway.
         if self.last_scale > 0.0 && (s - self.last_scale).abs() > 1e-6 {
             let k = s / self.last_scale;
             self.rect = Rect::from_center_size(self.rect.center(), self.rect.size() * k);
-            let r = self.rect;
-            self.anchor = Some(self.anchor_of(r, frame));
         }
         self.last_scale = s;
         // Placement is a pure function of (anchor, frame) — the center

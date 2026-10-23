@@ -434,7 +434,8 @@ mod win_dpi_defer {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+        GetWindowRect, WINDOWPOS, WM_DPICHANGED, WM_ENTERSIZEMOVE,
+        WM_EXITSIZEMOVE, WM_WINDOWPOSCHANGING,
     };
 
     // Single root window — process-wide state is fine.
@@ -445,6 +446,14 @@ mod win_dpi_defer {
     /// wherever the mid-drag flip fired. The replay builds a rect at
     /// the window's settled position instead.
     static PENDING: Mutex<Option<WPARAM>> = Mutex::new(None);
+    /// Armed while a DPI change is being forwarded: winit scales the
+    /// window by the DPI ratio to preserve its LOGICAL size, but this
+    /// app's UI holds a constant PHYSICAL size across DPIs (the
+    /// interior density compensation), so the window must keep its
+    /// physical size too. The WM_WINDOWPOSCHANGING clamp pins the
+    /// geometry to this rect — the grown size never exists, rather
+    /// than growing visibly and snapping back.
+    static CLAMP: Mutex<Option<RECT>> = Mutex::new(None);
 
     unsafe extern "system" fn proc(
         hwnd: HWND,
@@ -466,15 +475,42 @@ mod win_dpi_defer {
                 if let Some(wp) = PENDING.lock().unwrap().take() {
                     let mut rc = RECT::default();
                     let _ = unsafe { GetWindowRect(hwnd, &mut rc) };
+                    *CLAMP.lock().unwrap() = Some(rc);
                     unsafe {
                         DefSubclassProc(hwnd, WM_DPICHANGED, wp, LPARAM(&mut rc as *mut RECT as isize));
                     }
+                    *CLAMP.lock().unwrap() = None;
                 }
                 return out;
             }
             WM_DPICHANGED if IN_MOVE.load(Ordering::Relaxed) => {
                 *PENDING.lock().unwrap() = Some(wparam);
                 return LRESULT(0);
+            }
+            WM_DPICHANGED => {
+                // Stationary flip (a display-settings change, not a
+                // drag): same keep-physical-size treatment — capture
+                // the rect, let winit update its scale factor, veto
+                // the resize through the geometry clamp.
+                let mut rc = RECT::default();
+                let _ = unsafe { GetWindowRect(hwnd, &mut rc) };
+                *CLAMP.lock().unwrap() = Some(rc);
+                let out = unsafe { DefSubclassProc(hwnd, umsg, wparam, lparam) };
+                *CLAMP.lock().unwrap() = None;
+                return out;
+            }
+            WM_WINDOWPOSCHANGING => {
+                // Only armed while a DPI change is forwarded: pin the
+                // geometry to the settled rect. winit's own SetWindowPos
+                // then applies the unchanged rect — the DPI resize is
+                // vetoed before it ever reaches the screen.
+                if let Some(rc) = *CLAMP.lock().unwrap() {
+                    let wp = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+                    wp.x = rc.left;
+                    wp.y = rc.top;
+                    wp.cx = rc.right - rc.left;
+                    wp.cy = rc.bottom - rc.top;
+                }
             }
             _ => {}
         }
@@ -674,17 +710,12 @@ struct AesRustApp {
     /// section (prototype; ROM items land later).
     emu: emulation::EmuView,
     started: std::time::Instant,
-    /// Debounced monitor-DPI base for the global UI scale. Crossing
-    /// differently-scaled monitors flips `native_pixels_per_point`
-    /// (repeatedly while the window straddles the boundary) at the
-    /// same time as winit resizes the window — re-densifying on every
-    /// flip fought the OS window drag. A new base only commits after
-    /// the value and the window position both stay put for a beat.
+    /// Monitor-DPI base for the global UI scale. Crossing
+    /// differently-scaled monitors flips `native_pixels_per_point`;
+    /// the Win32 subclass swallows mid-drag flips and replays the
+    /// latest at the drop, so a change commits in the same frame the
+    /// ppp lands — the density flip never shows an intermediate size.
     dpi_base: f32,
-    dpi_base_pending: Option<(f32, std::time::Instant)>,
-    /// `outer_rect` last frame — a change re-arms `dpi_base_pending`
-    /// so the commit also waits for the window to go quiet.
-    last_outer_rect: Option<Rect>,
 }
 
 /// Selection owner for Delete-key routing — set by whichever view
@@ -1565,8 +1596,6 @@ impl AesRustApp {
                 settings.window.x.is_some() && settings.window.y.is_some()
             },
             dpi_base,
-            dpi_base_pending: None,
-            last_outer_rect: None,
             mode_switch: None,
             restore_album: settings.library.last_album.clone(),
             shadertoy: cc.wgpu_render_state.as_ref().map(|rs| {
@@ -2310,49 +2339,17 @@ impl eframe::App for AesRustApp {
         // so scaled font sizes stay bounded while the slider drags.
         // Effective = live monitor DPI base x the manual slider offset —
         // moving the window across displays re-densifies on its own.
-        // Debounced DPI base: `native_pixels_per_point` flips each time
-        // a dragged window's majority monitor changes (possibly several
-        // times while straddling the boundary), and winit resizes the
-        // window in the same breath. Rebasing the whole UI scale on
-        // every flip re-laid out and re-persisted mid-OS-drag — the
-        // jerky/stuck move and the size jumps. A new base commits only
-        // after the value AND the window rect have both been quiet for
-        // ~300ms, so the re-densify lands after the move finishes.
-        const DPI_SETTLE_MS: u128 = 300;
+        // The base commits the instant `native_pixels_per_point` flips:
+        // the Win32 subclass swallows every mid-drag DPICHANGED and
+        // replays it at the drop, so a change here is always settled
+        // — committing in the same frame lands the density flip in the
+        // very first rendered frame, with no scale-up-and-back flash.
         let raw_base = ui
             .ctx()
             .input(|i| i.viewport().native_pixels_per_point)
             .unwrap_or(1.0)
             .clamp(1.0, 2.0);
-        let outer = ui.ctx().input(|i| i.viewport().outer_rect);
-        if outer != self.last_outer_rect {
-            self.last_outer_rect = outer;
-            if let Some((v, _)) = self.dpi_base_pending {
-                self.dpi_base_pending = Some((v, std::time::Instant::now()));
-            }
-        }
-        match self.dpi_base_pending {
-            Some((v, _)) if (v - raw_base).abs() > 0.001 => {
-                self.dpi_base_pending = Some((raw_base, std::time::Instant::now()));
-            }
-            None if (raw_base - self.dpi_base).abs() > 0.001 => {
-                self.dpi_base_pending = Some((raw_base, std::time::Instant::now()));
-            }
-            _ => {}
-        }
-        if let Some((v, at)) = self.dpi_base_pending {
-            if (raw_base - self.dpi_base).abs() <= 0.001 {
-                // Flapped back to the live base — nothing to commit.
-                self.dpi_base_pending = None;
-            } else if at.elapsed().as_millis() >= DPI_SETTLE_MS {
-                self.dpi_base = v;
-                self.dpi_base_pending = None;
-            } else {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(
-                    (DPI_SETTLE_MS - at.elapsed().as_millis()) as u64,
-                ));
-            }
-        }
+        self.dpi_base = raw_base;
         let base = self.dpi_base;
         let scale = (((base * self.settings.ui.scale_manual.unwrap_or(1.0))
             .clamp(1.0, 3.0)
@@ -4958,7 +4955,7 @@ impl eframe::App for AesRustApp {
                 let (mut differs, mut pdiffers, mut idiffers) = (false, false, false);
                 if !settings.window.mini {
                 let off = clock.anchor_offset(frame_rect);
-                let wsize = clock.rect.size();
+                let wsize = clock.rect.size() / s;
                 differs = settings.clock.left != off.x
                     || settings.clock.top != off.y
                     || settings.clock.width != wsize.x
@@ -4971,7 +4968,7 @@ impl eframe::App for AesRustApp {
                 settings.clock.visible = clock.visible;
                 // The turntable widget persists the same way.
                 let poff = player_widget.anchor_offset(frame_rect);
-                let psize = player_widget.rect.size();
+                let psize = player_widget.rect.size() / s;
                 pdiffers = settings.player.left != poff.x
                     || settings.player.top != poff.y
                     || settings.player.width != psize.x
@@ -4984,7 +4981,7 @@ impl eframe::App for AesRustApp {
                 settings.player.visible = player_widget.visible;
                 // The PlayerInfo strip persists the same way.
                 let ioff = player_info.anchor_offset(frame_rect);
-                let isize = player_info.rect.size();
+                let isize = player_info.rect.size() / s;
                 idiffers = settings.player_info.left != ioff.x
                     || settings.player_info.top != ioff.y
                     || settings.player_info.width != isize.x
