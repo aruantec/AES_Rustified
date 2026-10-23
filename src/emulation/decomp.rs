@@ -1916,6 +1916,158 @@ fn fit_rect(slot: Rect, iw: f32, ih: f32) -> Rect {
     Rect::from_center_size(slot.center(), Vec2::new(iw * k, ih * k))
 }
 
+/// Tab bar accent — the app's cyan, used for the active underline
+/// and the count badges.
+const TAB_ACCENT: Color32 = Color32::from_rgb(0x12, 0xC0, 0xF0);
+
+/// One painted glyph per tab — same stroke-drawn style as the
+/// transport icons: a `size`-sized box centered on `c`.
+fn tab_icon(painter: &egui::Painter, c: Pos2, size: f32, t: DecompTab, col: Color32) {
+    let h = size / 2.0;
+    let stroke = Stroke::new((size * 0.09).max(1.2), col);
+    match t {
+        DecompTab::Favorites => {
+            // Heart — two top circles + a diamond bottom.
+            let r = size * 0.21;
+            let cy = c.y - h * 0.3;
+            painter.circle_filled(Pos2::new(c.x - r, cy), r, col);
+            painter.circle_filled(Pos2::new(c.x + r, cy), r, col);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x - 2.0 * r, cy + r * 0.3),
+                    Pos2::new(c.x + 2.0 * r, cy + r * 0.3),
+                    Pos2::new(c.x, c.y + h * 0.75),
+                ],
+                col,
+                Stroke::NONE,
+            ));
+        }
+        DecompTab::All => {
+            // 2x2 rounded squares.
+            let q = size * 0.30;
+            let g = size * 0.10;
+            for &(dx, dy) in &[(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                painter.rect_filled(
+                    Rect::from_center_size(
+                        Pos2::new(c.x + dx * (q + g) / 2.0, c.y + dy * (q + g) / 2.0),
+                        Vec2::splat(q),
+                    ),
+                    CornerRadius::same((size * 0.07).round() as u8),
+                    col,
+                );
+            }
+        }
+        DecompTab::Kind(Kind::Decomp) => {
+            // </> code brackets.
+            for sx in [-1.0f32, 1.0] {
+                painter.add(egui::Shape::line(
+                    vec![
+                        Pos2::new(c.x + sx * h * 0.15, c.y - h * 0.55),
+                        Pos2::new(c.x + sx * h * 0.75, c.y),
+                        Pos2::new(c.x + sx * h * 0.15, c.y + h * 0.55),
+                    ],
+                    stroke,
+                ));
+            }
+            painter.add(egui::Shape::line(
+                vec![
+                    Pos2::new(c.x + h * 0.14, c.y - h * 0.75),
+                    Pos2::new(c.x - h * 0.14, c.y + h * 0.75),
+                ],
+                stroke,
+            ));
+        }
+        DecompTab::Kind(Kind::Recomp) => {
+            // Circular arrow — 3/4 arc + arrowhead at its end.
+            let r = h * 0.62;
+            let a0 = -2.2f32;
+            let sweep = 4.6f32;
+            let pts: Vec<Pos2> = (0..=18)
+                .map(|i| {
+                    let a = a0 + i as f32 / 18.0 * sweep;
+                    Pos2::new(c.x + r * a.cos(), c.y + r * a.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, stroke));
+            let ae = a0 + sweep;
+            let tip = Pos2::new(c.x + r * ae.cos(), c.y + r * ae.sin());
+            let tan = Vec2::new(-ae.sin(), ae.cos());
+            let nrm = Vec2::new(ae.cos(), ae.sin());
+            painter.add(egui::Shape::line(
+                vec![
+                    tip - tan * h * 0.36 + nrm * h * 0.26,
+                    tip,
+                    tip - tan * h * 0.36 - nrm * h * 0.26,
+                ],
+                stroke,
+            ));
+        }
+        DecompTab::Kind(Kind::Disasm) => {
+            // Listing rows — leading dash + bar, staggered.
+            for i in 0..3 {
+                let y = c.y - h * 0.5 + i as f32 * h * 0.5;
+                let end = c.x + h * (0.7 - (i % 2) as f32 * 0.28);
+                painter.line_segment(
+                    [Pos2::new(c.x - h * 0.75, y), Pos2::new(c.x - h * 0.45, y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [Pos2::new(c.x - h * 0.15, y), Pos2::new(end, y)],
+                    stroke,
+                );
+            }
+        }
+        DecompTab::Kind(Kind::Port) => {
+            // ⇄ — two opposing arrows.
+            painter.line_segment(
+                [Pos2::new(c.x - h * 0.75, c.y - h * 0.32), Pos2::new(c.x + h * 0.6, c.y - h * 0.32)],
+                stroke,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    Pos2::new(c.x + h * 0.3, c.y - h * 0.6),
+                    Pos2::new(c.x + h * 0.6, c.y - h * 0.32),
+                    Pos2::new(c.x + h * 0.3, c.y - h * 0.04),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [Pos2::new(c.x + h * 0.75, c.y + h * 0.32), Pos2::new(c.x - h * 0.6, c.y + h * 0.32)],
+                stroke,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    Pos2::new(c.x - h * 0.3, c.y + h * 0.04),
+                    Pos2::new(c.x - h * 0.6, c.y + h * 0.32),
+                    Pos2::new(c.x - h * 0.3, c.y + h * 0.6),
+                ],
+                stroke,
+            ));
+        }
+        DecompTab::Kind(Kind::Mod) => {
+            // Plus in a circle.
+            painter.circle_stroke(c, h * 0.72, stroke);
+            painter.line_segment(
+                [Pos2::new(c.x - h * 0.38, c.y), Pos2::new(c.x + h * 0.38, c.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x, c.y - h * 0.38), Pos2::new(c.x, c.y + h * 0.38)],
+                stroke,
+            );
+        }
+        DecompTab::Kind(Kind::Tool) => {
+            // Gear — ring + 6 spokes + hub.
+            painter.circle_stroke(c, h * 0.44, stroke);
+            for i in 0..6 {
+                let a = Vec2::angled(i as f32 * std::f32::consts::TAU / 6.0);
+                painter.line_segment([c + a * h * 0.44, c + a * h * 0.72], stroke);
+            }
+            painter.circle_filled(c, h * 0.14, col);
+        }
+    }
+}
+
 /// Plural tab label per kind.
 fn tab_label(kind: Kind) -> &'static str {
     match kind {
@@ -1951,7 +2103,7 @@ pub fn view(
     let upper = Rect::from_min_max(content.min, Pos2::new(content.max.x, band.min.y));
     let painter = ui.painter().clone();
 
-    painter.rect_filled(upper, 0.0, Color32::BLACK.gamma_multiply(alpha));
+    painter.rect_filled(upper, 0.0, crate::GRID_BG.gamma_multiply(alpha));
 
     // --- Capture session housekeeping (the emulation view's form) --
     // The spawn worker hands the session over; the game lands on the
@@ -2213,13 +2365,11 @@ pub fn view(
         view.search.close(ui.ctx());
     }
 
-    // --- Kind tabs (settings-overlay style) ------------------------
-    // Text tabs in a row — active is white with an underline,
-    // inactive gray, hover lighter; a small count trails the label.
+    // --- Kind tabs — icon pill bar ---------------------------------
+    // iOS-style: a floating rounded bar of icon slots, the active tab
+    // raised with an accent underline, counts as notification badges
+    // on each icon. Labels ride as tooltips.
     let counts = view.kind_counts();
-    let tab_font = FontId::proportional(19.0 * s);
-    let tab_gap = 26.0 * s;
-    let tab_row_h = 34.0 * s;
     let mut set_tab: Option<DecompTab> = None;
     // "Favorites" leads the row — its count is catalog entries the
     // slug set covers (stale slugs don't pad it).
@@ -2246,65 +2396,82 @@ pub fn view(
         DecompTab::All => "all".to_string(),
         DecompTab::Kind(k) => k.label().to_string(),
     };
-    let mut tab_x = upper.min.x + 40.0 * s;
-    let tab_y = upper.min.y + 12.0 * s;
-    let tabs_right = content.max.x - 300.0 * s; // keep clear of the search pill
+    let pill_h = 56.0 * s;
+    let slot_w = 64.0 * s;
+    let pill_w = tabs.len() as f32 * slot_w + 16.0 * s;
+    // Left-anchored pill, clear of the view's own padding.
+    let pill = Rect::from_min_size(
+        Pos2::new(upper.min.x + 20.0 * s, upper.min.y + 24.0 * s),
+        Vec2::new(pill_w, pill_h),
+    );
+    let tabs_bottom = pill.max.y;
     if !covered {
-        for (this, label, n) in &tabs {
-            let lg = painter.layout_no_wrap(label.clone(), tab_font.clone(), Color32::WHITE);
-            let ng = painter.layout_no_wrap(
-                format!(" {n}"),
-                FontId::proportional(13.0 * s),
-                Color32::WHITE,
+        painter.rect(
+            pill,
+            CornerRadius::same((pill_h / 2.0).round() as u8),
+            Color32::from_black_alpha(0x55).gamma_multiply(alpha),
+            Stroke::new(1.0, Color32::from_white_alpha(0x10).gamma_multiply(alpha)),
+            egui::StrokeKind::Inside,
+        );
+        for (i, (this, label, n)) in tabs.iter().enumerate() {
+            let slot = Rect::from_min_size(
+                Pos2::new(pill.min.x + 8.0 * s + i as f32 * slot_w, pill.min.y),
+                Vec2::new(slot_w, pill_h),
             );
-            let w = lg.size().x + ng.size().x + 4.0 * s;
-            if tab_x + w > tabs_right {
-                break;
-            }
-            let rect = Rect::from_min_size(Pos2::new(tab_x, tab_y), Vec2::new(w, tab_row_h));
             let resp = if content_interactive {
-                ui.interact(rect, ui.scope_id().with(("decomp-tab", tab_id(*this))), Sense::click())
+                ui.interact(slot, ui.scope_id().with(("decomp-tab", tab_id(*this))), Sense::click())
             } else {
-                ui.interact(rect, ui.scope_id().with(("decomp-tab", tab_id(*this))), Sense::hover())
+                ui.interact(slot, ui.scope_id().with(("decomp-tab", tab_id(*this))), Sense::hover())
             };
             let active = view.tab == *this;
-            let color = if active {
-                Color32::WHITE
-            } else if resp.hovered() {
-                Color32::from_gray(200)
-            } else {
-                Color32::from_gray(140)
-            };
-            painter.galley(
-                Pos2::new(rect.min.x, rect.min.y + 4.0 * s),
-                lg,
-                color.gamma_multiply(alpha),
-            );
-            painter.galley(
-                Pos2::new(rect.min.x + rect.width() - ng.size().x - 2.0 * s, rect.min.y + 10.0 * s),
-                ng,
-                Color32::from_gray(120).gamma_multiply(alpha),
-            );
             if active {
-                painter.line_segment(
-                    [
-                        Pos2::new(rect.min.x, rect.max.y - 2.0 * s),
-                        Pos2::new(rect.min.x + rect.width(), rect.max.y - 2.0 * s),
-                    ],
-                    Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(alpha)),
+                // Raised rounded square behind the icon + accent bar
+                // under it — the image's selected-tab treatment.
+                let sq = Rect::from_center_size(
+                    Pos2::new(slot.center().x, slot.center().y - 2.0 * s),
+                    Vec2::splat(42.0 * s),
+                );
+                painter.rect_filled(
+                    sq,
+                    CornerRadius::same((12.0 * s).round() as u8),
+                    Color32::from_white_alpha(0x14).gamma_multiply(alpha),
+                );
+                painter.rect_filled(
+                    Rect::from_center_size(
+                        Pos2::new(slot.center().x, pill.max.y - 8.0 * s),
+                        Vec2::new(24.0 * s, 4.0 * s),
+                    ),
+                    CornerRadius::same((2.0 * s).round() as u8),
+                    TAB_ACCENT.gamma_multiply(alpha),
                 );
             }
+            let col = if active {
+                Color32::WHITE
+            } else if resp.hovered() {
+                Color32::from_gray(210)
+            } else {
+                Color32::from_gray(150)
+            };
+            tab_icon(
+                &painter,
+                Pos2::new(slot.center().x, slot.center().y - 2.0 * s),
+                28.0 * s,
+                *this,
+                col.gamma_multiply(alpha),
+            );
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
             if resp.clicked() {
                 set_tab = Some(*this);
             }
-            tab_x += w + tab_gap;
+            let _ = resp.on_hover_text(format!("{label} ({n})"));
         }
         if let Some(t) = set_tab {
             view.set_tab(t);
         }
+    } else {
+        // Chrome hidden (fullscreen capture) — the list reclaims the top.
     }
 
     // --- The shared item list ---------------------------------------
@@ -2318,7 +2485,7 @@ pub fn view(
         upper.max,
     );
     let grid = Rect::from_min_max(
-        Pos2::new(upper.min.x, tab_y + tab_row_h + 10.0 * s),
+        Pos2::new(upper.min.x, tabs_bottom + 10.0 * s),
         Pos2::new(upper.max.x, pane.min.y - 4.0 * s),
     );
 
@@ -2526,11 +2693,12 @@ pub fn view(
 
         // The item search pill — docked in the top-right corner with a
         // small top/right margin so the cards never slide under it.
+        // Same top margin as the tab bar — the two align on one row.
         if !chrome_hidden {
             view.search.ui(
                 ui,
                 content.max.x - 18.0 * s,
-                upper.min.y + 10.0 * s,
+                upper.min.y + 24.0 * s,
                 "Search",
                 true,
                 false,
@@ -3455,6 +3623,9 @@ fn info_pane(
     s: f32,
 ) {
     let painter = ui.painter().clone();
+    // The selected-item area stays black — the grid above now shares
+    // the audio view's GRID_BG, so the pane gets its own fill.
+    painter.rect_filled(pane, 0.0, Color32::BLACK.gamma_multiply(alpha));
     painter.line_segment(
         [pane.left_top(), pane.right_top()],
         Stroke::new(
