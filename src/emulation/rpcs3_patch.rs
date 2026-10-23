@@ -5,7 +5,7 @@
 //! directory. Its layout is *not* plain-YAML friendly: the file
 //! repeats top-level `Anchors:` blocks (~160 of them) and references
 //! them through `*alias` / `&anchor` all over — yaml-cpp merges
-//! duplicate keys, serde_yaml errors on them, so this module carries
+//! duplicate keys, serde_norway errors on them, so this module carries
 //! a focused YAML-subset parser with the same merge semantics.
 //!
 //! Activation state lives in `config/patch_config.yml`:

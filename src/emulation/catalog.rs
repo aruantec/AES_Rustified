@@ -231,8 +231,8 @@ struct YamlEntry {
     toolchain: Option<String>,
     #[serde(rename = "forkOf")]
     fork_of: Option<YamlFork>,
-    desc: Option<serde_yaml::Value>,
-    requirements: Option<serde_yaml::Value>,
+    desc: Option<serde_norway::Value>,
+    requirements: Option<serde_norway::Value>,
     tags: Option<Vec<String>>,
     featured: Option<bool>,
     year: Option<u32>,
@@ -240,13 +240,13 @@ struct YamlEntry {
     abandoned: Option<bool>,
     takedown: Option<bool>,
     author: Option<String>,
-    game: Option<serde_yaml::Value>,
+    game: Option<serde_norway::Value>,
     links: Option<Vec<YamlLink>>,
 }
 
 #[derive(Deserialize)]
 struct YamlLink {
-    label: Option<serde_yaml::Value>,
+    label: Option<serde_norway::Value>,
     url: Option<String>,
 }
 
@@ -268,12 +268,12 @@ struct StatEntry {
 
 /// `en` text out of a localized YAML value — falls back to `es`
 /// (upstream allows `{es}` alone) or a plain scalar.
-fn en_text(v: Option<serde_yaml::Value>) -> String {
+fn en_text(v: Option<serde_norway::Value>) -> String {
     match v {
-        Some(serde_yaml::Value::Mapping(m)) => {
+        Some(serde_norway::Value::Mapping(m)) => {
             for lang in ["en", "es"] {
                 if let Some(s) = m
-                    .get(serde_yaml::Value::String(lang.into()))
+                    .get(serde_norway::Value::String(lang.into()))
                     .and_then(|v| v.as_str())
                 {
                     return s.trim().to_string();
@@ -281,7 +281,7 @@ fn en_text(v: Option<serde_yaml::Value>) -> String {
             }
             String::new()
         }
-        Some(serde_yaml::Value::String(s)) => s.trim().to_string(),
+        Some(serde_norway::Value::String(s)) => s.trim().to_string(),
         _ => String::new(),
     }
 }
@@ -372,7 +372,7 @@ pub fn fetch() -> Result<Catalog, String> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Ok(y) = serde_yaml::from_str::<YamlEntry>(&text) else {
+            let Ok(y) = serde_norway::from_str::<YamlEntry>(&text) else {
                 continue;
             };
             let repo = y.repo.unwrap_or_default().trim().trim_matches('"').to_string();
@@ -483,10 +483,10 @@ mod tests {
     /// normalized entry; plain-string desc works too.
     #[test]
     fn en_text_handles_map_and_scalar() {
-        let map: serde_yaml::Value =
-            serde_yaml::from_str("en: \"Hello\"\nes: \"Hola\"").unwrap();
+        let map: serde_norway::Value =
+            serde_norway::from_str("en: \"Hello\"\nes: \"Hola\"").unwrap();
         assert_eq!(en_text(Some(map)), "Hello");
-        let scalar: serde_yaml::Value = serde_yaml::from_str("\"Just text\"").unwrap();
+        let scalar: serde_norway::Value = serde_norway::from_str("\"Just text\"").unwrap();
         assert_eq!(en_text(Some(scalar)), "Just text");
         assert_eq!(en_text(None), "");
     }
