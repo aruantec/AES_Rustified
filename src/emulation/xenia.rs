@@ -31,7 +31,9 @@ use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HWND, LPARAM, POINT, RECT, WAIT_TIMEOUT, WPARAM,
 };
 #[cfg(windows)]
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE,
+};
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 #[cfg(windows)]
@@ -115,6 +117,18 @@ unsafe extern "system" {
 #[cfg(windows)]
 const SUSPEND_ACCESS: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(PROCESS_SUSPEND_RESUME.0 | PROCESS_QUERY_LIMITED_INFORMATION.0);
+
+/// Env hints applied to every spawned child — a captured window is
+/// cloaked and never holds OS focus, so SDL-based exes (decomp ports,
+/// shadPS4, Flycast…) must be told to keep polling input anyway.
+/// `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS` is the gamepad gate (both
+/// SDL2 and SDL3 read this name); the minimize hints keep SDL from
+/// iconifying on focus loss (Lacrima sets the same).
+const SDL_ENV: &[(&str, &str)] = &[
+    ("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1"),
+    ("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0"),
+    ("SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0"),
+];
 
 /// Owns a Windows Job Object with KILL_ON_JOB_CLOSE: when the last
 /// handle to the job closes — on normal Drop AND on an abrupt process
@@ -564,7 +578,17 @@ impl Session {
             }
             // Decomp ports launch bare — the discovered exe IS the
             // game (or its launcher); no CLI args, no config writes.
-            Kind::Decomp => {}
+            Kind::Decomp => {
+                // A console-subsystem build would allocate a command
+                // window next to the render window; suppress it at
+                // spawn — the sweep still hides consoles helper
+                // children open later.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
+            }
             _ => {
                 cmd.arg(game);
             }
@@ -587,6 +611,15 @@ impl Session {
             // EnsureBackgroundInputCaptureEnabled). Same mechanism
             // hides the in-frame menubar and the first-run welcome.
             ensure_xemu_settings(&work_dir);
+        }
+        // A cloaked/parked window never holds OS focus (and the
+        // watchdog reclaims it to the app every sweep) — SDL children
+        // drop joystick/gamepad events for unfocused windows unless
+        // the background-events hint says otherwise. SDL2 and SDL3
+        // read the same env names (Lacrima sets them on its launch
+        // path); harmless for non-SDL emulators.
+        for &(k, v) in SDL_ENV {
+            cmd.env(k, v);
         }
         // Own process group — stop() can kill the whole tree on unix
         // (emulators spawn helper processes), matching the Windows
@@ -876,18 +909,28 @@ impl Session {
     /// are harmless.
     #[cfg(windows)]
     fn input_targets(&self) -> Vec<HWND> {
-        let hwnd = self.hwnd();
-        if hwnd.is_invalid() {
-            return Vec::new();
-        }
-        let mut out = vec![hwnd];
-        for mode in [GA_ROOT, GA_ROOTOWNER] {
-            let anc = unsafe { GetAncestor(hwnd, mode) };
-            if !anc.is_invalid() && !out.contains(&anc) {
-                out.push(anc);
-            }
-        }
-        out
+        input_targets(self.hwnd())
+    }
+
+    /// The non-destructive half of Lacrima's ForceEmulatorFocus —
+    /// posted activation/focus messages instead of a real
+    /// SetForegroundWindow handoff (the watchdog reclaims OS focus to
+    /// the app every sweep, and a real steal would kill app
+    /// shortcuts while the capture owns input). The messages flip
+    /// the target's *internal* focus flag — SDL's
+    /// `SDL_WINDOW_INPUT_FOCUS` gates gamepad input on it; Qt/Unity
+    /// WndProcs check the same — so pads and focus-gated clicks flow
+    /// while the window stays cloaked at the OS level.
+    #[cfg(windows)]
+    pub fn send_activation(&self) -> usize {
+        activate_targets(self.hwnd())
+    }
+
+    /// Non-Windows stub — the nested compositor owns focus there.
+    #[cfg(not(windows))]
+    #[allow(dead_code)]
+    pub fn send_activation(&self) -> usize {
+        0
     }
 
     /// Post a pointer message (`(x, y)` = client coords of the
@@ -923,18 +966,52 @@ impl Session {
         n
     }
 
-    /// The render window's client size in its own pixel space — the
-    /// tunnel scales captured-frame coords by client/frame rather
-    /// than assuming they're equal.
+    /// The client area inside the captured frame, in window px:
+    /// `(frame_w, frame_h, off_x, off_y, client_w, client_h)` where
+    /// the frame is the window's visible bounds (DWMWA_EXTENDED_
+    /// FRAME_BOUNDS — what WGC captures) and the offset is the
+    /// client's origin within it. Kinds on the cloak-only prep path
+    /// (Decomp/Dolphin/Cemu/Eden) keep their caption, so the frame
+    /// carries a title bar the draw must crop out and the input
+    /// tunnel must offset past — without SetWindowPos/SetWindowLongPtr
+    /// calls into a possibly-busy game thread (why those kinds skip
+    /// `prepare_window_for_capture` at all). Borderless windows
+    /// report a full-frame rect — identity for both consumers.
     #[cfg(windows)]
-    pub fn client_size(&self) -> Option<(i32, i32)> {
+    pub fn client_frame(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
         let hwnd = self.hwnd();
         if hwnd.is_invalid() {
             return None;
         }
-        let mut r = RECT::default();
-        unsafe { GetClientRect(hwnd, &mut r) }.ok()?;
-        Some((r.right - r.left, r.bottom - r.top))
+        unsafe {
+            let mut ext = RECT::default();
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut ext as *mut _ as *mut _,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .ok()?;
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client).ok()?;
+            let mut org = POINT::default();
+            let _ = ClientToScreen(hwnd, &mut org);
+            Some((
+                (ext.right - ext.left).max(1) as f32,
+                (ext.bottom - ext.top).max(1) as f32,
+                (org.x - ext.left) as f32,
+                (org.y - ext.top) as f32,
+                (client.right - client.left).max(1) as f32,
+                (client.bottom - client.top).max(1) as f32,
+            ))
+        }
+    }
+
+    /// Non-Windows stub — compositor frames are pure client content.
+    #[cfg(not(windows))]
+    #[allow(dead_code)]
+    pub fn client_frame(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
+        None
     }
 
     /// WM_MOUSEWHEEL takes *screen* coords in lParam — translate a
@@ -1729,6 +1806,8 @@ fn worker_main(
     //    capture-failure restore path.
     let mut hidden: std::collections::HashMap<usize, SavedWindow> =
         std::collections::HashMap::new();
+    // Pre-dated so the first sweep attaches consoles immediately.
+    let mut console_t = Instant::now() - Duration::from_secs(1);
     // Lacrima's CaptureStartupDelayMs — xemu waits 1500ms for its
     // early boot windows, RPCS3 2500ms (the gs_frame takes longer).
     // RPCS3 sweeps at 25ms instead of 100ms so a freshly-spawned Qt
@@ -1775,6 +1854,7 @@ fn worker_main(
             &mut hidden,
             kind,
             app_hwnd,
+            &mut console_t,
         );
         if stop.load(Ordering::Relaxed)
             || (!alive(proc)
@@ -1806,6 +1886,7 @@ fn worker_main(
                     &mut hidden,
                     kind,
                     app_hwnd,
+                    &mut console_t,
                 );
                 if let Ok(meta) = std::fs::metadata(tp) {
                     if meta.len() < pos {
@@ -1852,6 +1933,7 @@ fn worker_main(
                     &mut hidden,
                     kind,
                     app_hwnd,
+                    &mut console_t,
                 );
                 let ready = logs.iter().any(|p| {
                     std::fs::read_to_string(p)
@@ -1928,7 +2010,14 @@ fn worker_main(
             break;
         }
         let pids = win_pids(pid, kind, match_root);
-        sweep_hide(&pids, HWND::default(), &mut hidden, kind, app_hwnd);
+        sweep_hide(
+            &pids,
+            HWND::default(),
+            &mut hidden,
+            kind,
+            app_hwnd,
+            &mut console_t,
+        );
         if kind == Kind::Decomp {
             let others: Vec<u32> = pids.iter().copied().filter(|&p| p != pid).collect();
             if others.is_empty() {
@@ -2340,6 +2429,7 @@ fn worker_main(
         &mut hidden,
         kind,
         app_hwnd,
+        &mut console_t,
     );
 
     if kind == Kind::RetroArch {
@@ -2380,6 +2470,9 @@ fn worker_main(
     //    The sweep keeps parking late windows (dialogs, consoles) the
     //    emulator creates after the target resolved.
     let mut capture_err: Option<String> = None;
+    // First poll is immediate — SDL/Qt read their focus flag once at
+    // startup, before the first frame ever draws.
+    let mut last_act = Instant::now() - Duration::from_secs(2);
     loop {
         if stop.load(Ordering::Relaxed)
             || (!alive(proc)
@@ -2394,6 +2487,7 @@ fn worker_main(
             &mut hidden,
             kind,
             app_hwnd,
+            &mut console_t,
         );
         if kind == Kind::RetroArch {
             retroarch_watchdog(
@@ -2414,6 +2508,18 @@ fn worker_main(
         // game windows carry no HMENU anyway.)
         if !matches!(kind, Kind::Cemu | Kind::RetroArch | Kind::Decomp) {
             strip_menu(hwnd);
+        }
+        // Lacrima's ForceEmulatorFocus, sustained: a cloaked window
+        // never holds OS focus, so focus-gated input (SDL's gamepad
+        // filter above all) stays dead unless its WndProc's internal
+        // flag is flipped. Posted activation — NOT a real
+        // SetForegroundWindow steal: reclaim_app_focus hands OS focus
+        // back to the app every sweep, and a real steal would kill
+        // app shortcuts while the capture owns input. ~1.2s keeps the
+        // flag asserted for gamepad-only sessions that never click.
+        if last_act.elapsed() >= Duration::from_millis(1200) {
+            last_act = Instant::now();
+            activate_targets(hwnd);
         }
         if let Some(err) = frames.lock().unwrap_or_else(|p| p.into_inner()).err.clone() {
             capture_err = Some(err);
@@ -4105,6 +4211,50 @@ fn reclaim_app_focus(app: HWND, emu_pids: &[u32]) {
     }
 }
 
+/// The deduped hwnd set input events and activation posts target —
+/// the window itself plus its GA_ROOT and GA_ROOTOWNER ancestors.
+#[cfg(windows)]
+fn input_targets(hwnd: HWND) -> Vec<HWND> {
+    if hwnd.is_invalid() {
+        return Vec::new();
+    }
+    let mut out = vec![hwnd];
+    for mode in [GA_ROOT, GA_ROOTOWNER] {
+        let anc = unsafe { GetAncestor(hwnd, mode) };
+        if !anc.is_invalid() && !out.contains(&anc) {
+            out.push(anc);
+        }
+    }
+    out
+}
+
+/// Posted activation triplet — the message half of Lacrima's
+/// ForceEmulatorFocus (`WA_CLICKACTIVE`=2). `WM_SETFOCUS` carries
+/// lParam=0 (no "losing" window); `WM_NCACTIVATE` wParam=TRUE.
+#[cfg(windows)]
+const ACTIVATION_MSGS: [(u32, usize, isize); 3] = [
+    (WM_NCACTIVATE, 1, 0),
+    (WM_ACTIVATE, 2, 0),
+    (WM_SETFOCUS, 0, 0),
+];
+
+/// Post the activation triplet to every input target — flips the
+/// WndProc's internal focused/active flag (SDL's
+/// `SDL_WINDOW_INPUT_FOCUS` gates gamepad input on it) without a
+/// real foreground steal, which the watchdog would undo anyway and
+/// which would starve the app's own keyboard input.
+#[cfg(windows)]
+fn activate_targets(hwnd: HWND) -> usize {
+    let targets = input_targets(hwnd);
+    let n = targets.len();
+    for t in targets {
+        for &(msg, w, l) in &ACTIVATION_MSGS {
+            let _ = unsafe { PostMessageW(Some(t), msg, WPARAM(w), LPARAM(l)) };
+        }
+    }
+    n
+}
+
 /// Strip the frame off RA's render window so only the game surface
 /// shows even when a core re-centers it on-screen. Removing
 /// WS_CAPTION drops the title bar but NOT the HMENU — a menu-less
@@ -4219,23 +4369,11 @@ fn retroarch_watchdog(
     hwnd_out: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
     unsafe {
-        // No-op when RA has no console, and skipped entirely when
-        // this process already owns one (test harnesses).
-        if AttachConsole(pid).is_ok() {
-            let w = GetConsoleWindow();
-            let _ = FreeConsole();
-            // FreeConsole closes the console handles Windows just
-            // associated with our process — our std handles are left
-            // DANGLING, and the next Command::spawn dies in
-            // CreateProcess with ERROR_INVALID_HANDLE ("Das Handle
-            // ist ungültig", os error 6). A GUI app's std handles
-            // should be NULL — restore that so handle-inheritance
-            // survives into the next launch.
-            for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-                let _ = SetStdHandle(h, HANDLE::default());
-            }
-            hide_console_window(w);
-        }
+        // Hide the core's console — the sweep does this for every
+        // kind, but it also has to run while the watchdog is in its
+        // early-return reattach path (skipped entirely when this
+        // process already owns a console, e.g. test harnesses).
+        hide_pid_console(pid);
         if !IsWindow(Some(*hwnd)).as_bool() {
             let new = resolve_capture_target(&win_pids(pid, Kind::RetroArch, None), pid, Kind::RetroArch);
             if retroarch_needs_retarget(*hwnd, new) {
@@ -4328,6 +4466,7 @@ fn sweep_hide(
     hidden: &mut std::collections::HashMap<usize, SavedWindow>,
     kind: Kind,
     app: HWND,
+    console_t: &mut Instant,
 ) {
     // RetroArchHandler.PrepareProcessForCapture is a NO-OP:
     // "RetroArch uses Vulkan/DX and can fail to render if its window
@@ -4340,7 +4479,19 @@ fn sweep_hide(
     // parked at the corner, so nothing ever flashes on-screen).
     // Cores like Panda3DS AllocConsole a "Log Console" (console
     // windows report the owner's pid on Win11) — those get SW_HIDE,
-    // the reliable console hide.
+    // the reliable console hide. Consoles owned by conhost/
+    // OpenConsole don't report the game's pid and never reach the
+    // window sweep — AttachConsole→GetConsoleWindow is the only
+    // reliable reach. Throttled: a console window flashes a beat at
+    // most instead of riding the 25ms poll with an LPC attach per
+    // pid. Runs for every kind — a decomp game spawning `cmd` for
+    // setup is no different from a core's AllocConsole.
+    if console_t.elapsed() >= Duration::from_millis(500) {
+        *console_t = Instant::now();
+        for &p in pids {
+            hide_pid_console(p);
+        }
+    }
     if kind == Kind::RetroArch {
         for hwnd in process_windows_of(pids, false) {
             if hwnd == skip || hwnd.is_invalid() {
@@ -4390,7 +4541,14 @@ fn sweep_hide(
                 | Kind::Decomp
         );
         hidden.entry(hwnd.0 as usize).or_insert_with(|| {
-            if cloak {
+            if class_name(hwnd).to_lowercase().contains("console") {
+                // ConsoleWindowClass is conhost-drawn — DWM cloaking
+                // is unreliable on it (why RetroArch's branch hid
+                // consoles with SW_HIDE instead). Any kind can own
+                // one — a decomp game spawning `cmd` for setup.
+                hide_console_window(hwnd);
+                snapshot_window(hwnd)
+            } else if cloak {
                 let s = snapshot_window(hwnd);
                 set_cloaked(hwnd, true);
                 s
@@ -4406,6 +4564,28 @@ fn sweep_hide(
     // shortcut (and the input tunnel's event source) goes dead for
     // the session. Hand it back to the app window.
     reclaim_app_focus(app, pids);
+}
+
+/// Hide the console a matched process owns. conhost-drawn console
+/// windows are outside the pid sweep entirely (the per-window class
+/// check only catches consoles that report the owner's pid), and
+/// AttachConsole→GetConsoleWindow is the only reliable reach —
+/// Lacrima's console hide, generalized from RetroArch to every kind.
+/// The std-handle restore after FreeConsole is REQUIRED: FreeConsole
+/// leaves our std handles dangling, and the next Command::spawn
+/// dies in CreateProcess with ERROR_INVALID_HANDLE (os error 6).
+#[cfg(windows)]
+fn hide_pid_console(pid: u32) {
+    unsafe {
+        if AttachConsole(pid).is_ok() {
+            let w = GetConsoleWindow();
+            let _ = FreeConsole();
+            for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let _ = SetStdHandle(h, HANDLE::default());
+            }
+            hide_console_window(w);
+        }
+    }
 }
 
 /// Lacrima's TrySendControlS — RPCS3's graceful stop shortcut. Focus
@@ -4900,6 +5080,46 @@ mod tests {
         std::fs::write(sys.join("mpr-17933.bin"), b"x").unwrap();
         assert!(super::saturn_bios_error(&exe, &beetle).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The captured window is cloaked and never holds OS focus — SDL
+    /// children must get the background-events hint at spawn or
+    /// gamepad input stays dead (SDL2/SDL3 read the same names).
+    #[test]
+    fn sdl_env_has_background_joystick() {
+        let pairs: std::collections::HashMap<&str, &str> =
+            super::SDL_ENV.iter().copied().collect();
+        assert_eq!(
+            pairs.get("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"),
+            Some(&"1")
+        );
+        // Focus-loss must not minimize either (Lacrima's hint set).
+        assert_eq!(pairs.get("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS"), Some(&"0"));
+    }
+
+    /// The posted-activation triplet mirrors Lacrima's
+    /// ForceEmulatorFocus: WM_NCACTIVATE(TRUE), WM_ACTIVATE with
+    /// WA_CLICKACTIVE(2), WM_SETFOCUS — in that order, so the
+    /// WndProc's internal focus flag flips before input posts land.
+    #[cfg(windows)]
+    #[test]
+    fn activation_msgs_clickactive_order() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WM_ACTIVATE, WM_NCACTIVATE, WM_SETFOCUS,
+        };
+        let msgs = super::ACTIVATION_MSGS;
+        assert_eq!(msgs[0], (WM_NCACTIVATE, 1, 0));
+        assert_eq!(msgs[1], (WM_ACTIVATE, 2, 0)); // WA_CLICKACTIVE
+        assert_eq!(msgs[2], (WM_SETFOCUS, 0, 0));
+    }
+
+    /// Activation posts go to the same deduped target set the input
+    /// tunnel uses — window + GA_ROOT + GA_ROOTOWNER ancestors.
+    /// (Invalid hwnd → no targets, no posts.)
+    #[cfg(windows)]
+    #[test]
+    fn input_targets_empty_on_invalid() {
+        assert!(super::input_targets(windows::Win32::Foundation::HWND::default()).is_empty());
     }
 
     /// Repro driver for the live RetroArch capture path — run with

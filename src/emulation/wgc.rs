@@ -116,6 +116,11 @@ pub struct GpuState {
     pub share: Mutex<Option<GpuShare>>,
     /// Latest signaled frame — also the fence value.
     pub seq: std::sync::atomic::AtomicU64,
+    /// Every frame the pool handed us — including ones the drain
+    /// skipped for a newer one. The stats overlay derives capture
+    /// fps from this delta; `seq` alone undercounts whenever more
+    /// than one frame lands between drains.
+    pub arrived: std::sync::atomic::AtomicU64,
     /// First interop failure — the capture stays on the CPU mirror
     /// permanently after this is set (surfaced in the stats overlay).
     pub err: Mutex<Option<String>>,
@@ -315,7 +320,12 @@ fn run(
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
     let size = item.Size()?;
 
-    let pool_frames = if low_latency { 1 } else { 2 };
+    // Lacrima's WgcBridge: 3 buffers low-latency, 10 otherwise. A
+    // frame stays checked out for the whole copy+swizzle, and WGC
+    // silently drops arrivals while every slot is held — 1-2 slots
+    // starve a 120fps source down to ~60 delivered. Depth costs
+    // nothing on latency here: the drain always picks the newest.
+    let pool_frames = if low_latency { 3 } else { 10 };
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -378,6 +388,17 @@ fn run(
     // applies — the session casts to the session2/3 interfaces itself).
     let _ = session.SetIsCursorCaptureEnabled(false);
     let _ = session.SetIsBorderRequired(false);
+    // WGC throttles produced frames to ~60fps by default
+    // (MinUpdateInterval floor) regardless of display refresh —
+    // Sunshine/Apollo hit the same cap on >60Hz sources. A small
+    // floor lifts it; production stays content-gated so a 60Hz
+    // source still can't over-produce. The floor must be below the
+    // real update cadence — an interval larger than the frame
+    // spacing makes WGC drop alternate frames (Apollo's 100Hz→50).
+    // 1ms = up to 1000fps allowed; no-op on pre-24H2 Windows.
+    let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan {
+        Duration: 10_000,
+    });
     session.StartCapture()?;
 
     // Park: the frame pool runs on its own threads; we just hold the
@@ -395,8 +416,13 @@ fn run(
 #[cfg(windows)]
 fn drain_frames(pool: &Direct3D11CaptureFramePool, ctx: &mut Ctx) {
     let mut frame: Option<Direct3D11CaptureFrame> = None;
+    let mut dequeued = 0u64;
     while let Ok(next) = pool.TryGetNextFrame() {
         frame = Some(next);
+        dequeued += 1;
+    }
+    if dequeued > 0 {
+        ctx.gpu.arrived.fetch_add(dequeued, Ordering::Relaxed);
     }
     let Some(frame) = frame else { return };
 

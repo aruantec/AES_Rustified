@@ -52,7 +52,7 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
 /// Section keys that have a playable handler — Xenia/X360,
@@ -759,6 +759,10 @@ pub struct EmuView {
     /// The live frame mapping the tunnel needs — `(dest, uv)` —
     /// refreshed every frame the session draw path computes them.
     tun_map: Option<(Rect, Rect)>,
+    /// The client rect's sub-rect inside the captured frame (window
+    /// chrome correction) — cached so the end-of-session fade keeps
+    /// the same crop after the session drops.
+    client_uv: Option<Rect>,
     /// Held mouse-button mask (MK_* bits on Windows, BTN_* bits off
     /// it) + tracked modifier state so tunneled events carry correct
     /// key flags.
@@ -878,6 +882,7 @@ impl EmuView {
             aspect_applied: false,
             input_tun: false,
             tun_map: None,
+            client_uv: None,
             tun_buttons: 0,
             tun_mods: 0,
             tun_sent: 0,
@@ -1015,6 +1020,11 @@ impl EmuView {
     /// emulator's hidden window.
     pub fn toggle_input_tunnel(&mut self) {
         self.input_tun = !self.input_tun;
+        if self.input_tun {
+            if let Some(s) = &self.session {
+                s.send_activation();
+            }
+        }
     }
 
     /// Play a card by path — the carousel's `Action::Play` routing
@@ -1604,6 +1614,7 @@ pub fn view(
                 emu.launch_rx = None;
                 emu.notice = None;
                 emu.fx.stats_instant = None;
+                emu.fx.stats_seq = 0;
                 emu.fx.frametimes.clear();
                 // A fresh launch always opens on the game — the
                 // presentation fades in over the carousel.
@@ -2921,6 +2932,74 @@ pub(crate) fn frame_dest_uv(
     (dest, uv)
 }
 
+/// Non-client chrome correction for the cloak-path kinds (Decomp,
+/// Dolphin, Cemu, Eden): the captured frame is the window's visible
+/// bounds — title bar and borders included — but game content and
+/// input live in the client rect. Returns `(content_w, content_h,
+/// pillar_in_client_px, client_subrect_uv)` so the fit aspect uses
+/// the client size, pillar insets shift into client space, and the
+/// returned sub-rect composes a content-space uv into frame space
+/// (`uv_in_frame`) — chrome is never sampled. Identity `(fw, fh,
+/// pillar, None)` for borderless windows or unreadable geometry —
+/// the restyle-free equivalent of Lacrima's caption strip, with no
+/// calls into a possibly-busy game thread.
+pub(crate) fn client_frame_fit(
+    session: Option<&xenia::Session>,
+    fw: usize,
+    fh: usize,
+    pillar: (f32, f32),
+) -> (usize, usize, (f32, f32), Option<Rect>) {
+    match session.and_then(|s| s.client_frame()) {
+        Some(cf) => client_frame_fit_of(cf, fw, fh, pillar),
+        None => (fw, fh, pillar, None),
+    }
+}
+
+/// The pure half of `client_frame_fit` — split out for tests. `cf` is
+/// `Session::client_frame`'s `(frame_w, frame_h, off_x, off_y,
+/// client_w, client_h)` in window px.
+fn client_frame_fit_of(
+    cf: (f32, f32, f32, f32, f32, f32),
+    fw: usize,
+    fh: usize,
+    pillar: (f32, f32),
+) -> (usize, usize, (f32, f32), Option<Rect>) {
+    let (w, h, ox, oy, cw, ch) = cf;
+    // A mid-resize/minimized window can report a frame that doesn't
+    // contain its client rect — draw the raw frame rather than crop
+    // to garbage. (2px tolerance for DWM rounding.)
+    if ox < 0.0 || oy < 0.0 || ox + cw > w + 2.0 || oy + ch > h + 2.0 {
+        return (fw, fh, pillar, None);
+    }
+    // Borderless/full-client → the compose is an identity; report it
+    // as `None` so callers skip the extra rect math entirely.
+    let sub = if ox <= 0.5 && oy <= 0.5 && (w - cw).abs() <= 1.5 && (h - ch).abs() <= 1.5 {
+        None
+    } else {
+        Some(Rect::from_min_size(
+            Pos2::new(ox / w, oy / h),
+            Vec2::new(cw / w, ch / h),
+        ))
+    };
+    // Frame-space pillar insets shift by the client's left/top
+    // (right inset by the trailing non-client strip).
+    let pl = (pillar.0 - ox).max(0.0);
+    let pr = (pillar.1 - (w - ox - cw)).max(0.0);
+    (cw as usize, ch as usize, (pl, pr), sub)
+}
+
+/// Compose a content-space uv into frame space through a sub-rect —
+/// `inner` samples the client area, the result samples the frame.
+pub(crate) fn uv_in_frame(sub: Rect, inner: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            sub.min.x + inner.min.x * sub.width(),
+            sub.min.y + inner.min.y * sub.height(),
+        ),
+        Vec2::new(inner.width() * sub.width(), inner.height() * sub.height()),
+    )
+}
+
 /// Per-view tunnel state the shared forwarder reads/writes — the
 /// emulation and re/decomp views carry the same fields, so the
 /// bundle hands them over without duplicating the message plumbing.
@@ -2968,15 +3047,16 @@ pub(crate) fn tunnel_input(
     if !matches!(session.status(), xenia::Status::Capturing) {
         return;
     }
-    let Some((cw, ch)) = session.client_size() else {
+    let Some((fw, fh, ox, oy, cw, ch)) = session.client_frame() else {
         *io.dbg = Some("no client rect".into());
         return;
     };
     *io.dbg = None;
     // egui point → emulator client pixel. `uv` is the sampled frame
-    // window (pillar crops included) normalized 0..1, so a fraction
-    // of the client size lands on the right texel without needing
-    // the frame's own DPI scale.
+    // window (pillar crops included) normalized 0..1 over the whole
+    // captured frame — which includes the title bar for kinds that
+    // keep their chrome, so the map works in window px and subtracts
+    // the client offset instead of assuming frame == client.
     // Callers gate `dest.contains` themselves; the map clamps so
     // drags/releases that leave the frame still resolve to an edge.
     let map = |p: Pos2| -> Option<(i32, i32)> {
@@ -2989,9 +3069,16 @@ pub(crate) fn tunnel_input(
         );
         let tx = (p.x - dest.min.x) / dest.width();
         let ty = (p.y - dest.min.y) / dest.height();
+        // Frame fraction → window px → client px, clamped into the
+        // client rect so clicks on captured chrome land on the edge
+        // rather than at negative/overflowing coordinates.
         Some((
-            ((uv.min.x + tx * uv.width()) * cw as f32).round() as i32,
-            ((uv.min.y + ty * uv.height()) * ch as f32).round() as i32,
+            ((uv.min.x + tx * uv.width()) * fw - ox)
+                .round()
+                .clamp(0.0, cw - 1.0) as i32,
+            ((uv.min.y + ty * uv.height()) * fh - oy)
+                .round()
+                .clamp(0.0, ch - 1.0) as i32,
         ))
     };
     let btns = io.buttons;
@@ -3049,6 +3136,24 @@ pub(crate) fn tunnel_input(
                     // always forward when the button was held so a
                     // drag-out can't leave it stuck.
                     if (*pressed && dest.contains(*pos)) || (!*pressed && held) {
+                        if *pressed {
+                            // Re-assert activation on every click
+                            // (posted, not a real focus steal; same
+                            // FIFO queue as the button so it lands
+                            // first) — then WM_MOUSEACTIVATE, the
+                            // handshake real clicks run before the
+                            // button message. WndProcs that gate
+                            // clicks on it (SDL's capture logic)
+                            // need to see it.
+                            session.send_activation();
+                            // LOWORD=HTCLIENT(1), HIWORD=the mouse
+                            // message that prompted it.
+                            session.post(
+                                WM_MOUSEACTIVATE,
+                                WPARAM(0),
+                                LPARAM(1 | ((down as isize) << 16)),
+                            );
+                        }
                         if let Some((x, y)) = map(*pos) {
                             *sent += session.post_at(
                                 if *pressed { down } else { up },
@@ -3421,6 +3526,10 @@ pub(crate) struct CapFx {
     /// Stats overlay — capture fps/frametime tracking and the
     /// rolling frametime ring for the graph.
     pub stats_instant: Option<std::time::Instant>,
+    /// Last-seen `GpuState::arrived` — the fps delta is measured on
+    /// the producer's delivery counter, not the displayed seq, so
+    /// frames the drain skipped for a newer one still count.
+    pub stats_seq: u64,
     pub stats_fps: f32,
     pub stats_ft_ms: f32,
     pub frametimes: std::collections::VecDeque<f32>,
@@ -3444,6 +3553,7 @@ impl Default for CapFx {
     fn default() -> Self {
         Self {
             stats_instant: None,
+            stats_seq: 0,
             stats_fps: 0.0,
             stats_ft_ms: 0.0,
             frametimes: std::collections::VecDeque::new(),
@@ -3459,19 +3569,28 @@ impl Default for CapFx {
     }
 }
 
-/// Stats bookkeeping on a new captured seq — capture fps and the
-/// rolling frametime ring (Lacrima's PortalCaptureFps /
-/// PortalFrametimeGraphGeometry).
-pub(crate) fn fx_stats_tick(fx: &mut CapFx) {
+/// Stats bookkeeping on newly arrived capture frames — capture fps
+/// and the rolling frametime ring (Lacrima's PortalCaptureFps /
+/// PortalFrametimeGraphGeometry). `arrived` is the producer's seq
+/// delta since the last tick: the UI repaints at display-vs sync
+/// rate while WGC can deliver faster, so a 120fps source on a 60Hz
+/// UI carries arrived=2 per tick — counting ticks would report the
+/// monitor's rate, not the capture's.
+pub(crate) fn fx_stats_tick(fx: &mut CapFx, arrived: u64) {
     let now = std::time::Instant::now();
     if let Some(last) = fx.stats_instant.replace(now) {
-        let ms = now.duration_since(last).as_secs_f32() * 1000.0;
-        fx.frametimes.push_back(ms);
+        let dt = now.duration_since(last).as_secs_f32() * 1000.0;
+        let ms = dt / arrived.max(1) as f32;
+        // One ring entry per arrived frame (capped — a stalled tick
+        // must not flood the graph with interpolated points).
+        for _ in 0..arrived.min(8) {
+            fx.frametimes.push_back(ms);
+        }
         while fx.frametimes.len() > 240 {
             fx.frametimes.pop_front();
         }
         fx.stats_ft_ms += (ms - fx.stats_ft_ms) * 0.15;
-        fx.stats_fps += (1000.0 / ms.max(0.01) - fx.stats_fps) * 0.15;
+        fx.stats_fps += (arrived.max(1) as f32 * 1000.0 / dt.max(0.01) - fx.stats_fps) * 0.15;
     }
 }
 
@@ -3643,8 +3762,21 @@ fn draw_session(
         } else {
             return;
         };
-        let (dest, uv) =
-            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.fx.pillar_cur);
+        // Session gone — keep the last client crop so the fade doesn't
+        // flash window chrome back for a few frames.
+        let (cw, ch, cu) = emu
+            .client_uv
+            .map(|r| {
+                (
+                    ((r.width() * fw as f32).max(1.0)) as usize,
+                    ((r.height() * fh as f32).max(1.0)) as usize,
+                    Some(r),
+                )
+            })
+            .unwrap_or((fw, fh, None));
+        let (dest, uv0) =
+            frame_dest_uv(rect, cw, ch, emu.crop_t, emu.render.stretch, emu.fx.pillar_cur);
+        let uv = cu.map(|sub| uv_in_frame(sub, uv0)).unwrap_or(uv0);
         let seq = emu.frame_seq;
         let adjust = render_adjust(&emu.render);
         let cb = emu
@@ -3820,10 +3952,16 @@ fn draw_session(
             }
         }
         if let Some(seq) = new_seq {
-            emu.frame_seq = seq;
             // Stats-overlay bookkeeping — capture-side fps and the
-            // rolling frametime ring.
-            fx_stats_tick(&mut emu.fx);
+            // rolling frametime ring. The fps delta is measured on
+            // the producer's `arrived` counter: it also counts the
+            // frames the drain skipped for a newer one, which the
+            // displayed seq delta cannot.
+            let a = session.gpu_state().arrived.load(Ordering::Acquire);
+            let arrived = a.saturating_sub(emu.fx.stats_seq).clamp(1, 64);
+            emu.fx.stats_seq = a;
+            emu.frame_seq = seq;
+            fx_stats_tick(&mut emu.fx, arrived);
         }
     }
 
@@ -3877,8 +4015,16 @@ fn draw_session(
     }
 
     if let Some((fw, fh)) = frame_dims {
-        let (dest, uv) =
-            frame_dest_uv(rect, fw, fh, emu.crop_t, emu.render.stretch, emu.fx.pillar_cur);
+        let (cw, ch, pillar, cu) = client_frame_fit(
+            emu.session.as_ref(),
+            fw,
+            fh,
+            emu.fx.pillar_cur,
+        );
+        let (dest, uv0) =
+            frame_dest_uv(rect, cw, ch, emu.crop_t, emu.render.stretch, pillar);
+        let uv = cu.map(|sub| uv_in_frame(sub, uv0)).unwrap_or(uv0);
+        emu.client_uv = cu;
         // The tunnel maps screen → frame → client through this same
         // transform — refresh it wherever the draw moved to.
         emu.tun_map = Some((dest, uv));
@@ -5674,6 +5820,55 @@ mod tests {
         );
     }
 
+    /// A window that keeps its chrome (cloak-path kinds: Decomp,
+    /// Dolphin, Cemu, Eden) captures the title bar in the frame —
+    /// the fit must use the client size and the sub-rect must crop
+    /// the non-client area. Borderless geometry is an identity.
+    #[test]
+    fn client_frame_fit_crops_chrome() {
+        // 1600x932 window: 8px side/bottom borders + 32px caption →
+        // 1584x900 client.
+        let cf = (1600.0, 932.0, 8.0, 32.0, 1584.0, 900.0);
+        let (cw, ch, (pl, pr), sub) = client_frame_fit_of(cf, 1600, 932, (0.0, 0.0));
+        assert_eq!((cw, ch), (1584, 900));
+        let sub = sub.expect("chrome window crops");
+        assert!((sub.min.x - 8.0 / 1600.0).abs() < 1e-6);
+        assert!((sub.min.y - 32.0 / 932.0).abs() < 1e-6);
+        assert!((sub.width() - 1584.0 / 1600.0).abs() < 1e-6);
+        assert_eq!((pl, pr), (0.0, 0.0));
+        // Pillar insets shift from frame space into client space:
+        // 100px left bar → 92px in client px; right bar measured
+        // from the frame edge loses the trailing 8px border.
+        let (_, _, (pl, pr), _) = client_frame_fit_of(cf, 1600, 932, (100.0, 50.0));
+        assert_eq!((pl, pr), (92.0, 42.0));
+        // Borderless (off 0, client == frame) → identity, no sub-rect.
+        let (cw, ch, p, sub) =
+            client_frame_fit_of((1920.0, 1080.0, 0.0, 0.0, 1920.0, 1080.0), 1920, 1080, (9.0, 9.0));
+        assert_eq!((cw, ch), (1920, 1080));
+        assert_eq!(p, (9.0, 9.0));
+        assert!(sub.is_none());
+        // Broken containment (mid-resize) → identity fallback.
+        let (cw, ch, _, sub) =
+            client_frame_fit_of((800.0, 600.0, -10.0, 0.0, 900.0, 600.0), 800, 600, (0.0, 0.0));
+        assert_eq!((cw, ch), (800, 600));
+        assert!(sub.is_none());
+    }
+
+    /// A content-space uv composed through the client sub-rect lands
+    /// inside the frame's client area — the tunnel maps clicks and
+    /// the draw samples pixels through this same transform, so
+    /// window chrome can never shift them.
+    #[test]
+    fn uv_in_frame_composes() {
+        let sub = Rect::from_min_size(Pos2::new(0.1, 0.2), Vec2::new(0.8, 0.6));
+        let inner = Rect::from_min_size(Pos2::new(0.25, 0.5), Vec2::new(0.5, 0.5));
+        let out = uv_in_frame(sub, inner);
+        assert!((out.min.x - (0.1 + 0.25 * 0.8)).abs() < 1e-6);
+        assert!((out.min.y - (0.2 + 0.5 * 0.6)).abs() < 1e-6);
+        assert!((out.width() - 0.5 * 0.8).abs() < 1e-6);
+        assert!((out.height() - 0.5 * 0.6).abs() < 1e-6);
+    }
+
     /// The balance split: when the lanes flanking the pause hold the
     /// same icon count, the innermost right-cluster slots park left
     /// so the band reads symmetric (`spill_from` is the present-icon
@@ -5881,12 +6076,44 @@ mod tests {
     #[test]
     fn capfx_stats_tick_rolls_frametimes() {
         let mut fx = CapFx::default();
-        fx_stats_tick(&mut fx);
+        fx_stats_tick(&mut fx, 1);
         assert!(fx.frametimes.is_empty());
         std::thread::sleep(std::time::Duration::from_millis(2));
-        fx_stats_tick(&mut fx);
+        fx_stats_tick(&mut fx, 1);
         assert_eq!(fx.frametimes.len(), 1);
         assert!(fx.stats_ft_ms > 0.0);
         assert!(fx.stats_fps > 0.0);
+    }
+
+    /// Regression — the overlay must report the producer's arrival
+    /// rate, not the UI's repaint rate: a 120fps source delivers two
+    /// frames per 60Hz UI tick, so `arrived` scales both the fps
+    /// estimate and the frametime ring (each arrived frame gets an
+    /// entry, divided dt).
+    #[test]
+    fn capfx_stats_tick_counts_seq_delta() {
+        let mut fx = CapFx::default();
+        fx_stats_tick(&mut fx, 1); // seed
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        fx_stats_tick(&mut fx, 2);
+        // 2 arrived frames → 2 ring entries; frametime is the
+        // interval divided across them, fps the doubled rate.
+        assert_eq!(fx.frametimes.len(), 2);
+        let expected_ms = fx.frametimes[0];
+        let expected_fps = 2.0 * 1000.0 / (expected_ms * 2.0);
+        assert!((fx.stats_ft_ms - expected_ms * 0.15).abs() < 0.01);
+        assert!((fx.stats_fps - expected_fps * 0.15).abs() < 0.5);
+    }
+
+    /// A stalled tick must not flood the ring — the arrival burst is
+    /// capped so the graph still shows real frames, not a wall of
+    /// interpolated points.
+    #[test]
+    fn capfx_stats_tick_caps_arrival_burst() {
+        let mut fx = CapFx::default();
+        fx_stats_tick(&mut fx, 1); // seed
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fx_stats_tick(&mut fx, 500);
+        assert_eq!(fx.frametimes.len(), 8);
     }
 }

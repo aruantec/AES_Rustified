@@ -591,6 +591,10 @@ pub struct DecompView {
     /// The live frame mapping the tunnel needs — `(dest, uv)` —
     /// refreshed every frame the capture draw computes it.
     tun_map: Option<(Rect, Rect)>,
+    /// The client rect's sub-rect inside the captured frame (window
+    /// chrome correction) — cached so the end-of-session fade keeps
+    /// the same crop after the session drops.
+    client_uv: Option<Rect>,
     /// Held mouse-button mask + tracked modifier state so tunneled
     /// events carry correct key flags.
     tun_buttons: u8,
@@ -733,6 +737,7 @@ impl Default for DecompView {
             aspect_applied: false,
             input_tun: false,
             tun_map: None,
+            client_uv: None,
             tun_buttons: 0,
             tun_mods: 0,
             tun_sent: 0,
@@ -1292,6 +1297,11 @@ impl DecompView {
     /// game's hidden window.
     pub fn toggle_input_tunnel(&mut self) {
         self.input_tun = !self.input_tun;
+        if self.input_tun {
+            if let Some(s) = &self.session {
+                s.send_activation();
+            }
+        }
     }
 
     /// Entering also un-dismisses the viewport: `game_fs` alone is a
@@ -3073,14 +3083,27 @@ fn draw_capture(
         } else {
             return;
         };
-        let (dest, uv) = crate::emulation::frame_dest_uv(
+        // Session gone — keep the last client crop so the fade doesn't
+        // flash window chrome back for a few frames.
+        let (cw, ch, cu) = view
+            .client_uv
+            .map(|r| {
+                (
+                    ((r.width() * fw as f32).max(1.0)) as usize,
+                    ((r.height() * fh as f32).max(1.0)) as usize,
+                    Some(r),
+                )
+            })
+            .unwrap_or((fw, fh, None));
+        let (dest, uv0) = crate::emulation::frame_dest_uv(
             rect,
-            fw,
-            fh,
+            cw,
+            ch,
             view.crop_t,
             view.render.stretch,
             view.fx.pillar_cur,
         );
+        let uv = cu.map(|sub| crate::emulation::uv_in_frame(sub, uv0)).unwrap_or(uv0);
         let seq = view.frame_seq;
         let adjust = crate::emulation::render_adjust(&view.render);
         let cb = view
@@ -3251,10 +3274,15 @@ fn draw_capture(
             }
         }
         if let Some(seq) = new_seq {
-            view.frame_seq = seq;
             // Stats-overlay bookkeeping — capture fps + the rolling
-            // frametime ring.
-            crate::emulation::fx_stats_tick(&mut view.fx);
+            // frametime ring. The fps delta is measured on the
+            // producer's `arrived` counter, which also counts frames
+            // the drain skipped for a newer one.
+            let a = session.gpu_state().arrived.load(Ordering::Acquire);
+            let arrived = a.saturating_sub(view.fx.stats_seq).clamp(1, 64);
+            view.fx.stats_seq = a;
+            view.frame_seq = seq;
+            crate::emulation::fx_stats_tick(&mut view.fx, arrived);
         }
     }
 
@@ -3300,14 +3328,22 @@ fn draw_capture(
                 view.crop_t = view.crop_target;
             }
         }
-        let (dest, uv) = crate::emulation::frame_dest_uv(
-            rect,
+        let (cw, ch, pillar, cu) = crate::emulation::client_frame_fit(
+            view.session.as_ref(),
             fw,
             fh,
-            view.crop_t,
-            view.render.stretch,
             view.fx.pillar_cur,
         );
+        let (dest, uv0) = crate::emulation::frame_dest_uv(
+            rect,
+            cw,
+            ch,
+            view.crop_t,
+            view.render.stretch,
+            pillar,
+        );
+        let uv = cu.map(|sub| crate::emulation::uv_in_frame(sub, uv0)).unwrap_or(uv0);
+        view.client_uv = cu;
         // The tunnel maps screen → frame → client through this same
         // transform — refresh it wherever the draw moved to.
         view.tun_map = Some((dest, uv));
