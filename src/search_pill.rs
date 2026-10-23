@@ -11,7 +11,7 @@
 //!   around the icon.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2,
+    self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2,
 };
 
 const OPEN_SECS: f32 = 0.35;
@@ -245,34 +245,26 @@ impl SearchPill {
         // stroked circle around the collapsed icon (same treatment as
         // the band pill and its album-toggle sibling). The top-right
         // ring is proportionally lighter and eases to its thin open
-        // border as the box grows.
-        if spec.grow_right {
-            painter.rect_stroke(
-                rect,
-                r,
-                Stroke::new(
-                    3.5 * s,
-                    Color32::from_white_alpha((0xB0 as f32 * alpha) as u8),
-                ),
-                StrokeKind::Inside,
-            );
+        // border as the box grows. Drawn as a tessellated stadium —
+        // egui's rect_stroke leaves a hairline where the arc ends
+        // meet on a full-circle border.
+        let (bw, bcol) = if spec.grow_right {
+            (
+                3.5 * s,
+                Color32::from_white_alpha((0xB0 as f32 * alpha) as u8),
+            )
         } else {
             // Collapsed face sits dimmed — ~50% — brightening to full
             // as the box opens.
             let dim = 0.5 + 0.5 * t;
-            painter.rect_stroke(
-                rect,
-                r,
-                Stroke::new(
-                    (2.5 - 1.5 * t) * s,
-                    Color32::from_white_alpha(
-                        ((0xB0 as f32 - (0xB0 - 0x44) as f32 * t) * alpha * dim)
-                            as u8,
-                    ),
+            (
+                (2.5 - 1.5 * t) * s,
+                Color32::from_white_alpha(
+                    ((0xB0 as f32 - (0xB0 - 0x44) as f32 * t) * alpha * dim) as u8,
                 ),
-                StrokeKind::Inside,
-            );
-        }
+            )
+        };
+        stadium_stroke(painter, rect, Stroke::new(bw, bcol));
 
         // Magnifier, docked left (InnerLeftContent, Margin 10,0,5,0).
         let ic = Pos2::new(
@@ -378,6 +370,37 @@ impl SearchPill {
             self.focused = false;
         }
     }
+}
+
+/// Rounded-rect (stadium) border as one closed tessellated path —
+/// `rect_stroke` tessellates each corner arc as a separate segment,
+/// which leaves a hairline seam where the ends meet on a
+/// full-circle (collapsed) border. The path is inset by half the
+/// stroke so the line lands inside like `StrokeKind::Inside`.
+fn stadium_stroke(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
+    let rect = rect.shrink(stroke.width * 0.5);
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let r = (rect.height() * 0.5).min(rect.width() * 0.5);
+    const SEG: usize = 14;
+    let mut pts = Vec::with_capacity(SEG * 4 + 1);
+    let (cl, cr) = (rect.min.x + r, rect.max.x - r);
+    let (ct, cb) = (rect.min.y + r, rect.max.y - r);
+    use std::f32::consts::{FRAC_PI_2, PI};
+    // Clockwise, starting at the top of the right cap.
+    for (cx, cy, a0, a1) in [
+        (cr, ct, -FRAC_PI_2, 0.0),
+        (cr, cb, 0.0, FRAC_PI_2),
+        (cl, cb, FRAC_PI_2, PI),
+        (cl, ct, PI, PI + FRAC_PI_2),
+    ] {
+        for i in 0..SEG {
+            let a = a0 + (a1 - a0) * i as f32 / SEG as f32;
+            pts.push(Pos2::new(cx + r * a.cos(), cy + r * a.sin()));
+        }
+    }
+    painter.add(egui::Shape::closed_line(pts, stroke));
 }
 
 /// The magnifier glyph at `k` = size/24 scale.

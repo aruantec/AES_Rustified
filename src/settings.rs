@@ -450,6 +450,10 @@ pub struct Emulation {
     /// music band's Carousel.LayoutMode (Lacrima shares one global
     /// CoverLayoutMode; the views cycle their own here).
     pub cover_layout_mode: u8,
+    /// The Re/Decomp view's cover-layout mode — same 0/1/2 mapping,
+    /// independent of `cover_layout_mode`; defaults to the
+    /// horizontal card rows.
+    pub decomp_layout_mode: u8,
     /// GameplayRecordingOutputDirectory — where recorded videos land.
     pub recording_dir: String,
     /// Emulator executable paths keyed by handler id (Lacrima's
@@ -558,6 +562,7 @@ impl Default for Emulation {
             gameplay_autoplay: false,
             back_cover_letterbox_fill: false,
             cover_layout_mode: 0,
+            decomp_layout_mode: 2,
             // Lacrima: MyVideos/AES_Lacrima, else DataRoot/Recordings.
             recording_dir: dirs::video_dir()
                 .map(|d| d.join("AES_Rustified").to_string_lossy().into_owned())

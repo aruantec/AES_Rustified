@@ -1,55 +1,40 @@
-//! Re/Decompilation view — a curated catalog of decomp, source-port
-//! and disassembly projects, rendered in the AES card-grid language.
+//! Re/Decompilation view — a catalog of decomp, recomp, source-port
+//! and tool projects, rendered in the AES card-grid language.
 //!
-//! There is no central registry for decomp projects, so the catalog
-//! is a fixed manifest. Tracking is cheap: one `repos/{o}/{r}` call
-//! per project per session reads `pushed_at` + `default_branch`, and
-//! the installed copy carries a `.oxide_pushed` marker written at
-//! download time — a newer remote `pushed_at` is the update badge.
-//! Downloads pull the repo's zipball (default branch) into
-//! `<data>/Decomps/<slug>` via the emu_dl extract helpers. Source is
-//! copied OVER the existing tree — never a wipe — so a baserom or
-//! build outputs parked inside the project dir survive an update.
+//! The catalog itself is rebuilt from the Recompendium dataset
+//! (`catalog.rs`): one zipball fetch → normalized `catalog.json`
+//! under `<data>/Decomps/` → entries + fresh per-repo stats
+//! (`pushedAt`, release tag, stars) with zero extra API calls. The
+//! built-in `PROJECTS` manifest below stays as the offline fallback.
+//!
+//! Installs live in `<data>/Decomps/<slug>`; `.oxide_pushed` (written
+//! at download time) vs the catalog's `pushedAt` is the update badge.
+//! Source is copied OVER the existing tree — never a wipe — so a
+//! baserom or build outputs parked inside survive an update.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
 };
 
+use crate::album_row::AlbumRow;
+use crate::carousel::{self, Mode};
+use crate::emulation::catalog::{self, Entry, Kind};
+use crate::library::CoverSrc;
+use crate::search_pill::SearchPill;
+use crate::settings;
+
 /// The install marker written next to the extracted source — holds
 /// the remote `pushed_at` seen at download time.
 const MARKER: &str = ".oxide_pushed";
 const USER_AGENT: &str = "AES_Oxide-DecompCatalog/1.0";
 
-/// What kind of project this is — drives the small badge on the card.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    /// Byte-matching decompilation (zeldaret, n64decomp, pmret, …).
-    Decomp,
-    /// Static recompilation to a native port (Zelda64Recomp).
-    Recomp,
-    /// Maintained disassembly (pret's Pokémon repos).
-    Disasm,
-    /// Decomp-derived playable port that ships builds (devilutionX).
-    SourcePort,
-}
-
-impl Kind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Kind::Decomp => "Decomp",
-            Kind::Recomp => "Recomp",
-            Kind::Disasm => "Disassembly",
-            Kind::SourcePort => "Port",
-        }
-    }
-}
-
-/// One catalog entry — `repo` is `owner/repo` on GitHub.
+/// One fallback-manifest entry — `repo` is `owner/repo` on GitHub.
 pub struct Project {
     pub slug: &'static str,
     pub name: &'static str,
@@ -62,7 +47,8 @@ pub struct Project {
     pub cover_q: &'static str,
 }
 
-/// The curated catalog — big-name, actively-maintained projects.
+/// Offline fallback — big-name, actively-maintained projects shown
+/// while the upstream catalog is missing or unfetchable.
 pub const PROJECTS: &[Project] = &[
     Project {
         slug: "sm64",
@@ -195,7 +181,7 @@ pub const PROJECTS: &[Project] = &[
         name: "DevilutionX",
         repo: "diasurgical/devilutionX",
         console: "PC",
-        kind: Kind::SourcePort,
+        kind: Kind::Port,
         blurb: "The playable port — ships actual binaries.",
         cover_q: "Diablo 1996 box art",
     },
@@ -236,6 +222,67 @@ pub const PROJECTS: &[Project] = &[
         cover_q: "Zelda Majora's Mask box art",
     },
 ];
+
+/// The fallback manifest as catalog entries.
+fn fallback_entries() -> Vec<Entry> {
+    PROJECTS
+        .iter()
+        .map(|p| Entry {
+            slug: p.slug.to_string(),
+            name: p.name.to_string(),
+            kind: p.kind,
+            console: p.console.to_lowercase(),
+            status: String::new(),
+            repo: p.repo.to_string(),
+            homepage: String::new(),
+            developer: String::new(),
+            toolchain: String::new(),
+            fork_label: String::new(),
+            fork_url: String::new(),
+            description: p.blurb.to_string(),
+            requirements: String::new(),
+            tags: Vec::new(),
+            featured: false,
+            cover_q: p.cover_q.to_string(),
+            stars: None,
+            pushed_at: String::new(),
+            version: String::new(),
+            license: String::new(),
+            language: String::new(),
+            year: None,
+            progress: None,
+            abandoned: false,
+            takedown: false,
+            author: String::new(),
+            game: String::new(),
+            links: Vec::new(),
+            search_blob: String::new(),
+        })
+        .collect()
+}
+
+/// Lowercased haystack for `Entry::matches` — built once when the
+/// catalog lands in the view (fetch, cache load, or fallback).
+fn prepare_entries(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        if e.cover_q.is_empty() {
+            e.cover_q = format!("{} box art", e.name);
+        }
+        e.search_blob = format!(
+            "{} {} {} {} {} {} {} {} {}",
+            e.name,
+            e.repo,
+            e.console,
+            catalog::console_label(&e.console),
+            e.developer,
+            e.toolchain,
+            e.author,
+            e.game,
+            e.tags.join(" ")
+        )
+        .to_lowercase();
+    }
+}
 
 /// `<data>/Decomps/<slug>` — installed project trees live here.
 pub fn decomps_root() -> Option<PathBuf> {
@@ -278,7 +325,7 @@ pub(crate) struct RemoteInfo {
 /// What a card's action button does right now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
-    /// Not installed — download the source.
+    /// Not installed — download the release/source.
     Install,
     /// Installed, remote is newer — re-download.
     Update,
@@ -308,87 +355,277 @@ pub fn card_action(installed: Option<&str>, remote: Option<&RemoteInfo>) -> Acti
     }
 }
 
-impl Action {
-    fn label(self) -> &'static str {
-        match self {
-            Action::Install => "Install",
-            Action::Update => "Update",
-            Action::Open => "Open",
-        }
-    }
-}
+/// Result of a catalog fetch/cache-load, delivered to the view.
+type CatalogResult = Result<catalog::Catalog, String>;
 
-/// View state — selection, scroll spring, remote check results and
-/// in-flight downloads keyed by slug.
+/// View state — the shared item list, the loaded catalog, the
+/// kind/search filters, remote check results and in-flight
+/// downloads keyed by slug. The list itself is the same
+/// `carousel::Carousel` the music/emulation views drive: one widget
+/// for the perspective carousel and both card grids, its spring
+/// scrolling, scrollbar, marquee and menus.
 pub struct DecompView {
-    pub selected: i32,
-    scroll_cur: f32,
-    scroll_tgt: f32,
-    scroll_vel: f32,
-    /// Last computed grid column count — the vertical arrow step.
-    columns: usize,
-    /// slug → remote info; filled progressively by the check worker
-    /// (a refresh button can run it again).
+    /// The shared item list — every item's `path` is its slug.
+    pub cards: carousel::Carousel,
+    /// Texture/decode pool the shared list draws covers through.
+    row: AlbumRow,
+    /// slug → `entries` index — card paths are slugs, so the info
+    /// pane resolves the focused item through this.
+    slug_idx: HashMap<String, usize>,
+    /// slug → installed-stamp cache — refreshed on catalog load,
+    /// download completion and a staleness timer (every frame would
+    /// mean ~900 fs stats).
+    installed: HashMap<String, Option<String>>,
+    installed_at: Instant,
+    /// Working catalog — the fallback manifest until the fetched or
+    /// cached `catalog.json` lands.
+    entries: Vec<Entry>,
+    catalog: Option<catalog::Catalog>,
+    catalog_rx: Option<mpsc::Receiver<CatalogResult>>,
+    catalog_loading: bool,
+    catalog_started: bool,
+    /// slug → remote info. Filled from catalog stats in catalog mode;
+    /// by the per-repo check worker in fallback mode.
     remote: HashMap<String, RemoteInfo>,
     check_rx: Option<mpsc::Receiver<(String, RemoteInfo)>>,
     check_running: bool,
     downloads: HashMap<String, crate::emulation::emu_dl::Shared>,
     notice: Option<String>,
-    /// One-shot session check — armed on first view.
+    /// One-shot fallback check — armed only when no catalog arrives.
     checked: bool,
-    /// slug → decoded box art, fetched once + disk-cached under
-    /// `Decomps/covers/`. `None` in the channel means "failed —
-    /// don't retry this session".
-    covers: HashMap<String, egui::TextureHandle>,
-    cover_rx: Option<mpsc::Receiver<(String, Option<egui::ColorImage>)>>,
-    cover_started: bool,
+    /// Kind filter tab — `None` shows everything.
+    filter: Option<Kind>,
+    /// The search pill's filter text lives in `search.text`.
+    pub search: SearchPill,
+    /// slugs whose cover fetch was already queued this session.
+    cover_requested: HashSet<String>,
+    cover_req_tx: mpsc::Sender<(String, String, Option<PathBuf>)>,
+    cover_req_rx: Option<mpsc::Receiver<(String, String, Option<PathBuf>)>>,
+    cover_res_rx: mpsc::Receiver<(String, bool)>,
+    cover_res_tx: mpsc::Sender<(String, bool)>,
+    /// The band's layout toggle wrote a persisted setting — the app
+    /// consumes this and saves.
+    pub settings_dirty: bool,
 }
 
 impl Default for DecompView {
     fn default() -> Self {
+        let (req_tx, req_rx) = mpsc::channel();
+        let (res_tx, res_rx) = mpsc::channel();
+        let mut cards = carousel::Carousel::new();
+        cards.decomp_menu = true;
+        // The horizontal grid's two-row floor — same floor the compact
+        // music view applies.
+        cards.h_min_rows = 2;
         Self {
-            selected: 0,
-            scroll_cur: 0.0,
-            scroll_tgt: 0.0,
-            scroll_vel: 0.0,
-            columns: 1,
+            cards,
+            row: AlbumRow::new(),
+            slug_idx: HashMap::new(),
+            installed: HashMap::new(),
+            installed_at: Instant::now() - std::time::Duration::from_secs(60),
+            entries: fallback_entries(),
+            catalog: None,
+            catalog_rx: None,
+            catalog_loading: false,
+            catalog_started: false,
             remote: HashMap::new(),
             check_rx: None,
             check_running: false,
             downloads: HashMap::new(),
             notice: None,
             checked: false,
-            covers: HashMap::new(),
-            cover_rx: None,
-            cover_started: false,
+            filter: None,
+            search: SearchPill::default(),
+            cover_requested: HashSet::new(),
+            cover_req_tx: req_tx,
+            cover_req_rx: Some(req_rx),
+            cover_res_rx: res_rx,
+            cover_res_tx: res_tx,
+            settings_dirty: false,
         }
     }
 }
 
 impl DecompView {
     pub fn new() -> Self {
-        Self::default()
+        let mut v = Self::default();
+        prepare_entries(&mut v.entries);
+        v.rebuild_index();
+        v.sync_items();
+        v.apply_subset();
+        v.refresh_installed();
+        v
     }
 
-    /// Fire the once-per-session remote check (and on manual refresh).
-    /// One `repos/{o}/{r}` GET per project on a worker thread — paced
-    /// and streamed: ~19 instant API calls trip GitHub's secondary
-    /// rate limit, and per-item sends let cards resolve as answers
-    /// land instead of waiting for the slowest.
-    pub fn check_updates(&mut self) {
+    /// slug → entries index — rebuilt whenever `entries` is swapped.
+    fn rebuild_index(&mut self) {
+        self.slug_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.slug.clone(), i))
+            .collect();
+    }
+
+    /// Push `entries` into the shared list — each item's `path` is
+    /// the slug (identity for selection, covers, actions), `keywords`
+    /// carries the search haystack so `visible()`'s text filter keeps
+    /// matching repo/dev/toolchain/tags, `artist`/`album` stay clean
+    /// marquee lines.
+    fn sync_items(&mut self) {
+        let items = self
+            .entries
+            .iter()
+            .map(|e| carousel::Item {
+                path: PathBuf::from(&e.slug),
+                cover: cover_cache(&e.slug)
+                    .filter(|c| c.is_file())
+                    .map(CoverSrc::File)
+                    .unwrap_or_else(|| CoverSrc::Web(Vec::new())),
+                fallback: None,
+                title: e.name.clone(),
+                artist: if !e.developer.is_empty() {
+                    e.developer.clone()
+                } else {
+                    e.author.clone()
+                },
+                album: format!("{} · {}", catalog::console_label(&e.console), e.kind.label()),
+                keywords: e.search_blob.clone(),
+                duration: None,
+                marker: None,
+                progress: None,
+            })
+            .collect();
+        self.cards.open_items(items, "decomp".to_string());
+    }
+
+    /// The kind tab's `Carousel::set_subset` — slug paths of the
+    /// chosen kind, `None` for All.
+    fn apply_subset(&mut self) {
+        self.cards.set_subset(self.filter.map(|k| {
+            self.entries
+                .iter()
+                .filter(|e| e.kind == k)
+                .map(|e| PathBuf::from(&e.slug))
+                .collect()
+        }));
+    }
+
+    /// Tab switch: restrict the subset and re-anchor the focus on the
+    /// selection (a filtered-out selection lands on the first shown).
+    fn set_kind_filter(&mut self, k: Option<Kind>) {
+        self.filter = k;
+        self.apply_subset();
+        self.cards.focus(&self.search.text);
+    }
+
+    /// Re-stat every install marker — throttled so a frame never pays
+    /// ~900 fs stats; called on catalog load, download completion and
+    /// when the cache has gone stale.
+    fn refresh_installed(&mut self) {
+        self.installed = self
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.slug.clone(),
+                    install_dir(&e.slug).as_deref().and_then(installed_stamp),
+                )
+            })
+            .collect();
+        self.installed_at = Instant::now();
+    }
+
+    /// Consume the layout-toggle's settings write.
+    pub fn take_settings_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.settings_dirty)
+    }
+
+    /// Count of items the shared list currently shows (subset + text
+    /// filter applied) — the band's "n of m shown".
+    fn shown_count(&self) -> usize {
+        self.cards.visible(&self.search.text).len()
+    }
+
+    /// Per-kind counts for the tabs.
+    fn kind_counts(&self) -> HashMap<Kind, usize> {
+        let mut m = HashMap::new();
+        for e in &self.entries {
+            *m.entry(e.kind).or_insert(0) += 1;
+        }
+        m
+    }
+
+    /// Kick the catalog worker: serve the disk cache first (instant
+    /// entries), then fetch upstream when the cache is stale or
+    /// missing — the fetched catalog arrives as a second message.
+    /// `force` skips the freshness check (manual refresh).
+    fn spawn_catalog(&mut self, force: bool, ctx: &egui::Context) {
+        if self.catalog_loading {
+            return;
+        }
+        self.catalog_loading = true;
+        self.catalog_started = true;
+        let (tx, rx) = mpsc::channel();
+        self.catalog_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let cached = catalog::load_cached();
+            let stale = cached.as_ref().map(catalog::is_stale).unwrap_or(true);
+            if let Some(c) = &cached {
+                if tx.send(Ok(c.clone())).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+            if cached.is_some() && !stale && !force {
+                return;
+            }
+            match catalog::fetch() {
+                Ok(c) => {
+                    let _ = tx.send(Ok(c));
+                    ctx.request_repaint();
+                }
+                Err(e) => {
+                    // A stale cache still beats the fallback manifest.
+                    if cached.is_none() {
+                        let _ = tx.send(Err(e));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fallback-mode check: one `repos/{o}/{r}` GET per project,
+    /// paced to stay under GitHub's secondary rate limit. In catalog
+    /// mode `pushed_at` comes free with the data — this only runs
+    /// when the catalog never arrived.
+    pub fn check_updates(&mut self, ctx: &egui::Context) {
         if self.check_running {
+            return;
+        }
+        if self.catalog.is_some() {
+            // Catalog mode: refreshing means re-fetching the dataset.
+            self.spawn_catalog(true, ctx);
             return;
         }
         self.check_running = true;
         let (tx, rx) = mpsc::channel();
         self.check_rx = Some(rx);
+        let repos: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| !e.repo.is_empty())
+            .map(|e| (e.slug.clone(), e.repo.clone()))
+            .collect();
         std::thread::spawn(move || {
             let agent = crate::emulation::emu_dl::agent();
-            for (i, p) in PROJECTS.iter().enumerate() {
+            for (i, (slug, repo)) in repos.iter().enumerate() {
                 if i > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(350));
                 }
-                let url = format!("https://api.github.com/repos/{}", p.repo);
+                let url = format!("https://api.github.com/repos/{repo}");
                 let info = match agent
                     .get(&url)
                     .header("User-Agent", USER_AGENT)
@@ -413,112 +650,167 @@ impl DecompView {
                         ..Default::default()
                     },
                 };
-                if tx.send((p.slug.to_string(), info)).is_err() {
+                if tx.send((slug.clone(), info)).is_err() {
                     return;
                 }
             }
         });
     }
 
-    /// Arrow-key navigation: dx ±1 walks the row, dy ±1 walks a
-    /// column. `columns` is stamped by the layout each frame.
+    /// Arrow-key navigation — the shared list's directional walk:
+    /// ±1 horizontally, ±columns vertically in the grids.
     pub fn move_selection(&mut self, dx: i32, dy: i32) {
-        let n = PROJECTS.len() as i32;
-        if n == 0 {
-            return;
-        }
-        let cur = self.selected.max(0);
-        let step = dx + dy * self.columns.max(1) as i32;
-        self.selected = (cur + step).clamp(0, n - 1);
+        self.cards.arrow(&self.search.text, dx, dy);
     }
 
-    /// Enter / the card button — install, update, or open.
+    /// Enter — runs the focused entry's action (Install/Update/
+    /// Play/Open), same as its pane buttons.
     pub fn activate_selected(&mut self) {
-        if self.selected < 0 || self.selected as usize >= PROJECTS.len() {
-            return;
+        if let Some(p) = self.cards.focused_path(&self.search.text) {
+            self.activate_slug(&p.to_string_lossy());
         }
-        self.activate(&PROJECTS[self.selected as usize]);
     }
 
-    /// The card's resolved action, run for `project`.
-    fn activate(&mut self, p: &Project) {
+    /// The card's resolved action, run for `entry`.
+    fn activate(&mut self, e: &Entry) {
+        if e.repo.is_empty() {
+            return;
+        }
         match card_action(
-            install_dir(p.slug)
+            install_dir(&e.slug)
                 .as_deref()
                 .and_then(|d| installed_stamp(d))
                 .as_deref(),
-            self.remote.get(p.slug),
+            self.remote.get(&e.slug),
         ) {
-            Action::Install | Action::Update => self.download(p),
+            Action::Install | Action::Update => self.download(e),
             Action::Open => {
-                if let Some(dir) = install_dir(p.slug) {
-                    open_in_file_manager(&dir);
+                if let Some(dir) = install_dir(&e.slug) {
+                    if let Some(exe) = find_exe(&dir) {
+                        let _ = std::process::Command::new(&exe)
+                            .current_dir(&dir)
+                            .spawn();
+                    } else {
+                        open_in_file_manager(&dir);
+                    }
                 }
             }
         }
     }
 
-    /// Zipball → extract → copy into `<data>/Decomps/<slug>` on a
-    /// worker; `DlProgress` carries stage/frac for the card.
-    fn download(&mut self, p: &Project) {
-        if self.downloads.contains_key(p.slug) {
+    fn activate_slug(&mut self, slug: &str) {
+        if let Some(i) = self.entries.iter().position(|e| e.slug == slug) {
+            let e = self.entries[i].clone();
+            self.activate(&e);
+        }
+    }
+
+    /// Release/zipball → extract → copy into `<data>/Decomps/<slug>`
+    /// on a worker; `DlProgress` carries stage/frac for the card.
+    fn download(&mut self, e: &Entry) {
+        if self.downloads.contains_key(&e.slug) {
             return;
         }
         let dl: crate::emulation::emu_dl::Shared = std::sync::Arc::new(std::sync::Mutex::new(
             crate::emulation::emu_dl::DlProgress {
-                stage: format!("Fetching {}…", p.name),
+                stage: format!("Fetching {}…", e.name),
                 ..Default::default()
             },
         ));
         let shared = dl.clone();
-        let repo = p.repo.to_string();
-        let slug = p.slug.to_string();
+        let repo = e.repo.clone();
+        let slug = e.slug.clone();
         std::thread::spawn(move || {
             let res = download_work(&shared, &repo, &slug);
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             g.done = Some(res);
         });
-        self.downloads.insert(p.slug.to_string(), dl);
+        self.downloads.insert(e.slug.clone(), dl);
     }
 
-    /// Per-frame bookkeeping: drain the check channel, retire finished
-    /// downloads into `notice`, and keep repaints flowing while
-    /// anything moves (scroll spring, live downloads, pending check).
+    /// Adopt a fetched/cached catalog: entries, per-repo stats as the
+    /// remote map, search blobs.
+    fn adopt_catalog(&mut self, mut c: catalog::Catalog) {
+        prepare_entries(&mut c.entries);
+        self.remote = c
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.slug.clone(),
+                    RemoteInfo {
+                        pushed_at: e.pushed_at.clone(),
+                        err: None,
+                    },
+                )
+            })
+            .collect();
+        self.entries = std::mem::take(&mut c.entries);
+        self.notice = None;
+        self.catalog = Some(c);
+        self.rebuild_index();
+        self.sync_items();
+        self.apply_subset();
+        self.refresh_installed();
+    }
+
+    /// Per-frame bookkeeping: kick the catalog + cover workers, drain
+    /// all channels, retire finished downloads, keep repaints flowing.
     fn pump(&mut self, ctx: &egui::Context) {
-        if !self.checked {
-            self.checked = true;
-            self.check_updates();
+        if !self.catalog_started {
+            self.spawn_catalog(false, ctx);
         }
-        if !self.cover_started {
-            self.cover_started = true;
-            let (tx, rx) = mpsc::channel();
-            self.cover_rx = Some(rx);
-            std::thread::spawn(move || cover_work(tx));
+        if let Some(req_rx) = self.cover_req_rx.take() {
+            let res_tx = self.cover_res_tx.clone();
+            let c = ctx.clone();
+            std::thread::spawn(move || cover_work(req_rx, res_tx, c));
         }
-        if let Some(rx) = &self.cover_rx {
-            let mut dead = false;
+        let mut catalog_msgs = Vec::new();
+        let mut catalog_dead = false;
+        if let Some(rx) = &self.catalog_rx {
             loop {
                 match rx.try_recv() {
-                    Ok((slug, Some(img))) => {
-                        self.covers.insert(
-                            slug.clone(),
-                            ctx.load_texture(
-                                format!("decomp-cover-{slug}"),
-                                img,
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        );
-                    }
-                    Ok((_, None)) => {}
+                    Ok(r) => catalog_msgs.push(r),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        dead = true;
+                        catalog_dead = true;
                         break;
                     }
                 }
             }
-            if dead {
-                self.cover_rx = None;
+        }
+        for m in catalog_msgs {
+            match m {
+                Ok(c) => self.adopt_catalog(c),
+                Err(e) => self.notice = Some(e),
+            }
+        }
+        if catalog_dead {
+            self.catalog_rx = None;
+            self.catalog_loading = false;
+        }
+        // Fallback mode: no catalog after the worker finished → run
+        // the old per-repo check once.
+        if self.catalog_started
+            && !self.catalog_loading
+            && self.catalog.is_none()
+            && !self.checked
+        {
+            self.checked = true;
+            self.check_updates(ctx);
+        }
+        loop {
+            match self.cover_res_rx.try_recv() {
+                // The worker cached art to disk — swap the item's
+                // cover source so the row's decode pool picks it up.
+                Ok((slug, true)) => {
+                    if let Some(c) = cover_cache(&slug).filter(|f| f.is_file()) {
+                        self.cards
+                            .set_cover(&PathBuf::from(&slug), CoverSrc::File(c));
+                    }
+                }
+                Ok((_, false)) => {}
+                Err(_) => break,
             }
         }
         if let Some(rx) = &self.check_rx {
@@ -550,35 +842,15 @@ impl DecompView {
         for (slug, res) in finished {
             self.downloads.remove(&slug);
             match res {
-                Ok(path) => self.notice = Some(format!("Installed to {path}")),
+                Ok(path) => {
+                    self.notice = Some(format!("Installed to {path}"));
+                    self.refresh_installed();
+                }
                 Err(e) => self.notice = Some(e),
             }
         }
-        if self.check_running || !self.downloads.is_empty() || self.cover_rx.is_some() {
+        if self.check_running || self.catalog_loading || !self.downloads.is_empty() {
             ctx.request_repaint();
-        }
-    }
-
-    /// The scroll spring's rest test — same keepalive contract as the
-    /// album strip's (event-driven frames must be asked for).
-    fn scroll_settled(&self, max_scroll: f32) -> bool {
-        self.scroll_cur == self.scroll_tgt
-            && self.scroll_vel == 0.0
-            && self.scroll_tgt >= 0.0
-            && self.scroll_tgt <= max_scroll
-    }
-
-    /// Spring `target` so card `index` is fully inside the view.
-    fn reveal(&mut self, index: i32, rect: Rect, card_h: f32, spacing: f32, s: f32) {
-        let cols = self.columns.max(1) as i32;
-        let row = index.div_euclid(cols);
-        let top = 24.0 * s + row as f32 * (card_h + spacing);
-        let bot = top + card_h;
-        let view_h = rect.height();
-        if top < self.scroll_tgt {
-            self.scroll_tgt = top;
-        } else if bot > self.scroll_tgt + view_h {
-            self.scroll_tgt = bot - view_h;
         }
     }
 }
@@ -780,48 +1052,38 @@ fn open_in_file_manager(dir: &Path) {
 }
 
 /// Cache path for a project's box art — `Decomps/covers/<slug>.png`.
-/// The `covers` dir shares the Decomps root but no project slug
-/// collides with it (guarded by `slugs_are_unique_and_reserved`).
 fn cover_cache(slug: &str) -> Option<PathBuf> {
     decomps_root().map(|d| d.join("covers").join(format!("{slug}.png")))
 }
 
-/// The box-art worker: for each project, read the disk cache or run
-/// the image pipeline once and save the result. Cache hits and
-/// freshly fetched bytes both decode here so the UI thread only
-/// ever sees ready `ColorImage`s; a `None` payload just means "no
-/// art this session".
-fn cover_work(tx: mpsc::Sender<(String, Option<egui::ColorImage>)>) {
-    for p in PROJECTS {
-        let cache = cover_cache(p.slug);
-        let bytes = cache
-            .as_ref()
-            .filter(|f| f.is_file())
-            .and_then(|f| std::fs::read(f).ok())
-            .or_else(|| {
-                let b = crate::emulation::emu_meta::boxart_bytes(p.cover_q)?;
-                if let Some(f) = &cache {
-                    if let Some(d) = f.parent() {
-                        let _ = std::fs::create_dir_all(d);
-                    }
-                    let _ = std::fs::write(f, &b);
-                }
-                Some(b)
-            });
-        let _ = tx.send((
-            p.slug.to_string(),
-            bytes.and_then(|b| decode_color_image(&b)),
-        ));
+/// The box-art worker: requests arrive per visible card, disk cache
+/// first, `boxart_bytes` on a miss cached back to disk. The row's
+/// decode pool owns pixels — the worker only reports whether a cover
+/// file now exists so the view can `set_cover` the item.
+fn cover_work(
+    rx: mpsc::Receiver<(String, String, Option<PathBuf>)>,
+    tx: mpsc::Sender<(String, bool)>,
+    ctx: egui::Context,
+) {
+    while let Ok((slug, query, cache)) = rx.recv() {
+        let ok = cache.as_ref().is_some_and(|f| f.is_file())
+            || (!query.is_empty()
+                && crate::emulation::emu_meta::boxart_bytes(&query)
+                    .map(|b| {
+                        if let Some(f) = &cache {
+                            if let Some(d) = f.parent() {
+                                let _ = std::fs::create_dir_all(d);
+                            }
+                            let _ = std::fs::write(f, &b);
+                        }
+                        true
+                    })
+                    .unwrap_or(false));
+        if tx.send((slug, ok)).is_err() {
+            return;
+        }
+        ctx.request_repaint();
     }
-}
-
-fn decode_color_image(bytes: &[u8]) -> Option<egui::ColorImage> {
-    let d = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let (w, h) = (d.width() as usize, d.height() as usize);
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        [w, h],
-        &d.into_raw(),
-    ))
 }
 
 /// Contain-fit `iw`×`ih` inside `slot` (letterboxed, centered) —
@@ -834,14 +1096,29 @@ fn fit_rect(slot: Rect, iw: f32, ih: f32) -> Rect {
     Rect::from_center_size(slot.center(), Vec2::new(iw * k, ih * k))
 }
 
-/// The Re/Decompilation view: a card grid over black with the AES
-/// bottom band — same geometry as the emulation view's chrome.
+/// Plural tab label per kind.
+fn tab_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Decomp => "Decomps",
+        Kind::Recomp => "Recomps",
+        Kind::Disasm => "Disassemblies",
+        Kind::Port => "Ports",
+        Kind::Mod => "Mods",
+        Kind::Tool => "Tools",
+    }
+}
+
+/// The Re/Decompilation view: kind tabs + the shared item list over
+/// black with the AES bottom band — same geometry as the emulation
+/// view, and the list itself IS the emulation/music `Carousel`.
 pub fn view(
     ui: &mut egui::Ui,
     content: Rect,
     alpha: f32,
     interactive: bool,
     view: &mut DecompView,
+    emu_cfg: &mut settings::Emulation,
+    cfg: &settings::Carousel,
     s: f32,
 ) {
     view.pump(ui.ctx());
@@ -856,319 +1133,207 @@ pub fn view(
 
     painter.rect_filled(upper, 0.0, Color32::BLACK.gamma_multiply(alpha));
 
-    // --- Card grid -------------------------------------------------
-    let pad_x = 40.0 * s;
-    let spacing = 20.0 * s;
-    let card_w = 360.0 * s;
-    let card_h = 150.0 * s;
-    let avail_w = (upper.width() - pad_x * 2.0).max(card_w);
-    let cols = ((avail_w + spacing) / (card_w + spacing)).max(1.0) as usize;
-    view.columns = cols.max(1);
-    let grid_w = cols as f32 * card_w + (cols.saturating_sub(1)) as f32 * spacing;
-    let origin_x = upper.min.x + (upper.width() - grid_w).max(0.0) * 0.5;
-    let rows = PROJECTS.len().div_ceil(cols);
-    let content_h = 24.0 * s + rows as f32 * card_h + rows.saturating_sub(1) as f32 * spacing + 24.0 * s;
-    let max_scroll = (content_h - upper.height()).max(0.0);
 
-    // Wheel scroll + spring (same model as the strip's — eased
-    // target, velocity-carrying current).
-    let pointer = ui.ctx().input(|i| i.pointer.latest_pos());
-    if interactive && pointer.is_some_and(|p| upper.contains(p)) {
-        let d = ui.ctx().input(|i| i.smooth_scroll_delta);
-        if d != Vec2::ZERO {
-            view.scroll_tgt = (view.scroll_tgt - (d.x + d.y)).clamp(0.0, max_scroll);
-        }
-    }
-    let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
-    if view.scroll_tgt < 0.0 {
-        view.scroll_tgt += -view.scroll_tgt * (12.0 * dt).min(1.0);
-    } else if view.scroll_tgt > max_scroll {
-        view.scroll_tgt -= (view.scroll_tgt - max_scroll) * (12.0 * dt).min(1.0);
-    }
-    let dist = view.scroll_tgt - view.scroll_cur;
-    let stiffness = 680.0f32;
-    let damping = 2.0 * stiffness.sqrt() * 0.9;
-    view.scroll_vel += (dist * stiffness - view.scroll_vel * damping) * dt;
-    view.scroll_cur += view.scroll_vel * dt;
-    if dist.abs() < 0.01 && view.scroll_vel.abs() < 0.01 {
-        view.scroll_cur = view.scroll_tgt;
-        view.scroll_vel = 0.0;
-    }
-    if !view.scroll_settled(max_scroll) {
-        ui.ctx().request_repaint();
-    }
-
-    let mut activate: Option<&'static Project> = None;
-    for (i, p) in PROJECTS.iter().enumerate() {
-        let col = i % cols;
-        let row = i / cols;
-        let card = Rect::from_min_size(
-            Pos2::new(
-                origin_x + col as f32 * (card_w + spacing),
-                upper.min.y + 24.0 * s + row as f32 * (card_h + spacing) - view.scroll_cur,
-            ),
-            Vec2::new(card_w, card_h),
-        );
-        if card.max.y < upper.min.y - 4.0 || card.min.y > upper.max.y + 4.0 {
-            continue;
-        }
-        let cp = painter.with_clip_rect(upper);
-        let hovered = interactive && pointer.is_some_and(|pt| card.contains(pt));
-        let selected = view.selected == i as i32;
-
-        // Tile: white-alpha fill like the settings buttons; the
-        // selection ring matches the carousel's picked-card cue.
-        let fill = if hovered || selected { 14.0 } else { 8.0 };
-        cp.rect_filled(
-            card,
-            CornerRadius::same((12.0 * s).round() as u8),
-            Color32::from_white_alpha((fill * alpha) as u8),
-        );
-        let ring = if selected {
-            150.0
-        } else if hovered {
-            90.0
-        } else {
-            40.0
-        };
-        cp.rect_stroke(
-            card,
-            CornerRadius::same((12.0 * s).round() as u8),
-            Stroke::new(
-                if selected { 2.0 * s } else { s },
-                Color32::from_white_alpha((ring * alpha) as u8),
-            ),
-            StrokeKind::Inside,
-        );
-
-        // Box art — a dark inset slot on the card's left; the image
-        // is contain-fit (letterboxed) so odd aspects never crop.
-        let cover_h = card_h - 20.0 * s;
-        let slot = Rect::from_min_size(
-            card.min + Vec2::new(10.0 * s, 10.0 * s),
-            Vec2::new(cover_h * 0.72, cover_h),
-        );
-        cp.rect_filled(
-            slot,
-            CornerRadius::same((8.0 * s).round() as u8),
-            Color32::from_white_alpha((6.0 * alpha) as u8),
-        );
-        if let Some(tex) = view.covers.get(p.slug) {
-            let dest = fit_rect(
-                slot.shrink(2.0 * s),
-                tex.size()[0] as f32,
-                tex.size()[1] as f32,
-            );
-            cp.image(
-                tex.id(),
-                dest,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE.gamma_multiply(alpha),
-            );
-            cp.rect_stroke(
-                slot,
-                CornerRadius::same((8.0 * s).round() as u8),
-                Stroke::new(
-                    s.max(1.0),
-                    Color32::from_white_alpha((30.0 * alpha) as u8),
-                ),
-                StrokeKind::Inside,
-            );
-        }
-
-        // Name + console/kind badges — the text column starts right
-        // of the cover slot.
-        let tx = slot.max.x + 14.0 * s;
-        let text_w = card.max.x - 14.0 * s - tx;
-        cp.text(
-            Pos2::new(tx, card.min.y + 24.0 * s),
-            Align2::LEFT_CENTER,
-            crate::ellipsize(&cp, p.name, &FontId::proportional(19.0 * s), text_w - 86.0 * s),
-            FontId::proportional(19.0 * s),
-            Color32::WHITE.gamma_multiply(alpha),
-        );
-        let badge = format!("{} · {}", p.console, p.kind.label());
-        cp.text(
-            Pos2::new(card.max.x - 14.0 * s, card.min.y + 26.0 * s),
-            Align2::RIGHT_CENTER,
-            &badge,
-            FontId::proportional(11.0 * s),
-            Color32::from_gray(140).gamma_multiply(alpha),
-        );
-        cp.text(
-            Pos2::new(tx, card.min.y + 48.0 * s),
-            Align2::LEFT_CENTER,
-            &p.repo,
-            FontId::monospace(11.0 * s),
-            Color32::from_gray(110).gamma_multiply(alpha),
-        );
-        cp.text(
-            Pos2::new(tx, card.min.y + 74.0 * s),
-            Align2::LEFT_CENTER,
-            crate::ellipsize(&cp, p.blurb, &FontId::proportional(13.0 * s), text_w),
+    // --- Kind tabs (settings-overlay style) ------------------------
+    // Text tabs in a row — active is white with an underline,
+    // inactive gray, hover lighter; a small count trails the label.
+    let counts = view.kind_counts();
+    let tab_font = FontId::proportional(19.0 * s);
+    let tab_gap = 26.0 * s;
+    let tab_row_h = 34.0 * s;
+    let mut set_filter: Option<Option<Kind>> = None;
+    let tabs: Vec<(Option<Kind>, String, usize)> = std::iter::once((None, "All".to_string(), view.entries.len()))
+        .chain(Kind::CHIPS.iter().filter_map(|k| {
+            counts
+                .get(k)
+                .map(|&n| (Some(*k), tab_label(*k).to_string(), n))
+        }))
+        .collect();
+    let mut tab_x = upper.min.x + 40.0 * s;
+    let tab_y = upper.min.y + 12.0 * s;
+    let tabs_right = content.max.x - 300.0 * s; // keep clear of the search pill
+    for (this, label, n) in &tabs {
+        let lg = painter.layout_no_wrap(label.clone(), tab_font.clone(), Color32::WHITE);
+        let ng = painter.layout_no_wrap(
+            format!(" {n}"),
             FontId::proportional(13.0 * s),
-            Color32::from_gray(180).gamma_multiply(alpha),
+            Color32::WHITE,
         );
-
-        // Status line — installed stamp, update state, or the live
-        // download stage.
-        let dir = install_dir(p.slug);
-        let stamp = dir.as_deref().and_then(installed_stamp);
-        // Release installs display their tag; source installs the
-        // pushed_at stamp they always carried.
-        let disp = dir
-            .as_deref()
-            .and_then(installed_release)
-            .or_else(|| stamp.clone());
-        let remote = view.remote.get(p.slug);
-        let act = card_action(stamp.as_deref(), remote);
-        let dl = view.downloads.get(p.slug);
-        let (status, status_c) = if let Some(dl) = dl {
-            let g = dl.lock().unwrap_or_else(|e| e.into_inner());
-            (g.stage.clone(), Color32::from_rgb(120, 180, 255))
+        let w = lg.size().x + ng.size().x + 4.0 * s;
+        if tab_x + w > tabs_right {
+            break;
+        }
+        let rect = Rect::from_min_size(Pos2::new(tab_x, tab_y), Vec2::new(w, tab_row_h));
+        let resp = if interactive {
+            ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::click())
         } else {
-            match (disp.as_deref(), act) {
-                (Some(st), Action::Update) => (
-                    format!("Installed · {st} — update available"),
-                    Color32::from_rgb(255, 190, 90),
-                ),
-                (Some(st), _) => (
-                    format!("Installed · {st}"),
-                    Color32::from_rgb(120, 200, 120),
-                ),
-                (None, _) if remote.is_some_and(|r| r.err.is_some()) => (
-                    "Update check failed".to_string(),
-                    Color32::from_rgb(255, 190, 90),
-                ),
-                (None, _) => ("Not installed".to_string(), Color32::from_gray(150)),
-            }
+            ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::hover())
         };
-        cp.text(
-            Pos2::new(tx, card.max.y - 20.0 * s),
-            Align2::LEFT_CENTER,
-            crate::ellipsize(&cp, &status, &FontId::proportional(11.5 * s), text_w - 108.0 * s),
-            FontId::proportional(11.5 * s),
-            status_c.gamma_multiply(alpha),
-        );
-
-        // Action button — small pill at the card's bottom-right,
-        // painted like the settings' "Open AES Directory" button.
-        // While a download runs it becomes a progress bar.
-        let bw = 92.0 * s;
-        let bh = 30.0 * s;
-        let btn = Rect::from_min_size(
-            Pos2::new(card.max.x - bw - 14.0 * s, card.max.y - bh - 12.0 * s),
-            Vec2::new(bw, bh),
-        );
-        if let Some(dl) = dl {
-            let g = dl.lock().unwrap_or_else(|e| e.into_inner());
-            cp.rect_filled(
-                btn,
-                CornerRadius::same((bh * 0.5).round() as u8),
-                Color32::from_white_alpha((10.0 * alpha) as u8),
-            );
-            let fill_w = (btn.width() * g.frac.clamp(0.0, 1.0)).max(0.0);
-            if fill_w > 1.0 {
-                let mut fr = btn;
-                fr.max.x = fr.min.x + fill_w;
-                cp.rect_filled(
-                    fr,
-                    CornerRadius::same((bh * 0.5).round() as u8),
-                    Color32::from_rgb(70, 130, 200).gamma_multiply(0.8 * alpha),
-                );
-            }
+        let active = view.filter == *this;
+        let color = if active {
+            Color32::WHITE
+        } else if resp.hovered() {
+            Color32::from_gray(200)
         } else {
-            let r = if interactive {
-                ui.interact(btn, ui.scope_id().with(("decomp-act", p.slug)), Sense::click())
-            } else {
-                ui.interact(btn, ui.scope_id().with(("decomp-act", p.slug)), Sense::hover())
-            }
-            .on_hover_text(match act {
-                Action::Install => "Download the latest release (or source)",
-                Action::Update => "Re-download — a newer commit is up",
-                Action::Open => "Open the install folder",
-            });
-            // idle / hover / pressed — a real button reads all three.
-            let hot = r.hovered();
-            let down = r.is_pointer_button_down_on();
-            let (fill, edge, txt) = if down {
-                (30.0, 160.0, 255)
-            } else if hot {
-                (20.0, 120.0, 235)
-            } else {
-                (10.0, 70.0, 200)
-            };
-            cp.rect_filled(
-                btn,
-                CornerRadius::same((bh * 0.5).round() as u8),
-                Color32::from_white_alpha((fill * alpha) as u8),
-            );
-            cp.rect_stroke(
-                btn,
-                CornerRadius::same((bh * 0.5).round() as u8),
-                Stroke::new(
-                    s,
-                    Color32::from_white_alpha((edge * alpha) as u8),
-                ),
-                StrokeKind::Inside,
-            );
-            cp.text(
-                btn.center(),
-                Align2::CENTER_CENTER,
-                act.label(),
-                FontId::proportional(13.0 * s),
-                Color32::from_gray(txt).gamma_multiply(alpha),
-            );
-            if hot {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            if r.clicked() {
-                activate = Some(p);
-            }
-        }
-
-        // Whole-card click selects (double-click runs the action).
-        let cr = if interactive {
-            ui.interact(card, ui.scope_id().with(("decomp-card", p.slug)), Sense::click())
-        } else {
-            ui.interact(card, ui.scope_id().with(("decomp-card", p.slug)), Sense::hover())
+            Color32::from_gray(140)
         };
-        if cr.clicked() {
-            view.selected = i as i32;
+        painter.galley(
+            Pos2::new(rect.min.x, rect.min.y + 4.0 * s),
+            lg,
+            color.gamma_multiply(alpha),
+        );
+        painter.galley(
+            Pos2::new(rect.min.x + rect.width() - ng.size().x - 2.0 * s, rect.min.y + 10.0 * s),
+            ng,
+            Color32::from_gray(120).gamma_multiply(alpha),
+        );
+        if active {
+            painter.line_segment(
+                [
+                    Pos2::new(rect.min.x, rect.max.y - 2.0 * s),
+                    Pos2::new(rect.min.x + rect.width(), rect.max.y - 2.0 * s),
+                ],
+                Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(alpha)),
+            );
         }
-        if cr.double_clicked() {
-            view.selected = i as i32;
-            activate = Some(p);
-        }
-        if hovered {
+        if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
+        if resp.clicked() {
+            set_filter = Some(*this);
+        }
+        tab_x += w + tab_gap;
     }
-    if let Some(p) = activate {
-        view.activate(p);
+    if let Some(f) = set_filter {
+        view.set_kind_filter(f);
     }
-    view.reveal(view.selected, upper, card_h, spacing, s);
 
-    // Thin right-edge scrollbar when the grid overflows — same look
-    // as the grids'.
-    if max_scroll > 1.0 {
-        let track = Rect::from_min_max(
-            Pos2::new(upper.max.x - 6.0 * s, upper.min.y + 12.0 * s),
-            Pos2::new(upper.max.x - 2.0 * s, upper.max.y - 12.0 * s),
-        );
-        let frac = (view.scroll_cur / max_scroll).clamp(0.0, 1.0);
-        let view_frac = (upper.height() / (upper.height() + max_scroll)).min(1.0);
-        let th = (track.height() * view_frac).max(24.0 * s);
-        let thumb = Rect::from_min_size(
-            Pos2::new(track.min.x, track.min.y + (track.height() - th) * frac),
-            Vec2::new(track.width(), th),
-        );
-        painter.rect_filled(
-            thumb,
-            CornerRadius::same(2),
-            Color32::from_white_alpha((80.0 * alpha) as u8),
+    // --- The shared item list ---------------------------------------
+    // The exact widget the music and emulation views drive — the
+    // perspective carousel and both card grids with their scroll
+    // physics, scrollbar, marquee and context menus. The info pane
+    // docks below and follows the focused card.
+    let pane_h = 360.0 * s;
+    let pane = Rect::from_min_max(
+        Pos2::new(upper.min.x, upper.max.y - pane_h),
+        upper.max,
+    );
+    let grid = Rect::from_min_max(
+        Pos2::new(upper.min.x, tab_y + tab_row_h + 10.0 * s),
+        Pos2::new(upper.max.x, pane.min.y - 4.0 * s),
+    );
+
+    // Lazy cover fetches — the list reports which items are on
+    // screen; the worker caches bytes to disk and `set_cover` swaps
+    // the source into the row's decode pool when one lands.
+    for p in view.cards.onscreen_paths(&view.search.text) {
+        let slug = p.to_string_lossy().into_owned();
+        if cover_cache(&slug).is_some_and(|c| c.is_file())
+            || !view.cover_requested.insert(slug.clone())
+        {
+            continue;
+        }
+        if let Some(&ei) = view.slug_idx.get(&slug) {
+            let _ = view.cover_req_tx.send((
+                slug,
+                view.entries[ei].cover_q.clone(),
+                cover_cache(&view.entries[ei].slug),
+            ));
+        }
+    }
+    // Card status markers — the widget paints the dot + the download
+    // strip: green installed, amber update, blue while downloading.
+    {
+        let installed = &view.installed;
+        let remote = &view.remote;
+        let dls = &view.downloads;
+        view.cards.update_markers(&move |p| {
+            let slug = p.to_string_lossy();
+            if let Some(dl) = dls.get(slug.as_ref()) {
+                let g = dl.lock().unwrap_or_else(|e| e.into_inner());
+                return (
+                    Some(Color32::from_rgb(70, 130, 200)),
+                    Some(g.frac.clamp(0.0, 1.0)),
+                );
+            }
+            let stamp = installed.get(slug.as_ref()).and_then(|s| s.as_deref());
+            match card_action(stamp, remote.get(slug.as_ref())) {
+                Action::Update => (Some(Color32::from_rgb(255, 190, 90)), None),
+                Action::Open => (Some(Color32::from_rgb(120, 220, 120)), None),
+                Action::Install => (None, None),
+            }
+        });
+    }
+
+    let mode = match emu_cfg.decomp_layout_mode.min(2) {
+        1 => Mode::VerticalGrid,
+        2 => Mode::HorizontalGrid,
+        _ => Mode::Carousel,
+    };
+    // The focused card wears the pulsing selection ring and feeds
+    // the info pane — the same item the overlay labels describe.
+    let focused = view.cards.focused_path(&view.search.text);
+    let action = view.cards.ui(
+        ui,
+        grid,
+        grid,
+        &mut view.row,
+        focused.as_deref(),
+        false,
+        &view.search.text,
+        cfg,
+        mode,
+        alpha,
+        interactive,
+        false,
+        s,
+    );
+    match action {
+        // Double-click / "Play" and "Install / Update" both resolve
+        // to the entry's card action — Install→download, Update→
+        // download, Open→launch.
+        carousel::Action::Play(p) | carousel::Action::Download(p) => {
+            view.activate_slug(&p.to_string_lossy());
+        }
+        carousel::Action::OpenFolder(p) => {
+            if let Some(dir) = install_dir(&p.to_string_lossy()) {
+                open_in_file_manager(&dir);
+            }
+        }
+        // The catalog menu's "Refresh catalog" reuses the ROM menu's
+        // "Scan Folder" slot.
+        carousel::Action::ScanFolder => view.check_updates(ui.ctx()),
+        _ => {}
+    }
+    if view.catalog_loading && view.entries.is_empty() {
+        painter.text(
+            grid.center(),
+            Align2::CENTER_CENTER,
+            "Loading catalog…",
+            FontId::proportional(15.0 * s),
+            Color32::from_gray(180).gamma_multiply(alpha),
         );
     }
+
+    // --- Selected-entry info pane (always docked at the bottom) ------
+    let sel_idx = focused
+        .as_deref()
+        .and_then(|p| view.slug_idx.get(&*p.to_string_lossy()).copied());
+    info_pane(ui, pane, view, sel_idx, alpha, interactive, s);
+
+    // The item search pill — docked in the top-right corner with a
+    // small top/right margin so the cards never slide under it.
+    view.search.ui(
+        ui,
+        content.max.x - 18.0 * s,
+        upper.min.y + 10.0 * s,
+        "Search",
+        true,
+        false,
+        alpha,
+        interactive,
+        s,
+    );
 
     // --- Bottom band -----------------------------------------------
     painter.rect_filled(
@@ -1186,24 +1351,14 @@ pub fn view(
         FontId::proportional(16.0 * s),
         Color32::WHITE.gamma_multiply(alpha),
     );
-    let installed = PROJECTS
+    let installed = view.installed.values().flatten().count();
+    let updates = view
+        .entries
         .iter()
-        .filter(|p| {
-            install_dir(p.slug)
-                .as_deref()
-                .and_then(installed_stamp)
-                .is_some()
-        })
-        .count();
-    let updates = PROJECTS
-        .iter()
-        .filter(|p| {
+        .filter(|e| {
             card_action(
-                install_dir(p.slug)
-                    .as_deref()
-                    .and_then(installed_stamp)
-                    .as_deref(),
-                view.remote.get(p.slug),
+                view.installed.get(&e.slug).and_then(|s| s.as_deref()),
+                view.remote.get(&e.slug),
             ) == Action::Update
         })
         .count();
@@ -1212,15 +1367,22 @@ pub fn view(
         .clone()
         .unwrap_or_else(|| {
             format!(
-                "{} projects · {} installed{}{}",
-                PROJECTS.len(),
+                "{} of {} projects · {} installed{}{}",
+                view.shown_count(),
+                view.entries.len(),
                 installed,
                 if updates > 0 {
                     format!(" · {updates} update{}", if updates == 1 { "" } else { "s" })
                 } else {
                     String::new()
                 },
-                if view.check_running { " · checking…" } else { "" },
+                if view.catalog_loading {
+                    " · fetching catalog…"
+                } else if view.check_running {
+                    " · checking…"
+                } else {
+                    ""
+                },
             )
         });
     painter.text(
@@ -1231,77 +1393,629 @@ pub fn view(
         Color32::from_gray(150).gamma_multiply(alpha),
     );
 
-    // Right cluster: refresh check + open the Decomps folder. Same
-    // 60px icon-button slots as the emulation band's.
-    let mut right_x = band.max.x - 50.0 * s;
-    let rsz = Vec2::splat(60.0 * s);
-    let rrect = Rect::from_center_size(Pos2::new(right_x, cy), rsz);
-    let rr = if interactive {
-        ui.interact(rrect, ui.scope_id().with("decomp-refresh"), Sense::click())
+    // Right cluster: the card-layout toggle — the same 60px icon
+    // slot and glyph the music band uses for its view modes. It
+    // persists Emulation.DecompLayoutMode — independent of the
+    // emulation view's own CoverLayoutMode.
+    let trect = Rect::from_center_size(Pos2::new(band.max.x - 50.0 * s, cy), Vec2::splat(60.0 * s));
+    let tr = if interactive {
+        ui.interact(trect, ui.scope_id().with("decomp-layout"), Sense::click())
     } else {
-        ui.interact(rrect, ui.scope_id().with("decomp-refresh"), Sense::hover())
+        ui.interact(trect, ui.scope_id().with("decomp-layout"), Sense::hover())
     }
-    .on_hover_text(if view.check_running {
-        "Checking…"
-    } else {
-        "Check for updates"
+    .on_hover_text(match emu_cfg.decomp_layout_mode.min(2) {
+        0 => "Carousel — click for the vertical card grid",
+        1 => "Vertical cards — click for horizontal rows",
+        _ => "Horizontal cards — click for the carousel strip",
     });
-    if rr.hovered() {
+    if tr.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    crate::transport::icon_update(&painter, rrect, alpha);
-    if rr.clicked() {
-        view.notice = None;
-        view.check_updates();
+    crate::transport::icon_layout(
+        &painter,
+        trect.shrink(10.0 * s),
+        emu_cfg.decomp_layout_mode.min(2),
+        alpha,
+    );
+    if tr.clicked() {
+        emu_cfg.decomp_layout_mode = (emu_cfg.decomp_layout_mode.min(2) + 1) % 3;
+        view.settings_dirty = true;
     }
-    right_x -= 64.0 * s;
-    let orect = Rect::from_center_size(Pos2::new(right_x, cy), rsz);
-    let orr = if interactive {
-        ui.interact(orect, ui.scope_id().with("decomp-open"), Sense::click())
+}
+
+
+/// `painter.layout_job` equivalent — the card painter doesn't carry
+/// a Ui, so lay the title job out through the painter's context.
+fn ui_fonts_job(painter: &egui::Painter, job: egui::text::LayoutJob) -> std::sync::Arc<egui::Galley> {
+    painter.ctx().fonts_mut(|f| f.layout_job(job))
+}
+
+// ---- Selected-entry info pane ---------------------------------------------
+
+/// The docked pane below the cards — the focused entry's cover,
+/// catalog metadata, setup notes and the Install/Update/Play/Open
+/// actions, all live as the focus moves.
+fn info_pane(
+    ui: &mut egui::Ui,
+    pane: Rect,
+    view: &mut DecompView,
+    e_idx: Option<usize>,
+    alpha: f32,
+    interactive: bool,
+    s: f32,
+) {
+    let painter = ui.painter().clone();
+    painter.line_segment(
+        [pane.left_top(), pane.right_top()],
+        Stroke::new(
+            s.max(1.0),
+            Color32::from_white_alpha((40.0 * alpha) as u8),
+        ),
+    );
+
+    let e = e_idx.map(|i| view.entries[i].clone());
+    let Some(e) = e else {
+        painter.text(
+            pane.center(),
+            Align2::CENTER_CENTER,
+            "Select a project — its details and actions show here",
+            FontId::proportional(13.0 * s),
+            Color32::from_gray(140).gamma_multiply(alpha),
+        );
+        return;
+    };
+
+    // The pane needs the cover even when the card itself scrolled
+    // out of view.
+    if !cover_cache(&e.slug).is_some_and(|c| c.is_file())
+        && view.cover_requested.insert(e.slug.clone())
+    {
+        let _ = view.cover_req_tx.send((
+            e.slug.clone(),
+            e.cover_q.clone(),
+            cover_cache(&e.slug),
+        ));
+    }
+
+    let pad_x = 40.0 * s;
+    let dir = install_dir(&e.slug);
+    let stamp = dir.as_deref().and_then(installed_stamp);
+    let disp = dir
+        .as_deref()
+        .and_then(installed_release)
+        .or_else(|| stamp.clone());
+    let act = card_action(stamp.as_deref(), view.remote.get(&e.slug));
+    let dl = view.downloads.get(&e.slug).cloned();
+    let installed = stamp.is_some();
+    let (status_txt, status_c) = if let Some(dl) = &dl {
+        (
+            dl.lock().unwrap_or_else(|e| e.into_inner()).stage.clone(),
+            Color32::from_rgb(120, 180, 255),
+        )
     } else {
-        ui.interact(orect, ui.scope_id().with("decomp-open"), Sense::hover())
+        match (disp.as_deref(), act) {
+            (Some(st), Action::Update) => (
+                format!("Installed · {st} — update available"),
+                Color32::from_rgb(255, 190, 90),
+            ),
+            (Some(st), _) => (
+                format!("Installed · {st}"),
+                Color32::from_rgb(120, 200, 120),
+            ),
+            (None, _) if e.repo.is_empty() => (
+                "Listed — no repository yet".to_string(),
+                Color32::from_gray(150),
+            ),
+            (None, _) => (String::new(), Color32::from_gray(150)),
+        }
+    };
+
+    // --- Left column: the cover, full pane height ------------------
+    let slot_h = pane.height() - 28.0 * s;
+    let slot = Rect::from_min_size(
+        Pos2::new(pane.min.x + pad_x, pane.min.y + 14.0 * s),
+        Vec2::new(slot_h * 0.74, slot_h),
+    );
+    painter.rect_filled(
+        slot,
+        CornerRadius::same((8.0 * s).round() as u8),
+        Color32::from_white_alpha((6.0 * alpha) as u8),
+    );
+    let pane_tex = cover_cache(&e.slug)
+        .filter(|c| c.is_file())
+        .and_then(|c| view.row.cover_tex(ui.ctx(), &CoverSrc::File(c)));
+    if let Some(tex) = &pane_tex {
+        let dest = fit_rect(
+            slot.shrink(1.0),
+            tex.size()[0] as f32,
+            tex.size()[1] as f32,
+        );
+        painter.image(
+            tex.id(),
+            dest,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE.gamma_multiply(alpha),
+        );
     }
-    .on_hover_text("Open Decomps folder");
-    if orr.hovered() {
+    painter.rect_stroke(
+        slot,
+        CornerRadius::same((8.0 * s).round() as u8),
+        Stroke::new(
+            s.max(1.0),
+            Color32::from_white_alpha((30.0 * alpha) as u8),
+        ),
+        StrokeKind::Inside,
+    );
+
+    // --- Info column (fills the rest of the pane) -------------------
+    let tx = slot.max.x + 18.0 * s;
+    let tw = (pane.max.x - pad_x - tx).max(60.0 * s);
+    // The action row sits under the info text, pinned to the pane's
+    // bottom edge — the status line rides right above it.
+    let bh = 36.0 * s;
+    let gap = 10.0 * s;
+    let row_top = pane.max.y - 14.0 * s - bh;
+    let mut ty = pane.min.y + 24.0 * s;
+    let lh = 26.0 * s;
+
+    let title = if e.featured {
+        format!("★ {}", e.name)
+    } else {
+        e.name.clone()
+    };
+    painter.text(
+        Pos2::new(tx, ty),
+        Align2::LEFT_CENTER,
+        crate::ellipsize(&painter, &title, &FontId::proportional(22.0 * s), tw),
+        FontId::proportional(22.0 * s),
+        Color32::WHITE.gamma_multiply(alpha),
+    );
+    ty += lh + 3.0 * s;
+
+    // Badges: console · kind · version + a colored status flag.
+    let mut badges = format!(
+        "{} · {}",
+        catalog::console_label(&e.console),
+        e.kind.label()
+    );
+    if !e.version.is_empty() {
+        badges.push_str(&format!(" · {}", e.version));
+    }
+    let flag = if e.takedown {
+        Some(("Takedown", Color32::from_rgb(255, 110, 110)))
+    } else if e.abandoned {
+        Some(("Abandoned", Color32::from_rgb(255, 160, 110)))
+    } else {
+        catalog::status_label(&e.status)
+    };
+    let badges_txt = crate::ellipsize(&painter, &badges, &FontId::proportional(14.0 * s), tw * 0.7);
+    let bw = painter
+        .layout_no_wrap(badges_txt.clone(), FontId::proportional(14.0 * s), Color32::WHITE)
+        .size()
+        .x;
+    painter.text(
+        Pos2::new(tx, ty),
+        Align2::LEFT_CENTER,
+        badges_txt,
+        FontId::proportional(14.0 * s),
+        Color32::from_gray(170).gamma_multiply(alpha),
+    );
+    if let Some((ft, fc)) = flag {
+        painter.text(
+            Pos2::new(tx + bw + 10.0 * s, ty),
+            Align2::LEFT_CENTER,
+            ft,
+            FontId::proportional(14.0 * s),
+            fc.gamma_multiply(alpha),
+        );
+    }
+    ty += lh;
+
+    // Repo + homepage — small clickable links.
+    let mut link_clicks: Vec<String> = Vec::new();
+    if !e.repo.is_empty() {
+        let g = painter.layout_no_wrap(
+            e.repo.clone(),
+            FontId::monospace(14.0 * s),
+            Color32::from_rgb(120, 180, 255),
+        );
+        let rr = Rect::from_min_size(Pos2::new(tx, ty - g.size().y * 0.5), g.size());
+        let resp = if interactive {
+            ui.interact(rr, ui.scope_id().with("decomp-pane-repo"), Sense::click())
+        } else {
+            ui.interact(rr, ui.scope_id().with("decomp-pane-repo"), Sense::hover())
+        };
+        let col = if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            Color32::from_rgb(170, 210, 255)
+        } else {
+            Color32::from_rgb(120, 180, 255)
+        };
+        painter.galley(rr.min, g, col.gamma_multiply(alpha));
+        if resp.clicked() {
+            link_clicks.push(format!("https://github.com/{}", e.repo));
+        }
+        let mut lx = rr.max.x + 14.0 * s;
+        if !e.homepage.is_empty() {
+            let hg = painter.layout_no_wrap(
+                "homepage".to_string(),
+                FontId::proportional(13.0 * s),
+                Color32::from_rgb(120, 180, 255),
+            );
+            let hr = Rect::from_min_size(Pos2::new(lx, ty - hg.size().y * 0.5), hg.size());
+            let resp = if interactive {
+                ui.interact(hr, ui.scope_id().with("decomp-pane-home"), Sense::click())
+            } else {
+                ui.interact(hr, ui.scope_id().with("decomp-pane-home"), Sense::hover())
+            };
+            let col = if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                Color32::from_rgb(170, 210, 255)
+            } else {
+                Color32::from_rgb(120, 180, 255)
+            };
+            painter.galley(hr.min, hg, col.gamma_multiply(alpha));
+            if resp.clicked() {
+                link_clicks.push(e.homepage.clone());
+            }
+            lx = hr.max.x + 14.0 * s;
+        }
+        // First couple of curated links ride the same row.
+        for (label, url) in e.links.iter().take(2) {
+            let lg = painter.layout_no_wrap(
+                label.clone(),
+                FontId::proportional(13.0 * s),
+                Color32::from_rgb(120, 180, 255),
+            );
+            if lx + lg.size().x > tx + tw {
+                break;
+            }
+            let lr = Rect::from_min_size(Pos2::new(lx, ty - lg.size().y * 0.5), lg.size());
+            let resp = if interactive {
+                ui.interact(lr, ui.scope_id().with(("decomp-pane-link", url)), Sense::click())
+            } else {
+                ui.interact(lr, ui.scope_id().with(("decomp-pane-link", url)), Sense::hover())
+            };
+            let col = if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                Color32::from_rgb(170, 210, 255)
+            } else {
+                Color32::from_rgb(120, 180, 255)
+            };
+            painter.galley(lr.min, lg, col.gamma_multiply(alpha));
+            if resp.clicked() {
+                link_clicks.push(url.clone());
+            }
+            lx = lr.max.x + 14.0 * s;
+        }
+    }
+    ty += lh;
+
+    // Meta — year · dev · author · toolchain · progress, one line.
+    let mut meta: Vec<String> = Vec::new();
+    if let Some(yr) = e.year {
+        meta.push(yr.to_string());
+    }
+    if !e.developer.is_empty() {
+        meta.push(e.developer.clone());
+    }
+    if !e.author.is_empty() && e.author != e.developer {
+        meta.push(e.author.clone());
+    }
+    if !e.toolchain.is_empty() {
+        meta.push(e.toolchain.clone());
+    }
+    if let Some(p) = e.progress {
+        meta.push(format!("{p}%"));
+    }
+    if let Some(st) = e.stars {
+        meta.push(format!("★ {st}"));
+    }
+    if !e.language.is_empty() {
+        meta.push(e.language.clone());
+    }
+    if !meta.is_empty() {
+        painter.text(
+            Pos2::new(tx, ty),
+            Align2::LEFT_CENTER,
+            crate::ellipsize(
+                &painter,
+                &meta.join("  ·  "),
+                &FontId::proportional(13.5 * s),
+                tw,
+            ),
+            FontId::proportional(13.5 * s),
+            Color32::from_gray(150).gamma_multiply(alpha),
+        );
+        ty += lh;
+    }
+
+    // Description — wrapped, up to two lines with ellipsis.
+    if !e.description.is_empty() {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap = egui::text::TextWrapping {
+            max_width: tw,
+            max_rows: 3,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        job.append(
+            &e.description,
+            0.0,
+            egui::text::TextFormat::simple(
+                FontId::proportional(14.0 * s),
+                Color32::PLACEHOLDER,
+            ),
+        );
+        let g = ui_fonts_job(&painter, job);
+        painter.galley(
+            Pos2::new(tx, ty - 8.0 * s),
+            g.clone(),
+            Color32::from_gray(205).gamma_multiply(alpha),
+        );
+        ty += g.size().y + 5.0 * s;
+    }
+
+    // Setup requirements — amber, what the user needs to supply.
+    if !e.requirements.is_empty() && ty + lh < row_top - 18.0 * s {
+        painter.text(
+            Pos2::new(tx, ty),
+            Align2::LEFT_CENTER,
+            crate::ellipsize(
+                &painter,
+                &format!("Setup: {}", e.requirements),
+                &FontId::proportional(13.5 * s),
+                tw,
+            ),
+            FontId::proportional(13.5 * s),
+            Color32::from_rgb(235, 190, 120).gamma_multiply(alpha),
+        );
+        ty += lh;
+    }
+
+    // Tags ride the last line when there's room.
+    if !e.tags.is_empty() && ty + lh < row_top - 18.0 * s {
+        painter.text(
+            Pos2::new(tx, ty),
+            Align2::LEFT_CENTER,
+            crate::ellipsize(
+                &painter,
+                &e.tags.join("  ·  "),
+                &FontId::proportional(12.5 * s),
+                tw,
+            ),
+            FontId::proportional(12.5 * s),
+            Color32::from_gray(120).gamma_multiply(alpha),
+        );
+    }
+
+    // --- Action row (bottom of the info column) -------------------
+    // Install status line right above the row.
+    if !status_txt.is_empty() {
+        painter.text(
+            Pos2::new(tx, row_top - 6.0 * s),
+            Align2::LEFT_BOTTOM,
+            crate::ellipsize(
+                &painter,
+                &status_txt,
+                &FontId::proportional(12.0 * s),
+                tw,
+            ),
+            FontId::proportional(12.0 * s),
+            status_c.gamma_multiply(alpha),
+        );
+    }
+    let mut bx = tx;
+    if let Some(dl) = &dl {
+        let g = dl.lock().unwrap_or_else(|e| e.into_inner());
+        let btn = Rect::from_min_size(Pos2::new(bx, row_top), Vec2::new(170.0 * s, bh));
+        painter.rect_filled(
+            btn,
+            CornerRadius::same((bh * 0.5).round() as u8),
+            Color32::from_white_alpha((10.0 * alpha) as u8),
+        );
+        let fill_w = (btn.width() * g.frac.clamp(0.0, 1.0)).max(0.0);
+        if fill_w > 1.0 {
+            let mut fr = btn;
+            fr.max.x = fr.min.x + fill_w;
+            painter.rect_filled(
+                fr,
+                CornerRadius::same((bh * 0.5).round() as u8),
+                Color32::from_rgb(70, 130, 200).gamma_multiply(0.8 * alpha),
+            );
+        }
+        painter.text(
+            btn.center(),
+            Align2::CENTER_CENTER,
+            crate::ellipsize(
+                &painter,
+                &g.stage,
+                &FontId::proportional(13.0 * s),
+                btn.width() - 12.0 * s,
+            ),
+            FontId::proportional(13.0 * s),
+            Color32::from_gray(220).gamma_multiply(alpha),
+        );
+        bx = btn.max.x + gap;
+        ui.ctx().request_repaint();
+    } else {
+        let mut ops: Vec<(&str, PaneOp, bool)> = Vec::new();
+        if e.repo.is_empty() {
+            ops.push(("No repository", PaneOp::Download, false));
+        } else {
+            ops.push(match act {
+                Action::Install => ("Install", PaneOp::Download, true),
+                _ => ("Play", PaneOp::Play, true),
+            });
+            if installed {
+                ops.push(("Open folder", PaneOp::OpenFolder, true));
+            }
+            if act == Action::Update {
+                ops.push(("Update", PaneOp::Download, true));
+            }
+        }
+        for (label, op, enabled) in ops {
+            let btn =
+                Rect::from_min_size(Pos2::new(bx, row_top), Vec2::new(170.0 * s, bh));
+            if pane_button(
+                ui, &painter, btn, label, label, enabled, interactive, alpha, s,
+            ) {
+                run_pane_op(view, &e, &dir, op);
+            }
+            bx += 170.0 * s + gap;
+        }
+    }
+    // CC BY-SA attribution for the upstream dataset trails the row.
+    painter.text(
+        Pos2::new(bx + 6.0 * s, row_top + bh * 0.5),
+        Align2::LEFT_CENTER,
+        "Catalog data: recompendium.com · CC BY-SA 4.0",
+        FontId::proportional(11.0 * s),
+        Color32::from_gray(100).gamma_multiply(alpha),
+    );
+
+    for url in link_clicks {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+}
+
+/// What the pane's buttons do — kept separate from `Action` since
+/// Play is pane-only.
+#[derive(Clone, Copy, PartialEq)]
+enum PaneOp {
+    Download,
+    Play,
+    OpenFolder,
+}
+
+/// One pane pill button — white-alpha fill/edge like the settings
+/// buttons, three states (idle/hover/pressed) plus a disabled dim.
+/// Returns true on click.
+#[allow(clippy::too_many_arguments)]
+fn pane_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    id: &str,
+    label: &str,
+    enabled: bool,
+    interactive: bool,
+    alpha: f32,
+    s: f32,
+) -> bool {
+    let resp = if interactive && enabled {
+        ui.interact(rect, ui.scope_id().with(("decomp-pane-btn", id)), Sense::click())
+    } else {
+        ui.interact(rect, ui.scope_id().with(("decomp-pane-btn", id)), Sense::hover())
+    };
+    let hot = enabled && resp.hovered();
+    let down = hot && resp.is_pointer_button_down_on();
+    let (fill, edge) = if !enabled {
+        (4.0, 30.0)
+    } else if down {
+        (30.0, 160.0)
+    } else if hot {
+        (22.0, 120.0)
+    } else {
+        (10.0, 70.0)
+    };
+    painter.rect_filled(
+        rect,
+        CornerRadius::same((rect.height() * 0.5).round() as u8),
+        Color32::from_white_alpha((fill * alpha) as u8),
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same((rect.height() * 0.5).round() as u8),
+        Stroke::new(
+            s.max(1.0),
+            Color32::from_white_alpha((edge * alpha) as u8),
+        ),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(15.0 * s),
+        (if enabled {
+            Color32::from_gray(235)
+        } else {
+            Color32::from_gray(130)
+        })
+        .gamma_multiply(alpha),
+    );
+    if hot {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    icon_folder(&painter, orect, alpha);
-    if orr.clicked() {
-        if let Some(d) = decomps_root() {
-            let _ = std::fs::create_dir_all(&d);
-            open_in_file_manager(&d);
+    resp.clicked() && enabled
+}
+
+/// What a pane button click does — Download reuses the card's
+/// resolved action; Play launches the installed exe (folder fallback
+/// when no binary is found); OpenFolder opens the install dir.
+fn run_pane_op(view: &mut DecompView, e: &Entry, dir: &Option<PathBuf>, op: PaneOp) {
+    match op {
+        PaneOp::Download => view.activate(e),
+        PaneOp::Play => {
+            if let Some(d) = dir {
+                match find_exe(d) {
+                    Some(exe) => {
+                        let _ = std::process::Command::new(&exe).current_dir(d).spawn();
+                    }
+                    None => {
+                        view.notice =
+                            Some("No executable found — opening the folder".into());
+                        open_in_file_manager(d);
+                    }
+                }
+            }
+        }
+        PaneOp::OpenFolder => {
+            if let Some(d) = dir {
+                open_in_file_manager(d);
+            }
         }
     }
 }
 
-/// A plain folder glyph for the band's open button — sized and lit
-/// to match the update cog's presence next to it.
-fn icon_folder(painter: &egui::Painter, rect: Rect, alpha: f32) {
-    let c = Color32::from_gray(235).gamma_multiply(alpha);
-    let k = rect.height() / 100.0;
-    let cx = rect.center();
-    let w = 56.0 * k;
-    let h = 42.0 * k;
-    let y = cx.y - h * 0.5 + 5.0 * k;
-    // Back of the folder with the tab raised on the left.
-    let tab = Rect::from_min_size(
-        Pos2::new(cx.x - w * 0.5, y),
-        Vec2::new(w * 0.38, 8.0 * k),
-    );
-    let body = Rect::from_min_size(
-        Pos2::new(cx.x - w * 0.5, y + 6.0 * k),
-        Vec2::new(w, h - 6.0 * k),
-    );
-    painter.rect_filled(
-        tab,
-        CornerRadius::same((2.0 * k).round() as u8),
-        c,
-    );
-    painter.rect_filled(
-        body,
-        CornerRadius::same((3.0 * k).round() as u8),
-        c,
-    );
+/// The binary `Play` launches: shallow scan for a `.exe`, install
+/// root first, skipping uninstallers; the largest file wins — the
+/// built binary tends to outweigh launchers and tools.
+fn find_exe(dir: &Path) -> Option<PathBuf> {
+    let mut found: Vec<(u8, u64, PathBuf)> = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0u8)];
+    while let Some((d, depth)) = stack.pop() {
+        if depth > 2 {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push((p, depth + 1));
+            } else if p
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
+            {
+                let stem = p
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if stem.contains("uninstall") || stem.starts_with("unins") {
+                    continue;
+                }
+                let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
+                found.push((depth, size, p));
+            }
+        }
+    }
+    // Shallower first, larger second.
+    found.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    found.into_iter().next().map(|(_, _, p)| p)
 }
 
 #[cfg(test)]
@@ -1345,22 +2059,49 @@ mod tests {
         assert_eq!(card_action(None, Some(&bad)), Action::Install);
     }
 
-    /// Keyboard nav clamps at the edges and vertical steps use the
-    /// computed column count.
+    /// Keyboard nav clamps at the edges — `nav_geo` only exists
+    /// after a painted frame, so dy steps +/-1 like dx here.
     #[test]
     fn move_selection_walks_grid() {
         let mut v = DecompView::new();
-        v.columns = 4;
+        let sel = |v: &DecompView| {
+            v.cards
+                .primary_path()
+                .map(|p| p.to_string_lossy().into_owned())
+        };
         v.move_selection(1, 0);
-        assert_eq!(v.selected, 1);
+        assert_eq!(sel(&v).as_deref(), Some("oot"));
         v.move_selection(0, 1);
-        assert_eq!(v.selected, 5);
+        assert_eq!(sel(&v).as_deref(), Some("mm"));
         v.move_selection(-1, 0);
-        assert_eq!(v.selected, 4);
+        assert_eq!(sel(&v).as_deref(), Some("oot"));
         v.move_selection(0, -10);
-        assert_eq!(v.selected, 0);
+        assert_eq!(sel(&v).as_deref(), Some("sm64"));
         v.move_selection(0, 99);
-        assert_eq!(v.selected, PROJECTS.len() as i32 - 1);
+        assert_eq!(sel(&v).as_deref(), PROJECTS.last().map(|p| p.slug));
+    }
+
+    /// The kind tab narrows the shown set (the list's subset);
+    /// search text narrows it further -- name/repo/console/tags all
+    /// match via the item keywords.
+    #[test]
+    fn filters_narrow_visible() {
+        let mut v = DecompView::new();
+        let shown = |v: &DecompView| v.cards.visible(&v.search.text).len();
+        assert_eq!(shown(&v), PROJECTS.len());
+        v.set_kind_filter(Some(Kind::Decomp));
+        let decomps = shown(&v);
+        assert!(decomps < PROJECTS.len() && decomps > 0);
+        v.set_kind_filter(None);
+        v.search.text = "zelda".into();
+        // Repo names match too -- the three zeldaret decomps plus
+        // Zelda64Recomp.
+        assert_eq!(shown(&v), 4);
+        v.search.text = "ocarina".into();
+        assert_eq!(shown(&v), 1);
+        v.search.text.clear();
+        v.search.text = "n64decomp".into();
+        assert_eq!(shown(&v), 3);
     }
 
     /// Two slugs colliding would alias install dirs AND cover cache
@@ -1423,7 +2164,7 @@ mod tests {
             Some("https://x/port-windows-x64.zip")
         );
         // No windows asset at all → the caller falls back to source.
-        let none = vec![a("port-linux-x64.tar.gz"), a("port-macos.dmg")];
+        let none = vec![a("port-linux-x64.tar.gz"), a("port-windows.dmg")];
         assert_eq!(pick_os_asset(&none), None);
         // A single unmarked-arch windows build still wins.
         let single = vec![a("port-linux.tar.gz"), a("port-windows.zip")];

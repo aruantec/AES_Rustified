@@ -56,6 +56,7 @@ skrifa = "0.48"
 tiny-skia = "0.11"
 read-fonts = "0.45"
 raw-window-handle = "0.6"
+serde_yaml = "0.9.34"
 
 # POSIX kill()/SIGSTOP/SIGCONT for session stop+pause on unix.
 [target.'cfg(unix)'.dependencies]

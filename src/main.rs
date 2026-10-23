@@ -3633,7 +3633,20 @@ impl eframe::App for AesRustApp {
                                     );
                                 }
                                 View::Recomp => {
-                                    emulation::decomp::view(ui, content, a, view_interactive, decomp, s)
+                                    // The shared list's pill-slider
+                                    // knob flag — same wiring the
+                                    // music cards get.
+                                    decomp.cards.progress_knob = settings.ui.progress_knob;
+                                    emulation::decomp::view(
+                                        ui,
+                                        content,
+                                        a,
+                                        view_interactive,
+                                        decomp,
+                                        &mut settings.emulation,
+                                        &settings.carousel,
+                                        s,
+                                    );
                                 }
                                 _ => placeholder_view(ui, content, v.name(), s),
                             }
@@ -3677,6 +3690,11 @@ impl eframe::App for AesRustApp {
                 // Emulation game-list edits (Add Roms / Scan Folder /
                 // Remove / Clear, Xenia path) persist immediately.
                 if emu.take_settings_dirty() {
+                    settings::save(settings);
+                }
+                // The Re/Decomp band's layout toggle persists
+                // Emulation.DecompLayoutMode.
+                if decomp.take_settings_dirty() {
                     settings::save(settings);
                 }
                 // The band's power button and the capture menu's
@@ -3947,6 +3965,7 @@ impl eframe::App for AesRustApp {
                     && !ui.ctx().text_edit_focused()
                     && !search.wants_focus()
                     && !album_search.wants_focus()
+                    && !decomp.search.wants_focus()
                 {
                     ui.ctx().memory_mut(|m| m.stop_text_input());
                 }
@@ -4158,6 +4177,7 @@ impl eframe::App for AesRustApp {
                                 emu.search.open()
                             }
                         }
+                        View::Recomp => decomp.search.open(),
                         _ => {}
                     }
                 }
@@ -4199,6 +4219,8 @@ impl eframe::App for AesRustApp {
                             album_search.close(ui.ctx());
                         } else if emu.search.is_open() {
                             emu.search.close(ui.ctx());
+                        } else if nav.target() == View::Recomp && decomp.search.is_open() {
+                            decomp.search.close(ui.ctx());
                         } else if emu.render_open {
                             // The capture render-options panel closes
                             // like the other overlays.
@@ -6578,7 +6600,9 @@ fn music_view(
         | carousel::Action::Patches(_)
         | carousel::Action::CustomConfig(_)
         | carousel::Action::Cheats(_)
-        | carousel::Action::GraphicPacks(_) => None,
+        | carousel::Action::GraphicPacks(_)
+        | carousel::Action::Download(_)
+        | carousel::Action::OpenFolder(_) => None,
         carousel::Action::None => None,
     };
     // Transport prev/next resolve against the loaded album's items

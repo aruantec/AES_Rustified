@@ -139,23 +139,41 @@ pub enum Action {
     Cheats(PathBuf),
     /// WIIU ROM menu: "Graphic Packs" — the CemuGraphicPacksOverlay.
     GraphicPacks(PathBuf),
+    /// Re/Decomp menu: "Install / Update" — the caller resolves the
+    /// entry's state (fresh install vs update vs reinstall).
+    Download(PathBuf),
+    /// Re/Decomp menu: "Open install folder".
+    OpenFolder(PathBuf),
 }
 
 /// One carousel/grid item = one track of the loaded album.
-struct Item {
-    path: PathBuf,
+pub struct Item {
+    /// Identity — a file path, a URL, or a synthetic key (Re/Decomp
+    /// catalog entries use their slug).
+    pub path: PathBuf,
     /// Track's own embedded art.
-    cover: CoverSrc,
+    pub cover: CoverSrc,
     /// Shared folder artwork file (cover.jpg …) — Lacrima applies a
     /// local artwork file to every item in the folder, but a sibling
     /// track's embedded art never leaks onto items without art.
-    fallback: Option<CoverSrc>,
-    title: String,
-    artist: String,
-    album: String,
+    pub fallback: Option<CoverSrc>,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    /// Extra search haystack matched by `visible()` but never
+    /// painted — Re/Decomp entries stuff repo/dev/toolchain/tags
+    /// here while `artist`/`album` stay clean marquee lines.
+    pub keywords: String,
     /// Tag duration in seconds — `None` for ROM items and items
     /// whose info hasn't resolved yet (the mini list shows "--:--").
-    duration: Option<f64>,
+    pub duration: Option<f64>,
+    /// Status dot at the card's top-right (Re/Decomp install/update
+    /// state) — `None` hides it.
+    pub marker: Option<Color32>,
+    /// Download-progress strip along a grid card's bottom edge
+    /// (`None` hides it); carousel mode skips it — the detail pane
+    /// carries progress there.
+    pub progress: Option<f32>,
 }
 
 struct Press {
@@ -297,6 +315,10 @@ pub struct Carousel {
     mode: Mode,
     prev_mode: Option<Mode>,
     mode_t: f32,
+    /// Caller-computed path subset `visible()` intersects with the
+    /// text filter — the Re/Decomp kind tabs (All/Ports/Recomps/…)
+    /// restrict the list without rebuilding `items`. `None` = all.
+    subset: Option<std::collections::HashSet<PathBuf>>,
     /// Last frame's grid geometry + view rect — arrow-key navigation
     /// scrolls the target card into view between paints.
     nav_geo: Option<(GridGeo, Rect)>,
@@ -323,6 +345,10 @@ pub struct Carousel {
     /// ROM mode + cemu handler — shows the "Graphic Packs" entry
     /// (ShowCurrentSectionCemuGraphicPacksMenuItem).
     pub cemu_menu: bool,
+    /// Re/Decomp catalog mode: same widget, catalog menu vocabulary
+    /// (Refresh catalog / Install·Update / Play / Open install
+    /// folder) and no "add games" empty-state hint.
+    pub decomp_menu: bool,
     /// Row floor for the horizontal card grid — compact transport
     /// mode sets 2 so the shrunken cover area still shows two rows
     /// (cards shrink to fit); normal layouts leave it at 1.
@@ -373,6 +399,7 @@ impl Carousel {
             mode: Mode::Carousel,
             prev_mode: None,
             mode_t: 1.0,
+            subset: None,
             nav_geo: None,
             focus_flash: 0.0,
             pop: 0.0,
@@ -381,6 +408,7 @@ impl Carousel {
             rpcs3_menu: false,
             shadps4_menu: false,
             cemu_menu: false,
+            decomp_menu: false,
             h_min_rows: 1,
             marquee_title: false,
             marquee_off: 0.0,
@@ -416,7 +444,10 @@ impl Carousel {
                 .unwrap_or_else(|| p.display().to_string()),
             artist: String::new(),
             album: album.title.clone(),
+            keywords: String::new(),
             duration: None,
+            marker: None,
+            progress: None,
         };
         self.items = album.tracks.iter().map(|p| mk(p)).collect();
         // "Add Files" extras — local files outside the album's scanned
@@ -483,8 +514,11 @@ impl Carousel {
             title: stem,
             artist: String::new(),
             album: section.to_string(),
+            keywords: String::new(),
             path,
             duration: None,
+            marker: None,
+            progress: None,
         }
     }
 
@@ -510,6 +544,91 @@ impl Carousel {
     pub fn set_cover(&mut self, path: &Path, src: CoverSrc) {
         if let Some(i) = self.index_of(path) {
             self.items[i].cover = src;
+        }
+    }
+
+    /// Caller-built item set (the Re/Decomp catalog): the view owns
+    /// each `Item`'s fields — `keywords` feeds `visible()`'s search
+    /// without polluting the painted title/artist/album lines, and
+    /// `marker`/`progress` carry install state onto the cards.
+    /// `key` doubles as `album_key` so the context menu's non-item
+    /// entries stay reachable while the list is empty.
+    pub fn open_items(&mut self, items: Vec<Item>, key: String) {
+        self.items = items;
+        self.album_key = Some(key);
+        self.album_title = String::new();
+        self.reset_view();
+    }
+
+    /// Restrict `visible()` to a caller-computed path subset — the
+    /// Re/Decomp kind tabs compose it over the search text instead of
+    /// rebuilding the item list on every tab switch.
+    pub fn set_subset(&mut self, subset: Option<std::collections::HashSet<PathBuf>>) {
+        self.subset = subset;
+    }
+
+    /// Refresh every item's status marker + progress in one pass —
+    /// the Re/Decomp view calls this per frame with a cheap per-path
+    /// lookup (install state / active download).
+    pub fn update_markers(&mut self, f: &dyn Fn(&Path) -> (Option<Color32>, Option<f32>)) {
+        for it in &mut self.items {
+            let (m, p) = f(&it.path);
+            it.marker = m;
+            it.progress = p;
+        }
+    }
+
+    /// Item a detail pane should describe — carousel mode follows the
+    /// visually centered card (same pick the overlay labels make,
+    /// including the slider-hover preview), grid modes follow the
+    /// primary selection with a first-visible fallback when it got
+    /// filtered or scrolled out of view.
+    pub fn focused_path(&self, filter: &str) -> Option<PathBuf> {
+        let visible = self.visible(filter);
+        let idx = match self.mode {
+            Mode::Carousel => self.overlay_index(&visible),
+            _ if visible.contains(&self.sel) => Some(self.sel),
+            _ => visible.first().copied(),
+        }?;
+        self.items.get(idx).map(|i| i.path.clone())
+    }
+
+    /// Paths of items currently on screen — the caller's cue for lazy
+    /// per-item resource fetches (Re/Decomp covers). Carousel mode
+    /// returns a window around the focus; grids return the cards the
+    /// layout geometry intersects; before the first `ui()` paints
+    /// (no geometry yet) the head of the list.
+    pub fn onscreen_paths(&self, filter: &str) -> Vec<PathBuf> {
+        let visible = self.visible(filter);
+        match self.mode {
+            Mode::Carousel => {
+                let c = self.current.round() as i32;
+                (c - 10..=c + 10)
+                    .filter(|i| *i >= 0)
+                    .filter_map(|i| visible.get(i as usize))
+                    .map(|&idx| self.items[idx].path.clone())
+                    .collect()
+            }
+            _ => {
+                if let Some((g, area)) = &self.nav_geo {
+                    visible
+                        .iter()
+                        .enumerate()
+                        .filter(|(vi, _)| {
+                            g.card_rect(*vi, self.grid_current)
+                                .map(|r| r.intersects(*area))
+                                .unwrap_or(false)
+                        })
+                        .map(|(_, &idx)| self.items[idx].path.clone())
+                        .collect()
+                } else {
+                    visible
+                        .iter()
+                        .take(24)
+                        .map(|&idx| self.items[idx].path.clone())
+                        .collect()
+                }
+            }
         }
     }
 
@@ -564,7 +683,10 @@ impl Carousel {
                 .first()
                 .map(|i| i.album.clone())
                 .unwrap_or_default(),
+            keywords: String::new(),
             duration: None,
+            marker: None,
+            progress: None,
         });
     }
 
@@ -591,7 +713,10 @@ impl Carousel {
                 title: stem,
                 artist: String::new(),
                 album: album.clone(),
+                keywords: String::new(),
                 duration: None,
+                marker: None,
+                progress: None,
             });
             added.push(p.clone());
         }
@@ -1225,19 +1350,26 @@ impl Carousel {
     }
 
     /// Item indices passing `filter` (MusicView's CoverItems filter —
-    /// matches title, artist or album, case-insensitive).
+    /// matches title, artist or album, case-insensitive, plus the
+    /// caller-only `keywords` haystack) AND the caller's `subset`
+    /// when one is set (Re/Decomp kind tabs).
     pub(crate) fn visible(&self, filter: &str) -> Vec<usize> {
         let q = filter.trim().to_lowercase();
-        if q.is_empty() {
-            return (0..self.items.len()).collect();
-        }
         self.items
             .iter()
             .enumerate()
             .filter(|(_, i)| {
-                i.title.to_lowercase().contains(&q)
+                self.subset
+                    .as_ref()
+                    .map(|s| s.contains(&i.path))
+                    .unwrap_or(true)
+            })
+            .filter(|(_, i)| {
+                q.is_empty()
+                    || i.title.to_lowercase().contains(&q)
                     || i.artist.to_lowercase().contains(&q)
                     || i.album.to_lowercase().contains(&q)
+                    || i.keywords.to_lowercase().contains(&q)
             })
             .map(|(i, _)| i)
             .collect()
@@ -1846,7 +1978,7 @@ impl Carousel {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                if self.rom_mode {
+                if self.rom_mode || self.decomp_menu {
                     "No items"
                 } else {
                     "No album loaded"
@@ -1854,7 +1986,7 @@ impl Carousel {
                 FontId::proportional(24.0 * s),
                 Color32::from_rgb(0x78, 0x78, 0x78).gamma_multiply(alpha * 0.53),
             );
-            if self.rom_mode && self.album_key.is_some() {
+            if self.rom_mode && !self.decomp_menu && self.album_key.is_some() {
                 painter.text(
                     rect.center() + Vec2::new(0.0, 30.0 * s),
                     Align2::CENTER_CENTER,
@@ -1869,7 +2001,12 @@ impl Carousel {
             if interactive && self.album_key.is_some() {
                 let resp = ui.interact(rect, ui.scope_id().with("cover-view-empty"), Sense::click());
                 resp.context_menu(|ui| {
-                    if self.rom_mode {
+                    if self.decomp_menu {
+                        if ui.button("Refresh catalog").clicked() {
+                            action = Action::ScanFolder;
+                            ui.close();
+                        }
+                    } else if self.rom_mode {
                         if ui.button("Add Roms").clicked() {
                             action = Action::AddRoms;
                             ui.close();
@@ -2254,7 +2391,12 @@ impl Carousel {
                 // item entries only while one is pointed. ROM mode
                 // swaps in the emulation vocabulary (EmulationView's
                 // item ContextMenu).
-                if self.rom_mode {
+                if self.decomp_menu {
+                    if ui.button("Refresh catalog").clicked() {
+                        action = Action::ScanFolder;
+                        ui.close();
+                    }
+                } else if self.rom_mode {
                     if ui.button("Add Roms").clicked() {
                         action = Action::AddRoms;
                         ui.close();
@@ -2275,6 +2417,25 @@ impl Carousel {
                 }
                 if let Some(p) = self.menu_item.clone() {
                     ui.separator();
+                    if self.decomp_menu {
+                        // Catalog item actions — the view resolves
+                        // Install vs Update vs Reinstall from state.
+                        if ui.button("Install / Update").clicked() {
+                            action = Action::Download(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                        if ui.button("Play").clicked() {
+                            action = Action::Play(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                        if ui.button("Open install folder").clicked() {
+                            action = Action::OpenFolder(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                    } else {
                     if self.rom_mode && ui.button("Play").clicked() {
                         action = Action::Play(p.clone());
                         self.menu_item = None;
@@ -2334,27 +2495,32 @@ impl Carousel {
                         self.menu_item = None;
                         ui.close();
                     }
+                    }
                 }
-                ui.separator();
-                if !self.rom_mode && self.has_url_items() && ui.button("Export Playlist").clicked()
-                {
-                    action = Action::Export;
-                    ui.close();
-                }
-                if ui
-                    .button(if self.rom_mode {
-                        "Clear Section"
-                    } else {
-                        "Clear Album"
-                    })
-                    .clicked()
-                {
-                    action = Action::Clear;
-                    ui.close();
-                }
-                if self.rom_mode && ui.button("Clear Section Cache").clicked() {
-                    action = Action::ClearCache;
-                    ui.close();
+                if !self.decomp_menu {
+                    ui.separator();
+                    if !self.rom_mode
+                        && self.has_url_items()
+                        && ui.button("Export Playlist").clicked()
+                    {
+                        action = Action::Export;
+                        ui.close();
+                    }
+                    if ui
+                        .button(if self.rom_mode {
+                            "Clear Section"
+                        } else {
+                            "Clear Album"
+                        })
+                        .clicked()
+                    {
+                        action = Action::Clear;
+                        ui.close();
+                    }
+                    if self.rom_mode && ui.button("Clear Section Cache").clicked() {
+                        action = Action::ClearCache;
+                        ui.close();
+                    }
                 }
             });
         }
@@ -2784,6 +2950,7 @@ impl Carousel {
         for vi in order {
             let idx = visible[vi];
             let item = &self.items[idx];
+            let marker = item.marker;
             let tex = Self::item_tex(row, &ctx, item);
             let ei = self.disp_index(vi);
             let (tx, tz, rot, sc, w, h) = self.item_geo(ei, &tex, cfg, s);
@@ -2838,6 +3005,23 @@ impl Carousel {
                 false,
             );
             painter.add(Shape::mesh(m));
+
+            // Catalog status dot (Re/Decomp) — projected onto the
+            // card's top-right corner so it rides the perspective
+            // transform and fades with the card.
+            if let Some(mc) = marker {
+                let tr = self.item_corners(tx, tz, rot, sc, center, w, h)[1];
+                let inward = 8.0 * s * sc;
+                painter.circle(
+                    tr + Vec2::new(-inward, inward),
+                    (4.5 * s * sc).max(2.0),
+                    mc.gamma_multiply(base_opacity),
+                    Stroke::new(
+                        1.2 * s.max(1.0),
+                        Color32::BLACK.gamma_multiply(0.5 * base_opacity),
+                    ),
+                );
+            }
 
             // Playing item: pulsing white glow border on the projected
             // quad (DrawProjectedSelectionBorder) — a faint outer halo
@@ -3592,6 +3776,39 @@ impl Carousel {
                 s,
             );
         }
+
+        // Catalog status dot (Re/Decomp install/update state) — a
+        // small ringed disc at the card's top-right corner.
+        if let Some(c) = item.marker {
+            painter.circle(
+                Pos2::new(card.max.x - 9.0 * s, card.min.y + 9.0 * s),
+                4.5 * s,
+                c.gamma_multiply(alpha),
+                Stroke::new(
+                    1.2 * s.max(1.0),
+                    Color32::BLACK.gamma_multiply(0.5 * alpha),
+                ),
+            );
+        }
+        // Download progress — a thin strip along the card's bottom.
+        if let Some(p) = item.progress {
+            let bar = Rect::from_min_max(
+                Pos2::new(card.min.x + 4.0 * s, card.max.y - 4.0 * s),
+                Pos2::new(card.max.x - 4.0 * s, card.max.y - 1.0 * s),
+            );
+            painter.rect_filled(
+                bar,
+                1.5 * s,
+                Color32::BLACK.gamma_multiply(0.55 * alpha),
+            );
+            let mut fill = bar;
+            fill.max.x = bar.min.x + bar.width() * p.clamp(0.0, 1.0);
+            painter.rect_filled(
+                fill,
+                1.5 * s,
+                Color32::from_rgb(0x5A, 0x9F, 0xF0).gamma_multiply(0.95 * alpha),
+            );
+        }
     }
 }
 
@@ -4065,7 +4282,10 @@ mod tests {
                     title: format!("t{i}"),
                     artist: String::new(),
                     album: String::new(),
+                    keywords: String::new(),
                     duration: None,
+                    marker: None,
+                    progress: None,
                 });
             }
             c
@@ -4109,7 +4329,10 @@ mod tests {
             title: title.to_string(),
             artist: artist.to_string(),
             album: String::new(),
+            keywords: String::new(),
             duration: None,
+            marker: None,
+            progress: None,
         };
         assert_eq!(c.first_artist(), None);
         c.items.push(item("a", ""));

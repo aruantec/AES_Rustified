@@ -3,6 +3,7 @@
 //! plumbing (WGC on Windows, the nested Wayland compositor elsewhere).
 
 pub mod cap_shader;
+pub mod catalog;
 pub mod cemu_gpack;
 pub mod cemu_overlay;
 pub mod decomp;
