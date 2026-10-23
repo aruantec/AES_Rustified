@@ -492,57 +492,49 @@ fn paint_player_info(
     duration: f64,
 ) {
     let wrap = (rect.width() - 42.0 * s).max(1.0);
-    let mut lines: Vec<(std::sync::Arc<egui::Galley>, f32)> = Vec::with_capacity(4);
+    // Emoji chars ride along as TRANSPARENT sections (same wrap) —
+    // `galley_overlay` draws their color strikes after the text.
+    let lay = |text: &str, size: f32, color: Color32| {
+        let mut job = crate::emoji::rich_job(
+            text,
+            egui::TextFormat::simple(FontId::proportional(size), color),
+        );
+        job.wrap.max_width = wrap;
+        painter.layout_job(job)
+    };
+    let mut lines: Vec<(std::sync::Arc<egui::Galley>, f32, f32)> = Vec::with_capacity(4);
     if !title.is_empty() {
-        lines.push((
-            painter.layout(
-                title.to_string(),
-                FontId::proportional(32.0 * s),
-                Color32::WHITE,
-                wrap,
-            ),
-            0.0,
-        ));
+        lines.push((lay(title, 32.0 * s, Color32::WHITE), 0.0, 32.0 * s));
     }
     if !artist.is_empty() {
-        lines.push((
-            painter.layout(
-                artist.to_string(),
-                FontId::proportional(24.0 * s),
-                Color32::WHITE,
-                wrap,
-            ),
-            0.0,
-        ));
+        lines.push((lay(artist, 24.0 * s, Color32::WHITE), 0.0, 24.0 * s));
     }
     if !album.is_empty() {
         lines.push((
-            painter.layout(
-                album.to_string(),
-                FontId::proportional(24.0 * s),
-                Color32::from_rgb(0xA9, 0xA9, 0xA9),
-                wrap,
-            ),
+            lay(album, 24.0 * s, Color32::from_rgb(0xA9, 0xA9, 0xA9)),
             0.0,
+            24.0 * s,
         ));
     }
     if duration > 0.0 {
         lines.push((
-            painter.layout(
-                format!("{} / {}", crate::fmt_time(position), crate::fmt_time(duration)),
-                FontId::proportional(40.0 * s),
+            lay(
+                &format!("{} / {}", crate::fmt_time(position), crate::fmt_time(duration)),
+                40.0 * s,
                 Color32::WHITE,
-                wrap,
             ),
             10.0 * s,
+            40.0 * s,
         ));
     }
-    let total_h: f32 = lines.iter().map(|(g, gap)| g.size().y + gap).sum();
+    let total_h: f32 = lines.iter().map(|(g, gap, _)| g.size().y + gap).sum();
     let mut y = rect.center().y - total_h * 0.5;
-    for (g, gap) in lines {
+    for (g, gap, fs) in &lines {
         y += gap;
         let h = g.size().y;
-        painter.galley(Pos2::new(rect.center().x - g.size().x * 0.5, y), g, Color32::WHITE);
+        let gp = Pos2::new(rect.center().x - g.size().x * 0.5, y);
+        painter.galley(gp, g.clone(), Color32::WHITE);
+        crate::emoji::galley_overlay(painter, gp, g, *fs, Color32::WHITE);
         y += h;
     }
 }

@@ -348,15 +348,17 @@ pub(crate) fn view(
                 Pos2::new(tx + lane_w * 0.5, title_y),
                 Vec2::new(lane_w, galley.rect.height() * 1.2),
             );
-            painter.with_clip_rect(lane).galley(
-                Pos2::new(lane.min.x + off, lane.center().y - galley.rect.height() * 0.5),
-                galley,
+            let clip = painter.with_clip_rect(lane);
+            crate::emoji::rich_text(
+                &clip,
+                Pos2::new(lane.min.x + off, lane.center().y),
+                &title,
+                &font,
                 Color32::WHITE,
             );
         } else {
             crate::emoji::rich_text(
                 &painter,
-                &ctx,
                 Pos2::new(tx, title_y),
                 &ellipsize(&painter, &title, &font, lane_w),
                 &font,
@@ -1341,7 +1343,6 @@ pub(crate) fn view(
                         );
                         crate::emoji::rich_text(
                             lp,
-                            &ctx,
                             Pos2::new(text_x, cy),
                             &text,
                             &font,

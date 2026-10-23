@@ -2088,9 +2088,11 @@ impl AlbumRow {
         let title_editing =
             self.editing.as_deref() == Some(album.dir.to_string_lossy().as_ref());
         if !title_editing && title_a > 0.001 {
-            // Wrap to at most 2 rows with an ellipsis tail.
-            let mut title_job = egui::text::LayoutJob::single_section(
-                album.title.clone(),
+            // Wrap to at most 2 rows with an ellipsis tail. Emoji
+            // chars sit in TRANSPARENT sections — same wrap — and
+            // the color strikes overlay below.
+            let mut title_job = crate::emoji::rich_job(
+                &album.title,
                 egui::TextFormat::simple(
                     FontId::proportional(18.0 * self.scale),
                     Color32::WHITE.gamma_multiply(title_a),
@@ -2107,7 +2109,15 @@ impl AlbumRow {
                 tile.center().x - title_galley.size().x * 0.5,
                 title_rect.center().y - title_galley.size().y * 0.5,
             );
-            painter.with_clip_rect(title_rect).galley(tp, title_galley, Color32::WHITE);
+            let clip = painter.with_clip_rect(title_rect);
+            clip.galley(tp, title_galley.clone(), Color32::WHITE);
+            crate::emoji::galley_overlay(
+                &clip,
+                tp,
+                &title_galley,
+                18.0 * self.scale,
+                Color32::WHITE.gamma_multiply(title_a),
+            );
         }
 
         // Track-count badge, top-right — files + url items (Lacrima

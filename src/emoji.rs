@@ -455,11 +455,99 @@ fn emoji_tex(ctx: &egui::Context, c: char) -> Option<egui::TextureHandle> {
     tex
 }
 
+/// `(text, is_emoji)` segments of `text` — feed each into a LayoutJob
+/// with emoji sections formatted `Color32::TRANSPARENT` so the glyphs
+/// keep their advances and `galley_overlay` supplies the visible paint.
+pub fn sections(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut run = String::new();
+    for c in text.chars() {
+        if is_emoji(c) {
+            if !run.is_empty() {
+                out.push((std::mem::take(&mut run), false));
+            }
+            out.push((c.to_string(), true));
+        } else {
+            run.push(c);
+        }
+    }
+    if !run.is_empty() {
+        out.push((run, false));
+    }
+    out
+}
+
+/// A LayoutJob for `text` where emoji chars sit in TRANSPARENT
+/// sections — lays out and wraps identically to a plain job (same
+/// advances); paint the galley, then `galley_overlay` draws the
+/// color images on top of the invisible glyph spots.
+pub fn rich_job(text: &str, format: egui::TextFormat) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for (seg, emoji) in sections(text) {
+        let mut f = format.clone();
+        if emoji {
+            f.color = Color32::TRANSPARENT;
+        }
+        job.append(&seg, 0.0, f);
+    }
+    job
+}
+
+/// The color-emoji overlay for a `rich_job` galley — paint after
+/// `painter.galley` at the same `pos` (and with the same clip).
+/// Glyph boxes come straight from the galley, so wrapping and
+/// alignment need no second-guessing. `font_size` squares the
+/// strikes like `rich_text`'s `font.size`; `tint` fades them with
+/// the text (pass an alpha-multiplied white).
+pub fn galley_overlay(
+    painter: &egui::Painter,
+    pos: Pos2,
+    galley: &egui::Galley,
+    font_size: f32,
+    tint: Color32,
+) {
+    for row in &galley.rows {
+        for g in &row.glyphs {
+            if !is_emoji(g.chr) {
+                continue;
+            }
+            let Some(tex) = emoji_tex(painter.ctx(), g.chr) else {
+                continue;
+            };
+            // Baseline pos + advance → center the square strike in the
+            // glyph's advance and line box.
+            let c = Pos2::new(
+                pos.x + row.pos.x + g.pos.x + g.advance_width * 0.5,
+                pos.y + row.pos.y + g.pos.y - g.font_ascent + g.font_height * 0.5,
+            );
+            painter.image(
+                tex.id(),
+                Rect::from_center_size(c, Vec2::splat(font_size)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                tint,
+            );
+        }
+    }
+}
+
+/// The run's painted width as `rich_text` draws it — text runs plus
+/// per-emoji glyph advances (needed to center the run).
+fn run_width(painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
+    sections(text)
+        .into_iter()
+        .map(|(seg, _)| {
+            painter
+                .layout_no_wrap(seg, font.clone(), Color32::WHITE)
+                .rect
+                .width()
+        })
+        .sum()
+}
+
 /// `painter.text` LEFT_CENTER, but emoji chars draw as their color
 /// bitmap/paint instead of the monochrome outline glyph.
 pub fn rich_text(
     painter: &egui::Painter,
-    ctx: &egui::Context,
     pos: Pos2,
     text: &str,
     font: &FontId,
@@ -469,6 +557,7 @@ pub fn rich_text(
         painter.text(pos, Align2::LEFT_CENTER, text, font.clone(), color);
         return;
     }
+    let ctx = painter.ctx().clone();
     let mut x = pos.x;
     let cy = pos.y;
     let mut run = String::new();
@@ -487,7 +576,7 @@ pub fn rich_text(
     };
     for c in text.chars() {
         if is_emoji(c) {
-            match emoji_tex(ctx, c) {
+            match emoji_tex(&ctx, c) {
                 Some(tex) => {
                     flush(&mut run, &mut x);
                     // Advance = the outline glyph's advance; the
@@ -503,7 +592,7 @@ pub fn rich_text(
                             Vec2::splat(font.size),
                         ),
                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
+                        Color32::WHITE.gamma_multiply(color.a() as f32 / 255.0),
                     );
                     x += adv;
                 }
@@ -514,6 +603,43 @@ pub fn rich_text(
         }
     }
     flush(&mut run, &mut x);
+}
+
+/// `painter.text` CENTER_CENTER with color emoji — the run's width is
+/// measured (runs + glyph advances) so the whole line centers on `pos`.
+pub fn rich_text_centered(
+    painter: &egui::Painter,
+    pos: Pos2,
+    text: &str,
+    font: &FontId,
+    color: Color32,
+) {
+    if !text.chars().any(is_emoji) {
+        painter.text(pos, Align2::CENTER_CENTER, text, font.clone(), color);
+        return;
+    }
+    let w = run_width(painter, text, font);
+    rich_text(painter, Pos2::new(pos.x - w * 0.5, pos.y), text, font, color);
+}
+
+/// `painter.text` LEFT_TOP with color emoji — `pos` is the text's
+/// top edge (the stacked-lines convention elsewhere in the views).
+pub fn rich_text_top(
+    painter: &egui::Painter,
+    pos: Pos2,
+    text: &str,
+    font: &FontId,
+    color: Color32,
+) {
+    if !text.chars().any(is_emoji) {
+        painter.text(pos, Align2::LEFT_TOP, text, font.clone(), color);
+        return;
+    }
+    let h = painter
+        .layout_no_wrap(text.to_owned(), font.clone(), color)
+        .rect
+        .height();
+    rich_text(painter, Pos2::new(pos.x, pos.y + h * 0.5), text, font, color);
 }
 
 #[cfg(test)]

@@ -3259,40 +3259,40 @@ impl Carousel {
                 Pos2::new(cx, y),
                 Vec2::new(avail_w, galley.rect.height() * 1.2),
             );
-            painter.with_clip_rect(lane).galley(
-                Pos2::new(
-                    lane.min.x + self.marquee_off,
-                    lane.center().y - galley.rect.height() * 0.5,
-                ),
-                galley,
+            let clip = painter.with_clip_rect(lane);
+            crate::emoji::rich_text(
+                &clip,
+                Pos2::new(lane.min.x + self.marquee_off, lane.center().y),
+                &title,
+                &font,
                 color,
             );
         } else {
-            painter.text(
+            crate::emoji::rich_text_centered(
+                painter,
                 Pos2::new(cx, y),
-                Align2::CENTER_CENTER,
-                crate::ellipsize(painter, &title, &font, avail_w),
-                font,
+                &crate::ellipsize(painter, &title, &font, avail_w),
+                &font,
                 color,
             );
         }
         y += 34.0 * s;
         if !artist.is_empty() {
-            painter.text(
+            crate::emoji::rich_text_centered(
+                painter,
                 Pos2::new(cx, y),
-                Align2::CENTER_CENTER,
-                crate::ellipsize(painter, &artist, &FontId::proportional(19.0 * s), avail_w),
-                FontId::proportional(19.0 * s),
+                &crate::ellipsize(painter, &artist, &FontId::proportional(19.0 * s), avail_w),
+                &FontId::proportional(19.0 * s),
                 Color32::WHITE.gamma_multiply(0.8 * alpha),
             );
             y += 26.0 * s;
         }
         if !album.is_empty() {
-            painter.text(
+            crate::emoji::rich_text_centered(
+                painter,
                 Pos2::new(cx, y),
-                Align2::CENTER_CENTER,
-                crate::ellipsize(painter, &album, &FontId::proportional(16.0 * s), avail_w),
-                FontId::proportional(16.0 * s),
+                &crate::ellipsize(painter, &album, &FontId::proportional(16.0 * s), avail_w),
+                &FontId::proportional(16.0 * s),
                 Color32::WHITE.gamma_multiply(0.6 * alpha),
             );
         }
@@ -3714,20 +3714,20 @@ impl Carousel {
         // Title text: up to 2 wrapped lines with ellipsis,
         // shadow + white (the baked card's title area).
         let font = FontId::proportional((card.width() * 0.09).clamp(13.0 * s, 17.0 * s));
-        let mut job = egui::text::LayoutJob::default();
+        // Emoji chars go into TRANSPARENT sections — same wrapping,
+        // the color strikes overlay below (`galley_overlay`).
+        // PLACEHOLDER so each galley() call's color wins — an explicit
+        // white here would ignore the alpha fade.
+        let mut job = crate::emoji::rich_job(
+            &item.title,
+            egui::text::TextFormat::simple(font.clone(), Color32::PLACEHOLDER),
+        );
         job.wrap = egui::text::TextWrapping {
             max_width: card.width() - 24.0 * s,
             max_rows: 2,
             break_anywhere: true,
             overflow_character: Some('…'),
         };
-        job.append(
-            &item.title,
-            0.0,
-            // PLACEHOLDER so each galley() call's color wins —
-            // an explicit white here would ignore the alpha fade.
-            egui::text::TextFormat::simple(font, Color32::PLACEHOLDER),
-        );
         let galley = ctx.fonts_mut(|f| f.layout_job(job));
         let tpos = Pos2::new(
             card.min.x + 12.0 * s,
@@ -3738,7 +3738,14 @@ impl Carousel {
             galley.clone(),
             Color32::BLACK.gamma_multiply(0.55 * alpha),
         );
-        clip.galley(tpos, galley, Color32::WHITE.gamma_multiply(0.96 * alpha));
+        clip.galley(tpos, galley.clone(), Color32::WHITE.gamma_multiply(0.96 * alpha));
+        crate::emoji::galley_overlay(
+            &clip,
+            tpos,
+            &galley,
+            font.size,
+            Color32::WHITE.gamma_multiply(0.96 * alpha),
+        );
 
         // Selected / playing accents.
         if playing {

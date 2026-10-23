@@ -6396,27 +6396,27 @@ fn music_view(
             let mut y = content.min.y + 20.0 * s;
             let paint = ui.painter();
             let a = alpha * meta_t * (1.0 - cct);
-            paint.text(
+            crate::emoji::rich_text_top(
+                paint,
                 Pos2::new(x, y),
-                Align2::LEFT_TOP,
-                title,
-                FontId::proportional(28.0 * s),
+                &title,
+                &FontId::proportional(28.0 * s),
                 Color32::WHITE.gamma_multiply(a),
             );
             y += 37.0 * s;
-            paint.text(
+            crate::emoji::rich_text_top(
+                paint,
                 Pos2::new(x, y),
-                Align2::LEFT_TOP,
-                artist,
-                FontId::proportional(22.0 * s),
+                &artist,
+                &FontId::proportional(22.0 * s),
                 Color32::from_rgb(0xCC, 0xCC, 0xCC).gamma_multiply(a),
             );
             y += 29.0 * s;
-            paint.text(
+            crate::emoji::rich_text_top(
+                paint,
                 Pos2::new(x, y),
-                Align2::LEFT_TOP,
-                album,
-                FontId::proportional(22.0 * s),
+                &album,
+                &FontId::proportional(22.0 * s),
                 Color32::from_rgb(0x88, 0x88, 0x88).gamma_multiply(a),
             );
             y += 42.0 * s;
@@ -6464,11 +6464,11 @@ fn music_view(
             let tx = bar.min.x + 14.0 * s;
             let avail = bar.max.x - 14.0 * s - tw - 18.0 * s - tx;
             let nfont = FontId::proportional(26.0 * s);
-            paint.text(
+            crate::emoji::rich_text(
+                paint,
                 Pos2::new(tx, cy),
-                Align2::LEFT_CENTER,
-                ellipsize(paint, &title, &nfont, avail),
-                nfont,
+                &ellipsize(paint, &title, &nfont, avail),
+                &nfont,
                 Color32::WHITE.gamma_multiply(a),
             );
         }
