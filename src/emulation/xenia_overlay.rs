@@ -26,6 +26,10 @@ const PANEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x1A, 0x1
 const PANEL_LINE: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x3F, 0x3F, 0x3F, 0x3F);
 const CARD_BG: egui::Color32 = egui::Color32::from_black_alpha(0x14);
 const CARD_LINE: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x33, 0x33, 0x33, 0x33);
+const CARD_HOVER_BG: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x10, 0x10, 0x10, 0x10);
+const CARD_HOVER_LINE: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x77, 0x77, 0x77, 0x77);
 const SEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x1F, 0x1F, 0x1F, 0x1F);
 const PROMPT_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0xE6, 0x1F, 0x1F, 0x1F);
 
@@ -569,16 +573,24 @@ impl PatchesOverlay {
                                         (e.name.clone(), e.desc.clone())
                                     };
                                     let h = (if desc.is_empty() { 46.0 } else { 66.0 }) * s;
-                                    let (card, _) = ui.allocate_exact_size(
+                                    let (card, resp) = ui.allocate_exact_size(
                                         egui::vec2(w, h),
                                         egui::Sense::hover(),
                                     );
                                     let cr = card.shrink2(egui::vec2(0.0, 4.0 * s));
+                                    // contains_pointer (not hovered()) —
+                                    // the card still lights up when the
+                                    // pointer rests on the toggle switch
+                                    // inside it.
+                                    let hov = resp.contains_pointer();
                                     ui.painter().rect(
                                         cr,
                                         CornerRadius::same((8.0 * s).round() as u8),
-                                        CARD_BG,
-                                        Stroke::new(1.0, CARD_LINE),
+                                        if hov { CARD_HOVER_BG } else { CARD_BG },
+                                        Stroke::new(
+                                            1.0,
+                                            if hov { CARD_HOVER_LINE } else { CARD_LINE },
+                                        ),
                                         egui::StrokeKind::Inside,
                                     );
                                     // Name + desc as one vertically centered block.

@@ -25,6 +25,10 @@ const PANEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x1A, 0x1
 const PANEL_LINE: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x3F, 0x3F, 0x3F, 0x3F);
 const CARD_BG: egui::Color32 = egui::Color32::from_black_alpha(0x14);
 const CARD_LINE: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x33, 0x33, 0x33, 0x33);
+const CARD_HOVER_BG: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x10, 0x10, 0x10, 0x10);
+const CARD_HOVER_LINE: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x77, 0x77, 0x77, 0x77);
 const TOGGLE_ON: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x7D, 0x46);
 const SEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x2B, 0x3B, 0x4B, 0x2B);
 
@@ -157,13 +161,16 @@ fn entry_card(
     id: &str,
     i: usize,
 ) -> bool {
-    let (card, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let (card, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
     let cr = card.shrink2(egui::vec2(0.0, 4.0 * s));
+    // contains_pointer (not hovered()) — the card still lights up
+    // when the pointer rests on the toggle switch inside it.
+    let hov = resp.contains_pointer();
     ui.painter().rect(
         cr,
         CornerRadius::same((8.0 * s).round() as u8),
-        CARD_BG,
-        Stroke::new(1.0, CARD_LINE),
+        if hov { CARD_HOVER_BG } else { CARD_BG },
+        Stroke::new(1.0, if hov { CARD_HOVER_LINE } else { CARD_LINE }),
         egui::StrokeKind::Inside,
     );
     let text_w = (cr.width() - 100.0 * s).max(60.0 * s);

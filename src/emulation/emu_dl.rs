@@ -6,6 +6,7 @@
 //! the installed version — all on a worker thread while the settings
 //! card polls `DlProgress`.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1559,14 +1560,193 @@ fn install_patches(dl: &Shared, emu_dir: &Path, update_dir: &Path) -> Result<(),
         find_dir(&extracted, "patches").ok_or_else(|| "No patches folder in archive".to_string())?
     };
     let dst = emu_dir.join("patches");
+    // Patch files carry `is_enabled` inline — a bare wipe+extract
+    // drops every toggle the user applied. Snapshot the enabled
+    // state first and re-apply it onto the fresh files (matched by
+    // title id + patch name so upstream renames still resolve).
+    let saved = snapshot_patch_state(&dst);
     let _ = std::fs::remove_dir_all(&dst);
     copy_dir_contents(&src, &dst, "")?;
+    restore_patch_state(&dst, &saved);
     Ok(())
+}
+
+/// Toggle state snapshotted across a patches dir before a refresh.
+/// `flags`: file name → patch name → enabled (name-keyed so a file
+/// reorder or an upstream rename doesn't lose the user's toggles —
+/// the restore also tries name-matching across same-title files).
+/// `keep`: file name → raw text for files holding ≥1 enabled patch —
+/// restored verbatim when the new archive dropped the file entirely
+/// (custom/imported patch files and upstream removals alike).
+#[derive(Default)]
+struct PatchState {
+    flags: HashMap<String, HashMap<String, bool>>,
+    keep: HashMap<String, String>,
+}
+
+/// A patch file's title-id prefix — the first alphanumeric run of
+/// the file name ("4D5307D5 - Game.patch.toml" → "4d5307d5").
+fn patch_tid(file_name: &str) -> String {
+    file_name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn snapshot_patch_state(dir: &Path) -> PatchState {
+    let mut saved = PatchState::default();
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    for f in files {
+        let is_patch = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().ends_with(".patch.toml"));
+        if !is_patch {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        let entries = super::xenia_cfg::parse_patch_entries(&text);
+        if entries.is_empty() {
+            continue;
+        }
+        let Ok(rel) = f.strip_prefix(dir) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let mut flags = HashMap::new();
+        let mut any_on = false;
+        for e in entries {
+            flags.insert(e.name.clone(), e.enabled);
+            any_on |= e.enabled;
+        }
+        saved.flags.insert(rel.clone(), flags);
+        if any_on {
+            saved.keep.insert(rel, text);
+        }
+    }
+    saved
+}
+
+fn restore_patch_state(dir: &Path, saved: &PatchState) {
+    // Same-tid fallback map — a patch moved to a differently-named
+    // file between DB versions still finds its saved state.
+    let mut by_tid: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    for (rel, flags) in &saved.flags {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let tid = patch_tid(name);
+        by_tid.entry(tid).or_default().extend(flags.clone());
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    for f in files {
+        let is_patch = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().ends_with(".patch.toml"));
+        if !is_patch {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        let Ok(rel) = f.strip_prefix(dir) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let fname = rel.rsplit('/').next().unwrap_or(&rel);
+        let lookup = saved
+            .flags
+            .get(&rel)
+            .or_else(|| by_tid.get(&patch_tid(fname)));
+        let Some(saved_flags) = lookup else { continue };
+        let mut entries = super::xenia_cfg::parse_patch_entries(&text);
+        let mut touched = false;
+        for e in entries.iter_mut() {
+            if let Some(&on) = saved_flags.get(&e.name) {
+                if e.enabled != on {
+                    e.enabled = on;
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            let doc = super::xenia_cfg::rewrite_patch_doc(&text, &entries);
+            let _ = std::fs::write(&f, doc);
+        }
+    }
+    // Files the new archive no longer ships: restore the ones the
+    // user had enabled patches in (custom files survive verbatim).
+    for (rel, raw) in &saved.keep {
+        let out = dir.join(rel);
+        if !out.exists() {
+            if let Some(p) = out.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&out, raw);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// install_patches wipes `patches/` before extracting the fresh
+    /// archive — the user's `is_enabled` toggles must be carried
+    /// over by name, and files the new archive dropped but the user
+    /// had enabled must come back verbatim.
+    #[test]
+    fn patch_state_survives_patches_refresh() {
+        let base = std::env::temp_dir().join(format!("aes_ps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dst = base.join("patches");
+        let fresh = base.join("fresh");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+
+        let doc = |on60: bool, onbloom: bool| {
+            format!(
+                "title_id = \"4D5307D5\"\n\n[[patch]]\n    name = \"60 FPS\"\n    is_enabled = {on60}\n\n[[patch]]\n    name = \"Bloom\"\n    is_enabled = {onbloom}\n"
+            )
+        };
+        // Old install: 60 FPS on, Bloom off — and a custom file the
+        // upstream archive never shipped.
+        std::fs::write(dst.join("4D5307D5 - Game.patch.toml"), doc(true, false)).unwrap();
+        let custom = "[[patch]]\n    name = \"My Fix\"\n    is_enabled = true\n";
+        std::fs::write(dst.join("custom.patch.toml"), custom).unwrap();
+
+        // Fresh archive: same file, all defaults off; plus a RENAMED
+        // file carrying a patch the user had on in a removed file.
+        std::fs::write(fresh.join("4D5307D5 - Game.patch.toml"), doc(false, false)).unwrap();
+        std::fs::write(
+            fresh.join("4D5308AA - Other v2.patch.toml"),
+            "[[patch]]\n    name = \"Widescreen\"\n    is_enabled = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dst.join("4D5308AA - Other.patch.toml"),
+            "[[patch]]\n    name = \"Widescreen\"\n    is_enabled = true\n",
+        )
+        .unwrap();
+
+        let saved = snapshot_patch_state(&dst);
+        let _ = std::fs::remove_dir_all(&dst);
+        copy_dir_contents(&fresh, &dst, "").unwrap();
+        restore_patch_state(&dst, &saved);
+
+        let out = std::fs::read_to_string(dst.join("4D5307D5 - Game.patch.toml")).unwrap();
+        let entries = super::super::xenia_cfg::parse_patch_entries(&out);
+        assert_eq!(entries[0].name, "60 FPS");
+        assert!(entries[0].enabled);
+        assert_eq!(entries[1].name, "Bloom");
+        assert!(!entries[1].enabled);
+        // Renamed file: tid-prefix fallback restored the toggle.
+        let out = std::fs::read_to_string(dst.join("4D5308AA - Other v2.patch.toml")).unwrap();
+        let entries = super::super::xenia_cfg::parse_patch_entries(&out);
+        assert!(entries.iter().any(|e| e.name == "Widescreen" && e.enabled));
+        // Custom file restored verbatim.
+        assert_eq!(
+            std::fs::read_to_string(dst.join("custom.patch.toml")).unwrap(),
+            custom
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// EmuCR post pages mix the windows archive with apk/arm links —
     /// the picker must land on dolphin-<ver>-x64.7z specifically.
