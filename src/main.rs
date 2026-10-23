@@ -2139,26 +2139,25 @@ impl AesRustApp {
                     // HLS/DASH manifests symphonia can't
                     // parse). `best` muxed last resort.
                     let sel = "ba[ext=m4a][protocol^=http]/ba[acodec!=opus][protocol^=http]/b[protocol^=http]";
-                    // YouTube's SABR experiment can strip the
-                    // audio-only formats' URLs under the android
-                    // profile — the muxed `b` fallback then carries
-                    // HE-AAC, which symphonia can't decode. Retry
-                    // unrestricted clients for an audio-mime stream.
-                    let first = one(sel, ytdlp::ExtractorProfile::Default);
+                    // The android_music family serves audio-only
+                    // itags without the sign-in gate that now hits
+                    // the web/tv default clients — lead with it for
+                    // audio resolves (bot-checked IPs fail Default
+                    // entirely). Default is the retry, Unrestricted
+                    // last; a non-audio first hit still survives as
+                    // the muxed fallback.
+                    let first = one(sel, ytdlp::ExtractorProfile::AndroidMusic);
                     let stream = match &first {
                         Some(u) if is_audio_mime(u) => first.clone(),
-                        // Unrestricted's default clients are now
-                        // sign-in gated; the android_music family
-                        // still serves audio-only itags. Try it
-                        // first, unrestricted last.
-                        _ => one(sel, ytdlp::ExtractorProfile::AndroidMusic)
+                        _ => one(sel, ytdlp::ExtractorProfile::Default)
                             .filter(|u| is_audio_mime(u))
                             .or_else(|| one(sel, ytdlp::ExtractorProfile::Unrestricted)
                                 .filter(|u| is_audio_mime(u)))
                             .or(first),
                     };
                     let stream = stream
-                        .or_else(|| one("b", ytdlp::ExtractorProfile::Default));
+                        .or_else(|| one("b", ytdlp::ExtractorProfile::Default))
+                        .or_else(|| one("b", ytdlp::ExtractorProfile::Unrestricted));
                     // `dur=` rides the resolved media url — merge it
                     // into the item's cached metadata so the playlist
                     // duration column fills after a single resolve.
@@ -2371,8 +2370,12 @@ fn end_advance(
 /// streams and `mime=video%2F…` for muxed — the latter's embedded
 /// track can be HE-AAC, which symphonia can't decode, so audio-only
 /// results are strongly preferred.
+/// Decodable-audio check on a resolved googlevideo URL: the mime must
+/// be audio/* AND not webm — webm audio itags are Opus, which
+/// symphonia has no decoder for (a "resolves fine, plays nothing"
+/// failure; the muxed `b` fallback carries mp4/AAC instead).
 fn is_audio_mime(url: &str) -> bool {
-    url.contains("mime=audio")
+    url.contains("mime=audio") && !url.contains("webm")
 }
 
 /// Whether the end-of-track check may run this tick. While a play is
@@ -9498,6 +9501,7 @@ mod tests {
         assert!(palette_promote(3, 3, 0.0, Playing, true, 11.0));
     }
 
+
     /// The palette crossfade lerps per channel, clamps mismatched
     /// stop counts, and lands exactly on the target.
     #[test]
@@ -9995,13 +9999,15 @@ mod tests {
     /// falls to `b` (muxed) whose embedded audio can be HE-AAC —
     /// symphonia can't decode it. The resolver retries unrestricted
     /// clients and prefers audio-mime results; `is_audio_mime` is the
-    /// discriminator.
+    /// discriminator. Webm audio is Opus — also undecodable — so the
+    /// gate rejects it too (muxed mp4/AAC via the `b` fallback is the
+    /// playable last resort).
     #[test]
     fn audio_mime_prefers_audio_only_streams() {
         assert!(is_audio_mime(
             "https://rr2---sn-x.googlevideo.com/videoplayback?expire=1&mime=audio%2Fmp4&clen=100"
         ));
-        assert!(is_audio_mime(
+        assert!(!is_audio_mime(
             "https://x/videoplayback?mime=audio%2Fwebm&foo=bar"
         ));
         assert!(!is_audio_mime(
