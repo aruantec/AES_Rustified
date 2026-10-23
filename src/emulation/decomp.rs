@@ -1836,7 +1836,6 @@ fn info_pane(
             FontId::proportional(13.0 * s),
             Color32::from_gray(220).gamma_multiply(alpha),
         );
-        bx = btn.max.x + gap;
         ui.ctx().request_repaint();
     } else {
         let mut ops: Vec<(&str, PaneOp, bool)> = Vec::new();
@@ -1865,15 +1864,15 @@ fn info_pane(
             bx += 170.0 * s + gap;
         }
     }
-    // CC BY-SA attribution for the upstream dataset trails the row.
+    // CC BY-SA attribution for the upstream dataset docks to the
+    // pane's bottom-right corner, clear of the action row.
     painter.text(
-        Pos2::new(bx + 6.0 * s, row_top + bh * 0.5),
-        Align2::LEFT_CENTER,
+        Pos2::new(pane.max.x - 10.0 * s, pane.max.y - 8.0 * s),
+        Align2::RIGHT_BOTTOM,
         "Catalog data: recompendium.com · CC BY-SA 4.0",
         FontId::proportional(11.0 * s),
         Color32::from_gray(100).gamma_multiply(alpha),
     );
-
     for url in link_clicks {
         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
