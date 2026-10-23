@@ -748,9 +748,6 @@ pub struct EmuView {
     /// closes the running emulator; it fires once the old session is
     /// fully gone (TryLaunchPendingEmulatorRequest).
     pending_launch: Option<PathBuf>,
-    /// Whether the saved aspect_key was applied to this session's
-    /// window (the HWND resolves asynchronously after launch).
-    aspect_applied: bool,
     /// Input tunnel — pointer/keys over the capture forward to the
     /// hidden emulator window via PostMessage so its own UI (Xenia's
     /// sign-in prompts etc.) is reachable. Session-only; Esc or the
@@ -879,7 +876,6 @@ impl EmuView {
             reboot: false,
             close_req: false,
             pending_launch: None,
-            aspect_applied: false,
             input_tun: false,
             tun_map: None,
             client_uv: None,
@@ -1602,7 +1598,6 @@ pub fn view(
                 // ReloadArcadeLockedPillarboxCropFromMetadata — the
                 // per-ROM locked crop wins over auto-detection.
                 emu.fx.pillar_lock = crate::emulation::emu_meta::locked_crop(&s.game);
-                emu.aspect_applied = false;
                 // Fresh capture — the old ring/seqs belong to the
                 // dead session.
                 emu.gpu_cap = None;
@@ -1659,26 +1654,11 @@ pub fn view(
         }
     }
 
-    // ApplyCaptureAspectRatioToRunningTarget — once the worker
-    // resolves the render window, resize it to the section's saved
-    // aspect ("handler" leaves the emulator's own).
-    #[cfg(windows)]
-    if !emu.aspect_applied {
-        if let Some(session) = &emu.session {
-            let hwnd = session.hwnd();
-            if !hwnd.is_invalid() {
-                if let Some(ratio) = aspect_ratio_of(&emu.render.aspect_key) {
-                    xenia::apply_aspect_ratio(hwnd, ratio);
-                }
-                emu.aspect_applied = true;
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        emu.aspect_applied = true;
-    }
-
+    // SelectedCaptureAspectRatio is display-side only — the saved
+    // aspect_key folds into frame_dest_uv's dest/crop each draw. The
+    // game window is never resized (a hidden window's renderer can
+    // die on SetWindowPos and never recover — the "aspect change →
+    // black capture" bug).
     // Session teardown once the emulator reports exit. The last
     // captured frame stays mounted so the presentation layer can fade
     // out over the carousel instead of snapping away (Lacrima's
@@ -1961,16 +1941,6 @@ pub fn view(
                         if emu.render.aspect_key != key {
                             emu.render.aspect_key = key.to_string();
                             emu.render_dirty = true;
-                            #[cfg(windows)]
-                            if let Some(session) = &emu.session {
-                                let hwnd = session.hwnd();
-                                if !hwnd.is_invalid() {
-                                    if let Some(ratio) = aspect_ratio_of(key) {
-                                        xenia::apply_aspect_ratio(hwnd, ratio);
-                                    }
-                                    emu.aspect_applied = true;
-                                }
-                            }
                         }
                         ui.close();
                     }
@@ -2895,6 +2865,13 @@ fn cemu_storage(cfg: &settings::Emulation) -> Option<PathBuf> {
 /// RemoveArcadePillarboxBars: measured left/right black-bar insets
 /// in frame px (0,0 when off or none detected) — the sampled window
 /// shrinks to the content between them.
+/// `force` is the aspect-menu override: `Some(a)` shapes `dest` to
+/// `a` while `eff` (the real content aspect) keeps driving the
+/// center-crop — the sampled region is the middle `a`-aspect slice
+/// of the frame. The game window itself is NEVER resized (a hidden
+/// window's renderer can die on SetWindowPos and never come back —
+/// the display-side crop is also instantly reversible, which a dead
+/// swapchain was not). `None` = the frame's own aspect.
 pub(crate) fn frame_dest_uv(
     rect: Rect,
     fw: usize,
@@ -2902,12 +2879,14 @@ pub(crate) fn frame_dest_uv(
     crop_t: f32,
     stretch: u8,
     pillar: (f32, f32),
+    force: Option<f64>,
 ) -> (Rect, Rect) {
     let (pl, pr) = pillar;
     let fwf = fw as f32;
     let fhf = fh as f32;
     let cw = (fwf - pl - pr).max(1.0);
     let eff = cw / fhf; // content aspect
+    let dasp = force.unwrap_or(eff as f64).max(0.01) as f32;
                         // Pillar window in uv: [wl, wr] horizontally, full height.
     let wl = (pl / fwf).clamp(0.0, 0.5);
     let wr = (1.0 - pr / fwf).clamp(0.5, 1.0);
@@ -2919,8 +2898,9 @@ pub(crate) fn frame_dest_uv(
         let uv = Rect::from_min_max(Pos2::new(wl, 0.0), Pos2::new(wr, 1.0));
         return (rect, uv);
     }
-    let fit = (rect.width() / (fhf * eff)).min(rect.height() / fhf);
-    let fit_dest = Rect::from_center_size(rect.center(), Vec2::new(fhf * eff * fit, fhf * fit));
+    let fit = (rect.width() / (fhf * dasp)).min(rect.height() / fhf);
+    let fit_dest =
+        Rect::from_center_size(rect.center(), Vec2::new(fhf * dasp * fit, fhf * fit));
     let dest = lerp_rect(fit_dest, rect, crop_t);
     let d = dest.width() / dest.height();
     let uw = (d / eff).min(1.0) * ww;
@@ -3774,8 +3754,15 @@ fn draw_session(
                 )
             })
             .unwrap_or((fw, fh, None));
-        let (dest, uv0) =
-            frame_dest_uv(rect, cw, ch, emu.crop_t, emu.render.stretch, emu.fx.pillar_cur);
+        let (dest, uv0) = frame_dest_uv(
+            rect,
+            cw,
+            ch,
+            emu.crop_t,
+            emu.render.stretch,
+            emu.fx.pillar_cur,
+            aspect_ratio_of(&emu.render.aspect_key),
+        );
         let uv = cu.map(|sub| uv_in_frame(sub, uv0)).unwrap_or(uv0);
         let seq = emu.frame_seq;
         let adjust = render_adjust(&emu.render);
@@ -4021,8 +4008,15 @@ fn draw_session(
             fh,
             emu.fx.pillar_cur,
         );
-        let (dest, uv0) =
-            frame_dest_uv(rect, cw, ch, emu.crop_t, emu.render.stretch, pillar);
+        let (dest, uv0) = frame_dest_uv(
+            rect,
+            cw,
+            ch,
+            emu.crop_t,
+            emu.render.stretch,
+            pillar,
+            aspect_ratio_of(&emu.render.aspect_key),
+        );
         let uv = cu.map(|sub| uv_in_frame(sub, uv0)).unwrap_or(uv0);
         emu.client_uv = cu;
         // The tunnel maps screen → frame → client through this same
@@ -5867,6 +5861,43 @@ mod tests {
         assert!((out.min.y - (0.2 + 0.5 * 0.6)).abs() < 1e-6);
         assert!((out.width() - 0.5 * 0.8).abs() < 1e-6);
         assert!((out.height() - 0.5 * 0.6).abs() < 1e-6);
+    }
+
+    /// Forced aspect is display-side only: `dest` takes the forced
+    /// aspect while the uv center-crops the same slice of the frame —
+    /// no window resize, and `None` reverts to the frame's own
+    /// aspect instantly (the old SetWindowPos path blacked the
+    /// capture permanently once the hidden renderer died).
+    #[test]
+    fn frame_dest_uv_forced_aspect_crops_not_resizes() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        // 16:9 frame forced to 4:3 → dest is the centered 4:3 region
+        // (1200x900) and the uv keeps full height over the middle
+        // 75% of the width.
+        let (dest, uv) =
+            frame_dest_uv(rect, 1920, 1080, 0.0, 0, (0.0, 0.0), Some(4.0 / 3.0));
+        assert!((dest.width() / dest.height() - 4.0 / 3.0).abs() < 0.01);
+        assert!((dest.center().x - 800.0).abs() < 1.0);
+        assert!((uv.min.x - 0.125).abs() < 0.01);
+        assert!((uv.width() - 0.75).abs() < 0.01);
+        assert!(uv.min.y.abs() < 1e-6 && (uv.height() - 1.0).abs() < 1e-6);
+        // No force → frame's own aspect, full-frame uv.
+        let (dest2, uv2) =
+            frame_dest_uv(rect, 1920, 1080, 0.0, 0, (0.0, 0.0), None);
+        assert!((dest2.width() / dest2.height() - 16.0 / 9.0).abs() < 0.01);
+        assert!((uv2.width() - 1.0).abs() < 1e-6);
+        // Wider force (32:9) → full width, top/bottom crop.
+        let (_, uv3) = frame_dest_uv(
+            rect,
+            1920,
+            1080,
+            0.0,
+            0,
+            (0.0, 0.0),
+            Some(32.0 / 9.0),
+        );
+        assert!((uv3.width() - 1.0).abs() < 1e-6);
+        assert!(uv3.height() < 0.6);
     }
 
     /// The balance split: when the lanes flanking the pause hold the

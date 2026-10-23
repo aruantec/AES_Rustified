@@ -539,8 +539,158 @@ mod win_dpi_defer {
 /// the new state (`window.fullscreen()` flips synchronously). The window
 /// is already borderless, so `Decorations(false)` itself changes nothing.
 pub(crate) fn set_fullscreen(ctx: &egui::Context, on: bool) {
+    if on {
+        let from = ctx.input(|i| i.viewport().outer_rect);
+        let to = from.and_then(|f| monitor_rect(ctx, f.center()));
+        if let (Some(from), Some(to)) = (from, to) {
+            if (to.size() - from.size()).length() > 4.0 {
+                // Inflate: animate outer pos + inner size up to the
+                // monitor rect over ~180ms, then hand winit real
+                // fullscreen — the flip itself is invisible since
+                // the geometry already covers the display.
+                ctx.data_mut(|d| {
+                    d.insert_temp(fs_restore_id(), from);
+                    d.insert_temp(
+                        fs_anim_id(),
+                        FsInflate {
+                            from,
+                            to,
+                            entering: true,
+                            at: std::time::Instant::now(),
+                        },
+                    );
+                });
+                ctx.request_repaint();
+                return;
+            }
+        }
+    } else {
+        // Exiting mid-inflate cancels the grow — its completion must
+        // not send Fullscreen(true) back in.
+        ctx.data_mut(|d| d.remove::<FsInflate>(fs_anim_id()));
+    }
     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(on));
     ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+    if !on {
+        // winit restores the geometry saved when Fullscreen(true)
+        // landed — the monitor-size rect the inflate ended at — so
+        // the user's own rect comes from our stash, then eases back
+        // down as a normal window (the deflate).
+        let restore = ctx.data_mut(|d| d.get_temp::<Rect>(fs_restore_id()));
+        let is_fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if let (Some(from), Some(to)) =
+            (ctx.input(|i| i.viewport().outer_rect), restore)
+        {
+            if is_fs {
+                ctx.data_mut(|d| {
+                    d.insert_temp(
+                        fs_anim_id(),
+                        FsInflate {
+                            from,
+                            to,
+                            entering: false,
+                            at: std::time::Instant::now(),
+                        },
+                    );
+                });
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
+/// In-flight fullscreen inflate/deflate — geometry eases `from`→`to`;
+/// on completion the entering arm sends the real Fullscreen command,
+/// the exiting arm just snaps the last step (already windowed).
+#[derive(Clone, Copy)]
+struct FsInflate {
+    from: Rect,
+    to: Rect,
+    entering: bool,
+    at: std::time::Instant,
+}
+
+fn fs_anim_id() -> egui::Id {
+    egui::Id::unique("fs_inflate_anim")
+}
+/// The pre-fullscreen window rect — kept after entry so the exit
+/// deflate can return to the user's own geometry (winit only
+/// remembers the inflated monitor rect).
+fn fs_restore_id() -> egui::Id {
+    egui::Id::unique("fs_inflate_restore")
+}
+const FS_ANIM_DUR: f32 = 0.18;
+
+/// Per-frame driver — runs in `logic` so it ticks even while the
+/// window is occluded. Testable: `now` is injected.
+fn fs_inflate_tick(ctx: &egui::Context, now: std::time::Instant) {
+    let Some(a) = ctx.data_mut(|d| d.get_temp::<FsInflate>(fs_anim_id())) else {
+        return;
+    };
+    let t = (now - a.at).as_secs_f32() / FS_ANIM_DUR;
+    if t >= 1.0 {
+        ctx.data_mut(|d| d.remove::<FsInflate>(fs_anim_id()));
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(a.to.min));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(a.to.size()));
+        if a.entering {
+            // Geometry already covers the monitor — the real
+            // fullscreen flip lands invisibly on top.
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+            ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+        } else {
+            ctx.data_mut(|d| d.remove::<Rect>(fs_restore_id()));
+        }
+        return;
+    }
+    let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+    let pos = a.from.min + (a.to.min - a.from.min) * e;
+    let size = a.from.size() + (a.to.size() - a.from.size()) * e;
+    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+    ctx.request_repaint();
+}
+
+/// The monitor rect (in egui points) of the display `p` sits on.
+/// Windows answers via MonitorFromPoint+rcMonitor — multi-monitor
+/// safe; other platforms fall back to egui's monitor_size centered
+/// on the window (right for the primary display, best-effort for
+/// secondary).
+fn monitor_rect(ctx: &egui::Context, p: Pos2) -> Option<Rect> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+        };
+        let ppp = ctx.pixels_per_point();
+        let mon: HMONITOR = unsafe {
+            MonitorFromPoint(
+                POINT {
+                    x: (p.x * ppp).round() as i32,
+                    y: (p.y * ppp).round() as i32,
+                },
+                MONITOR_DEFAULTTONEAREST,
+            )
+        };
+        if !mon.is_invalid() {
+            let mut mi = MONITORINFO::default();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
+                return Some(Rect::from_min_max(
+                    Pos2::new(
+                        mi.rcMonitor.left as f32 / ppp,
+                        mi.rcMonitor.top as f32 / ppp,
+                    ),
+                    Pos2::new(
+                        mi.rcMonitor.right as f32 / ppp,
+                        mi.rcMonitor.bottom as f32 / ppp,
+                    ),
+                ));
+            }
+        }
+    }
+    ctx.input(|i| i.viewport().monitor_size)
+        .map(|m| Rect::from_center_size(p, m))
 }
 
 /// In-flight normal ⇄ mini switch: the content fades to black in its
@@ -2271,6 +2421,7 @@ impl eframe::App for AesRustApp {
     /// still works while hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_playback(ctx);
+        fs_inflate_tick(ctx, std::time::Instant::now());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -9761,6 +9912,82 @@ mod tests {
             assert!(cmds.contains(&egui::ViewportCommand::Decorations(false)));
             out.textures_delta.clear();
         }
+    }
+
+    /// Entering fullscreen inflates the window to the monitor rect
+    /// over the animation — the real Fullscreen command only lands
+    /// once the geometry already covers the display. Exiting sends
+    /// Fullscreen(false) immediately and deflates back toward the
+    /// stashed pre-fullscreen rect (winit would otherwise restore
+    /// the inflated monitor-sized windowed rect).
+    #[test]
+    fn fullscreen_enter_inflates_exit_deflates() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        let info = input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default();
+        info.outer_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::new(100.0, 100.0),
+            egui::Vec2::new(800.0, 600.0),
+        ));
+        info.monitor_size = Some(egui::Vec2::new(2560.0, 1440.0));
+        let cmds_of = |out: &egui::FullOutput| {
+            out.viewport_output
+                .values()
+                .flat_map(|v| v.commands.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+
+        // Enter: geometry animation starts — Fullscreen is deferred.
+        let mut out = ctx.run_ui(input.clone(), |_ui| {
+            set_fullscreen(&ctx, true);
+        });
+        let cmds = cmds_of(&out);
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))));
+        assert!(ctx
+            .data_mut(|d| d.get_temp::<FsInflate>(fs_anim_id()))
+            .is_some_and(|a| a.entering));
+        out.textures_delta.clear();
+
+        // Anim completes → the real fullscreen flip lands.
+        let mut out = ctx.run_ui(input.clone(), |_ui| {
+            fs_inflate_tick(
+                &ctx,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+        });
+        let cmds = cmds_of(&out);
+        assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(true)));
+        assert!(cmds.contains(&egui::ViewportCommand::Decorations(false)));
+        assert!(ctx
+            .data_mut(|d| d.get_temp::<FsInflate>(fs_anim_id()))
+            .is_none());
+        out.textures_delta.clear();
+
+        // Exit: Fullscreen(false) immediately + deflate anim armed.
+        let mut input2 = input;
+        let info = input2
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default();
+        info.fullscreen = Some(true);
+        info.outer_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(2560.0, 1440.0),
+        ));
+        let mut out = ctx.run_ui(input2, |_ui| {
+            set_fullscreen(&ctx, false);
+        });
+        let cmds = cmds_of(&out);
+        assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)));
+        assert!(ctx
+            .data_mut(|d| d.get_temp::<FsInflate>(fs_anim_id()))
+            .is_some_and(|a| !a.entering));
+        out.textures_delta.clear();
     }
 
     /// The SABR-experiment regression: under the android client

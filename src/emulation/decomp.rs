@@ -574,9 +574,6 @@ pub struct DecompView {
     /// Stats-overlay + pillarbox state — the same bundle the
     /// emulation capture draw uses.
     fx: crate::emulation::CapFx,
-    /// Whether the saved aspect_key was applied to this session's
-    /// window (the HWND resolves asynchronously after launch).
-    aspect_applied: bool,
     /// Uninstall request parked for the caller's delete prompt —
     /// `(slug, name)` so the dialog can name the project.
     uninstall_req: Option<(String, String)>,
@@ -734,7 +731,6 @@ impl Default for DecompView {
             render_open: false,
             render_dirty: false,
             fx: crate::emulation::CapFx::default(),
-            aspect_applied: false,
             input_tun: false,
             tun_map: None,
             client_uv: None,
@@ -1970,7 +1966,6 @@ pub fn view(
                 view.gpu_err = None;
                 view.slot_seq = 0;
                 view.frame_seq = 0;
-                view.aspect_applied = false;
                 view.session = Some(s);
                 view.launch_rx = None;
                 view.notice = None;
@@ -2107,25 +2102,10 @@ pub fn view(
         ui.ctx().request_repaint();
     }
 
-    // SelectedCaptureAspectRatio — once the session resolves its
-    // render window, resize it to the saved aspect ("handler"
-    // leaves the game's own; the context menu re-picks live).
-    #[cfg(windows)]
-    if !view.aspect_applied {
-        if let Some(session) = &view.session {
-            let hwnd = session.hwnd();
-            if !hwnd.is_invalid() {
-                if let Some(ratio) = crate::emulation::aspect_ratio_of(&view.render.aspect_key) {
-                    xenia::apply_aspect_ratio(hwnd, ratio);
-                }
-                view.aspect_applied = true;
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        view.aspect_applied = true;
-    }
+    // SelectedCaptureAspectRatio is display-side only — the saved
+    // aspect_key folds into frame_dest_uv's dest/crop each draw; the
+    // game window is never resized (same hidden-renderer-dies
+    // failure as the emulation view's old resize path).
     // The opaque capture layer fades in/out over the grid — 0.3s,
     // same duration as the emulation view.
     let cap_target = view.session.is_some() && !view.viewport_dismissed;
@@ -2633,18 +2613,6 @@ pub fn view(
                         if view.render.aspect_key != key {
                             view.render.aspect_key = key.to_string();
                             view.render_dirty = true;
-                            #[cfg(windows)]
-                            if let Some(session) = &view.session {
-                                let hwnd = session.hwnd();
-                                if !hwnd.is_invalid() {
-                                    if let Some(ratio) =
-                                        crate::emulation::aspect_ratio_of(key)
-                                    {
-                                        xenia::apply_aspect_ratio(hwnd, ratio);
-                                    }
-                                    view.aspect_applied = true;
-                                }
-                            }
                         }
                         ui.close();
                     }
@@ -3102,6 +3070,7 @@ fn draw_capture(
             view.crop_t,
             view.render.stretch,
             view.fx.pillar_cur,
+            crate::emulation::aspect_ratio_of(&view.render.aspect_key),
         );
         let uv = cu.map(|sub| crate::emulation::uv_in_frame(sub, uv0)).unwrap_or(uv0);
         let seq = view.frame_seq;
@@ -3341,6 +3310,7 @@ fn draw_capture(
             view.crop_t,
             view.render.stretch,
             pillar,
+            crate::emulation::aspect_ratio_of(&view.render.aspect_key),
         );
         let uv = cu.map(|sub| crate::emulation::uv_in_frame(sub, uv0)).unwrap_or(uv0);
         view.client_uv = cu;
