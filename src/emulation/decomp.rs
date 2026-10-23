@@ -358,6 +358,48 @@ pub fn card_action(installed: Option<&str>, remote: Option<&RemoteInfo>) -> Acti
 /// Result of a catalog fetch/cache-load, delivered to the view.
 type CatalogResult = Result<catalog::Catalog, String>;
 
+/// Maturity chip rows in the filter drawer — the raw upstream
+/// `status` strings each chip matches (`fully` and `stable` share
+/// the "Complete" label). Label/color come from
+/// `catalog::status_label`, ordered Experimental → Complete like a
+/// progression.
+const STATUS_OPTS: &[&[&str]] = &[
+    &["experimental"],
+    &["beta"],
+    &["usable"],
+    &["playable"],
+    &["fully", "stable"],
+];
+
+/// List ordering — `Catalog` keeps the fetched dataset's order.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SortKey {
+    #[default]
+    Catalog,
+    Stars,
+    Name,
+    Year,
+    Updated,
+}
+
+const SORT_OPTS: &[(&str, SortKey)] = &[
+    ("Catalog", SortKey::Catalog),
+    ("Stars", SortKey::Stars),
+    ("Name", SortKey::Name),
+    ("Year", SortKey::Year),
+    ("Updated", SortKey::Updated),
+];
+
+/// Chip order for the platform filter — grouped by maker like the
+/// site's category row (Nintendo → Sony → Sega → Xbox → PC/misc);
+/// ids not listed sort after, alphabetically.
+const CONSOLE_ORDER: &[&str] = &[
+    "nes", "snes", "n64", "gamecube", "wii", "wiiu", "switch", "switch2", "virtualboy", "gb", "gbc",
+    "gba", "nds", "3ds", "ps1", "ps2", "ps3", "ps4", "ps5", "psp", "vita", "megadrive", "genesis",
+    "segacd", "megacd", "32x", "sms", "gamegear", "saturn", "dreamcast", "xbox", "x360", "xboxone",
+    "xsx", "dos", "pc", "mac", "pc98", "mobile", "arcade", "neogeo", "other",
+];
+
 /// View state — the shared item list, the loaded catalog, the
 /// kind/search filters, remote check results and in-flight
 /// downloads keyed by slug. The list itself is the same
@@ -395,6 +437,17 @@ pub struct DecompView {
     checked: bool,
     /// Kind filter tab — `None` shows everything.
     filter: Option<Kind>,
+    /// Filter drawer — open state plus the platform/status/sort
+    /// options it owns (search stays in the top-right pill).
+    pub filter_open: bool,
+    /// Selected console ids (lowercased) — the empty set shows
+    /// every platform (entries with no console only match when
+    /// unfiltered).
+    platforms: HashSet<String>,
+    /// Index into `STATUS_OPTS` — `None` shows every maturity.
+    status: Option<usize>,
+    /// List ordering — `sync_items` rebuilds on change.
+    sort: SortKey,
     /// The search pill's filter text lives in `search.text`.
     pub search: SearchPill,
     /// slugs whose cover fetch was already queued this session.
@@ -435,6 +488,10 @@ impl Default for DecompView {
             notice: None,
             checked: false,
             filter: None,
+            filter_open: false,
+            platforms: HashSet::new(),
+            status: None,
+            sort: SortKey::Catalog,
             search: SearchPill::default(),
             cover_requested: HashSet::new(),
             cover_req_tx: req_tx,
@@ -467,6 +524,35 @@ impl DecompView {
             .collect();
     }
 
+    /// `entries` indices in the current sort — `sync_items` pushes
+    /// them in this order so the list matches the drawer's Sort row.
+    fn sort_order(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..self.entries.len()).collect();
+        let e = &self.entries;
+        match self.sort {
+            SortKey::Catalog => {}
+            SortKey::Stars => v.sort_by(|&a, &b| {
+                e[b]
+                    .stars
+                    .unwrap_or(0)
+                    .cmp(&e[a].stars.unwrap_or(0))
+                    .then_with(|| e[a].name.cmp(&e[b].name))
+            }),
+            SortKey::Name => {
+                v.sort_by(|&a, &b| e[a].name.to_lowercase().cmp(&e[b].name.to_lowercase()))
+            }
+            SortKey::Year => v.sort_by(|&a, &b| {
+                e[b]
+                    .year
+                    .unwrap_or(0)
+                    .cmp(&e[a].year.unwrap_or(0))
+                    .then_with(|| e[a].name.cmp(&e[b].name))
+            }),
+            SortKey::Updated => v.sort_by(|&a, &b| e[b].pushed_at.cmp(&e[a].pushed_at)),
+        }
+        v
+    }
+
     /// Push `entries` into the shared list — each item's `path` is
     /// the slug (identity for selection, covers, actions), `keywords`
     /// carries the search haystack so `visible()`'s text filter keeps
@@ -474,49 +560,115 @@ impl DecompView {
     /// marquee lines.
     fn sync_items(&mut self) {
         let items = self
-            .entries
+            .sort_order()
             .iter()
-            .map(|e| carousel::Item {
-                path: PathBuf::from(&e.slug),
-                cover: cover_cache(&e.slug)
-                    .filter(|c| c.is_file())
-                    .map(CoverSrc::File)
-                    .unwrap_or_else(|| CoverSrc::Web(Vec::new())),
-                fallback: None,
-                title: e.name.clone(),
-                artist: if !e.developer.is_empty() {
-                    e.developer.clone()
-                } else {
-                    e.author.clone()
-                },
-                album: format!("{} · {}", catalog::console_label(&e.console), e.kind.label()),
-                keywords: e.search_blob.clone(),
-                duration: None,
-                marker: None,
-                progress: None,
+            .map(|&i| {
+                let e = &self.entries[i];
+                carousel::Item {
+                    path: PathBuf::from(&e.slug),
+                    cover: cover_cache(&e.slug)
+                        .filter(|c| c.is_file())
+                        .map(CoverSrc::File)
+                        .unwrap_or_else(|| CoverSrc::Web(Vec::new())),
+                    fallback: None,
+                    title: e.name.clone(),
+                    artist: if !e.developer.is_empty() {
+                        e.developer.clone()
+                    } else {
+                        e.author.clone()
+                    },
+                    album: format!("{} · {}", catalog::console_label(&e.console), e.kind.label()),
+                    keywords: e.search_blob.clone(),
+                    duration: None,
+                    marker: None,
+                    progress: None,
+                }
             })
             .collect();
         self.cards.open_items(items, "decomp".to_string());
     }
 
-    /// The kind tab's `Carousel::set_subset` — slug paths of the
-    /// chosen kind, `None` for All.
+    /// `Carousel::set_subset` for every active filter at once —
+    /// kind tab ∩ platform chips ∩ status chip; `None` when nothing
+    /// is filtering so the whole list shows.
     fn apply_subset(&mut self) {
-        self.cards.set_subset(self.filter.map(|k| {
+        let status = self.status;
+        let active =
+            self.filter.is_some() || !self.platforms.is_empty() || status.is_some();
+        self.cards.set_subset(active.then(|| {
             self.entries
                 .iter()
-                .filter(|e| e.kind == k)
+                .filter(|e| {
+                    self.filter.map_or(true, |k| e.kind == k)
+                        && (self.platforms.is_empty()
+                            || self.platforms.contains(&e.console.to_lowercase()))
+                        && status.map_or(true, |i| {
+                            STATUS_OPTS[i].contains(&e.status.as_str())
+                        })
+                })
                 .map(|e| PathBuf::from(&e.slug))
                 .collect()
         }));
+    }
+
+    /// Any drawer filter actually narrowing the list — lights the
+    /// band's filter icon while the drawer is closed.
+    fn filters_active(&self) -> bool {
+        !self.platforms.is_empty() || self.status.is_some()
+    }
+
+    /// After a filter change: refresh the subset and re-anchor the
+    /// focus on the selection (a filtered-out selection lands on the
+    /// first shown) — the same contract the kind tabs follow.
+    fn apply_filters(&mut self) {
+        self.apply_subset();
+        self.cards.focus(&self.search.text);
+    }
+
+    /// The platform chips — consoles present in the catalog,
+    /// `(id, label)` pairs ordered by `CONSOLE_ORDER` then label.
+    /// Entries with no console get no chip (they only show when no
+    /// platform is selected). Ids are lowercased — the catalog uses
+    /// "n64" but the fallback manifest writes "N64".
+    fn platform_options(&self) -> Vec<(String, String)> {
+        let mut seen = HashSet::new();
+        for e in &self.entries {
+            if !e.console.is_empty() {
+                seen.insert(e.console.to_lowercase());
+            }
+        }
+        let rank = |id: &str| {
+            CONSOLE_ORDER
+                .iter()
+                .position(|c| *c == id)
+                .unwrap_or(usize::MAX)
+        };
+        let mut v: Vec<(String, String)> = seen
+            .into_iter()
+            .map(|id| {
+                let label = catalog::console_label(&id);
+                (id, label)
+            })
+            .collect();
+        v.sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.1.cmp(&b.1)));
+        v
     }
 
     /// Tab switch: restrict the subset and re-anchor the focus on the
     /// selection (a filtered-out selection lands on the first shown).
     fn set_kind_filter(&mut self, k: Option<Kind>) {
         self.filter = k;
-        self.apply_subset();
-        self.cards.focus(&self.search.text);
+        self.apply_filters();
+    }
+
+    /// Sort row: rebuild the list in the new order (open_items resets
+    /// the scroll/selection — explicit user reorder, that's fine).
+    /// `subset` survives `open_items`, so filters stay applied.
+    fn set_sort(&mut self, k: SortKey) {
+        if self.sort != k {
+            self.sort = k;
+            self.sync_items();
+        }
     }
 
     /// Re-stat every install marker — throttled so a frame never pays
@@ -1223,6 +1375,39 @@ pub fn view(
         Pos2::new(upper.max.x, pane.min.y - 4.0 * s),
     );
 
+    // --- Filter drawer (EQ-style damped reveal) -------------------
+    // The shelf is anchored at the footer separator — its top edge
+    // lifts up over the info pane, which keeps its layout behind
+    // the drawer, same as the audio view's EQ drawer.
+    let filter_t = {
+        let id = ui.scope_id().with("decomp-filter-drawer");
+        let mut t = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<f32>(id))
+            .unwrap_or(0.0);
+        let target = if view.filter_open { 1.0 } else { 0.0 };
+        let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+        t += (target - t) * (1.0 - (-dt * 8.0).exp());
+        if (target - t).abs() < 0.0015 {
+            t = target;
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(id, t));
+        if t != target {
+            ui.ctx().request_repaint();
+        }
+        t
+    };
+    // Never smaller than the pane — the open drawer covers the whole
+    // selected-entry area, extending over the list only when the
+    // options need more room.
+    let drawer_full = filter_drawer_height(&painter, view, upper.width(), upper.height(), s)
+        .max(pane.height())
+        .min(upper.height());
+    let drawer = Rect::from_min_max(
+        Pos2::new(upper.min.x, upper.max.y - drawer_full * filter_t),
+        upper.max,
+    );
+
     // Lazy cover fetches — the list reports which items are on
     // screen; the worker caches bytes to disk and `set_cover` swaps
     // the source into the row's decode pool when one lands.
@@ -1321,6 +1506,21 @@ pub fn view(
         .and_then(|p| view.slug_idx.get(&*p.to_string_lossy()).copied());
     info_pane(ui, pane, view, sel_idx, alpha, interactive, s);
 
+    // The drawer paints last, over the pane — it slides up from the
+    // footer separator and covers whatever sits behind it.
+    if filter_t > 0.001 {
+        painter.rect_filled(drawer, 0.0, Color32::BLACK.gamma_multiply(alpha));
+        painter.hline(
+            drawer.min.x..=drawer.max.x,
+            drawer.min.y,
+            Stroke::new(
+                s.max(1.0),
+                Color32::from_white_alpha((51.0 * alpha) as u8),
+            ),
+        );
+        filter_drawer(ui, &painter, drawer, drawer_full, view, alpha, interactive, s);
+    }
+
     // The item search pill — docked in the top-right corner with a
     // small top/right margin so the cards never slide under it.
     view.search.ui(
@@ -1392,6 +1592,32 @@ pub fn view(
         FontId::proportional(12.0 * s),
         Color32::from_gray(150).gamma_multiply(alpha),
     );
+
+    // Right cluster: the filter-drawer toggle left of the layout
+    // icon — a funnel, lit while the drawer is open or a platform/
+    // status filter is narrowing the list.
+    let frect = Rect::from_center_size(
+        Pos2::new(band.max.x - 110.0 * s, cy),
+        Vec2::splat(60.0 * s),
+    );
+    let fr = if interactive {
+        ui.interact(frect, ui.scope_id().with("decomp-filter"), Sense::click())
+    } else {
+        ui.interact(frect, ui.scope_id().with("decomp-filter"), Sense::hover())
+    }
+    .on_hover_text("Filters — platform, status, sort");
+    if fr.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    crate::transport::icon_filter(
+        &painter,
+        frect.shrink(10.0 * s),
+        view.filter_open || view.filters_active(),
+        alpha,
+    );
+    if fr.clicked() {
+        view.filter_open = !view.filter_open;
+    }
 
     // Right cluster: the card-layout toggle — the same 60px icon
     // slot and glyph the music band uses for its view modes. It
@@ -1885,6 +2111,306 @@ enum PaneOp {
     Download,
     Play,
     OpenFolder,
+}
+
+// ---- Filter drawer -------------------------------------------------------
+
+/// The drawer's full (unclipped) content height — the STATUS and
+/// SORT rows plus however many rows the uniform platform grid
+/// needs, capped at just over half the area so the list never
+/// disappears entirely.
+fn filter_drawer_height(
+    painter: &egui::Painter,
+    view: &DecompView,
+    width: f32,
+    area_h: f32,
+    s: f32,
+) -> f32 {
+    let chip_h = 34.0 * s;
+    let gap = 10.0 * s;
+    let font = FontId::proportional(16.0 * s);
+    let avail = width - 2.0 * 40.0 * s - 120.0 * s;
+    let plats = view.platform_options();
+    let cw = plats
+        .iter()
+        .map(|(_, l)| painter.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x)
+        .fold(0.0, f32::max)
+        + 26.0 * s;
+    let per_row = ((avail + gap) / (cw + gap)).floor().max(1.0) as usize;
+    let rows = plats.len().div_ceil(per_row).max(1) as f32;
+    let need = 18.0 * s
+        + chip_h
+        + 12.0 * s
+        + chip_h
+        + 14.0 * s
+        + rows * (chip_h + 8.0 * s)
+        - 8.0 * s
+        + 14.0 * s;
+    need.min((area_h * 0.65).max(200.0 * s))
+}
+
+/// One filter chip — a small `pane_button`-style pill; `active`
+/// brightens the fill and (for the maturity chips) tints the edge
+/// and label with the status color.
+#[allow(clippy::too_many_arguments)]
+fn filter_chip(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    id: &str,
+    label: &str,
+    active: bool,
+    tint: Option<Color32>,
+    interactive: bool,
+    alpha: f32,
+    s: f32,
+) -> bool {
+    let resp = if interactive {
+        ui.interact(rect, ui.scope_id().with(("decomp-chip", id)), Sense::click())
+    } else {
+        ui.interact(rect, ui.scope_id().with(("decomp-chip", id)), Sense::hover())
+    };
+    let hot = interactive && resp.hovered();
+    let down = hot && resp.is_pointer_button_down_on();
+    let (fill, edge) = if active {
+        (36.0, 175.0)
+    } else if down {
+        (28.0, 140.0)
+    } else if hot {
+        (20.0, 110.0)
+    } else {
+        (9.0, 60.0)
+    };
+    let rad = CornerRadius::same((rect.height() * 0.5).round() as u8);
+    painter.rect_filled(rect, rad, Color32::from_white_alpha((fill * alpha) as u8));
+    painter.rect_stroke(
+        rect,
+        rad,
+        Stroke::new(
+            s.max(1.0),
+            if active {
+                tint.unwrap_or(Color32::WHITE)
+            } else {
+                Color32::WHITE
+            }
+            .gamma_multiply(edge / 255.0 * alpha),
+        ),
+        StrokeKind::Inside,
+    );
+    let tc = if active {
+        tint.unwrap_or(Color32::WHITE)
+    } else {
+        Color32::from_gray(200)
+    };
+    let font = FontId::proportional(16.0 * s);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        crate::ellipsize(painter, label, &font, rect.width() - 14.0 * s),
+        font,
+        tc.gamma_multiply(alpha),
+    );
+    if hot {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp.clicked() && interactive
+}
+
+/// The drawer's content — laid out in the full shelf height and
+/// clipped by the animated rect so it reveals from the pane's edge
+/// upward like the EQ drawer. Chips compose through the same
+/// `apply_filters`/`set_sort` path the kind tabs use.
+fn filter_drawer(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    full_h: f32,
+    view: &mut DecompView,
+    alpha: f32,
+    interactive: bool,
+    s: f32,
+) {
+    let content = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - full_h), rect.max);
+    let clip = painter.with_clip_rect(rect);
+    let font = FontId::proportional(16.0 * s);
+    let cap_font = FontId::proportional(13.0 * s);
+    let chip_h = 34.0 * s;
+    let gap = 10.0 * s;
+    let pad_x = 40.0 * s;
+    let cap_w = 120.0 * s;
+    let x0 = content.min.x + pad_x;
+    let chip_x = x0 + cap_w;
+    let avail_w = (content.max.x - pad_x - chip_x).max(0.0);
+    let cap_col = Color32::from_gray(130).gamma_multiply(alpha);
+    let mut y = content.min.y + 18.0 * s;
+    let uniform_w = |labels: &[String]| {
+        labels
+            .iter()
+            .map(|l| painter.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x)
+            .fold(0.0, f32::max)
+            + 26.0 * s
+    };
+    let caption = |text: &str, cy: f32| {
+        clip.text(
+            Pos2::new(x0, cy),
+            Align2::LEFT_CENTER,
+            text,
+            cap_font.clone(),
+            cap_col,
+        );
+    };
+
+    // ---- STATUS — one maturity at a time, off = all ------------
+    caption("STATUS", y + chip_h * 0.5);
+    let labels: Vec<String> = STATUS_OPTS
+        .iter()
+        .map(|set| {
+            catalog::status_label(set[0])
+                .map(|(l, _)| l.to_string())
+                .unwrap_or_else(|| set[0].to_uppercase())
+        })
+        .collect();
+    let cw = uniform_w(&labels);
+    let mut x = chip_x;
+    for (i, set) in STATUS_OPTS.iter().enumerate() {
+        let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cw, chip_h));
+        let tint = catalog::status_label(set[0]).map(|(_, c)| c);
+        if filter_chip(
+            ui,
+            &clip,
+            r,
+            &format!("decomp-status-{i}"),
+            &labels[i],
+            view.status == Some(i),
+            tint,
+            interactive,
+            alpha,
+            s,
+        ) {
+            view.status = if view.status == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
+            view.apply_filters();
+        }
+        x += cw + gap;
+    }
+    if view.filters_active() {
+        let label = "Clear filters";
+        let w = painter
+            .layout_no_wrap(label.to_string(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            + 26.0 * s;
+        let r = Rect::from_min_size(
+            Pos2::new(content.max.x - pad_x - w, y),
+            Vec2::new(w, chip_h),
+        );
+        if filter_chip(
+            ui, &clip, r, "decomp-clear", label, false, None, interactive, alpha, s,
+        ) {
+            view.platforms.clear();
+            view.status = None;
+            view.apply_filters();
+        }
+    }
+    y += chip_h + 12.0 * s;
+
+    // ---- SORT — single-select, one always active ---------------
+    caption("SORT", y + chip_h * 0.5);
+    let sort_labels: Vec<String> = SORT_OPTS.iter().map(|(l, _)| l.to_string()).collect();
+    let cw = uniform_w(&sort_labels);
+    let mut x = chip_x;
+    for (i, (label, key)) in SORT_OPTS.iter().enumerate() {
+        let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cw, chip_h));
+        if filter_chip(
+            ui,
+            &clip,
+            r,
+            &format!("decomp-sort-{i}"),
+            label,
+            view.sort == *key,
+            None,
+            interactive,
+            alpha,
+            s,
+        ) {
+            view.set_sort(*key);
+        }
+        x += cw + gap;
+    }
+    y += chip_h + 14.0 * s;
+
+    // ---- PLATFORMS — uniform-width grid -------------------------
+    // Every cell gets the widest label's width, so the grid reads
+    // as a tidy matrix instead of the site's ragged chips. When the
+    // capped drawer can't fit every row the grid wheel-scrolls.
+    caption("PLATFORMS", y + chip_h * 0.5);
+    let plats = view.platform_options();
+    if plats.is_empty() {
+        return;
+    }
+    let plat_labels: Vec<String> = plats.iter().map(|(_, l)| l.clone()).collect();
+    let cw = uniform_w(&plat_labels);
+    let per_row = ((avail_w + gap) / (cw + gap)).floor().max(1.0) as usize;
+    let rows = plats.len().div_ceil(per_row);
+    let row_step = chip_h + 8.0 * s;
+    let grid_h = rows as f32 * row_step - 8.0 * s;
+    let grid_area = Rect::from_min_max(
+        Pos2::new(chip_x, y),
+        Pos2::new(content.max.x - pad_x, content.max.y - 12.0 * s),
+    );
+    let overflow = (grid_h - grid_area.height()).max(0.0);
+    let scroll = if overflow > 0.5 {
+        let id = ui.scope_id().with("decomp-plat-scroll");
+        let mut off = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<f32>(id))
+            .unwrap_or(0.0);
+        if ui
+            .interact(rect, ui.scope_id().with("decomp-plat-hit"), Sense::hover())
+            .hovered()
+        {
+            off -= ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        }
+        let off = off.clamp(0.0, overflow);
+        ui.ctx().data_mut(|d| d.insert_temp(id, off));
+        off
+    } else {
+        0.0
+    };
+    let gclip = clip.with_clip_rect(grid_area);
+    for (i, (id, label)) in plats.iter().enumerate() {
+        let (row, col) = (i / per_row, i % per_row);
+        let r = Rect::from_min_size(
+            Pos2::new(
+                chip_x + col as f32 * (cw + gap),
+                y - scroll + row as f32 * row_step,
+            ),
+            Vec2::new(cw, chip_h),
+        );
+        let active = view.platforms.contains(id);
+        if filter_chip(
+            ui,
+            &gclip,
+            r,
+            &format!("decomp-plat-{id}"),
+            label,
+            active,
+            None,
+            interactive,
+            alpha,
+            s,
+        ) {
+            if active {
+                view.platforms.remove(id);
+            } else {
+                view.platforms.insert(id.clone());
+            }
+            view.apply_filters();
+        }
+    }
 }
 
 /// One pane pill button — white-alpha fill/edge like the settings

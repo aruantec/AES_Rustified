@@ -1417,6 +1417,28 @@ pub(crate) fn icon_layout(painter: &egui::Painter, rect: Rect, mode: u8, alpha: 
     }
 }
 
+/// Re/Decomp filter-drawer toggle (not a Lacrima port): a funnel —
+/// a trapezoid mouth narrowing into a short stem. Lit while the
+/// drawer is open or a filter is active.
+pub(crate) fn icon_filter(painter: &egui::Painter, rect: Rect, lit: bool, alpha: f32) {
+    let c = (if lit { LIT } else { DIM }).gamma_multiply(alpha);
+    painter.add(Shape::convex_polygon(
+        vec![
+            cv(rect, 100.0, 14.0, 14.0),
+            cv(rect, 100.0, 86.0, 14.0),
+            cv(rect, 100.0, 57.0, 56.0),
+            cv(rect, 100.0, 43.0, 56.0),
+        ],
+        c,
+        Stroke::NONE,
+    ));
+    painter.rect_filled(
+        cv_rect(rect, 100.0, 43.0, 56.0, 14.0, 30.0),
+        CornerRadius::same((2.0 * rect.height() / 100.0) as u8),
+        c,
+    );
+}
+
 /// Emulator-viewport toggle (Lacrima's ToggleEmulatorViewport):
 /// a swap glyph — two counter-pointing horizontal arrows (game ⇄
 /// list). Lit while the emulator presentation covers the item list,
