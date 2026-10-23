@@ -494,6 +494,24 @@ pub struct Emulation {
     /// Per-section capture/render options (Lacrima's RenderOptions
     /// overlay, "Rendering" tab) — keyed by section key.
     pub render: std::collections::BTreeMap<String, RenderOpts>,
+    /// Slug set of the Re/Decomp view's "Favorites" tab.
+    pub decomp_favorites: Vec<String>,
+    /// Per-slug exe choices for multi-exe re/decomp installs — the
+    /// play exe and an optional setup launcher, paths relative to
+    /// the install dir so they survive a moved tree.
+    pub decomp_bins: std::collections::BTreeMap<String, DecompBins>,
+}
+
+/// The two executables a re/decomp install can bind — picked via
+/// the two-combobox prompt when an install ships more than one.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DecompBins {
+    /// The exe "Play" launches — relative to the install dir.
+    pub play: String,
+    /// The setup/config launcher — relative to the install dir;
+    /// "" means no launcher was chosen (no Launcher button).
+    pub launcher: String,
 }
 
 /// Capture presentation options, persisted per emulation section —
@@ -585,6 +603,8 @@ impl Default for Emulation {
             selected_fbn_core: String::new(),
             selected_arcade_core: String::new(),
             render: Default::default(),
+            decomp_favorites: Default::default(),
+            decomp_bins: Default::default(),
         }
     }
 }

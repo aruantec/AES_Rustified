@@ -3182,7 +3182,7 @@ impl eframe::App for AesRustApp {
                         emu.remove_games(&mut settings.emulation, &p);
                     }
                     Some(PendingDelete::Decomp { slug, .. }) => {
-                        decomp.uninstall(&slug);
+                        decomp.uninstall(&slug, ui.ctx());
                     }
                     None => {}
                 }
@@ -6712,7 +6712,9 @@ fn music_view(
         | carousel::Action::GraphicPacks(_)
         | carousel::Action::Download(_)
         | carousel::Action::OpenFolder(_)
-        | carousel::Action::Uninstall(_) => None,
+        | carousel::Action::Uninstall(_)
+        | carousel::Action::Favorite(_)
+        | carousel::Action::ChooseExe(_) => None,
         carousel::Action::None => None,
     };
     // Transport prev/next resolve against the loaded album's items
@@ -8891,7 +8893,27 @@ fn confirm_overlay(
 
     // Slight scale-in — the dialog pops like a Switch prompt.
     let pop = 0.94 + 0.06 * vis;
-    let dlg = Rect::from_center_size(rect.center(), Vec2::new(420.0 * s, 170.0 * s) * pop);
+    // Size to the texts — a long title ("Uninstall Resident Evil -
+    // Code: Veronica X (aikatore)?") widens the dialog instead of
+    // spilling past the stroke; only a name that out-grows even the
+    // content rect gets ellipsized.
+    let title_font = FontId::proportional(20.0 * s);
+    let sub_font = FontId::proportional(13.0 * s);
+    let measure = |t: &str, f: &FontId| {
+        painter
+            .layout_no_wrap(t.to_string(), f.clone(), Color32::WHITE)
+            .size()
+            .x
+    };
+    let max_w = (rect.width() - 60.0 * s).max(260.0 * s);
+    let dlg_w = (420.0 * s)
+        .max(measure(title, &title_font) + 56.0 * s)
+        .max(measure(subtitle, &sub_font) + 56.0 * s)
+        .min(max_w);
+    let dlg = Rect::from_center_size(rect.center(), Vec2::new(dlg_w, 170.0 * s) * pop);
+    let text_w = dlg.width() - 56.0 * s * pop;
+    let title = ellipsize(&painter, title, &title_font, text_w);
+    let subtitle = ellipsize(&painter, subtitle, &sub_font, text_w);
     let dr = CornerRadius::same((14.0 * s).round() as u8);
     painter.rect_filled(dlg, dr, Color32::from_black_alpha((240.0 * vis) as u8));
     painter.rect_stroke(
@@ -8904,14 +8926,14 @@ fn confirm_overlay(
         Pos2::new(dlg.center().x, dlg.min.y + 36.0 * s * pop),
         Align2::CENTER_CENTER,
         title,
-        FontId::proportional(20.0 * s),
+        title_font,
         Color32::WHITE.gamma_multiply(vis),
     );
     painter.text(
         Pos2::new(dlg.center().x, dlg.min.y + 66.0 * s * pop),
         Align2::CENTER_CENTER,
         subtitle,
-        FontId::proportional(13.0 * s),
+        sub_font,
         Color32::from_gray(190).gamma_multiply(vis),
     );
 

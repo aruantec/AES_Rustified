@@ -12,7 +12,7 @@
 //! Source is copied OVER the existing tree — never a wipe — so a
 //! baserom or build outputs parked inside survive an update.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -437,8 +437,36 @@ pub struct DecompView {
     notice: Option<String>,
     /// One-shot fallback check — armed only when no catalog arrives.
     checked: bool,
-    /// Kind filter tab — `None` shows everything.
-    filter: Option<Kind>,
+    /// Active tab — Favorites, All, or one kind.
+    tab: DecompTab,
+    /// The Favorites tab's slug set — hydrated from
+    /// `cfg.decomp_favorites` once, written back per toggle.
+    favorites: BTreeSet<String>,
+    /// One-shot flag for hydrating `favorites`/`bins` from cfg —
+    /// DecompView::new runs before cfg is in scope.
+    persisted_loaded: bool,
+    /// `favorites` changed — view() writes it into cfg.
+    favorites_dirty: bool,
+    /// Per-slug play/launcher exe choices — mirror of
+    /// `cfg.decomp_bins` (same hydrate-once/write-through shape).
+    bins: BTreeMap<String, settings::DecompBins>,
+    bins_dirty: bool,
+    /// Installed slugs → their exe candidates (absolute, sorted the
+    /// find_exe way) — feeds the multi-exe picker, the "Choose
+    /// executables" gate and Play's saved-choice lookup. Refreshed
+    /// with the install-stamp cache.
+    installed_exes: HashMap<String, Vec<PathBuf>>,
+    /// The two-combobox exe picker — Some while the modal is up.
+    exe_prompt: Option<ExePicker>,
+    /// Uninstalls deleting on a worker (`remove_dir_all` on a big
+    /// install tree must never run on the UI thread) — slugs in
+    /// flight gate the menu/button, the rx reports completion.
+    uninstalling: HashSet<String>,
+    uninstall_rx: Option<mpsc::Receiver<(String, Result<(), String>)>>,
+    /// A confirmed close asked the worker to stop the game — the
+    /// capture keeps the last frame up with a "Closing…" status
+    /// until teardown instead of freezing silently.
+    stop_pending: bool,
     /// Filter drawer — open state plus the platform/status/sort
     /// options it owns (search stays in the top-right pill).
     pub filter_open: bool,
@@ -481,7 +509,8 @@ pub struct DecompView {
     launch_rx: Option<mpsc::Receiver<Result<xenia::Session, String>>>,
     /// Play on a different card while a session runs — queued until
     /// the running game closes (Lacrima's pending-launch shape).
-    pending_launch: Option<(PathBuf, String)>,
+    /// Carries the resolved exe so a picker choice survives the wait.
+    pending_launch: Option<(PathBuf, String, PathBuf)>,
     /// ⇄ list/capture switch — the grid stays live while the
     /// capture runs underneath (Lacrima's dismissed viewport).
     pub viewport_dismissed: bool,
@@ -583,6 +612,40 @@ enum DecompPlayRoute {
     Launch,
 }
 
+/// The tab row's identity — "Favorites" leads, then All, then one
+/// tab per kind present in the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecompTab {
+    Favorites,
+    All,
+    Kind(Kind),
+}
+
+/// What the exe picker's Save does with the selection — launch it,
+/// queue behind the running game's close, or just persist it (the
+/// "Choose executables…" menu path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerMode {
+    Launch,
+    Queue,
+    SaveOnly,
+}
+
+/// The multi-exe prompt's state — two comboboxes (play exe +
+/// optional setup launcher) over the install's exe candidates.
+struct ExePicker {
+    slug: String,
+    name: String,
+    dir: PathBuf,
+    mode: PickerMode,
+    /// find_exes order — shallowest then largest, index 0 is the
+    /// heuristic default the Play selection starts on.
+    exes: Vec<PathBuf>,
+    play_idx: usize,
+    /// None = the "None" row — no launcher configured.
+    launcher_idx: Option<usize>,
+}
+
 impl Default for DecompView {
     fn default() -> Self {
         let (req_tx, req_rx) = mpsc::channel();
@@ -609,7 +672,17 @@ impl Default for DecompView {
             downloads: HashMap::new(),
             notice: None,
             checked: false,
-            filter: None,
+            tab: DecompTab::All,
+            favorites: BTreeSet::new(),
+            persisted_loaded: false,
+            favorites_dirty: false,
+            bins: BTreeMap::new(),
+            bins_dirty: false,
+            installed_exes: HashMap::new(),
+            exe_prompt: None,
+            uninstalling: HashSet::new(),
+            uninstall_rx: None,
+            stop_pending: false,
             filter_open: false,
             platforms: HashSet::new(),
             status: None,
@@ -758,13 +831,15 @@ impl DecompView {
     /// is filtering so the whole list shows.
     fn apply_subset(&mut self) {
         let status = self.status;
-        let active =
-            self.filter.is_some() || !self.platforms.is_empty() || status.is_some();
+        let tab = self.tab;
+        let active = !matches!(tab, DecompTab::All)
+            || !self.platforms.is_empty()
+            || status.is_some();
         self.cards.set_subset(active.then(|| {
             self.entries
                 .iter()
                 .filter(|e| {
-                    self.filter.map_or(true, |k| e.kind == k)
+                    self.tab_matches(e)
                         && (self.platforms.is_empty()
                             || self.platforms.contains(&e.console.to_lowercase()))
                         && status.map_or(true, |i| {
@@ -774,6 +849,16 @@ impl DecompView {
                 .map(|e| PathBuf::from(&e.slug))
                 .collect()
         }));
+    }
+
+    /// The tab's share of the subset predicate — favorites gate on
+    /// the slug set, kind tabs on `e.kind`, All matches everything.
+    fn tab_matches(&self, e: &Entry) -> bool {
+        match self.tab {
+            DecompTab::Favorites => self.favorites.contains(&e.slug),
+            DecompTab::All => true,
+            DecompTab::Kind(k) => e.kind == k,
+        }
     }
 
     /// Any drawer filter actually narrowing the list — lights the
@@ -821,9 +906,22 @@ impl DecompView {
 
     /// Tab switch: restrict the subset and re-anchor the focus on the
     /// selection (a filtered-out selection lands on the first shown).
-    fn set_kind_filter(&mut self, k: Option<Kind>) {
-        self.filter = k;
+    fn set_tab(&mut self, t: DecompTab) {
+        self.tab = t;
         self.apply_filters();
+    }
+
+    /// Context-menu "Add/Remove from Favorites" — flips the slug's
+    /// membership and re-filters when the Favorites tab is showing
+    /// so an unfavorited card drops out immediately.
+    fn toggle_favorite(&mut self, slug: &str) {
+        if !self.favorites.remove(slug) {
+            self.favorites.insert(slug.to_string());
+        }
+        self.favorites_dirty = true;
+        if matches!(self.tab, DecompTab::Favorites) {
+            self.apply_subset();
+        }
     }
 
     /// Sort row: rebuild the list in the new order (open_items resets
@@ -850,6 +948,20 @@ impl DecompView {
                 )
             })
             .collect();
+        // Exe inventory for installed games — the multi-exe picker,
+        // the menu's "Choose executables" gate and Play's saved
+        // choice all read this instead of re-walking the disk.
+        self.installed_exes = self
+            .entries
+            .iter()
+            .filter(|e| {
+                self.installed
+                    .get(&e.slug)
+                    .and_then(|s| s.as_ref())
+                    .is_some()
+            })
+            .filter_map(|e| install_dir(&e.slug).map(|d| (e.slug.clone(), find_exes(&d))))
+            .collect();
         self.installed_at = Instant::now();
     }
 
@@ -874,54 +986,190 @@ impl DecompView {
         }
     }
 
-    /// Card/pane "Play": launch the installed game as a captured
-    /// session (or route through the running one).
-    pub fn play_dir(&mut self, dir: &Path, name: String) {
-        match self.play_route(dir) {
-            DecompPlayRoute::UnDismiss => self.viewport_dismissed = false,
+    /// Card/pane "Play": resolve the exe, then launch the installed
+    /// game as a captured session (or route through the running
+    /// one). A multi-exe install with no saved choice opens the
+    /// two-combobox picker instead of guessing — the launch
+    /// continues when it confirms.
+    pub fn play_entry(&mut self, e: &Entry, dir: &Path) {
+        let route = self.play_route(dir);
+        // Same game running → just bring the viewport back; no exe
+        // resolution needed at all.
+        if route == DecompPlayRoute::UnDismiss {
+            self.viewport_dismissed = false;
+            return;
+        }
+        let name = e.name.clone();
+        // A saved choice wins only while the file still exists — a
+        // reinstall that dropped it re-opens the picker.
+        let exe = match self.saved_bin(&e.slug, dir, |b| &b.play) {
+            Some(p) => Some(p),
+            None => {
+                let exes = self
+                    .installed_exes
+                    .get(&e.slug)
+                    .cloned()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| find_exes(dir));
+                if exes.len() > 1 {
+                    self.open_exe_picker(
+                        e,
+                        dir,
+                        exes,
+                        if route == DecompPlayRoute::QueuePending {
+                            PickerMode::Queue
+                        } else {
+                            PickerMode::Launch
+                        },
+                    );
+                    return;
+                }
+                exes.into_iter().next()
+            }
+        };
+        let Some(exe) = exe else {
+            self.notice = Some("No executable found — opening the folder".into());
+            open_in_file_manager(dir);
+            return;
+        };
+        match route {
             DecompPlayRoute::QueuePending => {
-                self.pending_launch = Some((dir.to_path_buf(), name));
+                self.pending_launch = Some((dir.to_path_buf(), name, exe));
                 self.request_close();
             }
-            DecompPlayRoute::Launch => self.launch(dir, name),
+            // UnDismiss returned above.
+            DecompPlayRoute::Launch | DecompPlayRoute::UnDismiss => {
+                self.launch(dir, name, exe)
+            }
         }
     }
 
-    /// Find the game's exe and spawn the capture session on a
-    /// worker — the process + resolve worker land via `launch_rx`.
-    fn launch(&mut self, dir: &Path, name: String) {
-        self.notice = None;
-        xenia::session_log(&format!("decomp launch dir={} exe=find", dir.display()));
-        match find_exe(dir) {
+    /// The saved launcher exe — only while the file still exists.
+    fn launcher_exe(&self, e: &Entry, dir: &Path) -> Option<PathBuf> {
+        self.saved_bin(&e.slug, dir, |b| &b.launcher)
+    }
+
+    /// One side of `settings::DecompBins` resolved to a live file —
+    /// `pick` selects the play or launcher rel path.
+    fn saved_bin(
+        &self,
+        slug: &str,
+        dir: &Path,
+        pick: fn(&settings::DecompBins) -> &String,
+    ) -> Option<PathBuf> {
+        self.bins
+            .get(slug)
+            .map(|b| pick(b))
+            .filter(|rel| !rel.is_empty())
+            .map(|rel| dir.join(rel))
+            .filter(|p| p.is_file())
+    }
+
+    /// Pane "Launcher" — the setup launcher is NOT a capture
+    /// target: it spawns detached on the desktop, independent of
+    /// any running session (capturing a config tool's window makes
+    /// no sense — the game's own session is the capture one).
+    fn launch_launcher(&mut self, e: &Entry, dir: &Path) {
+        match self.launcher_exe(e, dir) {
             Some(exe) => {
-                let root = dir.to_path_buf();
-                let exe_s = exe.to_string_lossy().into_owned();
-                let (tx, rx) = mpsc::channel();
-                // LowLatencyCapture → the capture pool depth for the
-                // session about to start (the panel has no row for
-                // it; the DECOMP render slot carries the default).
-                let low_latency = self.render.low_latency;
-                std::thread::spawn(move || {
-                    let _ = tx.send(xenia::Session::start(
-                        &exe_s,
-                        &exe,
-                        low_latency,
-                        None,
-                        xenia::Kind::Decomp,
-                        None,
-                        Some(root),
-                    ));
-                });
-                self.launch_rx = Some(rx);
-                self.session_dir = Some(dir.to_path_buf());
-                self.session_name = name.clone();
-                self.notice = Some(format!("Launching {name}…"));
+                match std::process::Command::new(&exe).current_dir(dir).spawn() {
+                    Ok(_) => {
+                        self.notice = Some(format!("{} launcher started", e.name));
+                    }
+                    Err(err) => {
+                        self.notice = Some(format!("Launcher failed to start: {err}"));
+                    }
+                }
             }
             None => {
-                self.notice = Some("No executable found — opening the folder".into());
-                open_in_file_manager(dir);
+                self.notice = Some("No launcher configured for this project".into());
             }
         }
+    }
+
+    /// The exe picker — over the game's candidates, preselected to
+    /// the saved choices (or the find_exe heuristic for play).
+    /// "Choose executables…" calls this with SaveOnly; Play with
+    /// Launch/Queue.
+    fn open_exe_picker(&mut self, e: &Entry, dir: &Path, exes: Vec<PathBuf>, mode: PickerMode) {
+        let saved = self.bins.get(&e.slug);
+        let rel = |p: &Path| rel_exe(dir, p);
+        self.exe_prompt = Some(ExePicker {
+            slug: e.slug.clone(),
+            name: e.name.clone(),
+            dir: dir.to_path_buf(),
+            mode,
+            play_idx: saved
+                .and_then(|b| exes.iter().position(|p| rel(p) == b.play))
+                .unwrap_or(0),
+            launcher_idx: saved.and_then(|b| {
+                if b.launcher.is_empty() {
+                    None
+                } else {
+                    exes.iter().position(|p| rel(p) == b.launcher)
+                }
+            }),
+            exes,
+        });
+    }
+
+    /// Picker confirmed — persist the play/launcher choice (rel
+    /// paths, keyed by slug) and dispatch per mode.
+    fn picker_apply(&mut self, pk: ExePicker) {
+        let play = pk.exes[pk.play_idx].clone();
+        self.bins.insert(
+            pk.slug.clone(),
+            settings::DecompBins {
+                play: rel_exe(&pk.dir, &play),
+                launcher: pk
+                    .launcher_idx
+                    .map(|i| rel_exe(&pk.dir, &pk.exes[i]))
+                    .unwrap_or_default(),
+            },
+        );
+        self.bins_dirty = true;
+        match pk.mode {
+            PickerMode::Launch => self.launch(&pk.dir, pk.name, play),
+            PickerMode::Queue => {
+                self.pending_launch = Some((pk.dir.clone(), pk.name, play));
+                self.request_close();
+            }
+            PickerMode::SaveOnly => {}
+        }
+    }
+
+    /// Spawn the capture session on a worker — the process +
+    /// resolve worker land via `launch_rx`. `exe` is already
+    /// resolved (saved choice, picker result or heuristic).
+    fn launch(&mut self, dir: &Path, name: String, exe: PathBuf) {
+        self.notice = None;
+        xenia::session_log(&format!(
+            "decomp launch dir={} exe={}",
+            dir.display(),
+            exe.display()
+        ));
+        let root = dir.to_path_buf();
+        let exe_s = exe.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::channel();
+        // LowLatencyCapture → the capture pool depth for the
+        // session about to start (the panel has no row for
+        // it; the DECOMP render slot carries the default).
+        let low_latency = self.render.low_latency;
+        std::thread::spawn(move || {
+            let _ = tx.send(xenia::Session::start(
+                &exe_s,
+                &exe,
+                low_latency,
+                None,
+                xenia::Kind::Decomp,
+                None,
+                Some(root),
+            ));
+        });
+        self.launch_rx = Some(rx);
+        self.session_dir = Some(dir.to_path_buf());
+        self.session_name = name.clone();
+        self.notice = Some(format!("Launching {name}…"));
     }
 
     /// Ask the running session to stop the game — or cancel a
@@ -931,6 +1179,9 @@ impl DecompView {
     pub fn stop_session(&mut self) {
         if let Some(s) = &self.session {
             s.stop();
+            // Non-blocking — the worker posts WM_CLOSE; the flag
+            // drives the "Closing…" status until teardown lands.
+            self.stop_pending = true;
         } else if self.launch_rx.is_some() {
             self.launch_rx = None;
             self.session_dir = None;
@@ -956,6 +1207,11 @@ impl DecompView {
     /// through the close prompt first — its install dir can't be
     /// deleted mid-session — then re-arms once teardown lands.
     fn request_uninstall(&mut self, e: &Entry) {
+        // Already deleting — a second request would just queue
+        // another confirm for a tree that's already going away.
+        if self.uninstalling.contains(&e.slug) {
+            return;
+        }
         let req = (e.slug.clone(), e.name.clone());
         if self.session_dir == install_dir(&e.slug) {
             self.pending_uninstall = Some(req);
@@ -982,27 +1238,40 @@ impl DecompView {
         }
     }
 
-    /// Confirmed uninstall — drop the install tree, drop a queued
-    /// Play for it, and refresh the stamp cache so cards and the
-    /// pane flip back to Install. Refuses while the game still owns
-    /// a session or in-flight launch (the running path re-arms after
-    /// teardown instead, so this can't race the filesystem locks).
-    pub fn uninstall(&mut self, slug: &str) {
+    /// Confirmed uninstall — drop the install tree ON A WORKER
+    /// (remove_dir_all on a big install would freeze the UI), drop
+    /// a queued Play for it, and refresh the stamp cache when the
+    /// rx reports back so cards and the pane flip back to Install.
+    /// Refuses while the game still owns a session or in-flight
+    /// launch (the running path re-arms after teardown instead, so
+    /// this can't race the filesystem locks).
+    pub fn uninstall(&mut self, slug: &str, ctx: &egui::Context) {
         let Some(dir) = install_dir(slug) else {
             return;
         };
         if self.session_dir.as_deref() == Some(dir.as_path()) {
             return;
         }
+        if !self.uninstalling.insert(slug.to_string()) {
+            return; // already deleting
+        }
         if self
             .pending_launch
             .as_ref()
-            .is_some_and(|(d, _)| d == &dir)
+            .is_some_and(|(d, _, _)| d == &dir)
         {
             self.pending_launch = None;
         }
-        let _ = std::fs::remove_dir_all(&dir);
-        self.refresh_installed();
+        self.notice = Some(format!("Uninstalling {slug}…"));
+        let (tx, rx) = mpsc::channel();
+        let slug_c = slug.to_string();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = std::fs::remove_dir_all(&dir).map_err(|e| e.to_string());
+            let _ = tx.send((slug_c, res));
+            ctx.request_repaint();
+        });
+        self.uninstall_rx = Some(rx);
     }
 
     /// The ⇄ switch — dismissing also drops game-fullscreen and the
@@ -1180,7 +1449,7 @@ impl DecompView {
             Action::Install | Action::Update => self.download(e),
             Action::Open => {
                 if let Some(dir) = install_dir(&e.slug) {
-                    self.play_dir(&dir, e.name.clone());
+                    self.play_entry(e, &dir);
                 }
             }
         }
@@ -1343,13 +1612,53 @@ impl DecompView {
     }
 }
 
-/// Best OS-matching asset from a `releases/latest` `assets` array —
-/// a Windows x64 build is required; symbols, checksums, source dumps
-/// and foreign-OS artifacts are rejected up front, and `arch_ok`
-/// (the emu_dl gate) filters the arm/riscv builds release listings
-/// mix into the same page. x64 markers only *score* — projects that
-/// ship exactly one windows zip carry no arch marker at all.
+/// Best host-matching asset from a release `assets` array — the
+/// current OS's build is required (explicit marker), foreign-OS
+/// artifacts, symbols, checksums, source dumps and debug packages
+/// are rejected up front, and `arch_ok` (the emu_dl gate) filters
+/// the arm/riscv builds release listings mix into the same page.
+/// The host's arch markers only *score* — a 32-bit x86 build still
+/// wins when it's the only host candidate (WoW64 runs it), and
+/// unmarked single archives keep working.
 fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
+    // Junk + other-OS markers — rejected on every host.
+    const JUNK: &[&str] = &[
+        "symbols", ".sig", ".sha", "checksum", "source", "-src", "debug", ".pdb", ".txt",
+        ".json",
+    ];
+    #[cfg(windows)]
+    const FOREIGN: &[&str] = &[
+        "linux", "macos", "darwin", "osx", "android", "ios", "freebsd", "appimage", "flatpak",
+        ".deb", ".rpm", ".dmg", ".pkg",
+    ];
+    #[cfg(windows)]
+    const NEED: &[&str] = &[
+        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "-pc.",
+    ];
+    #[cfg(target_os = "macos")]
+    const FOREIGN: &[&str] = &[
+        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "linux", "ubuntu",
+        "debian", "fedora", "appimage", "flatpak", ".deb", ".rpm", "android", "ios", "freebsd",
+    ];
+    #[cfg(target_os = "macos")]
+    const NEED: &[&str] = &["macos", "darwin", "osx", ".dmg", ".pkg", "apple", "universal"];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    const FOREIGN: &[&str] = &[
+        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "macos", "darwin",
+        "osx", ".dmg", ".pkg", "android", "ios",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    const NEED: &[&str] =
+        &["linux", "ubuntu", "debian", "fedora", "appimage", "flatpak", ".deb", ".rpm", ".tar"];
+    // This host's arch — a matching marker scores; foreign arches
+    // died at `arch_ok` already.
+    #[cfg(target_arch = "x86_64")]
+    const ARCH_HIT: &[&str] = &["x64", "x86_64", "amd64"];
+    #[cfg(target_arch = "aarch64")]
+    const ARCH_HIT: &[&str] = &["arm64", "aarch64"];
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const ARCH_HIT: &[&str] = &[];
+
     let mut best: Option<(i32, &str)> = None;
     for a in assets {
         let Some(n) = a.get("name").and_then(|v| v.as_str()).map(str::to_lowercase) else {
@@ -1358,32 +1667,29 @@ fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
         let Some(url) = a.get("browser_download_url").and_then(|v| v.as_str()) else {
             continue;
         };
-        if [
-            "linux", "macos", "darwin", "osx", "android", "ios", "freebsd", "appimage",
-            "flatpak", ".deb", ".rpm", ".dmg", ".pkg", "symbols", ".sig", ".sha", "checksum",
-            "source", "-src", "debug", ".pdb", ".txt", ".json",
-        ]
-        .iter()
-        .any(|m| n.contains(m))
-        {
+        if JUNK.iter().any(|m| n.contains(m)) || FOREIGN.iter().any(|m| n.contains(m)) {
             continue;
         }
         if !crate::emulation::emu_dl::arch_ok(&n) {
             continue;
         }
-        // An explicit windows marker is required — a linux x64
-        // tarball otherwise scores just as well as the win build.
-        if ![
-            "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "-pc.",
-        ]
-        .iter()
-        .any(|m| n.contains(m))
-        {
+        // An explicit host-OS marker is required — a foreign x64
+        // tarball otherwise scores just as well as our build.
+        if !NEED.iter().any(|m| n.contains(m)) {
             continue;
         }
         let mut score = 0;
-        if n.contains("x64") || n.contains("x86_64") || n.contains("amd64") {
+        if ARCH_HIT.iter().any(|m| n.contains(m)) {
             score += 2;
+        }
+        // 32-bit intel builds run on x86_64 too — below the x64
+        // score but above an unmarked sibling.
+        #[cfg(target_arch = "x86_64")]
+        if ["i386", "i686", "-x86.", "-x86-", "x86-32"]
+            .iter()
+            .any(|m| n.contains(m))
+        {
+            score += 1;
         }
         if n.ends_with(".zip") || n.ends_with(".7z") {
             score += 1;
@@ -1393,6 +1699,20 @@ fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
         }
     }
     best.map(|(_, u)| u.to_string())
+}
+
+/// The release to install from a `/releases` listing (newest
+/// first): newest non-draft STABLE wins; only when no stable entry
+/// exists does a prerelease qualify — prerelease-only repos like
+/// recvx-enhanced-port 404 `releases/latest` but still list here.
+/// Drafts are never install candidates.
+fn pick_release(arr: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    let flag = |r: &serde_json::Value, key: &str| {
+        r.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    };
+    arr.iter()
+        .find(|r| !flag(r, "draft") && !flag(r, "prerelease"))
+        .or_else(|| arr.iter().find(|r| !flag(r, "draft")))
 }
 
 /// Whether a downloaded asset is an archive we can extract —
@@ -1469,15 +1789,21 @@ fn try_release(
     dest: &Path,
 ) -> Option<String> {
     crate::emulation::emu_dl::set(dl, "Checking release…", 0.0);
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    // `/releases/latest` only sees stable tags — repos that ship
+    // prereleases only (recvx-enhanced-port) 404 and the old code
+    // silently fell back to the source zipball. The list endpoint
+    // covers both: newest non-draft STABLE wins, else newest
+    // non-draft at all (a prerelease build still beats source).
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=10");
     let mut resp = agent
         .get(&url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", "application/vnd.github+json")
         .call()
         .ok()?;
-    let v: serde_json::Value =
+    let arr: Vec<serde_json::Value> =
         serde_json::from_str(&resp.body_mut().read_to_string().ok()?).ok()?;
+    let v = pick_release(&arr)?;
     let tag = v.get("tag_name")?.as_str()?.to_string();
     let asset = pick_os_asset(v.get("assets")?.as_array()?)?;
     let fname = asset.rsplit('/').next().unwrap_or("asset.bin");
@@ -1659,8 +1985,14 @@ pub fn view(
     // captured frame stays mounted so the layer can fade out over
     // the grid instead of snapping away.
     if view.session.as_mut().is_some_and(|s| s.finished()) {
-        view.session = None;
+        // Reap off-UI — Session::drop kills+waits the child; a game
+        // still finishing its own teardown would otherwise stall
+        // this frame.
+        if let Some(s) = view.session.take() {
+            std::thread::spawn(move || drop(s));
+        }
         view.session_dir = None;
+        view.stop_pending = false;
         view.viewport_dismissed = false;
         view.game_fs = false;
         view.input_tun = false;
@@ -1670,20 +2002,41 @@ pub fn view(
         view.settle_uninstall();
         // The queued Play fires only once the replaced session is
         // fully reaped (TryLaunchPendingEmulatorRequest).
-        if let Some((dir, name)) = view.pending_launch.take() {
-            view.launch(&dir, name);
+        if let Some((dir, name, exe)) = view.pending_launch.take() {
+            view.launch(&dir, name, exe);
         }
     }
     // A stopped/canceled/failed launch frees the install dir the
     // same way teardown does — the armed uninstall surfaces now.
     view.settle_uninstall();
+    // Uninstall worker — completion refreshes the stamp cache and
+    // surfaces the result as the status notice (UI never blocked:
+    // remove_dir_all ran on the thread).
+    if let Some(rx) = &view.uninstall_rx {
+        match rx.try_recv() {
+            Ok((slug, res)) => {
+                view.uninstall_rx = None;
+                view.uninstalling.remove(&slug);
+                view.refresh_installed();
+                view.notice = Some(match res {
+                    Ok(()) => format!("Uninstalled {slug}"),
+                    Err(e) => format!("Uninstall failed: {e}"),
+                });
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                view.uninstall_rx = None;
+                view.uninstalling.clear();
+            }
+        }
+    }
     // A confirmed close during an in-flight launch cleared the rx
     // (stop_session) — the queued game fires now that nothing is
     // running or starting. A canceled prompt leaves the session
     // (or its launch) alive, which blocks this arm.
     if view.session.is_none() && view.launch_rx.is_none() {
-        if let Some((dir, name)) = view.pending_launch.take() {
-            view.launch(&dir, name);
+        if let Some((dir, name, exe)) = view.pending_launch.take() {
+            view.launch(&dir, name, exe);
         }
     }
 
@@ -1697,6 +2050,26 @@ pub fn view(
             .get("DECOMP")
             .cloned()
             .unwrap_or_default();
+    }
+    // Favorites + per-slug exe choices hydrate once the same way —
+    // DecompView::new runs before cfg is in scope, and the
+    // view-owned copies are what every play/menu path reads.
+    if !view.persisted_loaded {
+        view.persisted_loaded = true;
+        view.favorites = emu_cfg.decomp_favorites.iter().cloned().collect();
+        view.bins = emu_cfg.decomp_bins.clone();
+    }
+    // Write-through — a favorite toggle or a picker save lands in
+    // cfg and flags the save like the layout/render writes do.
+    if view.favorites_dirty {
+        view.favorites_dirty = false;
+        emu_cfg.decomp_favorites = view.favorites.iter().cloned().collect();
+        view.settings_dirty = true;
+    }
+    if view.bins_dirty {
+        view.bins_dirty = false;
+        emu_cfg.decomp_bins = view.bins.clone();
+        view.settings_dirty = true;
     }
     // Live render options → the capture thread's swizzle reads these
     // atomics each frame, so panel edits land on the very next
@@ -1857,14 +2230,32 @@ pub fn view(
     let tab_font = FontId::proportional(19.0 * s);
     let tab_gap = 26.0 * s;
     let tab_row_h = 34.0 * s;
-    let mut set_filter: Option<Option<Kind>> = None;
-    let tabs: Vec<(Option<Kind>, String, usize)> = std::iter::once((None, "All".to_string(), view.entries.len()))
-        .chain(Kind::CHIPS.iter().filter_map(|k| {
-            counts
-                .get(k)
-                .map(|&n| (Some(*k), tab_label(*k).to_string(), n))
-        }))
-        .collect();
+    let mut set_tab: Option<DecompTab> = None;
+    // "Favorites" leads the row — its count is catalog entries the
+    // slug set covers (stale slugs don't pad it).
+    let fav_n = view
+        .entries
+        .iter()
+        .filter(|e| view.favorites.contains(&e.slug))
+        .count();
+    let tabs: Vec<(DecompTab, String, usize)> = [
+        (DecompTab::Favorites, "Favorites".to_string(), fav_n),
+        (DecompTab::All, "All".to_string(), view.entries.len()),
+    ]
+    .into_iter()
+    .chain(Kind::CHIPS.iter().filter_map(|k| {
+        counts
+            .get(k)
+            .map(|&n| (DecompTab::Kind(*k), tab_label(*k).to_string(), n))
+    }))
+    .collect();
+    // The interact id needs a stable per-tab key — the kind label
+    // for kind tabs, a fixed tag for the two fixed tabs.
+    let tab_id = |t: DecompTab| match t {
+        DecompTab::Favorites => "favorites".to_string(),
+        DecompTab::All => "all".to_string(),
+        DecompTab::Kind(k) => k.label().to_string(),
+    };
     let mut tab_x = upper.min.x + 40.0 * s;
     let tab_y = upper.min.y + 12.0 * s;
     let tabs_right = content.max.x - 300.0 * s; // keep clear of the search pill
@@ -1882,11 +2273,11 @@ pub fn view(
             }
             let rect = Rect::from_min_size(Pos2::new(tab_x, tab_y), Vec2::new(w, tab_row_h));
             let resp = if content_interactive {
-                ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::click())
+                ui.interact(rect, ui.scope_id().with(("decomp-tab", tab_id(*this))), Sense::click())
             } else {
-                ui.interact(rect, ui.scope_id().with(("decomp-tab", this.map(|k| k.label()))), Sense::hover())
+                ui.interact(rect, ui.scope_id().with(("decomp-tab", tab_id(*this))), Sense::hover())
             };
-            let active = view.filter == *this;
+            let active = view.tab == *this;
             let color = if active {
                 Color32::WHITE
             } else if resp.hovered() {
@@ -1917,12 +2308,12 @@ pub fn view(
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
             if resp.clicked() {
-                set_filter = Some(*this);
+                set_tab = Some(*this);
             }
             tab_x += w + tab_gap;
         }
-        if let Some(f) = set_filter {
-            view.set_kind_filter(f);
+        if let Some(t) = set_tab {
+            view.set_tab(t);
         }
     }
 
@@ -2032,6 +2423,19 @@ pub fn view(
         .filter(|(_, s)| s.is_some())
         .map(|(slug, _)| PathBuf::from(slug))
         .collect();
+    // "Remove from Favorites" vs "Add to" + the "Choose executables"
+    // gate ride the same per-frame menu-state refresh.
+    view.cards.decomp_favorites = view
+        .favorites
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    view.cards.decomp_multiexe = view
+        .installed_exes
+        .iter()
+        .filter(|(_, exes)| exes.len() > 1)
+        .map(|(slug, _)| PathBuf::from(slug))
+        .collect();
     // An opaque capture layer owns `upper` — skip the list draw and
     // its input entirely (it still runs underneath via `cap_t`'s
     // fade, same as the emulation view).
@@ -2071,6 +2475,26 @@ pub fn view(
             if let Some(&i) = view.slug_idx.get(&slug) {
                 let e = view.entries[i].clone();
                 view.request_uninstall(&e);
+            }
+        }
+        carousel::Action::Favorite(p) => {
+            view.toggle_favorite(&p.to_string_lossy());
+        }
+        carousel::Action::ChooseExe(p) => {
+            let slug = p.to_string_lossy().into_owned();
+            if let Some(&i) = view.slug_idx.get(&slug) {
+                let e = view.entries[i].clone();
+                if let Some(dir) = install_dir(&slug) {
+                    let exes = view
+                        .installed_exes
+                        .get(&slug)
+                        .cloned()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| find_exes(&dir));
+                    if !exes.is_empty() {
+                        view.open_exe_picker(&e, &dir, exes, PickerMode::SaveOnly);
+                    }
+                }
             }
         }
         // The catalog menu's "Refresh catalog" reuses the ROM menu's
@@ -2510,6 +2934,111 @@ pub fn view(
         view.request_close();
     }
     }
+
+    // --- Executable picker (multi-exe installs) --------------------
+    // The two-combobox prompt: play exe + optional setup launcher.
+    // Save writes the slug's DecompBins and proceeds per mode —
+    // launch now, queue behind the running game, or just persist.
+    let mut picker_out = 0u8; // 0 keep · 1 save · 2 cancel
+    if let Some(pk) = view.exe_prompt.as_mut() {
+        // Click-catch scrim so the list/capture underneath can't
+        // take input while the modal's up.
+        painter.rect_filled(content, CornerRadius::ZERO, Color32::from_black_alpha(150));
+        let _ = ui.interact(content, ui.scope_id().with("decomp-pick-scrim"), Sense::click());
+        let panel = Rect::from_center_size(
+            content.center(),
+            Vec2::new(620.0 * s, 300.0 * s),
+        );
+        painter.rect_filled(
+            panel,
+            CornerRadius::same((10.0 * s) as u8),
+            Color32::from_gray(20).gamma_multiply(alpha),
+        );
+        painter.rect_stroke(
+            panel,
+            CornerRadius::same((10.0 * s) as u8),
+            Stroke::new(s.max(1.0), Color32::from_gray(70).gamma_multiply(alpha)),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            panel.min + Vec2::new(24.0 * s, 18.0 * s),
+            Align2::LEFT_TOP,
+            format!("{} — choose executables", pk.name),
+            FontId::proportional(20.0 * s),
+            Color32::WHITE.gamma_multiply(alpha),
+        );
+        // The egui widgets live in a child ui — labels, comboboxes
+        // and the two buttons lay out vertically in panel order.
+        let inner_rect = Rect::from_min_max(
+            panel.min + Vec2::new(24.0 * s, 56.0 * s),
+            panel.max - Vec2::new(24.0 * s, 20.0 * s),
+        );
+        let mut inner = ui.new_child(
+            egui::UiBuilder::new().max_rect(inner_rect),
+        );
+        inner.spacing_mut().item_spacing.y = 8.0 * s;
+        let rel = |p: &Path| rel_exe(&pk.dir, p);
+        inner.label(
+            egui::RichText::new("Play executable")
+                .size(14.0 * s)
+                .color(Color32::from_gray(200).gamma_multiply(alpha)),
+        );
+        egui::ComboBox::from_id_salt("decomp-pick-play")
+            .selected_text(rel(&pk.exes[pk.play_idx]))
+            .width(inner_rect.width() - 8.0 * s)
+            .show_ui(&mut inner, |ui| {
+                for (i, p) in pk.exes.iter().enumerate() {
+                    ui.selectable_value(&mut pk.play_idx, i, rel(p));
+                }
+            });
+        inner.add_space(6.0 * s);
+        inner.label(
+            egui::RichText::new("Launcher executable (optional)")
+                .size(14.0 * s)
+                .color(Color32::from_gray(200).gamma_multiply(alpha)),
+        );
+        egui::ComboBox::from_id_salt("decomp-pick-launcher")
+            .selected_text(
+                pk.launcher_idx
+                    .map(|i| rel(&pk.exes[i]))
+                    .unwrap_or_else(|| "None".to_string()),
+            )
+            .width(inner_rect.width() - 8.0 * s)
+            .show_ui(&mut inner, |ui| {
+                ui.selectable_value(&mut pk.launcher_idx, None, "None");
+                for (i, p) in pk.exes.iter().enumerate() {
+                    ui.selectable_value(&mut pk.launcher_idx, Some(i), rel(p));
+                }
+            });
+        inner.add_space(12.0 * s);
+        inner.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Save").size(15.0 * s),
+                ))
+                .clicked()
+            {
+                picker_out = 1;
+            }
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Cancel").size(15.0 * s),
+                ))
+                .clicked()
+            {
+                picker_out = 2;
+            }
+        });
+    }
+    match picker_out {
+        1 => {
+            if let Some(pk) = view.exe_prompt.take() {
+                view.picker_apply(pk);
+            }
+        }
+        2 => view.exe_prompt = None,
+        _ => {}
+    }
 }
 
 
@@ -2840,13 +3369,19 @@ fn draw_capture(
     }
 
     // Centered status — the launch gate while resolving, failure/
-    // exit notices; nothing overlays a live capture.
-    let msg = match &status {
-        xenia::Status::Resolving => Some(format!("Launching {game_name}…")),
-        xenia::Status::Failed(e) => Some(format!("Capture failed: {e}")),
-        xenia::Status::Exited => Some("Game exited".into()),
-        xenia::Status::Capturing => {
-            (view.frame_seq == 0).then(|| format!("Waiting for frames — {game_name}"))
+    // exit notices; nothing overlays a live capture. A confirmed
+    // close shows progress instead of freezing on the last frame
+    // while the worker tears the game down.
+    let msg = if view.stop_pending {
+        Some(format!("Closing {game_name}…"))
+    } else {
+        match &status {
+            xenia::Status::Resolving => Some(format!("Launching {game_name}…")),
+            xenia::Status::Failed(e) => Some(format!("Capture failed: {e}")),
+            xenia::Status::Exited => Some("Game exited".into()),
+            xenia::Status::Capturing => {
+                (view.frame_seq == 0).then(|| format!("Waiting for frames — {game_name}"))
+            }
         }
     };
     if let Some(msg) = msg {
@@ -3315,9 +3850,27 @@ fn info_pane(
                 Action::Install => ("Install", PaneOp::Download, true),
                 _ => ("Play", PaneOp::Play, true),
             });
+            // A configured setup launcher gets its own button next
+            // to Play — chosen via the exe picker on multi-exe
+            // installs.
+            if installed
+                && view
+                    .bins
+                    .get(&e.slug)
+                    .is_some_and(|b| !b.launcher.is_empty())
+            {
+                ops.push(("Launcher", PaneOp::Launcher, true));
+            }
             if installed {
                 ops.push(("Open folder", PaneOp::OpenFolder, true));
-                ops.push(("Uninstall", PaneOp::Uninstall, true));
+                // The worker-delete sets this — the button dims to
+                // "Uninstalling…" so a second click can't queue a
+                // confirm for a tree already going away.
+                ops.push(if view.uninstalling.contains(&e.slug) {
+                    ("Uninstalling…", PaneOp::Uninstall, false)
+                } else {
+                    ("Uninstall", PaneOp::Uninstall, true)
+                });
             }
             if act == Action::Update {
                 ops.push(("Update", PaneOp::Download, true));
@@ -3354,6 +3907,7 @@ fn info_pane(
 enum PaneOp {
     Download,
     Play,
+    Launcher,
     OpenFolder,
     Uninstall,
 }
@@ -3729,7 +4283,12 @@ fn run_pane_op(view: &mut DecompView, e: &Entry, dir: &Option<PathBuf>, op: Pane
         PaneOp::Download => view.activate(e),
         PaneOp::Play => {
             if let Some(d) = dir {
-                view.play_dir(d, e.name.clone());
+                view.play_entry(e, d);
+            }
+        }
+        PaneOp::Launcher => {
+            if let Some(d) = dir {
+                view.launch_launcher(e, d);
             }
         }
         PaneOp::OpenFolder => {
@@ -3741,10 +4300,20 @@ fn run_pane_op(view: &mut DecompView, e: &Entry, dir: &Option<PathBuf>, op: Pane
     }
 }
 
-/// The binary `Play` launches: shallow scan for a `.exe`, install
-/// root first, skipping uninstallers; the largest file wins — the
-/// built binary tends to outweigh launchers and tools.
-fn find_exe(dir: &Path) -> Option<PathBuf> {
+/// A candidate's path relative to the install dir (the form
+/// `settings::DecompBins` persists — a moved tree still resolves).
+fn rel_exe(dir: &Path, exe: &Path) -> String {
+    exe.strip_prefix(dir)
+        .unwrap_or(exe)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The exe candidates `Play`/the picker rank: shallow scan for
+/// `.exe` files, install root first, skipping uninstallers; the
+/// largest file wins — the built binary tends to outweigh launchers
+/// and tools, so index 0 is the heuristic Play default.
+fn find_exes(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<(u8, u64, PathBuf)> = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), 0u8)];
     while let Some((d, depth)) = stack.pop() {
@@ -3777,7 +4346,7 @@ fn find_exe(dir: &Path) -> Option<PathBuf> {
     }
     // Shallower first, larger second.
     found.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    found.into_iter().next().map(|(_, _, p)| p)
+    found.into_iter().map(|(_, _, p)| p).collect()
 }
 
 #[cfg(test)]
@@ -3851,10 +4420,10 @@ mod tests {
         let mut v = DecompView::new();
         let shown = |v: &DecompView| v.cards.visible(&v.search.text).len();
         assert_eq!(shown(&v), PROJECTS.len());
-        v.set_kind_filter(Some(Kind::Decomp));
+        v.set_tab(DecompTab::Kind(Kind::Decomp));
         let decomps = shown(&v);
         assert!(decomps < PROJECTS.len() && decomps > 0);
-        v.set_kind_filter(None);
+        v.set_tab(DecompTab::All);
         v.search.text = "zelda".into();
         // Repo names match too -- the three zeldaret decomps plus
         // Zelda64Recomp.
@@ -3936,6 +4505,64 @@ mod tests {
         );
     }
 
+    /// recvx-enhanced-port's actual listing — the only Windows
+    /// builds are 32-bit (x86, runs on x64 via WoW64); the debug
+    /// twin, the linux pair and the checksums file must not win.
+    #[test]
+    fn pick_os_asset_accepts_x86_only_windows() {
+        let a = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("https://x/{name}"),
+            })
+        };
+        let assets = vec![
+            a("recvx-enhanced-port-0.6.8-linux-i686-debug.tar.gz"),
+            a("recvx-enhanced-port-0.6.8-linux-i686.tar.gz"),
+            a("recvx-enhanced-port-0.6.8-windows-x86-debug.zip"),
+            a("recvx-enhanced-port-0.6.8-windows-x86.zip"),
+            a("recvx-server-0.6.8-linux-x86_64.tar.gz"),
+            a("SHA256SUMS"),
+        ];
+        assert_eq!(
+            pick_os_asset(&assets).as_deref(),
+            Some("https://x/recvx-enhanced-port-0.6.8-windows-x86.zip")
+        );
+        // x64 still outranks x86 when a repo ships both.
+        let both = vec![
+            a("port-windows-x86.zip"),
+            a("port-windows-x64.zip"),
+        ];
+        assert_eq!(
+            pick_os_asset(&both).as_deref(),
+            Some("https://x/port-windows-x64.zip")
+        );
+    }
+
+    /// Release picking: a stable tag beats an older AND a newer
+    /// prerelease; prerelease-only listings still resolve (the
+    /// recvx case — `releases/latest` 404'd and the caller fell
+    /// back to the source zipball); drafts never qualify.
+    #[test]
+    fn pick_release_prefers_stable_allows_prerelease() {
+        let r = |tag: &str, pre: bool, draft: bool| {
+            serde_json::json!({"tag_name": tag, "prerelease": pre, "draft": draft})
+        };
+        // Listing order is newest-first.
+        let mixed = vec![r("v0.6.8", true, false), r("v0.5.0", false, false)];
+        assert_eq!(
+            pick_release(&mixed).and_then(|v| v.get("tag_name")).and_then(|t| t.as_str()),
+            Some("v0.5.0")
+        );
+        let pre_only = vec![r("v0.6.8", true, false), r("v0.6.7", true, false)];
+        assert_eq!(
+            pick_release(&pre_only).and_then(|v| v.get("tag_name")).and_then(|t| t.as_str()),
+            Some("v0.6.8")
+        );
+        let drafts_only = vec![r("v1.0", true, true), r("v0.9", false, true)];
+        assert!(pick_release(&drafts_only).is_none());
+    }
+
     /// Play routing mirrors the emulation view: no session launches
     /// straight away, the running game's own card only un-dismisses
     /// the capture viewport, a different card queues behind a close
@@ -3954,12 +4581,17 @@ mod tests {
         v.viewport_dismissed = true;
         assert_eq!(v.play_route(dir_a), DecompPlayRoute::UnDismiss);
         assert_eq!(v.play_route(dir_b), DecompPlayRoute::QueuePending);
-        v.play_dir(dir_a, "Same".into());
+        let e = v.entries[0].clone();
+        v.play_entry(&e, dir_a);
         assert!(!v.viewport_dismissed);
-        v.play_dir(dir_b, "Other".into());
+        // The queued game carries the resolved exe — seed the
+        // inventory so dir_b has a binary to bind.
+        v.installed_exes
+            .insert(e.slug.clone(), vec![dir_b.join("game.exe")]);
+        v.play_entry(&e, dir_b);
         assert_eq!(
-            v.pending_launch.as_ref().map(|(d, _)| d.as_path()),
-            Some(dir_b)
+            v.pending_launch.as_ref().map(|(d, _, exe)| (d.as_path(), exe.as_path())),
+            Some((dir_b, dir_b.join("game.exe").as_path()))
         );
         // The close request is parked for the caller's confirm —
         // consumed exactly once.
@@ -4019,9 +4651,10 @@ mod tests {
         assert!(!v.game_fs);
     }
 
-    /// find_exe picks the game binary — uninstallers are skipped
+    /// find_exes picks the game binary — uninstallers are skipped
     /// and the shallowest executable wins (a launcher in a subdir
-    /// loses to the game exe at the root).
+    /// loses to the game exe at the root); the full list feeds the
+    /// multi-exe picker.
     #[test]
     fn find_exe_skips_uninstaller_prefers_shallow() {
         let dir = std::env::temp_dir().join(format!("decomp_findexe_{}", std::process::id()));
@@ -4030,12 +4663,12 @@ mod tests {
         std::fs::write(dir.join("uninstall.exe"), b"x").unwrap();
         std::fs::write(sub.join("game.exe"), b"yy").unwrap();
         assert_eq!(
-            find_exe(&dir).as_deref(),
-            Some(sub.join("game.exe").as_path())
+            find_exes(&dir).as_slice(),
+            [sub.join("game.exe").as_path()]
         );
         std::fs::write(dir.join("game.exe"), b"zzz").unwrap();
         assert_eq!(
-            find_exe(&dir).as_deref(),
+            find_exes(&dir).first().map(|p| p.as_path()),
             Some(dir.join("game.exe").as_path())
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4081,8 +4714,95 @@ mod tests {
         let mut v = DecompView::default();
         let e = v.entries[0].clone();
         let dir = install_dir(&e.slug).unwrap_or_else(|| PathBuf::from("decomp-noop"));
-        v.pending_launch = Some((dir.clone(), e.name.clone()));
-        v.uninstall(&e.slug);
+        v.pending_launch = Some((dir.clone(), e.name.clone(), dir.join("game.exe")));
+        v.uninstall(&e.slug, &egui::Context::default());
         assert!(v.pending_launch.is_none());
+        // The tree deletes on a worker — the slug is in flight.
+        assert!(v.uninstalling.contains(&e.slug));
+        assert!(v.uninstall_rx.is_some());
+    }
+
+    /// The Favorites tab gates on the slug set — a toggle adds and
+    /// removes, and only favorited entries pass `tab_matches`.
+    #[test]
+    fn favorites_tab_matches_slug_set() {
+        let mut v = DecompView::default();
+        let e = v.entries[0].clone();
+        let other = v.entries[1].clone();
+        v.tab = DecompTab::Favorites;
+        assert!(!v.tab_matches(&e));
+        v.toggle_favorite(&e.slug);
+        assert!(v.tab_matches(&e));
+        assert!(!v.tab_matches(&other));
+        assert!(v.favorites_dirty);
+        v.toggle_favorite(&e.slug);
+        assert!(!v.tab_matches(&e));
+        // Kind tabs still gate on kind.
+        v.tab = DecompTab::All;
+        assert!(v.tab_matches(&e));
+    }
+
+    /// A multi-exe install with no saved choice opens the picker
+    /// instead of launching — the picker then persists the choice
+    /// and launches the selected play exe.
+    #[test]
+    fn multi_exe_play_opens_picker_then_launches() {
+        let mut v = DecompView::default();
+        let e = v.entries[0].clone();
+        let dir = PathBuf::from("C:/Decomps/multi");
+        v.installed_exes.insert(
+            e.slug.clone(),
+            vec![dir.join("game.exe"), dir.join("launcher.exe")],
+        );
+        v.play_entry(&e, &dir);
+        // No launch yet — the modal owns the choice.
+        assert!(v.launch_rx.is_none());
+        let pk = v.exe_prompt.take().expect("picker opened");
+        assert_eq!(pk.mode, PickerMode::Launch);
+        assert_eq!(pk.exes.len(), 2);
+        // Confirm with launcher selected → bins persist rel paths.
+        let mut pk = pk;
+        pk.launcher_idx = Some(1);
+        v.picker_apply(pk);
+        let bins = v.bins.get(&e.slug).expect("bins saved");
+        assert_eq!(bins.play, "game.exe");
+        assert_eq!(bins.launcher, "launcher.exe");
+        assert!(v.bins_dirty);
+        assert!(v.launch_rx.is_some());
+    }
+
+    /// A saved play choice skips the picker entirely, and the
+    /// Launcher press binds the saved launcher exe — both launch
+    /// straight into the capture session.
+    #[test]
+    fn saved_bins_drive_play_and_launcher() {
+        let mut v = DecompView::default();
+        let e = v.entries[0].clone();
+        let dir = std::env::temp_dir().join(format!("decomp_bins_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("game.exe"), b"x").unwrap();
+        std::fs::write(dir.join("setup.exe"), b"x").unwrap();
+        v.bins.insert(
+            e.slug.clone(),
+            settings::DecompBins {
+                play: "game.exe".into(),
+                launcher: "setup.exe".into(),
+            },
+        );
+        v.play_entry(&e, &dir);
+        assert!(v.exe_prompt.is_none());
+        assert!(v.launch_rx.is_some());
+        // The Launcher press resolves `bins.launcher` — and never
+        // becomes a captured session (setup tools spawn detached).
+        assert_eq!(
+            v.launcher_exe(&e, &dir).as_deref(),
+            Some(dir.join("setup.exe").as_path())
+        );
+        v.launch_rx = None;
+        v.session_dir = None;
+        v.launch_launcher(&e, &dir);
+        assert!(v.launch_rx.is_none());
+        assert!(v.session.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

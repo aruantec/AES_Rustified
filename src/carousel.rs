@@ -147,6 +147,12 @@ pub enum Action {
     /// Re/Decomp menu: "Uninstall" — the view confirms via the
     /// delete prompt before the install tree is deleted.
     Uninstall(PathBuf),
+    /// Re/Decomp menu: "Add to Favorites" / "Remove from
+    /// Favorites" — toggles the item's slug in the favorites set.
+    Favorite(PathBuf),
+    /// Re/Decomp menu: "Choose executables…" — re-opens the
+    /// play/launcher picker for a multi-exe install.
+    ChooseExe(PathBuf),
 }
 
 /// One carousel/grid item = one track of the loaded album.
@@ -356,6 +362,12 @@ pub struct Carousel {
     /// marker exists — gates the menu's "Uninstall" entry. The
     /// view refreshes it per frame from its stamp cache.
     pub decomp_installed: BTreeSet<PathBuf>,
+    /// Re/Decomp catalog mode: favorited slugs — flips the menu
+    /// label between "Add to" and "Remove from Favorites".
+    pub decomp_favorites: BTreeSet<PathBuf>,
+    /// Re/Decomp catalog mode: installed slugs shipping more than
+    /// one exe — gates the "Choose executables…" menu entry.
+    pub decomp_multiexe: BTreeSet<PathBuf>,
     /// Row floor for the horizontal card grid — compact transport
     /// mode sets 2 so the shrunken cover area still shows two rows
     /// (cards shrink to fit); normal layouts leave it at 1.
@@ -417,6 +429,8 @@ impl Carousel {
             cemu_menu: false,
             decomp_menu: false,
             decomp_installed: BTreeSet::new(),
+            decomp_favorites: BTreeSet::new(),
+            decomp_multiexe: BTreeSet::new(),
             h_min_rows: 1,
             marquee_title: false,
             marquee_off: 0.0,
@@ -2440,6 +2454,25 @@ impl Carousel {
                         }
                         if ui.button("Open install folder").clicked() {
                             action = Action::OpenFolder(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                        if ui
+                            .button(if self.decomp_favorites.contains(&p) {
+                                "Remove from Favorites"
+                            } else {
+                                "Add to Favorites"
+                            })
+                            .clicked()
+                        {
+                            action = Action::Favorite(p.clone());
+                            self.menu_item = None;
+                            ui.close();
+                        }
+                        if self.decomp_multiexe.contains(&p)
+                            && ui.button("Choose executables…").clicked()
+                        {
+                            action = Action::ChooseExe(p.clone());
                             self.menu_item = None;
                             ui.close();
                         }
