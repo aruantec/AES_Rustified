@@ -705,12 +705,23 @@ fn filename_track_number(stem: &str) -> Option<u32> {
 /// (#2D2D2D) double-eighth note — the default cover for items with
 /// no art at all.
 pub fn placeholder_image() -> egui::ColorImage {
-    // Lacrima renders this at 480x400 (MetadataScrapper); the wider
-    // aspect matters — tiles UniformToFill-crop its dark gradient edges
-    // off the sides rather than showing them.
+    glyph_placeholder_image(note_contains)
+}
+
+/// Decomp/ROM lists' placeholder — the classic ROM file icon (page +
+/// folded corner + "ROM" banner) instead of the music note (same soft
+/// gradient, same supersampled coverage).
+pub fn rom_placeholder_image() -> egui::ColorImage {
+    glyph_placeholder_image(rom_contains)
+}
+
+/// Lacrima renders this at 480x400 (MetadataScrapper); the wider
+/// aspect matters — tiles UniformToFill-crop its dark gradient edges
+/// off the sides rather than showing them.
+fn glyph_placeholder_image(contains: impl Fn(f32, f32) -> bool) -> egui::ColorImage {
     const W: usize = 480;
     const H: usize = 400;
-    /// Virtual units per pixel; the note geometry is authored on a
+    /// Virtual units per pixel; the glyph geometry is authored on a
     /// 400x400 canvas.
     const KX: f32 = 400.0 / W as f32;
     const KY: f32 = 400.0 / H as f32;
@@ -725,13 +736,13 @@ pub fn placeholder_image() -> egui::ColorImage {
             let dy = (fy / H as f32 - 0.5) / 0.5;
             let t = ((dx * dx + dy * dy).sqrt() * 0.62).min(1.0);
             let g = 224.0 + (160.0 - 224.0) * t;
-            // Note glyph coverage, 2x2 supersampled in virtual space.
+            // Glyph coverage, 2x2 supersampled in virtual space.
             let mut cov = 0.0f32;
             for sy in 0..2 {
                 for sx in 0..2 {
                     let u = (fx + sx as f32 * 0.5 - 0.25) * KX;
                     let v = (fy + sy as f32 * 0.5 - 0.25) * KY;
-                    if note_contains(u, v) {
+                    if contains(u, v) {
                         cov += 0.25;
                     }
                 }
@@ -741,6 +752,96 @@ pub fn placeholder_image() -> egui::ColorImage {
         }
     }
     egui::ColorImage::new([W, H], pixels)
+}
+
+/// Point-in-shape test for the ROM-file glyph (400x400 space) —
+/// outlined page with a folded top-right corner, a solid banner band
+/// across the middle, and the "ROM" letters knocked out of it.
+fn rom_contains(u: f32, v: f32) -> bool {
+    (band_or_page(u, v)) && !rom_letters(u, v)
+}
+
+/// The dark parts of the icon: banner rect ∪ page outline ∪ fold flap.
+fn band_or_page(u: f32, v: f32) -> bool {
+    // Banner — solid rounded band, wider than the page.
+    if (96.0..304.0).contains(&u) && (168.0..232.0).contains(&v) {
+        return true;
+    }
+    // Page outline — outer poly (cut top-right corner) minus inner.
+    const OUTER: [(f32, f32); 5] = [
+        (112.0, 56.0),
+        (232.0, 56.0),
+        (288.0, 112.0),
+        (288.0, 344.0),
+        (112.0, 344.0),
+    ];
+    const INNER: [(f32, f32); 5] = [
+        (126.0, 70.0),
+        (226.0, 70.0),
+        (274.0, 118.0),
+        (274.0, 330.0),
+        (126.0, 330.0),
+    ];
+    if point_in_poly(u, v, &OUTER) && !point_in_poly(u, v, &INNER) {
+        return true;
+    }
+    // Fold flap — the small solid triangle at the folded corner.
+    const FLAP: [(f32, f32); 3] = [(238.0, 72.0), (272.0, 106.0), (238.0, 106.0)];
+    point_in_poly(u, v, &FLAP)
+}
+
+/// Even-odd ray cast (same scheme as the note's beam polygon).
+fn point_in_poly(u: f32, v: f32, p: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = p.len() - 1;
+    for i in 0..p.len() {
+        let (xi, yi) = p[i];
+        let (xj, yj) = p[j];
+        if (yi > v) != (yj > v) && u < (xj - xi) * (v - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Point within `hw` of segment (x1,y1)-(x2,y2) — the letter strokes.
+fn seg(u: f32, v: f32, x1: f32, y1: f32, x2: f32, y2: f32, hw: f32) -> bool {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 > 0.0 {
+        (((u - x1) * dx + (v - y1) * dy) / l2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let px = x1 + t * dx - u;
+    let py = y1 + t * dy - v;
+    px * px + py * py <= hw * hw
+}
+
+/// The "ROM" letterforms (white on the banner — subtracted coverage),
+/// authored as stroke segments inside the 168..232 band.
+fn rom_letters(u: f32, v: f32) -> bool {
+    let y = 174.0f32;
+    // R
+    let x = 130.0;
+    let r = seg(u, v, x + 5.0, y, x + 5.0, y + 52.0, 5.0)
+        || seg(u, v, x + 5.0, y + 4.0, x + 38.0, y + 4.0, 5.0)
+        || seg(u, v, x + 38.0, y + 4.0, x + 38.0, y + 24.0, 5.0)
+        || seg(u, v, x + 5.0, y + 24.0, x + 38.0, y + 24.0, 5.0)
+        || seg(u, v, x + 18.0, y + 26.0, x + 42.0, y + 52.0, 5.0);
+    // O — ring.
+    let (ox, oy) = (196.0, y + 26.0);
+    let d = ((u - ox) * (u - ox) + (v - oy) * (v - oy)).sqrt();
+    let o = (14.0..24.0).contains(&d);
+    // M
+    let x = 226.0;
+    let m = seg(u, v, x + 5.0, y + 52.0, x + 5.0, y, 5.0)
+        || seg(u, v, x + 5.0, y, x + 22.0, y + 32.0, 5.0)
+        || seg(u, v, x + 22.0, y + 32.0, x + 39.0, y, 5.0)
+        || seg(u, v, x + 39.0, y, x + 39.0, y + 52.0, 5.0);
+    r || o || m
 }
 
 /// Point-in-shape test for the placeholder's note glyph (400x400 space).
@@ -785,6 +886,20 @@ fn note_contains(u: f32, v: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ROM-file glyph: banner and page outline covered, letters
+    /// knocked out of the banner, corners open.
+    #[test]
+    fn rom_glyph_geometry() {
+        assert!(rom_contains(110.0, 200.0)); // banner, left of letters
+        assert!(!rom_contains(150.0, 198.0)); // "R" mid-bar knocked out
+        assert!(!rom_contains(215.0, 200.0)); // "O" ring knocked out
+        assert!(rom_contains(196.0, 200.0)); // O interior stays band
+        assert!(rom_contains(200.0, 60.0)); // page top outline
+        assert!(!rom_contains(200.0, 300.0)); // page interior
+        assert!(rom_contains(113.0, 300.0)); // page left edge outline
+        assert!(!rom_contains(50.0, 200.0)); // outside everything
+    }
 
     #[test]
     fn cover_bytes_reads_file_source() {

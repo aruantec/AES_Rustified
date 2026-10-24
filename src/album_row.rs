@@ -252,6 +252,10 @@ pub struct AlbumRow {
     /// Lacrima's `PlaceholderGenerator` music-note cover, used for any
     /// layer with no real art (uploaded lazily on first use).
     placeholder: Option<egui::TextureHandle>,
+    /// Decomp/ROM lists' ROM-file-icon variant — swapped in via
+    /// `use_rom_placeholder` (the note reads wrong for ROM projects).
+    rom: Option<egui::TextureHandle>,
+    rom_placeholder: bool,
     /// Work queue shared with the local decode threads.
     cover_queue: Arc<(Mutex<VecDeque<CoverSrc>>, Condvar)>,
     /// Separate bounded queue for web covers — they block on network
@@ -384,6 +388,8 @@ impl AlbumRow {
             menu_album: None,
             textures: HashMap::new(),
             placeholder: None,
+            rom: None,
+            rom_placeholder: false,
             cover_queue,
             web_queue,
             cover_results,
@@ -432,8 +438,22 @@ impl AlbumRow {
         )
     }
 
-    /// Shared placeholder texture for layers with no real art.
+    /// Shared placeholder texture for layers with no real art —
+    /// the music note, or the ROM-file icon when `rom_placeholder` is
+    /// set (decomp/ROM lists, where the note reads wrong).
     pub fn placeholder_tex(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if self.rom_placeholder {
+            return self
+                .rom
+                .get_or_insert_with(|| {
+                    ctx.load_texture(
+                        "cover:placeholder-rom",
+                        library::rom_placeholder_image(),
+                        egui::TextureOptions::LINEAR,
+                    )
+                })
+                .clone();
+        }
         self.placeholder
             .get_or_insert_with(|| {
                 ctx.load_texture(
@@ -443,6 +463,11 @@ impl AlbumRow {
                 )
             })
             .clone()
+    }
+
+    /// Switch this row's placeholder to the ROM-file glyph.
+    pub fn use_rom_placeholder(&mut self) {
+        self.rom_placeholder = true;
     }
 
     /// Drop one cached cover texture (e.g. after a tag edit changed a

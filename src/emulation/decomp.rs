@@ -656,9 +656,13 @@ impl Default for DecompView {
         // The horizontal grid's two-row floor — same floor the compact
         // music view applies.
         cards.h_min_rows = 2;
+        let mut row = AlbumRow::new();
+        // ROM projects get the ROM-file placeholder — the music note
+        // reads wrong for coverless decomp/recomp entries.
+        row.use_rom_placeholder();
         Self {
             cards,
-            row: AlbumRow::new(),
+            row,
             slug_idx: HashMap::new(),
             installed: HashMap::new(),
             installed_at: Instant::now() - std::time::Duration::from_secs(60),
