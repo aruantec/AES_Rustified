@@ -1714,6 +1714,7 @@ impl AesRustApp {
             2 => transport::RepeatMode::One,
             _ => transport::RepeatMode::Off,
         };
+        transport.saved_vol = settings.audio.volume.clamp(0.0, 1.0);
 
         // Seed the row from the persisted manifest (last session's
         // display order incl. virtual keys): virtual albums build for
@@ -5160,6 +5161,16 @@ impl eframe::App for AesRustApp {
                 // settings — the audio clone in the tuple below
                 // catches the change and saves it.
                 settings.audio.repeat_mode = transport.repeat as u8;
+                // Volume mirrors the same way — the knob/mini slider
+                // edit the player when one exists, `saved_vol`
+                // before that; both land here and persist.
+                let vol = player
+                    .as_ref()
+                    .map(|p| p.volume())
+                    .unwrap_or(transport.saved_vol)
+                    .clamp(0.0, 1.0);
+                transport.saved_vol = vol;
+                settings.audio.volume = vol;
                 let fx_changed = fx_before
                     != (
                         settings.effects.show_lacrima,

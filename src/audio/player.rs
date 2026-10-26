@@ -555,6 +555,7 @@ impl AudioPlayer {
         self.shared
             .restart_resume
             .store(a.restart_on_resume_enabled, Ordering::Relaxed);
+        self.set_volume(a.volume);
         self.shared.restart_secs.store(
             (a.restart_on_resume_threshold_seconds as f64).to_bits(),
             Ordering::Relaxed,

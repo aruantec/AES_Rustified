@@ -515,7 +515,9 @@ pub(crate) fn view(
     if resp.clicked() {
         transport.toggle_mute(player);
     }
-    let vol = player.map(|p| p.volume()).unwrap_or(0.0);
+    // No player → the slider edits the transport's saved volume
+    // (persisted via settings) instead of showing a dead 0.
+    let vol = player.map(|p| p.volume()).unwrap_or(transport.saved_vol);
     let muted = transport.muted() || vol <= 0.0;
 
     // Collapsed: a circle around the icon; expanded: grows rightward
@@ -575,6 +577,7 @@ pub(crate) fn view(
         if let Some(v) = bar.mini_ui(
             ui, slider, vol as f64, 1.0, interactive, "mv-vol", true, progress_knob,
         ) {
+            transport.saved_vol = v as f32;
             if let Some(p) = player {
                 p.set_volume(v as f32);
             }

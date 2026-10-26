@@ -124,6 +124,16 @@ pub struct Transport {
     /// Volume captured when muted by a cap click — restored on the
     /// next click. `Some` doubles as the muted flag for drawing.
     muted_vol: Option<f32>,
+    /// The knob's volume store while no player exists — editable
+    /// before the first track and mirrored into
+    /// `settings.audio.volume` for persistence. Once a player is
+    /// up it's just a shadow of `player.volume()` again.
+    pub saved_vol: f32,
+    /// The interact id of the knob owning the current press. The
+    /// full/compact twins share `vol_drag`, `cap_press` and friends
+    /// during the crossfade — the non-interactive one must not wipe
+    /// the anchor out from under an active drag.
+    vol_owner: Option<egui::Id>,
     /// Full<->compact crossfade position: 0 = full row, 1 = compact
     /// strip (kebab + prev/play/next + knob).
     compact_t: f32,
@@ -152,6 +162,7 @@ impl Transport {
     pub fn new() -> Self {
         Self {
             album_list_open: true,
+            saved_vol: 0.8,
             ..Default::default()
         }
     }
@@ -644,7 +655,10 @@ impl Transport {
     /// Store/restore mute — the same semantics as the volume knob's
     /// cap click (min stashed 0.05 so a 0->restore round-trips).
     pub fn toggle_mute(&mut self, player: Option<&AudioPlayer>) {
-        let vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
+        let vol = player
+            .map(|p| p.volume())
+            .unwrap_or(self.saved_vol)
+            .clamp(0.0, 1.0);
         let v = match self.muted_vol.take() {
             Some(prev) => prev,
             None => {
@@ -652,6 +666,7 @@ impl Transport {
                 0.0
             }
         };
+        self.saved_vol = v;
         if let Some(p) = player {
             p.set_volume(v);
         }
@@ -936,7 +951,12 @@ impl Transport {
         let c = rect.center();
         let r = rect.height() * 0.5;
         let cap_r = r * 0.66;
-        let mut vol = player.map(|p| p.volume()).unwrap_or(0.8).clamp(0.0, 1.0);
+        // No player → the knob edits `saved_vol` (persisted via the
+        // settings mirror) instead of being dead.
+        let mut vol = player
+            .map(|p| p.volume())
+            .unwrap_or(self.saved_vol)
+            .clamp(0.0, 1.0);
         if interactive {
             let resp = ui
                 .interact(rect, ui.scope_id().with(id), Sense::click_and_drag())
@@ -948,6 +968,9 @@ impl Transport {
             // click — toggles mute; further than that was a turn.
             let down = resp.is_pointer_button_down_on();
             let was = self.pressed.insert(resp.id, down).unwrap_or(false);
+            if down {
+                self.vol_owner = Some(resp.id);
+            }
             let pos = resp
                 .interact_pointer_pos()
                 .or_else(|| ui.ctx().input(|i| i.pointer.interact_pos()));
@@ -959,12 +982,15 @@ impl Transport {
             self.cap_down = down && self.cap_press;
             // Release edge: a click needs ~zero pointer travel AND
             // ~zero accumulated rotation — a turn that lands back
-            // near the grab point is still a turn, not a mute.
+            // near the grab point is still a turn, not a mute. 5° of
+            // rotation is a real nudge (≈2% of range) — anything more
+            // must keep the dragged value instead of snapping back to
+            // the grab point.
             if !down && was {
                 let moved = pos
                     .and_then(|p| self.cap_origin.map(|o| p.distance(o)))
                     .unwrap_or(f32::MAX);
-                let clicked = moved < 8.0 * s && self.drag_travel < 15.0;
+                let clicked = moved < 8.0 * s && self.drag_travel < 5.0;
                 if clicked && self.cap_press {
                     if let Some(prev) = self.muted_vol.take() {
                         vol = prev;
@@ -972,6 +998,7 @@ impl Transport {
                         self.muted_vol = Some(vol.max(0.05));
                         vol = 0.0;
                     }
+                    self.saved_vol = vol;
                     if let Some(p) = player {
                         p.set_volume(vol);
                     }
@@ -991,6 +1018,7 @@ impl Transport {
                                 / KNOB_SWEEP
                         };
                         self.muted_vol = None;
+                        self.saved_vol = vol;
                         if let Some(p) = player {
                             p.set_volume(vol);
                         }
@@ -1002,13 +1030,19 @@ impl Transport {
             // Relative rotary drag: the value accumulates per-frame
             // angular deltas, so sweeping through the bottom dead
             // zone just saturates at the nearer end — it can never
-            // jump max->min (or back).
+            // jump max->min (or back). Anchored on the press, not
+            // egui's click-vs-drag decision — a small/slow turn stays
+            // inside that decision window for the whole hold, the
+            // release edge then swallowed it as a click, and the
+            // value snapped back to the grab point. A real click has
+            // ~zero angular travel, so early anchoring can't break
+            // click/mute detection.
             if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
                 let a = (p.y - c.y).atan2(p.x - c.x).to_degrees().rem_euclid(360.0);
-                if resp.drag_started() {
-                    self.vol_drag = Some((vol, a));
-                }
                 if down {
+                    if self.vol_drag.is_none() {
+                        self.vol_drag = Some((vol, a));
+                    }
                     if let Some((v0, a0)) = self.vol_drag {
                         let da = (a - a0 + 540.0).rem_euclid(360.0) - 180.0;
                         vol = (v0 + da / KNOB_SWEEP).clamp(0.0, 1.0);
@@ -1022,19 +1056,32 @@ impl Transport {
                 self.vol_drag = None;
                 self.cap_press = false;
                 self.cap_down = false;
+                self.vol_owner = None;
             }
             let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if resp.hovered() && scroll != 0.0 {
                 vol = (vol + scroll.signum() * 0.05).clamp(0.0, 1.0);
                 self.muted_vol = None;
             }
-            if let (Some(p), true) = (player, down || scroll != 0.0) {
-                p.set_volume(vol);
+            if down || scroll != 0.0 {
+                self.saved_vol = vol;
+                if let Some(p) = player {
+                    p.set_volume(vol);
+                }
             }
             hover_cursor(ui, &resp);
         } else {
-            self.vol_drag = None;
-            self.cap_down = false;
+            // The crossfading twin shares the drag state — only clear
+            // it when this knob owns (or nothing owns) the gesture,
+            // or an active drag on the twin loses its anchor every
+            // frame: dead knob, then the release lands as a click and
+            // the value snaps back.
+            let my_id = ui.scope_id().with(id);
+            if self.vol_owner.is_none() || self.vol_owner == Some(my_id) {
+                self.vol_drag = None;
+                self.cap_down = false;
+                self.vol_owner = None;
+            }
         }
 
         // Muted: the accent eases out to gray and the residual arc
@@ -1658,6 +1705,117 @@ mod tests {
         assert!(!compact_needed(1200.0, 1.0));
         assert!(compact_needed(1199.0, 1.0));
         assert_eq!(FULL_SPAN, 1200.0);
+    }
+
+    /// Volume must be editable before the first track — with no
+    /// player the control writes `saved_vol` (mirrored into settings
+    /// for persistence) instead of dead-ending, and cap-mute
+    /// stashes/restores through it.
+    #[test]
+    fn volume_works_without_player() {
+        let mut t = Transport::new();
+        assert_eq!(t.saved_vol, 0.8);
+        t.toggle_mute(None);
+        assert_eq!(t.saved_vol, 0.0);
+        assert!(t.muted());
+        t.toggle_mute(None);
+        assert_eq!(t.saved_vol, 0.8);
+        assert!(!t.muted());
+    }
+
+    /// A real pointer drag on the knob with no player must move
+    /// `saved_vol` — the reported bug was small turns staying inside
+    /// egui's click decision window, so the release swallowed them as
+    /// clicks and the value snapped back to the grab point.
+    #[test]
+    fn knob_drag_without_player_moves_saved_vol() {
+        let ctx = egui::Context::default();
+        let mut t = Transport::new();
+        let knob = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::splat(KNOB_D));
+        let frame = |pos: Pos2, down: bool, t: &mut Transport| {
+            // Synthetic passes don't retain button state — the press
+            // is re-sent each held frame (the code only needs `down`,
+            // not egui's click-vs-drag decision, since the rotary
+            // accumulator anchors on the press itself).
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: down,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    t.volume(ui, knob, None, 1.0, true, Color32::WHITE, 1.0, "t-vol");
+                },
+            );
+        };
+        // Press on the ring's right edge (angle 0°), drag upward and
+        // left ~90° of rotation, release. Center is (150,150), r=50.
+        frame(Pos2::new(195.0, 150.0), true, &mut t);
+        frame(Pos2::new(180.0, 115.0), true, &mut t);
+        frame(Pos2::new(150.0, 105.0), true, &mut t);
+        frame(Pos2::new(150.0, 105.0), false, &mut t);
+        // The first held frame registers `down` one pass late in the
+        // harness, so only the 310.6°→270° (-40.6°) move integrates:
+        // 0.8 - 40.6/270 ≈ 0.65.
+        assert!(
+            (t.saved_vol - 0.65).abs() < 0.02,
+            "drag with no player left saved_vol at {}",
+            t.saved_vol
+        );
+    }
+
+    /// The full<->compact crossfade runs BOTH knobs per frame and they
+    /// share the drag fields — the non-interactive twin's cleanup must
+    /// not clear the active drag's anchor (dead knob → release lands
+    /// as a click → value snaps back).
+    #[test]
+    fn knob_drag_survives_crossfade_twin() {
+        let ctx = egui::Context::default();
+        let mut t = Transport::new();
+        let knob = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::splat(KNOB_D));
+        let frame = |pos: Pos2, down: bool, t: &mut Transport| {
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: down,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    // Mid-crossfade: active knob + the fading twin —
+                    // the twin is drawn (interactive=false) at the
+                    // same rect with its own id.
+                    t.volume(ui, knob, None, 0.5, true, Color32::WHITE, 1.0, "t-vol");
+                    t.volume(ui, knob, None, 0.5, false, Color32::WHITE, 1.0, "t-cvol");
+                },
+            );
+        };
+        frame(Pos2::new(195.0, 150.0), true, &mut t);
+        frame(Pos2::new(180.0, 115.0), true, &mut t);
+        frame(Pos2::new(150.0, 105.0), true, &mut t);
+        frame(Pos2::new(150.0, 105.0), false, &mut t);
+        assert!(
+            (t.saved_vol - 0.65).abs() < 0.02,
+            "drag beside the fading twin left saved_vol at {}",
+            t.saved_vol
+        );
     }
 }
 

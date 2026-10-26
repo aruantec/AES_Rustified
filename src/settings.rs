@@ -404,6 +404,11 @@ pub struct Audio {
     /// The transport's RepeatMode — 0 Off / 1 All / 2 One. Mirrored
     /// from `transport.repeat` so the last mode survives relaunch.
     pub repeat_mode: u8,
+    /// Volume — the 0..1 level the knob/slider last set. Mirrored
+    /// from the player (or `transport.saved_vol` before one exists)
+    /// and pushed back onto freshly created players via
+    /// `apply_audio`.
+    pub volume: f32,
 }
 
 impl Default for Audio {
@@ -426,6 +431,7 @@ impl Default for Audio {
             ai_noise_reduction: false,
             volume_knob_color: [0x3F, 0xD8, 0xE8],
             repeat_mode: 0,
+            volume: 0.8,
         }
     }
 }
@@ -763,5 +769,25 @@ pub fn save(settings: &Settings) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Volume persists: it round-trips through Settings.json and a
+    /// pre-Volume settings file defaults to the knob's 0.8 instead
+    /// of deserializing to 0 (silence on upgrade).
+    #[test]
+    fn volume_persists_and_defaults() {
+        assert_eq!(Audio::default().volume, 0.8);
+        let legacy: Audio = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.volume, 0.8);
+        let saved: Audio = serde_json::from_str(r#"{"Volume":0.35}"#).unwrap();
+        assert_eq!(saved.volume, 0.35);
+        let round: Audio =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(round.volume, 0.35);
     }
 }
