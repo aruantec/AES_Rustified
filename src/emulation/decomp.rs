@@ -1630,44 +1630,81 @@ impl DecompView {
 /// The host's arch markers only *score* — a 32-bit x86 build still
 /// wins when it's the only host candidate (WoW64 runs it), and
 /// unmarked single archives keep working.
+/// Which release-asset names belong to a host OS: a `need` marker
+/// must appear in the (lowercased) name — explicit host build —
+/// while any `foreign` marker rejects it outright.
+struct OsMarks {
+    foreign: &'static [&'static str],
+    need: &'static [&'static str],
+}
+
+const WINDOWS_MARKS: OsMarks = OsMarks {
+    foreign: &[
+        "linux", "macos", "darwin", "osx", "android", "ios", "freebsd", "appimage", "flatpak",
+        ".deb", ".rpm", ".dmg", ".pkg",
+    ],
+    need: &[
+        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "-pc.",
+    ],
+};
+const MACOS_MARKS: OsMarks = OsMarks {
+    foreign: &[
+        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "linux", "ubuntu",
+        "debian", "fedora", "appimage", "flatpak", ".deb", ".rpm", "android", "ios", "freebsd",
+    ],
+    need: &["macos", "darwin", "osx", ".dmg", ".pkg", "apple", "universal"],
+};
+const LINUX_MARKS: OsMarks = OsMarks {
+    foreign: &[
+        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "macos", "darwin",
+        "osx", ".dmg", ".pkg", "android", "ios",
+    ],
+    need: &["linux", "ubuntu", "debian", "fedora", "appimage", "flatpak", ".deb", ".rpm", ".tar"],
+};
+
+// Arch markers: a hit scores +2; `arch_compat` marks 32-bit intel
+// builds that still run on x86_64 (WoW64/multilib) at +1 — below a
+// native arch marker but above an unmarked sibling.
+const X64_HIT: &[&str] = &["x64", "x86_64", "amd64"];
+const X64_COMPAT: &[&str] = &["i386", "i686", "-x86.", "-x86-", "x86-32"];
+const ARM64_HIT: &[&str] = &["arm64", "aarch64"];
+
+// `cfg!` (not `#[cfg]`) keeps every table referenced on every host —
+// a per-OS `#[cfg]` const would dead-code its siblings into warnings.
+const HOST_MARKS: OsMarks = if cfg!(windows) {
+    WINDOWS_MARKS
+} else if cfg!(target_os = "macos") {
+    MACOS_MARKS
+} else {
+    LINUX_MARKS
+};
+
+const ARCH_HIT: &[&str] = if cfg!(target_arch = "x86_64") {
+    X64_HIT
+} else if cfg!(target_arch = "aarch64") {
+    ARM64_HIT
+} else {
+    &[]
+};
+const ARCH_COMPAT: &[&str] = if cfg!(target_arch = "x86_64") { X64_COMPAT } else { &[] };
+
 fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
+    pick_asset(assets, &HOST_MARKS, ARCH_HIT, ARCH_COMPAT)
+}
+
+/// The matcher behind `pick_os_asset`, with the host tables as
+/// parameters so tests exercise every OS's picking on any host.
+fn pick_asset(
+    assets: &[serde_json::Value],
+    marks: &OsMarks,
+    arch_hit: &[&str],
+    arch_compat: &[&str],
+) -> Option<String> {
     // Junk + other-OS markers — rejected on every host.
     const JUNK: &[&str] = &[
         "symbols", ".sig", ".sha", "checksum", "source", "-src", "debug", ".pdb", ".txt",
         ".json",
     ];
-    #[cfg(windows)]
-    const FOREIGN: &[&str] = &[
-        "linux", "macos", "darwin", "osx", "android", "ios", "freebsd", "appimage", "flatpak",
-        ".deb", ".rpm", ".dmg", ".pkg",
-    ];
-    #[cfg(windows)]
-    const NEED: &[&str] = &[
-        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "-pc.",
-    ];
-    #[cfg(target_os = "macos")]
-    const FOREIGN: &[&str] = &[
-        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "linux", "ubuntu",
-        "debian", "fedora", "appimage", "flatpak", ".deb", ".rpm", "android", "ios", "freebsd",
-    ];
-    #[cfg(target_os = "macos")]
-    const NEED: &[&str] = &["macos", "darwin", "osx", ".dmg", ".pkg", "apple", "universal"];
-    #[cfg(all(unix, not(target_os = "macos")))]
-    const FOREIGN: &[&str] = &[
-        "windows", "win64", "win32", "-win", "win-", "msvc", ".exe", ".msi", "macos", "darwin",
-        "osx", ".dmg", ".pkg", "android", "ios",
-    ];
-    #[cfg(all(unix, not(target_os = "macos")))]
-    const NEED: &[&str] =
-        &["linux", "ubuntu", "debian", "fedora", "appimage", "flatpak", ".deb", ".rpm", ".tar"];
-    // This host's arch — a matching marker scores; foreign arches
-    // died at `arch_ok` already.
-    #[cfg(target_arch = "x86_64")]
-    const ARCH_HIT: &[&str] = &["x64", "x86_64", "amd64"];
-    #[cfg(target_arch = "aarch64")]
-    const ARCH_HIT: &[&str] = &["arm64", "aarch64"];
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    const ARCH_HIT: &[&str] = &[];
 
     let mut best: Option<(i32, &str)> = None;
     for a in assets {
@@ -1677,7 +1714,7 @@ fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
         let Some(url) = a.get("browser_download_url").and_then(|v| v.as_str()) else {
             continue;
         };
-        if JUNK.iter().any(|m| n.contains(m)) || FOREIGN.iter().any(|m| n.contains(m)) {
+        if JUNK.iter().any(|m| n.contains(m)) || marks.foreign.iter().any(|m| n.contains(m)) {
             continue;
         }
         if !crate::emulation::emu_dl::arch_ok(&n) {
@@ -1685,20 +1722,16 @@ fn pick_os_asset(assets: &[serde_json::Value]) -> Option<String> {
         }
         // An explicit host-OS marker is required — a foreign x64
         // tarball otherwise scores just as well as our build.
-        if !NEED.iter().any(|m| n.contains(m)) {
+        if !marks.need.iter().any(|m| n.contains(m)) {
             continue;
         }
         let mut score = 0;
-        if ARCH_HIT.iter().any(|m| n.contains(m)) {
+        if arch_hit.iter().any(|m| n.contains(m)) {
             score += 2;
         }
         // 32-bit intel builds run on x86_64 too — below the x64
         // score but above an unmarked sibling.
-        #[cfg(target_arch = "x86_64")]
-        if ["i386", "i686", "-x86.", "-x86-", "x86-32"]
-            .iter()
-            .any(|m| n.contains(m))
-        {
+        if arch_compat.iter().any(|m| n.contains(m)) {
             score += 1;
         }
         if n.ends_with(".zip") || n.ends_with(".7z") {
@@ -4672,16 +4705,26 @@ mod tests {
             a("port-windows-x64-symbols.zip"),
         ];
         assert_eq!(
-            pick_os_asset(&assets).as_deref(),
+            pick_asset(&assets, &WINDOWS_MARKS, X64_HIT, X64_COMPAT).as_deref(),
             Some("https://x/port-windows-x64.zip")
+        );
+        // The same listing on a linux host picks the linux tarball,
+        // on macOS the universal dmg.
+        assert_eq!(
+            pick_asset(&assets, &LINUX_MARKS, X64_HIT, X64_COMPAT).as_deref(),
+            Some("https://x/port-linux-x64.tar.gz")
+        );
+        assert_eq!(
+            pick_asset(&assets, &MACOS_MARKS, ARM64_HIT, &[]).as_deref(),
+            Some("https://x/port-macos-universal.dmg")
         );
         // No windows asset at all → the caller falls back to source.
         let none = vec![a("port-linux-x64.tar.gz"), a("port-windows.dmg")];
-        assert_eq!(pick_os_asset(&none), None);
+        assert_eq!(pick_asset(&none, &WINDOWS_MARKS, X64_HIT, X64_COMPAT), None);
         // A single unmarked-arch windows build still wins.
         let single = vec![a("port-linux.tar.gz"), a("port-windows.zip")];
         assert_eq!(
-            pick_os_asset(&single).as_deref(),
+            pick_asset(&single, &WINDOWS_MARKS, X64_HIT, X64_COMPAT).as_deref(),
             Some("https://x/port-windows.zip")
         );
     }
@@ -4706,8 +4749,14 @@ mod tests {
             a("SHA256SUMS"),
         ];
         assert_eq!(
-            pick_os_asset(&assets).as_deref(),
+            pick_asset(&assets, &WINDOWS_MARKS, X64_HIT, X64_COMPAT).as_deref(),
             Some("https://x/recvx-enhanced-port-0.6.8-windows-x86.zip")
+        );
+        // On linux the same listing yields the x86_64 server tarball —
+        // the i686 builds only score through the compat marker.
+        assert_eq!(
+            pick_asset(&assets, &LINUX_MARKS, X64_HIT, X64_COMPAT).as_deref(),
+            Some("https://x/recvx-server-0.6.8-linux-x86_64.tar.gz")
         );
         // x64 still outranks x86 when a repo ships both.
         let both = vec![
@@ -4715,7 +4764,7 @@ mod tests {
             a("port-windows-x64.zip"),
         ];
         assert_eq!(
-            pick_os_asset(&both).as_deref(),
+            pick_asset(&both, &WINDOWS_MARKS, X64_HIT, X64_COMPAT).as_deref(),
             Some("https://x/port-windows-x64.zip")
         );
     }
