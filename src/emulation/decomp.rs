@@ -258,6 +258,8 @@ fn fallback_entries() -> Vec<Entry> {
             author: String::new(),
             game: String::new(),
             links: Vec::new(),
+            cover_url: String::new(),
+            ai: false,
             search_blob: String::new(),
         })
         .collect()
@@ -271,7 +273,7 @@ fn prepare_entries(entries: &mut [Entry]) {
             e.cover_q = format!("{} box art", e.name);
         }
         e.search_blob = format!(
-            "{} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {}",
             e.name,
             e.repo,
             e.console,
@@ -280,6 +282,7 @@ fn prepare_entries(entries: &mut [Entry]) {
             e.toolchain,
             e.author,
             e.game,
+            if e.ai { "ai-assisted" } else { "" },
             e.tags.join(" ")
         )
         .to_lowercase();
@@ -399,7 +402,7 @@ const CONSOLE_ORDER: &[&str] = &[
     "nes", "snes", "n64", "gamecube", "wii", "wiiu", "switch", "switch2", "virtualboy", "gb", "gbc",
     "gba", "nds", "3ds", "ps1", "ps2", "ps3", "ps4", "ps5", "psp", "vita", "megadrive", "genesis",
     "segacd", "megacd", "32x", "sms", "gamegear", "saturn", "dreamcast", "xbox", "x360", "xboxone",
-    "xsx", "dos", "pc", "mac", "pc98", "mobile", "arcade", "neogeo", "other",
+    "xsx", "dos", "pc", "mac", "pc98", "amiga", "c64", "msx", "mobile", "arcade", "neogeo", "other",
 ];
 
 /// View state — the shared item list, the loaded catalog, the
@@ -482,8 +485,8 @@ pub struct DecompView {
     pub search: SearchPill,
     /// slugs whose cover fetch was already queued this session.
     cover_requested: HashSet<String>,
-    cover_req_tx: mpsc::Sender<(String, String, Option<PathBuf>)>,
-    cover_req_rx: Option<mpsc::Receiver<(String, String, Option<PathBuf>)>>,
+    cover_req_tx: mpsc::Sender<(String, String, String, Option<PathBuf>)>,
+    cover_req_rx: Option<mpsc::Receiver<(String, String, String, Option<PathBuf>)>>,
     cover_res_rx: mpsc::Receiver<(String, bool)>,
     cover_res_tx: mpsc::Sender<(String, bool)>,
     /// The band's layout toggle wrote a persisted setting — the app
@@ -1913,29 +1916,42 @@ fn cover_cache(slug: &str) -> Option<PathBuf> {
     decomps_root().map(|d| d.join("covers").join(format!("{slug}.png")))
 }
 
-/// The box-art worker: requests arrive per visible card, disk cache
-/// first, `boxart_bytes` on a miss cached back to disk. The row's
-/// decode pool owns pixels — the worker only reports whether a cover
-/// file now exists so the view can `set_cover` the item.
+/// The cover worker: requests arrive per visible card, disk cache
+/// first. A decomps.net `cover_url` fetches the thumb directly
+/// (decode-validated); `boxart_bytes` on the search phrase is the
+/// fallback when there's no direct URL or it 404s. The row's decode
+/// pool owns pixels — the worker only reports whether a cover file
+/// now exists so the view can `set_cover` the item.
 fn cover_work(
-    rx: mpsc::Receiver<(String, String, Option<PathBuf>)>,
+    rx: mpsc::Receiver<(String, String, String, Option<PathBuf>)>,
     tx: mpsc::Sender<(String, bool)>,
     ctx: egui::Context,
 ) {
-    while let Ok((slug, query, cache)) = rx.recv() {
+    while let Ok((slug, url, query, cache)) = rx.recv() {
+        let bytes = if cache.as_ref().is_some_and(|f| f.is_file()) {
+            None
+        } else {
+            (!url.is_empty())
+                .then(|| crate::emulation::emu_meta::fetch_image(&url))
+                .flatten()
+                .or_else(|| {
+                    (!query.is_empty())
+                        .then(|| crate::emulation::emu_meta::boxart_bytes(&query))
+                        .flatten()
+                })
+        };
         let ok = cache.as_ref().is_some_and(|f| f.is_file())
-            || (!query.is_empty()
-                && crate::emulation::emu_meta::boxart_bytes(&query)
-                    .map(|b| {
-                        if let Some(f) = &cache {
-                            if let Some(d) = f.parent() {
-                                let _ = std::fs::create_dir_all(d);
-                            }
-                            let _ = std::fs::write(f, &b);
+            || bytes
+                .map(|b| {
+                    if let Some(f) = &cache {
+                        if let Some(d) = f.parent() {
+                            let _ = std::fs::create_dir_all(d);
                         }
-                        true
-                    })
-                    .unwrap_or(false));
+                        let _ = std::fs::write(f, &b);
+                    }
+                    true
+                })
+                .unwrap_or(false);
         if tx.send((slug, ok)).is_err() {
             return;
         }
@@ -2081,6 +2097,20 @@ fn tab_icon(painter: &egui::Painter, c: Pos2, size: f32, t: DecompTab, col: Colo
                 stroke,
             ));
         }
+        DecompTab::Kind(Kind::Reimpl) => {
+            // Rebuilt engine — outer frame + filled inner block.
+            painter.rect_stroke(
+                Rect::from_center_size(c, Vec2::splat(h * 1.2)),
+                CornerRadius::same((size * 0.08).round() as u8),
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.rect_filled(
+                Rect::from_center_size(c, Vec2::splat(h * 0.55)),
+                CornerRadius::same((size * 0.06).round() as u8),
+                col,
+            );
+        }
         DecompTab::Kind(Kind::Mod) => {
             // Plus in a circle.
             painter.circle_stroke(c, h * 0.72, stroke);
@@ -2112,6 +2142,7 @@ fn tab_label(kind: Kind) -> &'static str {
         Kind::Recomp => "Recomps",
         Kind::Disasm => "Disassemblies",
         Kind::Port => "Ports",
+        Kind::Reimpl => "Reimplementations",
         Kind::Mod => "Mods",
         Kind::Tool => "Tools",
     }
@@ -2570,11 +2601,10 @@ pub fn view(
             continue;
         }
         if let Some(&ei) = view.slug_idx.get(&slug) {
-            let _ = view.cover_req_tx.send((
-                slug,
-                view.entries[ei].cover_q.clone(),
-                cover_cache(&view.entries[ei].slug),
-            ));
+            let e = &view.entries[ei];
+            let _ = view
+                .cover_req_tx
+                .send((slug, e.cover_url.clone(), e.cover_q.clone(), cover_cache(&e.slug)));
         }
     }
     // Card status markers — the widget paints the dot + the download
@@ -3690,6 +3720,7 @@ fn info_pane(
     {
         let _ = view.cover_req_tx.send((
             e.slug.clone(),
+            e.cover_url.clone(),
             e.cover_q.clone(),
             cover_cache(&e.slug),
         ));
@@ -3790,15 +3821,8 @@ fn info_pane(
     );
     ty += lh + 3.0 * s;
 
-    // Badges: console · kind · version + a colored status flag.
-    let mut badges = format!(
-        "{} · {}",
-        catalog::console_label(&e.console),
-        e.kind.label()
-    );
-    if !e.version.is_empty() {
-        badges.push_str(&format!(" · {}", e.version));
-    }
+    // Badges — decomps.net-style pills (console, kind, AI flag),
+    // then the version and a colored status flag as trailing text.
     let flag = if e.takedown {
         Some(("Takedown", Color32::from_rgb(255, 110, 110)))
     } else if e.abandoned {
@@ -3806,21 +3830,42 @@ fn info_pane(
     } else {
         catalog::status_label(&e.status)
     };
-    let badges_txt = crate::ellipsize(&painter, &badges, &FontId::proportional(14.0 * s), tw * 0.7);
-    let bw = painter
-        .layout_no_wrap(badges_txt.clone(), FontId::proportional(14.0 * s), Color32::WHITE)
-        .size()
-        .x;
-    painter.text(
-        Pos2::new(tx, ty),
-        Align2::LEFT_CENTER,
-        badges_txt,
-        FontId::proportional(14.0 * s),
-        Color32::from_gray(170).gamma_multiply(alpha),
-    );
+    let pill_font = FontId::proportional(14.0 * s);
+    let mut bx = tx;
+    let con = catalog::console_label(&e.console);
+    if !con.is_empty() {
+        bx += info_pill(&painter, bx, ty, &con, console_pill(&e.console), &pill_font, s, alpha)
+            + 8.0 * s;
+    }
+    bx += info_pill(&painter, bx, ty, e.kind.label(), kind_pill(e.kind), &pill_font, s, alpha)
+        + 8.0 * s;
+    if e.ai {
+        bx += info_pill(&painter, bx, ty, "AI-assisted", PILL_YELLOW, &pill_font, s, alpha)
+            + 8.0 * s;
+    }
+    if !e.version.is_empty() {
+        let vt = crate::ellipsize(
+            &painter,
+            &e.version,
+            &FontId::proportional(14.0 * s),
+            (pane.max.x - pad_x - bx).max(0.0),
+        );
+        let vw = painter
+            .layout_no_wrap(vt.clone(), FontId::proportional(14.0 * s), Color32::WHITE)
+            .size()
+            .x;
+        painter.text(
+            Pos2::new(bx, ty),
+            Align2::LEFT_CENTER,
+            vt,
+            FontId::proportional(14.0 * s),
+            Color32::from_gray(170).gamma_multiply(alpha),
+        );
+        bx += vw + 10.0 * s;
+    }
     if let Some((ft, fc)) = flag {
         painter.text(
-            Pos2::new(tx + bw + 10.0 * s, ty),
+            Pos2::new(bx, ty),
             Align2::LEFT_CENTER,
             ft,
             FontId::proportional(14.0 * s),
@@ -4227,6 +4272,100 @@ fn filter_chip(
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     resp.clicked() && interactive
+}
+
+/// decomps.net badge palettes (dark theme) — the fg doubles as the
+/// border color, like the site's `border-color: currentColor`.
+const PILL_TEAL: (Color32, Color32) = (
+    Color32::from_rgb(0x93, 0xDD, 0xEB),
+    Color32::from_rgb(0x0F, 0x1D, 0x21),
+);
+const PILL_BLUE: (Color32, Color32) = (
+    Color32::from_rgb(0xA9, 0xC3, 0xFF),
+    Color32::from_rgb(0x12, 0x1A, 0x2B),
+);
+const PILL_ORANGE: (Color32, Color32) = (
+    Color32::from_rgb(0xF5, 0xB9, 0x8A),
+    Color32::from_rgb(0x22, 0x19, 0x11),
+);
+const PILL_PURPLE: (Color32, Color32) = (
+    Color32::from_rgb(0xC9, 0xB5, 0xFF),
+    Color32::from_rgb(0x1A, 0x16, 0x28),
+);
+const PILL_GREEN: (Color32, Color32) = (
+    Color32::from_rgb(0x9E, 0xDD, 0xB8),
+    Color32::from_rgb(0x11, 0x1E, 0x18),
+);
+const PILL_PINK: (Color32, Color32) = (
+    Color32::from_rgb(0xF5, 0xA9, 0xC4),
+    Color32::from_rgb(0x22, 0x13, 0x19),
+);
+const PILL_YELLOW: (Color32, Color32) = (
+    Color32::from_rgb(0xF0, 0xD5, 0x8A),
+    Color32::from_rgb(0x20, 0x1C, 0x10),
+);
+const PILL_GRAY: (Color32, Color32) = (Color32::from_gray(170), Color32::from_gray(24));
+
+/// The site's per-kind chip color (its `k-*` classes).
+fn kind_pill(k: Kind) -> (Color32, Color32) {
+    match k {
+        Kind::Decomp => PILL_BLUE,
+        Kind::Disasm => PILL_PURPLE,
+        Kind::Recomp => PILL_GREEN,
+        Kind::Port => PILL_ORANGE,
+        Kind::Reimpl => PILL_TEAL,
+        Kind::Mod => PILL_YELLOW,
+        Kind::Tool => PILL_GRAY,
+    }
+}
+
+/// The site's per-platform chip color (its `pc0..pc6` classes).
+/// Unknown consoles get the neutral pill.
+fn console_pill(id: &str) -> (Color32, Color32) {
+    match id {
+        "c64" | "gba" | "nes" | "saturn" | "wiiu" => PILL_TEAL,
+        "dos" | "gbc" | "pc" | "segacd" | "xbox" => PILL_BLUE,
+        "32x" | "dreamcast" | "genesis" | "megadrive" | "ps1" | "snes" | "x360" => PILL_ORANGE,
+        "3ds" | "nds" | "sms" | "ps2" | "switch" => PILL_PURPLE,
+        "amiga" | "msx" | "ps3" => PILL_GREEN,
+        "arcade" | "gamecube" | "gc" | "n64" | "ps4" => PILL_PINK,
+        "gb" | "neogeo" | "psp" | "wii" => PILL_YELLOW,
+        _ => PILL_GRAY,
+    }
+}
+
+/// One info pill — tinted fill, colored 1px border + text; returns
+/// the drawn width so callers can pack pills left to right.
+fn info_pill(
+    painter: &egui::Painter,
+    x: f32,
+    y_center: f32,
+    label: &str,
+    (fg, bg): (Color32, Color32),
+    font: &FontId,
+    s: f32,
+    alpha: f32,
+) -> f32 {
+    let g = painter.layout_no_wrap(label.to_string(), font.clone(), fg);
+    let w = g.size().x + 14.0 * s;
+    let h = g.size().y + 8.0 * s;
+    let r = Rect::from_min_size(Pos2::new(x, y_center - h * 0.5), Vec2::new(w, h));
+    let rad = CornerRadius::same(5);
+    painter.rect_filled(r, rad, bg.gamma_multiply(alpha));
+    painter.rect_stroke(
+        r,
+        rad,
+        Stroke::new(s.max(1.0), fg.gamma_multiply(alpha)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        label,
+        font.clone(),
+        fg.gamma_multiply(alpha),
+    );
+    w
 }
 
 /// The drawer's content — laid out in the full shelf height and
