@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Vec2};
 use eframe::egui::epaint::{Mesh, Shape, Vertex};
 
 use crate::{
@@ -126,8 +126,29 @@ pub(crate) fn view(
     album_search: &mut search_pill::SearchPill,
 ) -> MiniOut {
     let painter = ui.painter().clone();
-    painter.rect_filled(content, 0, grid_bg);
     let ctx = ui.ctx().clone();
+    // Window corner radius — maximized/fullscreen stays square. On
+    // Linux nothing masks the window corners, so every fill that
+    // reaches a window edge must round it itself or the wedge
+    // outside the stroke's arc stays opaque.
+    let radius = {
+        let v = ctx.input(|i| i.viewport().clone());
+        if v.maximized.unwrap_or(false) || v.fullscreen.unwrap_or(false) {
+            0
+        } else {
+            crate::CORNER_RADIUS
+        }
+    };
+    painter.rect_filled(
+        content,
+        CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: radius,
+            se: radius,
+        },
+        grid_bg,
+    );
     let mut out = MiniOut::default();
 
     // Mini-local delete confirm — the shell's DeletePrompt paints in
@@ -161,10 +182,16 @@ pub(crate) fn view(
     let hp = painter.clone().with_clip_rect(header);
     // The zone under the title bar otherwise shows the bare window
     // clear color — fill it with the content bg so the surface is
-    // seamless top to bottom.
+    // seamless top to bottom. Its top edge IS the window's, so the
+    // corners round like the stroke's.
     hp.rect_filled(
         Rect::from_min_max(header.min, Pos2::new(content.max.x, content.min.y)),
-        0,
+        CornerRadius {
+            nw: radius,
+            ne: radius,
+            se: 0,
+            sw: 0,
+        },
         grid_bg,
     );
     // Cover palette wash when art is loaded; otherwise Lacrima's
@@ -173,14 +200,48 @@ pub(crate) fn view(
         Some(cols) => (cols[0], *cols.get(1).unwrap_or(&cols[0])),
         None => (Color32::from_gray(0x60), Color32::from_gray(0x60)),
     };
+    // The mesh's top edge is the window's rounded top — a flat quad
+    // would paint the corner wedges, so it's sliced into narrow
+    // columns whose top vertices follow the corner arcs.
+    let r = (f32::from(radius))
+        .min(header.width() * 0.5)
+        .min(title_h)
+        .max(0.0);
+    let arc_top = |x: f32| {
+        let cx = if x < header.min.x + r {
+            header.min.x + r
+        } else if x > header.max.x - r {
+            header.max.x - r
+        } else {
+            return header.min.y;
+        };
+        let dx = x - cx;
+        header.min.y + r - (r * r - dx * dx).max(0.0).sqrt()
+    };
+    let (la, ra) = (left.to_srgba_unmultiplied(), right.to_srgba_unmultiplied());
+    let mix = |t: f32| {
+        let c = |i: usize| {
+            (la[i] as f32 + (ra[i] as f32 - la[i] as f32) * t).clamp(0.0, 255.0) as u8
+        };
+        Color32::from_rgba_unmultiplied(c(0), c(1), c(2), c(3)).gamma_multiply(0.5)
+    };
     let fade = Color32::TRANSPARENT;
     let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(header.left_top(), left.gamma_multiply(0.5));
-    mesh.colored_vertex(header.right_top(), right.gamma_multiply(0.5));
-    mesh.colored_vertex(header.right_bottom(), fade);
-    mesh.colored_vertex(header.left_bottom(), fade);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
+    const COLS: usize = 32;
+    for i in 0..COLS {
+        let x0 = header.min.x + header.width() * i as f32 / COLS as f32;
+        let x1 = header.min.x + header.width() * (i + 1) as f32 / COLS as f32;
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(x0, arc_top(x0)), mix(i as f32 / COLS as f32));
+        mesh.colored_vertex(
+            Pos2::new(x1, arc_top(x1)),
+            mix((i + 1) as f32 / COLS as f32),
+        );
+        mesh.colored_vertex(Pos2::new(x1, header.max.y), fade);
+        mesh.colored_vertex(Pos2::new(x0, header.max.y), fade);
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    }
     hp.add(egui::Shape::mesh(mesh));
 
     // --- Now-playing bar --------------------------------------------

@@ -2234,8 +2234,12 @@ pub fn view(
             if emu.handler_icon_key.as_deref() != Some(key.as_str()) {
                 emu.handler_icon_key = Some(key);
                 emu.handler_icon = crate::exe_icon::load(p).map(|img| {
-                    ui.ctx()
-                        .load_texture("handler-icon", img, egui::TextureOptions::LINEAR)
+                    crate::shared_tex::load_tex(
+                        ui.ctx(),
+                        "handler-icon",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    )
                 });
             }
         }
@@ -3700,7 +3704,8 @@ fn draw_session(
                     .map(|img| {
                         let rgba = library::crop_black_bars(img).to_rgba8();
                         let (w, h) = rgba.dimensions();
-                        ui.ctx().load_texture(
+                        crate::shared_tex::load_tex(
+                            ui.ctx(),
                             "emu-letterbox",
                             egui::ColorImage::from_rgba_unmultiplied(
                                 [w as usize, h as usize],
@@ -3901,7 +3906,8 @@ fn draw_session(
                             tex.set(img, egui::TextureOptions::LINEAR)
                         }
                         _ => {
-                            emu.frame_tex = Some(ui.ctx().load_texture(
+                            emu.frame_tex = Some(crate::shared_tex::load_tex(
+                                ui.ctx(),
                                 "emu-capture",
                                 img,
                                 egui::TextureOptions::LINEAR,

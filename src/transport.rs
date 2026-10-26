@@ -1746,7 +1746,7 @@ mod tests {
                     modifiers: egui::Modifiers::default(),
                 },
             ];
-            let _ = ctx.run_ui(
+            let mut out = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
                     events,
@@ -1756,6 +1756,8 @@ mod tests {
                     t.volume(ui, knob, None, 1.0, true, Color32::WHITE, 1.0, "t-vol");
                 },
             );
+            // egui 0.37's TexturesDelta panics when dropped unhandled.
+            out.textures_delta.clear();
         };
         // Press on the ring's right edge (angle 0°), drag upward and
         // left ~90° of rotation, release. Center is (150,150), r=50.
@@ -1792,7 +1794,7 @@ mod tests {
                     modifiers: egui::Modifiers::default(),
                 },
             ];
-            let _ = ctx.run_ui(
+            let mut out = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
                     events,
@@ -1806,6 +1808,8 @@ mod tests {
                     t.volume(ui, knob, None, 0.5, false, Color32::WHITE, 1.0, "t-cvol");
                 },
             );
+            // egui 0.37's TexturesDelta panics when dropped unhandled.
+            out.textures_delta.clear();
         };
         frame(Pos2::new(195.0, 150.0), true, &mut t);
         frame(Pos2::new(180.0, 115.0), true, &mut t);

@@ -26,7 +26,7 @@ pub fn load(ctx: &egui::Context) -> MenuIcons {
     let load = |name: &str, svg: &str| -> TextureHandle {
         let image = egui_extras::image::load_svg_bytes_with_size(svg.as_bytes(), size_hint, &options)
             .unwrap_or_else(|err| panic!("invalid {name} icon: {err}"));
-        ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+        crate::shared_tex::load_tex(ctx, name, image, egui::TextureOptions::LINEAR)
     };
     MenuIcons {
         emulation: load("icon-emulation", EMULATION_SVG),

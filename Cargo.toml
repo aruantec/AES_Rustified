@@ -83,6 +83,9 @@ calloop = "0.14"
 wayland-server = "0.31"
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
+# Raw client-side protocol calls (wl_subsurface mini window) on
+# winit's own wl_display — resolved via dlopen handle, no link dep.
+wayland-sys = { version = "0.31", features = ["client"] }
 
 # Native Windows Graphics Capture for emulator frame capture (the
 # WgcBridge-equivalent path — WinRT WGC + D3D11 staging readback) plus

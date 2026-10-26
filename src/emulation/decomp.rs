@@ -3444,7 +3444,8 @@ fn draw_capture(
                             tex.set(img, egui::TextureOptions::LINEAR)
                         }
                         _ => {
-                            view.frame_tex = Some(ui.ctx().load_texture(
+                            view.frame_tex = Some(crate::shared_tex::load_tex(
+                                ui.ctx(),
                                 "decomp-capture",
                                 img,
                                 egui::TextureOptions::LINEAR,

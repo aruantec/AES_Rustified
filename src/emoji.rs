@@ -445,7 +445,8 @@ fn emoji_tex(ctx: &egui::Context, c: char) -> Option<egui::TextureHandle> {
         return hit;
     }
     let tex = render_emoji(c).map(|img| {
-        ctx.load_texture(
+        crate::shared_tex::load_tex(
+            ctx,
             format!("emoji-{:x}", c as u32),
             img,
             egui::TextureOptions::LINEAR,

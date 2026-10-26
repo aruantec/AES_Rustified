@@ -446,7 +446,8 @@ impl AlbumRow {
             return self
                 .rom
                 .get_or_insert_with(|| {
-                    ctx.load_texture(
+                    crate::shared_tex::load_tex(
+                        ctx,
                         "cover:placeholder-rom",
                         library::rom_placeholder_image(),
                         egui::TextureOptions::LINEAR,
@@ -456,7 +457,8 @@ impl AlbumRow {
         }
         self.placeholder
             .get_or_insert_with(|| {
-                ctx.load_texture(
+                crate::shared_tex::load_tex(
+                    ctx,
                     "cover:placeholder",
                     library::placeholder_image(),
                     egui::TextureOptions::LINEAR,
@@ -880,7 +882,8 @@ impl AlbumRow {
         while let Ok((src, sig, img)) = self.cover_results.try_recv() {
             self.cover_pending.remove(&src);
             let entry = match img {
-                Some(img) => CoverTex::Ready(ctx.load_texture(
+                Some(img) => CoverTex::Ready(crate::shared_tex::load_tex(
+                    ctx,
                     format!("cover:{src:?}"),
                     img,
                     egui::TextureOptions::LINEAR,
@@ -2026,7 +2029,8 @@ impl AlbumRow {
         // own art draw the album cover (Lacrima's UseFolderCover layers),
         // not the note placeholder.
         let n = album.covers.len().min(MAX_COVERS);
-        let top_tex = album.covers.get(n - 1).and_then(|src| {
+        // n==0 on a coverless album — `n - 1` would underflow.
+        let top_tex = n.checked_sub(1).and_then(|i| album.covers.get(i)).and_then(|src| {
             match self.textures.get(src) {
                 Some((CoverTex::Ready(t), _)) => Some(t.clone()),
                 _ => None,

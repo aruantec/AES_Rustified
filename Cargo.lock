@@ -184,6 +184,7 @@ dependencies = [
  "wayland-backend",
  "wayland-scanner",
  "wayland-server",
+ "wayland-sys",
  "wgpu",
  "windows",
  "zip",

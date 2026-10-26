@@ -14,11 +14,14 @@ mod library;
 mod logo;
 mod meta_cache;
 mod mini;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod miniwin;
 mod paint;
 mod particles;
 mod search_pill;
 mod settings;
 mod shadertoy;
+mod shared_tex;
 mod spectrum_bar;
 mod tag_editor;
 mod transport;
@@ -36,6 +39,13 @@ use eframe::egui::{
     Rect, ResizeDirection, Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2, ViewportCommand,
 };
 use eframe::egui_wgpu;
+
+/// Handle passed into `ui_body`: the floating Wayland mini window on
+/// unix/Wayland builds, `()` everywhere else (legacy resize path).
+#[cfg(all(unix, not(target_os = "macos")))]
+type MiniParam<'a> = Option<&'a mut miniwin::MiniWin>;
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+type MiniParam<'a> = ();
 
 const CORNER_RADIUS: u8 = 10;
 /// MainTopBar's declared height (virtual px, rendered at 1/ScaleFactor).
@@ -303,7 +313,14 @@ fn main() -> eframe::Result<()> {
     // window's size survives a round-trip through mini mode. Window
     // position is session-only — every launch centers.
     let w = &settings.window;
-    let (inner, min) = if w.mini {
+    // On Wayland the mini shell is a subsurface — the toplevel always
+    // keeps the NORMAL geometry so un-maximize restores the right
+    // rect. X11/Windows still resize the window itself.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let wayland_session = false;
+    let (inner, min) = if w.mini && !wayland_session {
         (
             Vec2::new(
                 w.mini_width.max(mini::MIN_SIZE.x),
@@ -317,7 +334,7 @@ fn main() -> eframe::Result<()> {
             Vec2::new(360.0, 260.0),
         )
     };
-    let pos = if w.mini {
+    let pos = if w.mini && !wayland_session {
         w.mini_x.zip(w.mini_y)
     } else {
         w.x.zip(w.y)
@@ -714,6 +731,14 @@ struct AesRustApp {
     centered: bool,
     /// Armed by the title-bar switch button; drives the crossfade.
     mode_switch: Option<ModeSwitch>,
+    /// Wayland-only floating mini window (subsurface + private egui
+    /// context). None on X11/Windows — they keep the resize path.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    miniwin: Option<miniwin::MiniWin>,
+    /// MiniWin construction is attempted once — a None there (X11,
+    /// missing globals) must not retry every frame.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    miniwin_tried: bool,
     /// The last session's open album, queued for reopen once the scan
     /// lands (or immediately when no scan runs at all).
     restore_album: Option<String>,
@@ -1748,6 +1773,10 @@ impl AesRustApp {
         // scan ever runs).
         merge_virtual_albums(&mut initial_albums, lib);
 
+        // Covers/icons loaded through shared_tex must resolve in the
+        // Wayland mini context too — register the main manager first.
+        shared_tex::register(&cc.egui_ctx);
+
         let mut app = Self {
             icons: icons::load(&cc.egui_ctx),
             menu_scales: [1.0; 4],
@@ -1760,6 +1789,10 @@ impl AesRustApp {
             },
             dpi_base,
             mode_switch: None,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            miniwin: None,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            miniwin_tried: false,
             restore_album: settings.library.last_album.clone(),
             shadertoy: cc.wgpu_render_state.as_ref().map(|rs| {
                 let mut toy = shadertoy::Shadertoy::new(rs);
@@ -2325,7 +2358,8 @@ impl AesRustApp {
                 img.clone(),
             );
             if let Some(img) = &img {
-                self.playing_cover = Some(ctx.load_texture(
+                self.playing_cover = Some(shared_tex::load_tex(
+                    ctx,
                     "player-cover",
                     img.clone(),
                     egui::TextureOptions::LINEAR,
@@ -2428,13 +2462,96 @@ impl eframe::App for AesRustApp {
         fs_inflate_tick(ctx, std::time::Instant::now());
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        #[cfg(all(not(windows), debug_assertions))]
-        ui.ctx().all_styles_mut(|s| {
-            s.debug.debug_on_hover = true;
-            s.debug.show_interactive_widgets = true;
-            s.debug.show_widget_hits = true;
-        });
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            if self.miniwin.is_none() && !self.miniwin_tried {
+                self.miniwin_tried = true;
+                if let (Some(win), Some(rs)) =
+                    (frame.winit_window(), frame.wgpu_render_state())
+                {
+                    let w = &self.settings.window;
+                    let size = Vec2::new(
+                        w.mini_width.max(mini::MIN_SIZE.x),
+                        w.mini_height.max(mini::MIN_SIZE.y),
+                    );
+                    self.miniwin = miniwin::MiniWin::new(
+                        win.as_ref(),
+                        rs,
+                        ui.ctx().clone(),
+                        size,
+                        Pos2::ZERO, // parked off-screen until activated
+                    );
+                    // Launching straight into mini mode: map the
+                    // surface now — there's no mode switch to do it.
+                    if self.settings.window.mini {
+                        if let Some(mw) = self.miniwin.as_mut() {
+                            mw.activate(&mut self.settings);
+                        }
+                    }
+                }
+                if self.miniwin.is_none() {
+                    // Not Wayland / plumbing failed — nothing will
+                    // ever drain the shared-texture queue.
+                    shared_tex::disable();
+                }
+            }
+            if self.settings.window.mini && self.miniwin.is_some() {
+                self.mini_frame(ui.ctx());
+                return;
+            }
+            let mut mw = self.miniwin.take();
+            self.ui_body(ui, mw.as_mut());
+            // Keep the mini renderer fed + the queues drained while
+            // the surface is hidden.
+            if let Some(mw) = mw.as_mut() {
+                mw.sync_pending();
+            }
+            self.miniwin = mw;
+            return;
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        self.ui_body(ui, ());
+    }
+
+    fn on_exit(&mut self) {
+        settings::save(&self.settings);
+    }
+}
+
+impl AesRustApp {
+    /// Wayland mini mode: the main surface ghosts to a transparent,
+    /// click-through frame while the whole shell paints in a floating
+    /// subsurface — see miniwin.rs. The parent's RawInput is cloned,
+    /// translated into mini-local coordinates and run through the
+    /// mini's private egui context.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn mini_frame(&mut self, ctx: &egui::Context) {
+        let Some(mut mw) = self.miniwin.take() else {
+            return;
+        };
+        let raw = ctx.input(|i| i.raw.clone());
+        // The UI scale the shell was laid out with — the router
+        // mirrors the chrome's title/button geometry from it.
+        let s = 1.0 / self.settings.ui.scale_factor.max(1.0);
+        mw.frame(&raw, s, |u, m| self.ui_body(u, m));
+        if mw.take_dirty_save() {
+            let w = &mut self.settings.window;
+            w.mini_x = Some(mw.pos.x);
+            w.mini_y = Some(mw.pos.y);
+            w.mini_width = mw.size.x;
+            w.mini_height = mw.size.y;
+            settings::save(&self.settings);
+        }
+        // The subsurface runs its own render loop — keep the main
+        // repaint train going so every parent frame drives one too.
+        ctx.request_repaint();
+        self.miniwin = Some(mw);
+    }
+
+    fn ui_body(&mut self, ui: &mut egui::Ui, mw: MiniParam<'_>) {
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = mw;
         {
             static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3021,7 +3138,8 @@ impl eframe::App for AesRustApp {
                                 img.clone(),
                             );
                             if let Some(img) = img {
-                                *playing_cover = Some(ui.ctx().load_texture(
+                                *playing_cover = Some(shared_tex::load_tex(
+                                    ui.ctx(),
                                     "player-cover",
                                     img,
                                     egui::TextureOptions::LINEAR,
@@ -3088,7 +3206,8 @@ impl eframe::App for AesRustApp {
                     // lands with the palette — the mini view
                     // crossfades the swap itself.
                     *playing_cover = pp.img.map(|img| {
-                        ui.ctx().load_texture(
+                        shared_tex::load_tex(
+                            ui.ctx(),
                             "player-cover",
                             img,
                             egui::TextureOptions::LINEAR,
@@ -3187,7 +3306,20 @@ impl eframe::App for AesRustApp {
         if let Some(sw) = &mut self.mode_switch {
             let t = sw.at.elapsed().as_secs_f32();
             if !sw.swapped && t >= SWITCH_OUT {
-                apply_window_mode(ui.ctx(), settings, &mut self.centered);
+                // On Wayland the flip swaps surfaces (ghost parent ⇄
+                // floating mini); elsewhere it's a window resize.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                let via_subsurface = if let Some(m) = mw {
+                    m.apply_mode(settings);
+                    true
+                } else {
+                    false
+                };
+                #[cfg(not(all(unix, not(target_os = "macos"))))]
+                let via_subsurface = false;
+                if !via_subsurface {
+                    apply_window_mode(ui.ctx(), settings, &mut self.centered);
+                }
                 sw.swapped = true;
             }
             // Smoothstep on both halves — the veil eases in, sits at
@@ -5564,10 +5696,6 @@ impl eframe::App for AesRustApp {
             }
         }
     }
-
-    fn on_exit(&mut self) {
-        settings::save(&self.settings);
-    }
 }
 
 /// Right-click context menu for the content area and widgets, mirroring
@@ -5726,27 +5854,44 @@ fn lacrima_window_frame(
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
-                // Off Windows the clear color is fully transparent, so
-                // this base fill replicates what the Windows
-                // (12,12,12,180) clear produced beneath all chrome —
-                // without it the 1px seams inside the stroke and the
-                // translucent title bar show the bare desktop. On
-                // Windows the clear already provides it; painting it
-                // again would double-blend.
-                .fill(if cfg!(windows) {
-                    Color32::TRANSPARENT
-                } else {
-                    Color32::from_rgba_unmultiplied(12, 12, 12, 180)
-                })
+                // The Frame's own fill+stroke are disabled on Linux:
+                // egui paints that shape on `content_ui.min_rect()`,
+                // which EXPANDS to any widget that allocates past the
+                // content inset (the title bar and back button reach
+                // `panel_rect.min`), ghosting a second rounded stroke
+                // ~1pt outside the real corner with a translucent halo.
+                // The base fill and border are painted manually on
+                // `panel_rect` inside `show` instead — fixed geometry.
+                // Windows keeps the Frame shape (its behavior there is
+                // verified; the manual repaints match it anyway).
+                .fill(Color32::TRANSPARENT)
                 .corner_radius(corner_radius)
-                .stroke(if maximized || is_fullscreen {
-                    Stroke::NONE
-                } else {
-                    Stroke::new(1.0, Color32::from_rgb(105, 105, 105))
-                }),
+                .stroke(
+                    if maximized || is_fullscreen || cfg!(not(windows)) {
+                        Stroke::NONE
+                    } else {
+                        Stroke::new(1.0, Color32::from_rgb(105, 105, 105))
+                    },
+                ),
         )
         .show(ui, |ui| {
             let app_rect = ui.max_rect();
+
+            // Linux base fill — what the (12,12,12,180) clear provides
+            // on Windows beneath all chrome. Painted on `panel_rect`
+            // (fixed geometry) because the Frame's own fill tracks
+            // `content_ui.min_rect()` and bulges ~1pt past the corner.
+            // The painter clips to `app_rect` by default, so use the
+            // panel clip to reach the actual window edge.
+            #[cfg(not(windows))]
+            ui.painter()
+                .clone()
+                .with_clip_rect(panel_rect)
+                .rect_filled(
+                    panel_rect,
+                    corner_radius,
+                    Color32::from_rgba_unmultiplied(12, 12, 12, 180),
+                );
 
             let resize_dir =
                 resize_direction(&ctx, app_rect, maximized || is_fullscreen, resize_exclude);
@@ -7184,7 +7329,8 @@ fn on_tag_saved(
                     pp.colors = Some(spectrum_bar::dominant_colors(&img, 3));
                     pp.img = Some(img);
                 } else {
-                    *playing_cover = Some(ctx.load_texture(
+                    *playing_cover = Some(shared_tex::load_tex(
+                        ctx,
                         "playing-cover",
                         img,
                         egui::TextureOptions::LINEAR,

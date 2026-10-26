@@ -892,7 +892,8 @@ impl TagEditor {
         let pad = egui::vec2(12.0, 6.0) * s;
         {
                 if self.placeholder.is_none() {
-                    self.placeholder = Some(ui.ctx().load_texture(
+                    self.placeholder = Some(crate::shared_tex::load_tex(
+                        ui.ctx(),
                         "meta_cover_placeholder",
                         crate::library::placeholder_image(),
                         egui::TextureOptions::LINEAR,
@@ -1015,7 +1016,8 @@ impl TagEditor {
                 Ok(c) => {
                     let rgba = c.to_rgba8();
                     let (tw, th) = rgba.dimensions();
-                    img.tex = Some(ui.ctx().load_texture(
+                    img.tex = Some(crate::shared_tex::load_tex(
+                        ui.ctx(),
                         format!("meta_img_{i}_{}", img.data.len()),
                         egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &rgba),
                         egui::TextureOptions::LINEAR,

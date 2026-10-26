@@ -1008,7 +1008,8 @@ impl RomEditor {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.placeholder.is_none() {
-                    self.placeholder = Some(ui.ctx().load_texture(
+                    self.placeholder = Some(crate::shared_tex::load_tex(
+                        ui.ctx(),
                         "rom_cover_ph",
                         crate::library::placeholder_image(),
                         egui::TextureOptions::LINEAR,
@@ -1058,7 +1059,8 @@ impl RomEditor {
                                                 Ok(c) => {
                                                     let rgba = c.to_rgba8();
                                                     let (tw, th) = rgba.dimensions();
-                                                    img.tex = Some(ui.ctx().load_texture(
+                                                    img.tex = Some(crate::shared_tex::load_tex(
+                                                        ui.ctx(),
                                                         format!("rom_img_{i}"),
                                                         egui::ColorImage::from_rgba_unmultiplied(
                                                             [tw as usize, th as usize],
@@ -1212,7 +1214,8 @@ impl RomEditor {
                         let (w, h) = rgba.dimensions();
                         s.thumbs.insert(
                             i,
-                            ctx.load_texture(
+                            crate::shared_tex::load_tex(
+                                ctx,
                                 format!("rom_search_{i}"),
                                 egui::ColorImage::from_rgba_unmultiplied(
                                     [w as usize, h as usize],
@@ -1237,7 +1240,8 @@ impl RomEditor {
                             s.preview_kind = infer_wallpaper_kind(url, img.width(), img.height());
                             let rgba = img.to_rgba8();
                             let (w, h) = rgba.dimensions();
-                            s.preview_tex = Some(ctx.load_texture(
+                            s.preview_tex = Some(crate::shared_tex::load_tex(
+                                ctx,
                                 "rom_search_preview",
                                 egui::ColorImage::from_rgba_unmultiplied(
                                     [w as usize, h as usize],
