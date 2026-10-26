@@ -341,6 +341,10 @@ fn main() -> eframe::Result<()> {
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("AES Oxide")
+        // Wayland/X11 window identity — the compositor resolves the
+        // taskbar/dock icon by matching this against a .desktop file
+        // of the same name (with_icon is ignored on Wayland).
+        .with_app_id("aes-rustified")
         // Taskbar/alt-tab icon (the file icon comes from app.rc).
         .with_icon(
             eframe::icon_data::from_png_bytes(include_bytes!("../assets/AES.png"))

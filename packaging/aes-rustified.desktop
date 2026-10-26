@@ -3,5 +3,6 @@ Type=Application
 Name=AES Rustified
 Exec=AES-Rustified
 Icon=aes-rustified
-Categories=Audio;Player;Utility;
+Categories=AudioVideo;Audio;Utility;
 Terminal=false
+StartupWMClass=aes-rustified
