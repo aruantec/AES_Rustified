@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AES Rustified
+Exec=AES-Rustified
+Icon=aes-rustified
+Categories=Audio;Player;Utility;
+Terminal=false
