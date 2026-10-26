@@ -3638,8 +3638,9 @@ fn render_adjust(render: &settings::RenderOpts) -> (f32, f32, [f32; 4]) {
 }
 
 /// SelectedCaptureAspectRatioKey → ratio — "handler" (or anything
-/// unrecognized) means the emulator's own, no resize.
-#[cfg(windows)]
+/// unrecognized) means the frame's own aspect (no forced crop).
+/// Pure mapping, needed on all platforms: the display-side aspect
+/// crop consumes it, no window calls involved.
 pub(crate) fn aspect_ratio_of(key: &str) -> Option<f64> {
     match key {
         "4:3" => Some(4.0 / 3.0),
