@@ -55,11 +55,14 @@ jobs:
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy.AppImage
           export APPIMAGE_EXTRACT_AND_RUN=1
+          # linuxdeploy deploys the icon under its own basename — it
+          # must match the desktop file's Icon= entry.
+          cp assets/AES.png aes-rustified.png
           ./linuxdeploy.AppImage \
             --appdir AppDir \
             --executable target/release/AES-Rustified \
             --desktop-file packaging/aes-rustified.desktop \
-            --icon-file assets/AES.png \
+            --icon-file aes-rustified.png \
             --output appimage
           mv ./*-x86_64.AppImage AES-Rustified-x86_64.AppImage
 
