@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "AES Oxide"
 
-# The shipped binary is AES-Rustified.exe — the package name stays a
+# The shipped binary is AES-Oxide.exe — the package name stays a
 # normal crate identifier.
 [[bin]]
-name = "AES-Rustified"
+name = "AES-Oxide"
 path = "src/main.rs"
 
 [dependencies]

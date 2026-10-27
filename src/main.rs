@@ -247,6 +247,33 @@ pub(crate) fn boot_mark(stage: &str) {
 
 fn main() -> eframe::Result<()> {
     let _ = BOOT_T0.set(std::time::Instant::now());
+    // First-run rebrand migration — mandatory (no skip): the existing
+    // AES_Rustified data root is renamed to AES_Oxide before anything
+    // else touches it. A plain native dialog is enough; nothing of the
+    // app is running yet so the rename can't race our own writes.
+    if settings::legacy_data_pending() {
+        rfd::MessageDialog::new()
+            .set_title("AES Oxide")
+            .set_description(
+                "AES Oxide found existing data from AES_Rustified.\n\n\
+                 Your settings, emulators and caches will be migrated\n\
+                 to the new AES_Oxide folder now.",
+            )
+            .set_buttons(rfd::MessageButtons::Ok)
+            .set_level(rfd::MessageLevel::Info)
+            .show();
+        if let Err(e) = settings::migrate_data_root() {
+            rfd::MessageDialog::new()
+                .set_title("AES Oxide")
+                .set_description(&format!(
+                    "Data migration failed:\n{e}\n\n\
+                     The app will start with a fresh AES_Oxide folder."
+                ))
+                .set_buttons(rfd::MessageButtons::Ok)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+        }
+    }
     if let Some(dir) = settings::data_root() {
         let _ = std::fs::write(dir.join("boot.log"), "");
     }
@@ -344,7 +371,7 @@ fn main() -> eframe::Result<()> {
         // Wayland/X11 window identity — the compositor resolves the
         // taskbar/dock icon by matching this against a .desktop file
         // of the same name (with_icon is ignored on Wayland).
-        .with_app_id("aes-rustified")
+        .with_app_id("aes-oxide")
         // Taskbar/alt-tab icon (the file icon comes from app.rc).
         .with_icon(
             eframe::icon_data::from_png_bytes(include_bytes!("../assets/AES.png"))
@@ -2467,6 +2494,7 @@ impl eframe::App for AesRustApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let _ = frame; // only the unix miniwin path below uses it
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             if self.miniwin.is_none() && !self.miniwin_tried {

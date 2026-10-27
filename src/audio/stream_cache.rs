@@ -300,7 +300,7 @@ pub fn delete(key: &str) {
     }
     let dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("AES_Rustified")
+        .join("AES_Oxide")
         .join("Cache")
         .join("Streams");
     let id = format!("{:016x}", hash_key(key));
@@ -312,7 +312,7 @@ impl StreamCache {
     fn load(key: &str) -> Self {
         let dir = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("AES_Rustified")
+            .join("AES_Oxide")
             .join("Cache")
             .join("Streams");
         let _ = std::fs::create_dir_all(&dir);

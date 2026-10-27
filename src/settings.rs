@@ -1,11 +1,11 @@
 //! Persistent settings, saved to
-//! `%LOCALAPPDATA%\AES_Rustified\Settings\Settings.json` on Windows
+//! `%LOCALAPPDATA%\AES_Oxide\Settings\Settings.json` on Windows
 //! (the equivalent per-OS data dir elsewhere).
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-const APP_DIR: &str = "AES_Rustified";
+const APP_DIR: &str = "AES_Oxide";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
@@ -146,7 +146,7 @@ pub struct Effects {
 impl Default for Effects {
     fn default() -> Self {
         Self {
-            show_lacrima: true,
+            show_lacrima: false,
             lacrima_cover_color: false,
             lacrima_count: 100,
             show_edge_border: false,
@@ -589,7 +589,7 @@ impl Default for Emulation {
             decomp_layout_mode: 2,
             // Lacrima: MyVideos/AES_Lacrima, else DataRoot/Recordings.
             recording_dir: dirs::video_dir()
-                .map(|d| d.join("AES_Rustified").to_string_lossy().into_owned())
+                .map(|d| d.join("AES_Oxide").to_string_lossy().into_owned())
                 .or_else(|| {
                     data_root().map(|d| d.join("Recordings").to_string_lossy().into_owned())
                 })
@@ -687,11 +687,36 @@ pub fn path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join(APP_DIR).join("Settings").join("Settings.json"))
 }
 
-/// `%LOCALAPPDATA%\AES_Rustified` — the app's data root (Settings/,
+/// `%LOCALAPPDATA%\AES_Oxide` — the app's data root (Settings/,
 /// Tools/, caches, Shaders/), opened by Settings' "Open AES
 /// Directory" button.
 pub fn data_root() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join(APP_DIR))
+}
+
+/// First-run rebrand check: a pre-rename `%LOCALAPPDATA%\AES_Rustified`
+/// (`~/.local/share/AES_Rustified` on Linux) exists and the AES_Oxide
+/// root does not — data migration is needed (prompted + performed in
+/// main before anything else touches the data root).
+pub fn legacy_data_pending() -> bool {
+    dirs::data_local_dir()
+        .map(|d| legacy_pending_at(&d))
+        .unwrap_or(false)
+}
+
+fn legacy_pending_at(base: &Path) -> bool {
+    base.join("AES_Rustified").is_dir() && !base.join(APP_DIR).exists()
+}
+
+/// Same-volume rename `AES_Rustified` -> `AES_Oxide` under the platform
+/// data root, so Settings/, Decomps/, Tools/ and caches move intact.
+pub fn migrate_data_root() -> std::io::Result<()> {
+    let Some(base) = dirs::data_local_dir() else { return Ok(()) };
+    migrate_at(&base)
+}
+
+fn migrate_at(base: &Path) -> std::io::Result<()> {
+    std::fs::rename(base.join("AES_Rustified"), base.join(APP_DIR))
 }
 
 pub fn load() -> Settings {
@@ -789,5 +814,52 @@ mod tests {
         let round: Audio =
             serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         assert_eq!(round.volume, 0.35);
+    }
+
+    fn fresh_base() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "aes_migrate_test_{}_{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    /// Rebrand migration: AES_Rustified -> AES_Oxide renames the whole
+    /// tree (contents survive), pending flips off, and it's skipped
+    /// entirely once the new root exists.
+    #[test]
+    fn legacy_migration_renames_data_root() {
+        let base = fresh_base();
+        let old = base.join("AES_Rustified");
+        std::fs::create_dir_all(old.join("Settings")).unwrap();
+        std::fs::write(old.join("Settings/Settings.json"), "{}").unwrap();
+
+        assert!(legacy_pending_at(&base));
+        migrate_at(&base).unwrap();
+
+        assert!(base.join(APP_DIR).join("Settings/Settings.json").exists());
+        assert!(!old.exists());
+        assert!(!legacy_pending_at(&base));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// No migration when only the new root exists or when both do
+    /// (a previously-migrated or post-"start fresh" state).
+    #[test]
+    fn legacy_pending_requires_old_without_new() {
+        let base = fresh_base();
+        assert!(!legacy_pending_at(&base));
+
+        std::fs::create_dir_all(base.join(APP_DIR)).unwrap();
+        assert!(!legacy_pending_at(&base));
+
+        std::fs::create_dir_all(base.join("AES_Rustified")).unwrap();
+        assert!(!legacy_pending_at(&base));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

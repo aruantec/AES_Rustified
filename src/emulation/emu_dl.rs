@@ -46,7 +46,7 @@ const EDEN_RELEASES_API: &str =
     "https://git.eden-emu.dev/api/v1/repos/eden-emu/eden/releases?limit=20";
 const GAME_PATCHES_URL: &str =
     "https://github.com/xenia-canary/game-patches/releases/download/latest/game-patches.7z";
-const USER_AGENT: &str = "AES_Rustified-XeniaUpdater/1.0";
+const USER_AGENT: &str = "AES_Oxide-XeniaUpdater/1.0";
 /// Same agent string, exposed for the RPCS3 patch downloader.
 pub(crate) const USER_AGENT_PUBLIC: &str = USER_AGENT;
 const XENIA_VERSION_MARKER: &str = "xenia_version.txt";

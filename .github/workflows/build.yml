@@ -48,6 +48,12 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Package Windows zip
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/AES-Oxide.exe -DestinationPath AES-Oxide-windows-x64.zip
+
       - name: Package AppImage
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -57,25 +63,25 @@ jobs:
           export APPIMAGE_EXTRACT_AND_RUN=1
           # linuxdeploy deploys the icon under its own basename — it
           # must match the desktop file's Icon= entry.
-          cp assets/AES.png aes-rustified.png
+          cp assets/AES.png aes-oxide.png
           ./linuxdeploy.AppImage \
             --appdir AppDir \
-            --executable target/release/AES-Rustified \
-            --desktop-file packaging/aes-rustified.desktop \
-            --icon-file aes-rustified.png \
+            --executable target/release/AES-Oxide \
+            --desktop-file packaging/aes-oxide.desktop \
+            --icon-file aes-oxide.png \
             --output appimage
-          mv ./*-x86_64.AppImage AES-Rustified-x86_64.AppImage
+          mv ./*-x86_64.AppImage AES-Oxide-Linux-x86_64.AppImage
 
-      - name: Upload Windows binary
+      - name: Upload Windows zip
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v6
         with:
-          name: AES-Rustified-windows
-          path: target/release/AES-Rustified.exe
+          name: AES-Oxide-windows-x64
+          path: AES-Oxide-windows-x64.zip
 
       - name: Upload Linux AppImage
         if: matrix.os == 'ubuntu-24.04'
         uses: actions/upload-artifact@v6
         with:
-          name: AES-Rustified-linux
-          path: AES-Rustified-x86_64.AppImage
+          name: AES-Oxide-Linux-x86_64
+          path: AES-Oxide-Linux-x86_64.AppImage

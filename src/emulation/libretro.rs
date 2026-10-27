@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 const INFO_BUNDLE_URL: &str = "https://buildbot.libretro.com/assets/frontend/info.zip";
 const CORE_DOWNLOAD_ROOT: &str = "https://buildbot.libretro.com/nightly";
-const USER_AGENT: &str = "AES_Rustified-Libretro/1.0";
+const USER_AGENT: &str = "AES_Oxide-Libretro/1.0";
 
 /// A RetroArch-backed section with its own Libretro core set —
 /// `Emulators/<dir>/Libretro` holds `cores/`, `info/` and the

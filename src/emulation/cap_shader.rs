@@ -360,7 +360,7 @@ impl CaptureShader {
         });
 
         // Shader list: embedded set plus any .glsl files dropped into
-        // %LOCALAPPDATA%/AES_Rustified/Shaders/glsl (disk wins on a
+        // %LOCALAPPDATA%/AES_Oxide/Shaders/glsl (disk wins on a
         // name clash). Missing embedded shaders are seeded there so
         // the set is editable in place, same as the shadertoys.
         let mut order: Vec<String> = EMBEDDED.iter().map(|(n, _)| n.to_string()).collect();
@@ -906,12 +906,12 @@ fn translate(src: &str) -> Option<String> {
     naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::EXPLICIT_TYPES).ok()
 }
 
-/// `%LOCALAPPDATA%\AES_Rustified\Shaders\glsl` — the disk-scanned
+/// `%LOCALAPPDATA%\AES_Oxide\Shaders\glsl` — the disk-scanned
 /// shader dir, matching Lacrima's `ApplicationPaths.ShadersDirectory`
 /// layout (`Shaders/glsl` is the runtime-usable set on Windows too —
 /// the HLSL twins only matter for the D3D compositor we don't have).
 fn shaders_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("AES_Rustified").join("Shaders").join("glsl"))
+    dirs::data_local_dir().map(|d| d.join("AES_Oxide").join("Shaders").join("glsl"))
 }
 
 /// Seed the disk dir with the embedded collection where missing

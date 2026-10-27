@@ -100,13 +100,13 @@ Text fields capture their own keys while focused — no shortcuts fire while typ
 ## Build
 
 - Compile: `cargo build --release`
-- Binary: `target/release/AES-Rustified.exe`
+- Binary: `target/release/AES-Oxide.exe`
 
 Optional: **yt-dlp** for online media — manage it from *Settings → Libraries* and the app
-downloads it into `%LOCALAPPDATA%\AES_Rustified\Tools` automatically (no PATH needed).
+downloads it into `%LOCALAPPDATA%\AES_Oxide\Tools` automatically (no PATH needed).
 
 App data (settings, metadata/cover caches, stream cache, tools) lives under
-`%LOCALAPPDATA%\AES_Rustified`.
+`%LOCALAPPDATA%\AES_Oxide`.
 
 ## Disclaimer
 

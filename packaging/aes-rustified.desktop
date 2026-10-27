@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=AES Rustified
-Exec=AES-Rustified
-Icon=aes-rustified
-Categories=AudioVideo;Audio;Utility;
-Terminal=false
-StartupWMClass=aes-rustified

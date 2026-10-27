@@ -525,7 +525,7 @@ impl Shadertoy {
         ));
 
         // Shader list: embedded set plus any .frag files dropped into
-        // %LOCALAPPDATA%/AES_Rustified/Shaders/Shadertoys (disk wins on
+        // %LOCALAPPDATA%/AES_Oxide/Shaders/Shadertoys (disk wins on
         // a name clash). Missing embedded shaders are seeded there so
         // the set is editable in place.
         let mut order: Vec<String> = EMBEDDED.iter().map(|(n, _)| n.to_string()).collect();
@@ -1195,12 +1195,12 @@ impl egui_wgpu::CallbackTrait for ShadertoyCallback {
     }
 }
 
-/// `%LOCALAPPDATA%\AES_Rustified\Shaders\Shadertoys` — the disk-scanned
+/// `%LOCALAPPDATA%\AES_Oxide\Shaders\Shadertoys` — the disk-scanned
 /// shader directory, next to the settings folder (was `<exe>/Shaders/
 /// Shadertoys`, matching Lacrima's ApplicationPaths.ShadersDirectory).
 fn shaders_dir() -> Option<PathBuf> {
     dirs::data_local_dir()
-        .map(|d| d.join("AES_Rustified").join("Shaders").join("Shadertoys"))
+        .map(|d| d.join("AES_Oxide").join("Shaders").join("Shadertoys"))
 }
 
 /// First line of an app-seeded copy: `// aes-seed:<fnv1a64 of the

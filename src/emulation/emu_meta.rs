@@ -3620,7 +3620,7 @@ fn github_tree(agent: &ureq::Agent, repo: &str, sha: &str) -> Option<Vec<(String
     let url = format!("https://api.github.com/repos/libretro-thumbnails/{repo}/git/trees/{sha}");
     let mut resp = agent
         .get(&url)
-        .header("User-Agent", "AES_Rustified")
+        .header("User-Agent", "AES_Oxide")
         .header("Accept", "application/vnd.github+json")
         .call()
         .ok()?;

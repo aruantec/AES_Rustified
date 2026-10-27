@@ -15,8 +15,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "AES Oxide"
             VALUE "FileVersion", "0.1.0"
-            VALUE "InternalName", "AES-Rustified"
-            VALUE "OriginalFilename", "AES-Rustified.exe"
+            VALUE "InternalName", "AES-Oxide"
+            VALUE "OriginalFilename", "AES-Oxide.exe"
             VALUE "ProductName", "AES Oxide"
             VALUE "ProductVersion", "0.1.0"
         END

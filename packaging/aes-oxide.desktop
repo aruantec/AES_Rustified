@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AES Oxide
+Exec=AES-Oxide
+Icon=aes-oxide
+Categories=AudioVideo;Audio;Utility;
+Terminal=false
+StartupWMClass=aes-oxide

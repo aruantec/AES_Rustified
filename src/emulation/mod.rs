@@ -597,7 +597,7 @@ pub struct EmuView {
     crop_target: f32,
     crop_prog: f32,
     /// Debug: records the capture rect trajectory while the strip
-    /// slide or fs tween runs → %LOCALAPPDATA%\AES_Rustified\motion.log
+    /// slide or fs tween runs → %LOCALAPPDATA%\AES_Oxide\motion.log
     motion_log: Option<std::fs::File>,
     motion_t0: std::time::Instant,
     /// CapturePresentationOpacity — eased 0..1 fade of the opaque

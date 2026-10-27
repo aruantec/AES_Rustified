@@ -71,7 +71,7 @@ fn cache_id(path: &Path) -> u64 {
 fn cache_path(path: &Path) -> Option<PathBuf> {
     Some(
         dirs::data_local_dir()?
-            .join("AES_Rustified")
+            .join("AES_Oxide")
             .join("Cache")
             .join("Waveform")
             .join(format!("{:016x}_{}.json", cache_id(path), BUCKETS)),

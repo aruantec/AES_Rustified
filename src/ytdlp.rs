@@ -2,7 +2,7 @@
 //! `YtDlpManager` and `YtDlpMetadata`.
 //!
 //! The binary lives in the per-user tools dir
-//! (`%LOCALAPPDATA%\AES_Rustified\Tools\yt-dlp.exe`) and is resolved
+//! (`%LOCALAPPDATA%\AES_Oxide\Tools\yt-dlp.exe`) and is resolved
 //! from there first, PATH second — Lacrima's `FindLocalExecutable`
 //! order. Install/update download the latest GitHub release
 //! (`yt-dlp_win.zip` preferred, plain `yt-dlp.exe` fallback), update
@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 
-const APP_DIR: &str = "AES_Rustified";
+const APP_DIR: &str = "AES_Oxide";
 const REPO: &str = "yt-dlp/yt-dlp";
-const USER_AGENT: &str = "Mozilla/5.0 (Compatible; YtDlpDownloader; AES_Rustified)";
+const USER_AGENT: &str = "Mozilla/5.0 (Compatible; YtDlpDownloader; AES_Oxide)";
 /// GitHub latest-version results stay fresh for this long (Lacrima's
 /// 15-minute cache window).
 const CACHE_TTL_SECS: u64 = 15 * 60;

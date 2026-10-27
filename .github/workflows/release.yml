@@ -1,0 +1,126 @@
+name: Release
+
+# Push a `v*` tag to cut a release — `git tag v0.2.0 && git push
+# origin v0.2.0` — or run it manually with a tag input. Assets:
+# AES-Oxide-windows-x64.zip and AES-Oxide-Linux-x86_64.AppImage.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. v0.2.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_REF: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}
+
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get install -y --no-install-recommends \
+            build-essential pkg-config libclang-dev \
+            libasound2-dev libudev-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libgbm-dev libdrm-dev \
+            libseat-dev libinput-dev libpixman-1-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-xkb-dev
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package Windows zip
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/AES-Oxide.exe -DestinationPath AES-Oxide-windows-x64.zip
+
+      - name: Package Linux AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          curl -sSfL -o linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy.AppImage
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          # linuxdeploy deploys the icon under its own basename — it
+          # must match the desktop file's Icon= entry.
+          cp assets/AES.png aes-oxide.png
+          ./linuxdeploy.AppImage \
+            --appdir AppDir \
+            --executable target/release/AES-Oxide \
+            --desktop-file packaging/aes-oxide.desktop \
+            --icon-file aes-oxide.png \
+            --output appimage
+          mv ./*-x86_64.AppImage AES-Oxide-Linux-x86_64.AppImage
+
+      - name: Upload Windows zip
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-x64
+          path: AES-Oxide-windows-x64.zip
+          retention-days: 5
+
+      - name: Upload Linux AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64
+          path: AES-Oxide-Linux-x86_64.AppImage
+          retention-days: 5
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.RELEASE_REF }}
+        run: |
+          PRE=""
+          if [[ "$TAG" == *-* ]]; then PRE="--prerelease"; fi
+          gh release create "$TAG" dist/* \
+            --title "AES Oxide $TAG" \
+            --generate-notes \
+            $PRE || \
+          gh release upload "$TAG" dist/* --clobber
