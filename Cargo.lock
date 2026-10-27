@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "aes_rustified"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "calloop 0.14.5",

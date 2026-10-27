@@ -52,6 +52,17 @@ jobs:
         with:
           ref: ${{ steps.resolve.outputs.sha }}
 
+      # The tag is the single version input — stamp it into the
+      # package so CARGO_PKG_VERSION (footer + updater) reports the
+      # release being built. Cargo.lock gets the same edit: the
+      # --locked build rejects a stale root-version entry.
+      - name: Stamp version from tag
+        shell: bash
+        run: |
+          VER="${RELEASE_TAG#v}"
+          sed -i "0,/^version = .*/s//version = \"$VER\"/" Cargo.toml
+          sed -i "/name = \"aes_rustified\"/{n;s/^version = .*/version = \"$VER\"/}" Cargo.lock
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
