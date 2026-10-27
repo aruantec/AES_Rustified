@@ -867,6 +867,12 @@ struct AesRustApp {
     /// Lacrima's ResolveMediaSourceAsync -> PlayFile hop. Carries the
     /// item path so stale results (user clicked away meanwhile) drop.
     resolve_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, Result<String, String>)>>,
+    /// load_gen latched when an end-of-track advance fires — the end
+    /// check must not re-evaluate until the next source has actually
+    /// applied (its run_decoder bumps the generation), otherwise a
+    /// stale Finished latch or an early end_hit on the old source
+    /// fires a SECOND advance and skips a track.
+    end_armed_gen: Option<u64>,
     /// Expanded playlist member urls arriving from the page scrape.
     playlist_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     /// Online metadata for freshly added url items (pairs with path).
@@ -1978,6 +1984,7 @@ impl AesRustApp {
             ytdlp: ytdlp::YtDlp::new(),
             url_prompt: url_prompt::UrlPrompt::new(),
             resolve_rx: None,
+            end_armed_gen: None,
             playlist_rx: None,
             url_info_rx: None,
             dur_loader: library::DurLoader::new(),
@@ -2105,7 +2112,12 @@ impl AesRustApp {
                         // video's cache instead of their own.
                         let key = ytdlp::clean_video_link(&path.to_string_lossy());
                         if let Some(p) = self.player.as_ref() {
-                            let _ = p.open_stream(&stream, &key);
+                            // A dead decode thread reports Err — drop
+                            // the bricked player so the next play
+                            // lazily recreates a working one.
+                            if p.open_stream(&stream, &key).is_err() {
+                                self.player = None;
+                            }
                         }
                         // Stream waveform: read-only consumer of that
                         // same cache — no second download; buckets fill
@@ -2114,6 +2126,12 @@ impl AesRustApp {
                         if let Some(c) = self.waveform_cancel.take() {
                             c.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
+                        // The outgoing waveform stayed up through the
+                        // resolve — swap to the spinner only now that
+                        // the new stream is actually starting.
+                        self.waveform.clear();
+                        self.waveform_shown.clear();
+                        self.waveform_loading = true;
                         let cancel =
                             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         self.waveform_rx = Some(audio::waveform::spawn_stream(
@@ -2147,7 +2165,21 @@ impl AesRustApp {
             if let (Some(p), Some(cur)) =
                 (self.player.as_ref(), self.playing_track.as_ref())
             {
-                let mut end_hit = p.state() == audio::PlayerState::Finished;
+                // An advance already fired — suppress evaluation until
+                // the replacement source actually applies (load_gen
+                // bumps in run_decoder). This kills the double-skip:
+                // a stale Finished latch or an end_hit computed on the
+                // dying source would otherwise advance a second time.
+                let suppressed = end_eval_suppressed(self.end_armed_gen, p.load_gen());
+                if !suppressed {
+                    self.end_armed_gen = None;
+                }
+                // A failed source (unprobeable stream, dead URL)
+                // advances exactly like a natural end — otherwise a
+                // dead open leaves a stuck Stopped with a live
+                // playing_track.
+                let mut end_hit = !suppressed
+                    && (p.state() == audio::PlayerState::Finished || p.failed());
                 // Lacrima's OnTimeChangedForSilence: once the
                 // position enters the waveform-measured
                 // trailing-silence region, wait
@@ -2155,6 +2187,7 @@ impl AesRustApp {
                 // early. Repeat-One is exempt — its loop
                 // replays the tail instead of advancing.
                 if !end_hit
+                    && !suppressed
                     && self.trailing_silence_s > 0.0
                     && self.transport.repeat != transport::RepeatMode::One
                     && p.state() == audio::PlayerState::Playing
@@ -2186,6 +2219,9 @@ impl AesRustApp {
                         // truly stopped.
                         EndAdvance::Stop => p.stop(),
                     }
+                    // Latch this generation — no further end eval
+                    // until the replacement source applies.
+                    self.end_armed_gen = Some(p.load_gen());
                 }
             }
             // A finished player with no current item can never
@@ -2321,15 +2357,12 @@ impl AesRustApp {
             if let Some(c) = self.waveform_cancel.take() {
                 c.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            self.waveform.clear();
-            self.waveform_shown.clear();
+            // Keep the outgoing waveform on screen until the new
+            // stream resolves and actually starts — clearing here
+            // leaves an empty row for the whole resolve+preroll gap.
+            self.waveform_rx = None;
             self.trailing_silence_s = 0.0;
             self.silence_entered = None;
-            // Spinner until the stream url resolves and the
-            // decoder is actually running (the waveform row
-            // has no local file to generate from).
-            self.waveform_loading = true;
-            self.waveform_rx = None;
         } else {
             let img = library::decode_cover(&library::CoverSrc::Tag(track.clone()));
             // The palette is staged until playback is audible — the
@@ -2364,7 +2397,11 @@ impl AesRustApp {
                 }
             }
             if let Some(p) = self.player.as_ref() {
-                let _ = p.open(&track);
+                // Dead decode thread — recycle so the next play
+                // lazily creates a working player.
+                if p.open(&track).is_err() {
+                    self.player = None;
+                }
             }
             self.playing_track = Some(track.clone());
             if let Some(c) = self.waveform_cancel.take() {
@@ -2498,6 +2535,14 @@ fn is_audio_mime(url: &str) -> bool {
 /// item before a single resolve could finish.
 fn end_check_open(resolve_pending: bool, queued: bool) -> bool {
     !resolve_pending && !queued
+}
+
+/// After an end-of-track advance fired, suppress re-evaluation until
+/// the replacement source actually applies (load_gen bumps inside
+/// run_decoder). A stale Finished latch or an end_hit computed on the
+/// dying source otherwise fires a SECOND advance — the double-skip.
+fn end_eval_suppressed(armed: Option<u64>, load_gen: u64) -> bool {
+    armed.is_some_and(|g| g == load_gen)
 }
 
 /// Whether playback still has work that can only progress inside
@@ -10552,6 +10597,17 @@ mod tests {
         assert!(!end_check_open(true, false));
         assert!(!end_check_open(false, true));
         assert!(!end_check_open(true, true));
+    }
+
+    /// After an advance fires, end evaluation stays suppressed while
+    /// load_gen sits at the armed value (old source still applied),
+    /// and re-opens the moment a NEW source bumps the generation —
+    /// the double-skip guard.
+    #[test]
+    fn end_eval_suppressed_until_new_source_applies() {
+        assert!(!end_eval_suppressed(None, 0));
+        assert!(end_eval_suppressed(Some(7), 7));
+        assert!(!end_eval_suppressed(Some(7), 8));
     }
 
     /// The keepalive is what keeps logic() ticking while nothing else

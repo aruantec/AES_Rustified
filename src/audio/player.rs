@@ -118,6 +118,17 @@ struct Shared {
     /// at ~realtime — starting playback on an empty ring means it can
     /// never get ahead and crackles on every jitter).
     buffering: AtomicBool,
+    /// Queued-command generation — open/stop bump it before sending;
+    /// an HttpSource captures it at open and a read blocked on the
+    /// stream condvar bails when it advanced since (a queued Load
+    /// preempts the stall watchdog). Generations avoid the arm/disarm
+    /// race a bool had: a Load armed before this source's open must
+    /// NOT kill it — only commands queued later count.
+    /// Set when a source open/decode genuinely failed (never by a
+    /// user Stop) — the UI's end-of-track check advances to the next
+    /// item on it, same as a Finished edge.
+    failed: AtomicBool,
+    interrupt: std::sync::Arc<AtomicU64>,
     /// Bumped by the decoder on track change/seek; the output callback
     /// clears the PCM ring when it sees a new value.
     flush_seq: AtomicU64,
@@ -214,6 +225,8 @@ impl AudioPlayer {
             band_db: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())),
             seek: Mutex::new(None),
             buffering: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            interrupt: std::sync::Arc::new(AtomicU64::new(0)),
             flush_seq: AtomicU64::new(0),
             load_gen: AtomicU64::new(0),
             pos_base: AtomicU64::new(0),
@@ -379,13 +392,29 @@ impl AudioPlayer {
     /// Open a file and start playing it.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<()> {
         self.shared.eof.store(false, Ordering::Relaxed);
+        self.shared.failed.store(false, Ordering::Relaxed);
         *self.shared.seek.lock().unwrap() = None;
         self.shared.buffering.store(false, Ordering::Relaxed);
         // The new source's ReplayGain is computed by the decode thread;
         // clear the previous track's adjustment so it never leaks in.
         self.shared.rg_db.store(0f32.to_bits(), Ordering::Relaxed);
         self.shared.state.store(STATE_PLAY, Ordering::Relaxed);
-        self.tx.send(Cmd::Load(Source::File(path.as_ref().to_path_buf())))?;
+        // Bump the read generation so a blocked stream read bails and
+        // the queued Load is picked up promptly.
+        let g = self.shared.interrupt.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::boot_mark(&format!("cmd-arm: open gen={g}"));
+        if self
+            .tx
+            .send(Cmd::Load(Source::File(path.as_ref().to_path_buf())))
+            .is_err()
+        {
+            // A dead decode thread drops the receiver — report the
+            // failure and leave a readable Stopped so the caller can
+            // recycle the player instead of showing Playing forever.
+            self.shared.failed.store(true, Ordering::Relaxed);
+            self.shared.state.store(STATE_STOP, Ordering::Relaxed);
+            return Err("decode thread is gone".into());
+        }
         Ok(())
     }
 
@@ -396,14 +425,30 @@ impl AudioPlayer {
     /// window.
     pub fn open_stream(&self, url: &str, key: &str) -> Result<()> {
         self.shared.eof.store(false, Ordering::Relaxed);
+        self.shared.failed.store(false, Ordering::Relaxed);
         *self.shared.seek.lock().unwrap() = None;
         self.shared.buffering.store(true, Ordering::Relaxed);
         self.shared.rg_db.store(0f32.to_bits(), Ordering::Relaxed);
         self.shared.state.store(STATE_PLAY, Ordering::Relaxed);
-        self.tx.send(Cmd::Load(Source::Stream {
-            url: url.to_string(),
-            key: key.to_string(),
-        }))?;
+        // Bump the read generation so a blocked stream read bails and
+        // the queued Load is picked up promptly.
+        let g = self.shared.interrupt.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::boot_mark(&format!("cmd-arm: open_stream gen={g}"));
+        if self
+            .tx
+            .send(Cmd::Load(Source::Stream {
+                url: url.to_string(),
+                key: key.to_string(),
+            }))
+            .is_err()
+        {
+            // Dead decode thread — unlatch the preroll gate too so the
+            // output isn't stuck muted on a forever-buffering state.
+            self.shared.buffering.store(false, Ordering::Relaxed);
+            self.shared.failed.store(true, Ordering::Relaxed);
+            self.shared.state.store(STATE_STOP, Ordering::Relaxed);
+            return Err("decode thread is gone".into());
+        }
         Ok(())
     }
 
@@ -461,6 +506,8 @@ impl AudioPlayer {
             .store(0f64.to_bits(), Ordering::Relaxed);
         self.shared.paused_zero_vol.store(false, Ordering::Relaxed);
         self.shared.rg_db.store(0f32.to_bits(), Ordering::Relaxed);
+        let g = self.shared.interrupt.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::boot_mark(&format!("cmd-arm: stop gen={g}"));
         let _ = self.tx.send(Cmd::Stop);
     }
 
@@ -492,6 +539,12 @@ impl AudioPlayer {
     /// later tells callers the load actually applied (a failed probe
     /// never bumps it). Acquire so the position reset that precedes
     /// the bump is visible with it.
+    /// Whether the last source failed to open/decode (drives the
+    /// end-check's skip-to-next on stream failures).
+    pub fn failed(&self) -> bool {
+        self.shared.failed.load(Ordering::Relaxed)
+    }
+
     pub fn load_gen(&self) -> u64 {
         self.shared.load_gen.load(Ordering::Acquire)
     }
@@ -628,7 +681,21 @@ fn decode_thread(
         }
         let src = pending.take().unwrap();
         last = Some(src.clone());
-        match decode_source(src, &rx, &shared, &mut prod, out_rate) {
+        // A panic inside a decode (malformed stream, symphonia edge,
+        // poisoned cache lock) must not kill this thread — a dead
+        // receiver bricks every later open()/open_stream() for the
+        // app's lifetime.
+        let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_source(src, &rx, &shared, &mut prod, out_rate)
+        }))
+        .unwrap_or(DecodeEnd::Stopped);
+        crate::boot_mark(match &end {
+            DecodeEnd::Eof => "decode-end: eof",
+            DecodeEnd::Stopped => "decode-end: stopped",
+            DecodeEnd::Reload(_) => "decode-end: reload",
+            DecodeEnd::Quit => "decode-end: quit",
+        });
+        match end {
             DecodeEnd::Eof => {
                 // A stream shorter than the preroll still plays what
                 // arrived — ungate the output.
@@ -669,7 +736,16 @@ fn decode_source(
 ) -> DecodeEnd {
     match run_decoder(src, rx, shared, prod, out_rate) {
         Ok(end) => end,
-        Err(_) => DecodeEnd::Stopped,
+        Err(_) => {
+            // A real open/decode failure (never a user Stop) — the
+            // UI advances to the next item on this flag. The failed
+            // attempt still CONSUMES a generation: the end-check's
+            // advance suppression is armed on load_gen and must
+            // release even when the source never reached decode.
+            shared.failed.store(true, Ordering::Relaxed);
+            shared.load_gen.fetch_add(1, Ordering::Release);
+            DecodeEnd::Stopped
+        }
     }
 }
 
@@ -689,15 +765,23 @@ fn run_decoder(
     };
     let media: Box<dyn MediaSource> = match src {
         Source::File(path) => patch_media(Box::new(std::fs::File::open(path)?)),
-        Source::Stream { url, key } => http_source(&url, &key, true)?,
+        Source::Stream { url, key } => {
+            http_source(&url, &key, true, Some(shared.interrupt.clone()))?
+        }
     };
     let mss = MediaSourceStream::new(media, Default::default());
-    let mut format = get_probe().probe(
+    let mut format = match get_probe().probe(
         &Hint::new(),
         mss,
         FormatOptions::default(),
         MetadataOptions::default(),
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::boot_mark(&format!("probe-err: {e}"));
+            return Err("probe".into());
+        }
+    };
     let track = format
         .tracks()
         .iter()
@@ -709,7 +793,11 @@ fn run_decoder(
                     a.codec != CODEC_ID_NULL_AUDIO && a.sample_rate.is_some()
                 })
         })
-        .ok_or("no audio track")?;
+        .ok_or("no audio track")
+        .map_err(|e| {
+            crate::boot_mark("no-audio-track");
+            e
+        })?;
     let params = track
         .codec_params
         .as_ref()
@@ -726,13 +814,24 @@ fn run_decoder(
     shared.pos_consumed.store(0, Ordering::Relaxed);
     shared.eof.store(false, Ordering::Relaxed);
     shared.flush_seq.fetch_add(1, Ordering::Relaxed);
-    // Release-ordered AFTER the position reset: an Acquire reader
-    // that sees the new generation also sees the zeroed position —
-    // never "new source applied, old track's position".
+    // The source applied — clear the failure latch (a Cmd::Seek
+    // replay never passes through open() where it is otherwise
+    // cleared), then release the generation AFTER the position
+    // reset: an Acquire reader that sees the new generation also
+    // sees the zeroed position — never "new source applied, old
+    // track's position".
+    shared.failed.store(false, Ordering::Relaxed);
     shared.load_gen.fetch_add(1, Ordering::Release);
 
-    let mut decoder =
-        get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default())?;
+    let mut decoder = match get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+    {
+        Ok(d) => d,
+        Err(e) => {
+            crate::boot_mark(&format!("decoder-err: {e}"));
+            return Err("decoder".into());
+        }
+    };
     let mut resampler = Resampler::new(src_rate, out_rate);
     let mut rg = RgTrack::new();
     let mut denoiser = Denoiser::new();
@@ -1183,6 +1282,12 @@ struct HttpSource {
     /// — a read-only consumer reports EOF rather than hang forever.
     last_covered: u64,
     progress_at: std::time::Instant,
+    /// Player-side command generation + the value seen at open —
+    /// reads bail when it advanced since this source was created (a
+    /// newer Load/Stop was queued). The generation form is immune to
+    /// the bool's arm/disarm ordering race.
+    interrupt: Option<std::sync::Arc<AtomicU64>>,
+    seen_gen: u64,
 }
 
 /// A boxed HTTP source for off-band decoding — the waveform worker
@@ -1192,8 +1297,9 @@ pub(crate) fn http_source(
     url: &str,
     key: &str,
     feeder: bool,
+    interrupt: Option<std::sync::Arc<AtomicU64>>,
 ) -> std::io::Result<Box<dyn MediaSource>> {
-    let src = HttpSource::open(url, key, feeder)?;
+    let src = HttpSource::open(url, key, feeder, interrupt)?;
     let patches = src.atom_patches();
     if patches.is_empty() {
         Ok(Box::new(src))
@@ -1502,7 +1608,19 @@ impl HttpSource {
     /// `feeder` = the playback consumer: it owns the download lanes and
     /// may restart them on misses. Non-feeders (waveform) are read-only:
     /// they consume what's cached and stop at gaps.
-    fn open(url: &str, key: &str, feeder: bool) -> std::io::Result<Self> {
+    fn open(
+        url: &str,
+        key: &str,
+        feeder: bool,
+        interrupt: Option<std::sync::Arc<AtomicU64>>,
+    ) -> std::io::Result<Self> {
+        let seen_gen = interrupt
+            .as_ref()
+            .map(|i| i.load(Ordering::Acquire))
+            .unwrap_or(0);
+        crate::boot_mark(&format!(
+            "src-open: feeder={feeder} seen_gen={seen_gen}"
+        ));
         let cache = stream_cache::cache_for(key);
         let mut src = Self {
             url: url.to_string(),
@@ -1516,11 +1634,19 @@ impl HttpSource {
                 .then(|| std::time::Instant::now() + std::time::Duration::from_secs(15)),
             last_covered: 0,
             progress_at: std::time::Instant::now(),
+            interrupt,
+            seen_gen,
         };
         if feeder {
             // Headers give us the total length + format signature for
             // cache validation; the feed then starts at the read pos.
-            let len = Self::head_len(url)?;
+            let len = match Self::head_len(url) {
+                Ok(l) => l,
+                Err(e) => {
+                    crate::boot_mark(&format!("head_len-err: {e}"));
+                    return Err(e);
+                }
+            };
             src.cache.ensure_format(len, &stream_cache::format_sig(url));
             src.start_feed(0);
         } else {
@@ -1574,12 +1700,34 @@ impl HttpSource {
     /// answers Content-Range without paying for a second connection —
     /// lane 0 opens the real download right after).
     fn head_len(url: &str) -> std::io::Result<Option<u64>> {
-        let resp = http_agent()
-            .get(url)
-            .header("Range", "bytes=0-0")
-            .header("User-Agent", HTTP_UA)
-            .call()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        // googlevideo intermittently answers the FIRST request on a
+        // freshly resolved url with 403 (edge bot-check/propagation)
+        // but serves the retry moments later — a single-shot failure
+        // here killed every cold-cache stream open ("loads but never
+        // plays until a seek re-opens on the warmed edge").
+        let mut last = std::io::Error::new(std::io::ErrorKind::Other, "head_len");
+        let mut resp = None;
+        for attempt in 0..6 {
+            match http_agent()
+                .get(url)
+                .header("Range", "bytes=0-0")
+                .header("User-Agent", HTTP_UA)
+                .call()
+            {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    last = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    // A cold googlevideo edge can 403 for a few
+                    // seconds on a fresh resolve — back off
+                    // progressively, capped at ~1.5s per wait.
+                    std::thread::sleep(Duration::from_millis(300 << attempt.min(3)));
+                }
+            }
+        }
+        let resp = resp.ok_or(last)?;
         let len = resp
             .headers()
             .get("content-range")
@@ -1630,6 +1778,22 @@ impl std::io::Read for HttpSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         const MAX_FAILS: u32 = 4;
         loop {
+            // A Load/Stop queued AFTER this source was created bumps
+            // the generation — report EOF so the decoder's command
+            // poll picks it up promptly.
+            if self
+                .interrupt
+                .as_ref()
+                .is_some_and(|i| i.load(Ordering::Relaxed) != self.seen_gen)
+            {
+                crate::boot_mark(&format!(
+                    "read-bail: pos={} seen={} cur={}",
+                    self.pos,
+                    self.seen_gen,
+                    self.interrupt.as_ref().map(|i| i.load(Ordering::Relaxed)).unwrap_or(0)
+                ));
+                return Ok(0);
+            }
             let mut inner = self.cache.inner();
             if let Some(n) = inner.covered_read(self.pos, buf) {
                 self.pos += n as u64;
@@ -1811,7 +1975,7 @@ mod tests {
         } else {
             let url = std::env::var("AES_TEST_URL").expect("AES_TEST_URL");
             let key = std::env::var("AES_TEST_KEY").unwrap_or_else(|_| url.clone());
-            http_source(&url, &key, true).expect("http_source")
+            http_source(&url, &key, true, None).expect("http_source")
         };
         let mss = MediaSourceStream::new(media, Default::default());
         let mut format = get_probe()
@@ -1877,6 +2041,8 @@ mod tests {
             live_grace: None,
             last_covered: 0,
             progress_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            interrupt: None,
+            seen_gen: 0,
         };
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1891,4 +2057,119 @@ mod tests {
             .expect("feeder read hung on a stalled live feed");
         assert!(matches!(res, Ok(0) | Err(_)), "unexpected: {res:?}");
     }
+    /// A dead decode thread drops the receiver — open_stream must
+    /// report it and leave a readable Stopped instead of latching the
+    /// preroll mute forever (the "second stream never loads" wedge).
+    #[test]
+    fn dead_decoder_reports_and_unlatches() {
+        let Some(p) = AudioPlayer::new().ok() else {
+            return; // no audio device in this CI env — nothing to test
+        };
+        let _ = p.tx.send(Cmd::Quit);
+        let mut dead = false;
+        for _ in 0..200 {
+            if p.open_stream("http://127.0.0.1:9/nope", "k").is_err() {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dead, "decode receiver never dropped");
+        assert_eq!(p.state(), PlayerState::Stopped);
+        assert!(!p.buffering());
+        assert!(p.failed(), "a dead thread must mark the open failed");
+    }
+    /// An armed interrupt must bail a parked stream read instantly —
+    /// a queued Load/Stop must not wait out the stall watchdog (the
+    /// "next stream loads but never plays" wedge).
+    #[test]
+    fn interrupt_flag_bails_parked_stream_read() {
+        let key = format!("interrupt-test-{}", std::process::id());
+        let cache = stream_cache::cache_for(&key);
+        // Registered live, never producing — the parked state.
+        cache.live_begin(stream_cache::next_live_id(), 0, FEED_LANES);
+        // Generation 1 vs this source's captured 0 — a newer command
+        // was queued after its open.
+        let flag = std::sync::Arc::new(AtomicU64::new(1));
+        let mut src = HttpSource {
+            url: "http://127.0.0.1:1/unreachable".to_string(),
+            pos: 0,
+            cache: cache.clone(),
+            feed: None,
+            feeder: true,
+            fails: 0,
+            saw_live: true,
+            live_grace: None,
+            last_covered: 0,
+            progress_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            interrupt: Some(flag),
+            seen_gen: 0,
+        };
+        let mut buf = [0u8; 64];
+        let res = std::io::Read::read(&mut src, &mut buf);
+        assert!(matches!(res, Ok(0)), "interrupt must report EOF: {res:?}");
+    }
+    /// googlevideo answers the first ranged GET on a fresh resolve
+    /// with a transient 403 — head_len must retry rather than kill
+    /// the whole stream open (the "loads but never plays" bug).
+    #[test]
+    fn head_len_retries_transient_403() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, conn) in listener.incoming().enumerate().take(2) {
+                let mut c = conn.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = c.read(&mut buf);
+                let res: &[u8] = if i == 0 {
+                    b"HTTP/1.1 403 Forbidden
+Content-Length: 0
+
+"
+                } else {
+                    b"HTTP/1.1 206 Partial Content
+Content-Range: bytes 0-0/12345
+Content-Length: 1
+
+x"
+                };
+                let _ = c.write_all(res);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/x");
+        let len = HttpSource::head_len(&url).unwrap();
+        assert_eq!(len, Some(12345));
+    }
+    /// A source that fails to open still consumes a load generation —
+    /// the end-check's advance suppression is armed on load_gen and
+    /// would otherwise stay latched forever, masking the failure
+    /// ("ends, queues the next stream, plays nothing").
+    #[test]
+    fn failed_open_consumes_load_gen() {
+        let Some(p) = AudioPlayer::new().ok() else {
+            return; // no audio device in this CI env — nothing to test
+        };
+        let shared = p.shared.clone();
+        let (_tx, rx) = mpsc::channel();
+        let (mut prod, _cons) = HeapRb::<f32>::new(1024).split();
+        let g0 = shared.load_gen.load(Ordering::Acquire);
+        let end = decode_source(
+            Source::File(std::path::PathBuf::from("definitely-not-a-real-file-xyz")),
+            &rx,
+            &shared,
+            &mut prod,
+            48000,
+        );
+        assert!(matches!(end, DecodeEnd::Stopped));
+        assert!(shared.failed.load(Ordering::Relaxed));
+        assert!(
+            shared.load_gen.load(Ordering::Acquire) > g0,
+            "a failed open must still move the generation"
+        );
+    }
 }
+
+
+
+

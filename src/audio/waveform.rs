@@ -248,7 +248,7 @@ pub fn spawn_stream(
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let ok = super::player::http_source(&url, &key, false)
+                let ok = super::player::http_source(&url, &key, false, None)
                     .ok()
                     .map(|s| generate(s, &cancel, &tx, &mut g))
                     .unwrap_or(false);
