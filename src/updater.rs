@@ -63,14 +63,12 @@ fn platform_asset() -> &'static str {
 }
 
 /// Semver-ish compare: `v0.2.0` > `0.1.9`; a pre-release suffix
-/// (`-rc1`) orders *before* the same bare version.
+/// (`-rc1`) orders *before* the same bare version, and suffixes
+/// order semver-ish among themselves (`rc2` < `rc10`).
 pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    fn parts(s: &str) -> (Vec<u64>, bool) {
+    fn parts(s: &str) -> (Vec<u64>, &str) {
         let s = s.trim().trim_start_matches('v');
-        let (core, pre) = match s.split_once('-') {
-            Some((c, _)) => (c, true),
-            None => (s, false),
-        };
+        let (core, pre) = s.split_once('-').unwrap_or((s, ""));
         (
             core.split('.')
                 .map(|p| p.parse::<u64>().unwrap_or(0))
@@ -87,9 +85,56 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             o => return o,
         }
     }
-    // Same numbers: release > pre-release (`false` sorts before
-    // `true`, so compare b's flag against a's).
-    bpre.cmp(&apre)
+    pre_cmp(apre, bpre)
+}
+
+/// Semver pre-release compare: digit and alpha runs compared
+/// separately (`rc2` < `rc10`, `alpha` < `beta`, numeric < alpha);
+/// `.`, `-`, `_` are separators, and an empty suffix (bare release)
+/// sorts above any pre-release.
+fn pre_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Equal,
+        (true, false) => return Greater,
+        (false, true) => return Less,
+        _ => {}
+    }
+    fn take(s: &str) -> Option<(bool, &str, &str)> {
+        let s = s.trim_start_matches(['.', '-', '_']);
+        if s.is_empty() {
+            return None;
+        }
+        let num = s.starts_with(|c: char| c.is_ascii_digit());
+        let end = s
+            .find(|c: char| c.is_ascii_digit() != num)
+            .unwrap_or(s.len());
+        Some((num, &s[..end], &s[end..]))
+    }
+    let (mut ar, mut br) = (a, b);
+    loop {
+        match (take(ar), take(br)) {
+            (None, None) => return Equal,
+            (None, Some(_)) => return Less,
+            (Some(_), None) => return Greater,
+            (Some((an, av, a_rest)), Some((bn, bv, b_rest))) => {
+                let ord = match (an, bn) {
+                    (true, true) => av
+                        .parse::<u64>()
+                        .unwrap_or(u64::MAX)
+                        .cmp(&bv.parse::<u64>().unwrap_or(u64::MAX)),
+                    (true, false) => Less,
+                    (false, true) => Greater,
+                    (false, false) => av.cmp(bv),
+                };
+                if ord != Equal {
+                    return ord;
+                }
+                ar = a_rest;
+                br = b_rest;
+            }
+        }
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -380,6 +425,11 @@ mod tests {
         // Same numbers: release beats its own rc.
         assert_eq!(version_cmp("0.2.0", "0.2.0-rc1"), Greater);
         assert_eq!(version_cmp("0.2.0-rc1", "0.2.0"), Less);
+        // Sequential rcs order; numeric runs compare numerically.
+        assert_eq!(version_cmp("0.1.1-rc2", "v0.1.1-rc1"), Greater);
+        assert_eq!(version_cmp("0.1.1-rc10", "0.1.1-rc2"), Greater);
+        assert_eq!(version_cmp("0.1.1-rc1", "0.1.1-rc2"), Less);
+        assert_eq!(version_cmp("0.1.1-beta", "0.1.1-alpha"), Greater);
     }
 
     #[test]

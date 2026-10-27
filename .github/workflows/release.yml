@@ -1,7 +1,8 @@
 name: Release
 
 # Push a `v*` tag to cut a release — `git tag v0.2.0 && git push
-# origin v0.2.0` — or run it manually with a tag input. Assets:
+# origin v0.2.0` — or run it manually with a tag input; the tag is
+# created at the built commit when it doesn't exist yet. Assets:
 # AES-Oxide-windows-x64.zip and AES-Oxide-Linux-x86_64.AppImage.
 on:
   push:
@@ -9,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to release (e.g. v0.2.0)
+        description: Tag to release — created if missing (e.g. v0.2.0)
         required: true
 
 permissions:
@@ -17,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_REF: ${{ inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -30,9 +31,22 @@ jobs:
         os: [windows-latest, ubuntu-24.04]
 
     steps:
+      # The dispatch tag may not exist yet — build the tag's commit
+      # when it does, the dispatched branch head otherwise. Tag pushes
+      # always resolve to the tagged commit via github.sha.
+      - name: Resolve build ref
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA=$(gh api "repos/${{ github.repository }}/git/ref/tags/${{ inputs.tag }}" \
+            --jq '.object.sha' 2>/dev/null || true)
+          echo "sha=${SHA:-${{ github.sha }}}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v6
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ steps.resolve.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -127,12 +141,15 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ env.RELEASE_REF }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           PRE=""
           if [[ "$TAG" == *-* ]]; then PRE="--prerelease"; fi
+          # --target pins a not-yet-existing tag to the built commit;
+          # it's ignored when the tag already exists.
           gh release create "$TAG" dist/* \
             --title "AES Oxide $TAG" \
+            --target "${{ github.sha }}" \
             --generate-notes \
             $PRE || \
           gh release upload "$TAG" dist/* --clobber
