@@ -227,16 +227,27 @@ pub(crate) fn view(
     };
     let fade = Color32::TRANSPARENT;
     let mut mesh = egui::Mesh::default();
+    // Column edges: a coarse even split for the color ramp, plus
+    // dense samples across each corner arc — an even column is wider
+    // than the radius, so its flat top would cut the arc as a chord
+    // and leave a dark lens of base fill under the frame stroke.
     const COLS: usize = 32;
-    for i in 0..COLS {
-        let x0 = header.min.x + header.width() * i as f32 / COLS as f32;
-        let x1 = header.min.x + header.width() * (i + 1) as f32 / COLS as f32;
+    const ARC_STEPS: usize = 12;
+    let mut xs: Vec<f32> = (0..=COLS)
+        .map(|i| header.min.x + header.width() * i as f32 / COLS as f32)
+        .collect();
+    for k in 1..ARC_STEPS {
+        let d = r * k as f32 / ARC_STEPS as f32;
+        xs.extend([header.min.x + d, header.max.x - d]);
+    }
+    xs.sort_by(f32::total_cmp);
+    xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    let t = |x: f32| ((x - header.min.x) / header.width().max(1.0)).clamp(0.0, 1.0);
+    for w in xs.windows(2) {
+        let (x0, x1) = (w[0], w[1]);
         let base = mesh.vertices.len() as u32;
-        mesh.colored_vertex(Pos2::new(x0, arc_top(x0)), mix(i as f32 / COLS as f32));
-        mesh.colored_vertex(
-            Pos2::new(x1, arc_top(x1)),
-            mix((i + 1) as f32 / COLS as f32),
-        );
+        mesh.colored_vertex(Pos2::new(x0, arc_top(x0)), mix(t(x0)));
+        mesh.colored_vertex(Pos2::new(x1, arc_top(x1)), mix(t(x1)));
         mesh.colored_vertex(Pos2::new(x1, header.max.y), fade);
         mesh.colored_vertex(Pos2::new(x0, header.max.y), fade);
         mesh.add_triangle(base, base + 1, base + 2);
