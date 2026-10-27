@@ -42,19 +42,31 @@ jobs:
 
       - name: Linux system dependencies
         if: runner.os == 'Linux'
-        timeout-minutes: 15
+        timeout-minutes: 30
+        # Retried: azure.archive.ubuntu.com occasionally stalls a
+        # package download mid-run — Acquire timeouts force a retry
+        # instead of the step hanging until its timeout.
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-            apt-get install -y --no-install-recommends \
-            build-essential pkg-config libclang-dev \
-            libasound2-dev libudev-dev \
-            libwayland-dev wayland-protocols \
-            libxkbcommon-dev libxkbcommon-x11-dev \
-            libegl1-mesa-dev libgles2-mesa-dev libgbm-dev libdrm-dev \
-            libseat-dev libinput-dev libpixman-1-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
-            libxcb-xfixes0-dev libxcb-xkb-dev
+          for attempt in 1 2 3; do
+            if sudo apt-get update \
+              -o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 && \
+              sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+              apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 \
+              build-essential pkg-config libclang-dev \
+              libasound2-dev libudev-dev \
+              libwayland-dev wayland-protocols \
+              libxkbcommon-dev libxkbcommon-x11-dev \
+              libegl1-mesa-dev libgles2-mesa-dev libgbm-dev libdrm-dev \
+              libseat-dev libinput-dev libpixman-1-dev \
+              libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+              libxcb-xfixes0-dev libxcb-xkb-dev; then
+              exit 0
+            fi
+            echo "::warning::apt install attempt $attempt failed — retrying in 10s"
+            sleep 10
+          done
+          exit 1
 
       - name: Test
         run: cargo test --release --locked
