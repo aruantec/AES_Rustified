@@ -168,6 +168,13 @@ pub(crate) fn view(
     // Capped at half the window height so a big zoom factor can't
     // push the rows below the bar off the bottom of a small window.
     let h = (BAR_H * s * 2.0).min(content.height() * 0.5);
+    // Text-scale floor: `h` shrinks with the UI scale factor until
+    // labels go unreadable (factor 2.3 -> h~70 -> ~8px list text).
+    // Geometry stays `h`-proportional, but text anchors to `th` —
+    // 0.12*90 = ~11px rows, the smallest still-readable size.
+    // Rows/menus derive their height from font.size, so flooring
+    // the font grows them naturally instead of clipping.
+    let text_h = h.max(90.0);
 
     // The header gradient is ONE continuous wash from the window top
     // (behind the title bar — its fill is transparent in mini mode)
@@ -388,7 +395,7 @@ pub(crate) fn view(
             Pos2::new(tx, cover_rect.min.y),
             Align2::LEFT_TOP,
             state,
-            FontId::proportional(0.13 * h),
+            FontId::proportional(0.13 * text_h),
             Color32::from_gray(160),
         );
     }
@@ -407,7 +414,7 @@ pub(crate) fn view(
         })
         .unwrap_or_default();
     if !title.is_empty() {
-        let font = FontId::proportional(0.15 * h);
+        let font = FontId::proportional(0.15 * text_h);
         let galley = painter.layout_no_wrap(title.clone(), font.clone(), Color32::WHITE);
         let tw = galley.rect.width();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -467,7 +474,7 @@ pub(crate) fn view(
         Pos2::new(tx, cover_rect.max.y),
         Align2::LEFT_BOTTOM,
         format!("{} / {}", fmt_time(pos_s), fmt_time(dur_s)),
-        FontId::proportional(0.16 * h),
+        FontId::proportional(0.16 * text_h),
         Color32::from_gray(160),
     );
 
@@ -802,7 +809,7 @@ pub(crate) fn view(
         } else {
             format!("{:02}:{:02}", ts / 60, ts % 60)
         };
-        let font = FontId::proportional(0.13 * h); // Lacrima's 12 in the 90px world
+        let font = FontId::proportional(0.13 * text_h); // Lacrima's 12 in the 90px world
         let text = ellipsize(
             &painter,
             &format!("{idx} of {} - {dur}", carousel.len()),
@@ -852,7 +859,7 @@ pub(crate) fn view(
         .data_mut(|d| d.get_temp(ui.scope_id().with("mv-albums")))
         .unwrap_or(false);
     if interactive {
-        let menu_font = FontId::proportional(0.13 * h);
+        let menu_font = FontId::proportional(0.13 * text_h);
         let items: &[(&str, MiniMenu)] = if albums_open {
             &[
                 ("Create Album", MiniMenu::CreateAlbum),
@@ -1026,7 +1033,7 @@ pub(crate) fn view(
         ctx.request_repaint();
     }
     if list.height() > 0.15 * h {
-        let font = FontId::proportional(0.12 * h);
+        let font = FontId::proportional(0.12 * text_h);
         let row_h = font.size * 1.75;
         let idx_w = painter
             .layout_no_wrap(
@@ -1334,7 +1341,7 @@ pub(crate) fn view(
             bg.context_menu(|ui| {
                 ui.set_min_width(1.3 * h);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let font = FontId::proportional(0.13 * h);
+                let font = FontId::proportional(0.13 * text_h);
                 for (label, menu) in [
                     ("Add Files", MiniMenu::AddFiles),
                     ("Add Url", MiniMenu::AddUrl),
@@ -1534,7 +1541,7 @@ pub(crate) fn view(
                         resp.context_menu(|ui| {
                             ui.set_min_width(1.3 * h);
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            let font = FontId::proportional(0.13 * h);
+                            let font = FontId::proportional(0.13 * text_h);
                             for (label, menu) in [
                                 ("Add Files", MiniMenu::AddFiles),
                                 ("Add Url", MiniMenu::AddUrl),
@@ -1888,7 +1895,7 @@ pub(crate) fn view(
                 bg.context_menu(|ui| {
                     ui.set_min_width(1.3 * h);
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    let font = FontId::proportional(0.13 * h);
+                    let font = FontId::proportional(0.13 * text_h);
                     if ui
                         .button(egui::RichText::new("Create Album").font(font.clone()))
                         .clicked()
@@ -1928,9 +1935,9 @@ pub(crate) fn view(
                     let card_h = 0.5 * h;
                     let pitch = card_h + 0.05 * h;
                     let pad = 0.05 * h;
-                    let tfont = FontId::proportional(0.15 * h);
-                    let afont = FontId::proportional(0.105 * h);
-                    let sfont = FontId::proportional(0.1 * h);
+                    let tfont = FontId::proportional(0.15 * text_h);
+                    let afont = FontId::proportional(0.105 * text_h);
+                    let sfont = FontId::proportional(0.1 * text_h);
                     // Selected indices — the cards that float during a
                     // drag and the rows that count as "m" below.
                     let afrom = album_sel_indices(albums, &asel_set, asel);
@@ -2197,7 +2204,7 @@ pub(crate) fn view(
                             resp.context_menu(|ui| {
                                 ui.set_min_width(1.3 * h);
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                let font = FontId::proportional(0.13 * h);
+                                let font = FontId::proportional(0.13 * text_h);
                                 // The pointed card's primary action —
                                 // the double-click's menu twin.
                                 if ui
