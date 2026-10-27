@@ -33,6 +33,9 @@ pub struct Settings {
     /// (Lacrima's EmulationUseFirstItemCover / EmulationGameplayAutoplay /
     /// EmulationUseBackCoverLetterboxFill / GameplayRecordingOutputDirectory).
     pub emulation: Emulation,
+    /// Updates tab — startup check toggle + the release tag the user
+    /// dismissed (a newer tag still re-prompts).
+    pub updates: Updates,
     pub ui: Ui,
     /// Whether `Ui.ScaleFactor` was actually present in the loaded JSON —
     /// Lacrima's `HasPersistedScaleFactor`. When false, the app picks the
@@ -630,6 +633,24 @@ impl Default for Equalizer {
     }
 }
 
+/// Self-update prefs (Updates tab): whether to check on start and
+/// the tag the user last dismissed.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct Updates {
+    pub check_on_start: bool,
+    pub skipped_version: Option<String>,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self {
+            check_on_start: true,
+            skipped_version: None,
+        }
+    }
+}
+
 /// UI tab, 1.0..=3.0). Zooms all chrome uniformly.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
@@ -677,6 +698,7 @@ impl Default for Settings {
             equalizer: Equalizer::default(),
             audio: Audio::default(),
             emulation: Emulation::default(),
+            updates: Updates::default(),
             ui: Ui::default(),
             scale_factor_persisted: false,
         }

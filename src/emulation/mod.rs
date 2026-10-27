@@ -2660,7 +2660,7 @@ pub fn view(
 }
 
 /// The update prompt's running phase.
-enum UpdPhase {
+pub(crate) enum UpdPhase {
     /// Still downloading/installing — keep the dialog up.
     Running,
     /// Finished and acknowledged (auto on success, Close on error).
@@ -2671,7 +2671,7 @@ enum UpdPhase {
 /// dialog dressing as `confirm_overlay`, but a status line and a
 /// progress bar instead of buttons. Success closes on its own; a
 /// failure swaps the bar for the error + a Close button.
-fn upd_progress_overlay(
+pub(crate) fn upd_progress_overlay(
     ui: &mut egui::Ui,
     rect: Rect,
     title: &str,

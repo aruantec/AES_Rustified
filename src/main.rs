@@ -25,6 +25,7 @@ mod shared_tex;
 mod spectrum_bar;
 mod tag_editor;
 mod transport;
+mod updater;
 mod url_prompt;
 mod waveform_bar;
 mod widgets;
@@ -246,7 +247,17 @@ pub(crate) fn boot_mark(stage: &str) {
 }
 
 fn main() -> eframe::Result<()> {
+    // Staged self-update helper: this process IS the downloaded
+    // `AES-Oxide.new` — wait for the parent to release the installed
+    // binary, swap ourselves in, relaunch, exit. Never reaches egui.
+    let mut args = std::env::args();
+    if args.nth(1).as_deref() == Some("--apply-update") {
+        if let Some(target) = args.next() {
+            updater::apply_update_helper(std::path::Path::new(&target));
+        }
+    }
     let _ = BOOT_T0.set(std::time::Instant::now());
+    updater::startup_cleanup();
     // First-run rebrand migration — mandatory (no skip): the existing
     // AES_Rustified data root is renamed to AES_Oxide before anything
     // else touches it. A plain native dialog is enough; nothing of the
@@ -898,6 +909,8 @@ struct AesRustApp {
     /// Switch-style "exit fullscreen?" confirmation — see
     /// `FsExitPrompt`.
     fs_exit: FsExitPrompt,
+    /// Self-update check/prompt/job — see `AppUpd`.
+    upd: AppUpd,
     /// Item/album delete confirmation — same dialog style.
     del_prompt: DeletePrompt,
     /// Transient bottom-of-content notice ("Album already added"
@@ -983,6 +996,30 @@ struct FsExitPrompt {
     vis: f32,
     /// Exit confirmed — fullscreen leaves once the fade completes.
     pending_exit: bool,
+}
+
+/// Self-update state — startup check result → "update available"
+/// prompt (same confirm dialog as fullscreen-exit), then the running
+/// download/apply job. The Updates tab reuses `releases`/`job`.
+#[derive(Default)]
+struct AppUpd {
+    /// Startup latest-release check (spawned once when
+    /// `updates.check_on_start` is on).
+    check_rx: Option<std::sync::mpsc::Receiver<Result<Option<updater::Release>, String>>>,
+    /// Newer-than-installed release that triggered/triggered the prompt.
+    latest: Option<updater::Release>,
+    /// Updates-tab release list (stable + pre) fetched on demand.
+    rels_rx: Option<std::sync::mpsc::Receiver<Result<Vec<updater::Release>, String>>>,
+    releases: Option<Vec<updater::Release>>,
+    /// Fetch error the tab shows instead of the list.
+    rels_err: Option<String>,
+    /// Prompt dialog — open/vis/sel mirror FsExitPrompt.
+    open: bool,
+    vis: f32,
+    sel: usize,
+    /// Running download+stage job; `Some` flips the dialog to its
+    /// progress view and applies the update on success.
+    job: Option<updater::Shared>,
 }
 
 impl FsExitPrompt {
@@ -1897,6 +1934,14 @@ impl AesRustApp {
                 Some(library::spawn_scan(&settings.library.music_roots))
             },
             scan_seen: std::collections::HashSet::new(),
+            upd: AppUpd {
+                // Startup check — the prompt opens when it resolves.
+                check_rx: settings
+                    .updates
+                    .check_on_start
+                    .then(updater::spawn_latest),
+                ..Default::default()
+            },
             settings,
             // AES_AUTOLAUNCH diagnostics land on the Emulation page
             // so the hook in emulation::view fires immediately.
@@ -2491,6 +2536,42 @@ impl eframe::App for AesRustApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick_playback(ctx);
         fs_inflate_tick(ctx, std::time::Instant::now());
+
+        // Startup self-update check — a newer stable release opens the
+        // prompt unless the user already skipped that tag. Failures
+        // (offline/rate limit) stay silent here; the Updates tab shows
+        // them when asked.
+        if let Some(res) = self.upd.check_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.upd.check_rx = None;
+            if let Ok(Some(rel)) = res {
+                let newer = updater::version_cmp(&rel.tag, updater::current_version())
+                    == std::cmp::Ordering::Greater;
+                let skipped = self.settings.updates.skipped_version.as_deref()
+                    == Some(rel.tag.as_str());
+                if newer && !skipped {
+                    self.upd.sel = 0;
+                    self.upd.open = true;
+                }
+                if newer || self.settings.updates.skipped_version.as_deref()
+                    == Some(rel.tag.as_str())
+                {
+                    // Kept for the Updates tab either way — skipped
+                    // updates stay installable from there.
+                    self.upd.latest = Some(rel);
+                }
+            }
+        }
+        // Updates-tab release list (stable + pre) resolving.
+        if let Some(res) = self.upd.rels_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.upd.rels_rx = None;
+            match res {
+                Ok(list) => {
+                    self.upd.releases = Some(list);
+                    self.upd.rels_err = None;
+                }
+                Err(e) => self.upd.rels_err = Some(e),
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -3006,6 +3087,7 @@ impl AesRustApp {
             alt_down,
             alt_clean,
             fs_exit,
+            upd,
             del_prompt,
             notice,
             emu_close,
@@ -5257,6 +5339,7 @@ impl AesRustApp {
                         transport,
                         ytdlp,
                         emu,
+                        upd,
                         shadertoy.as_ref().map(|t| t.names()).unwrap_or(&[]),
                         overlay_s,
                         base,
@@ -5433,6 +5516,116 @@ impl AesRustApp {
                 {
                     settings::save(settings);
                     *last_save = std::time::Instant::now();
+                }
+
+                // App self-update prompt — the same confirm dialog,
+                // sitting just under fs_exit in the stack. Update runs
+                // the download+stage job in the progress view; on
+                // success it swaps the binary in place and relaunches
+                // (the "Restarting" stage covers the swap window).
+                // Skip parks the tag in settings — a newer tag still
+                // re-prompts, and the release stays installable from
+                // the Updates tab.
+                if upd.open || upd.vis > 0.001 {
+                    let dtu = ui.ctx().input(|i| i.stable_dt);
+                    upd.vis = (upd.vis + dtu / if upd.open { 0.18 } else { -0.14 })
+                        .clamp(0.0, 1.0);
+                    if upd.job.is_none() {
+                        let sub = upd
+                            .latest
+                            .as_ref()
+                            .map(|r| {
+                                format!(
+                                    "{} → {} is available.",
+                                    updater::current_version(),
+                                    r.tag
+                                )
+                            })
+                            .unwrap_or_default();
+                        match confirm_overlay(
+                            ui,
+                            content,
+                            "AES Oxide update",
+                            &sub,
+                            "Update",
+                            "Skip",
+                            &mut upd.sel,
+                            s,
+                            upd.vis,
+                            upd.open,
+                            "app-upd",
+                        ) {
+                            DialogAction::Confirm => {
+                                if let Some(rel) = upd.latest.clone() {
+                                    upd.job = Some(updater::start(rel));
+                                } else {
+                                    upd.open = false;
+                                }
+                            }
+                            DialogAction::Cancel => {
+                                upd.open = false;
+                                if let Some(rel) = &upd.latest {
+                                    settings.updates.skipped_version =
+                                        Some(rel.tag.clone());
+                                    settings::save(settings);
+                                }
+                            }
+                            DialogAction::None => {}
+                        }
+                    } else {
+                        let (stage, frac, done) = upd
+                            .job
+                            .as_ref()
+                            .map(|j| {
+                                let g =
+                                    j.lock().unwrap_or_else(|e| e.into_inner());
+                                (g.stage.clone(), g.frac, g.done.clone())
+                            })
+                            .unwrap_or_default();
+                        if let Some(Ok(_tag)) = &done {
+                            // Staged — swap + relaunch. The progress
+                            // view stays up through it ("Restarting…");
+                            // a failed swap surfaces as a job error
+                            // with the overlay's Close.
+                            if let Some(j) = &upd.job {
+                                if let Ok(mut g) = j.lock() {
+                                    g.stage = "Restarting…".into();
+                                }
+                            }
+                            match updater::apply_and_relaunch() {
+                                Ok(()) => ui
+                                    .ctx()
+                                    .send_viewport_cmd(ViewportCommand::Close),
+                                Err(e) => {
+                                    if let Some(j) = &upd.job {
+                                        if let Ok(mut g) = j.lock() {
+                                            g.done = Some(Err(e));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match emulation::upd_progress_overlay(
+                            ui,
+                            content,
+                            "Updating AES Oxide",
+                            &stage,
+                            frac,
+                            false,
+                            done.as_ref()
+                                .and_then(|d| d.as_ref().err().map(|e| e.as_str())),
+                            s,
+                            upd.vis,
+                        ) {
+                            emulation::UpdPhase::Running => {}
+                            emulation::UpdPhase::Closed => {
+                                upd.open = false;
+                                upd.job = None;
+                            }
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    ui.ctx().request_repaint();
                 }
 
                 // Switch-style exit-fullscreen confirmation — the
@@ -7480,6 +7673,7 @@ fn settings_overlay(
     transport: &mut transport::Transport,
     ytdlp: &mut ytdlp::YtDlp,
     emu: &mut emulation::EmuView,
+    upd: &mut AppUpd,
     toy_names: &[String],
     scale: f32,
     // The debounced monitor-DPI base — the Scaling slider's
@@ -7635,6 +7829,8 @@ fn settings_overlay(
         ui_tab_effects(ui, body_panel, t, settings, toy_names, scale, dpi_base);
     } else if *tab == 1 {
         emulation::settings_tab(ui, body_panel, t, emu, &mut settings.emulation, scale);
+    } else if *tab == 2 {
+        ui_tab_updates(ui, body_panel, t, upd, settings, scale);
     } else if *tab == 3 {
         ui_tab_audio(ui, body_panel, t, settings, scale);
     } else if *tab == 4 {
@@ -9477,6 +9673,344 @@ fn flat_button(
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     (enabled && resp.clicked(), rect.width())
+}
+
+/// Updates tab — AES Oxide self-update: the CURRENT VERSION /
+/// UPDATE AVAILABLE columns and button row mirror the yt-dlp card,
+/// then every published release (stable + pre) lists with an
+/// Update/Revert action. The download+stage job's progress shows in
+/// the shared overlay; on success the binary swaps and relaunches.
+fn ui_tab_updates(
+    ui: &mut egui::Ui,
+    panel: Rect,
+    t: f32,
+    upd: &mut AppUpd,
+    settings: &mut settings::Settings,
+    s: f32,
+) {
+    // Lazily fetch the release list the first time the tab opens.
+    if upd.releases.is_none() && upd.rels_rx.is_none() && upd.rels_err.is_none() {
+        upd.rels_rx = Some(updater::spawn_list());
+    }
+    if upd.rels_rx.is_some() {
+        ui.ctx().request_repaint();
+    }
+    let painter = ui.painter().clone();
+    let x = panel.min.x + 30.0 * s;
+    let right = panel.max.x - 30.0 * s;
+    let mut y = panel.min.y + 95.0 * s;
+    let whitesmoke = Color32::from_rgb(0xF5, 0xF5, 0xF5);
+    let darkgray = Color32::from_gray(0xA9);
+    let busy = upd.job.is_some();
+    let cur = updater::current_version();
+    let newer = upd
+        .latest
+        .as_ref()
+        .filter(|r| updater::version_cmp(&r.tag, cur) == std::cmp::Ordering::Greater);
+
+    painter.text(
+        Pos2::new(x, y),
+        Align2::LEFT_TOP,
+        "AES Oxide",
+        FontId::proportional(30.0 * s),
+        Color32::WHITE.gamma_multiply(t),
+    );
+    y += 46.0 * s;
+    painter.line_segment(
+        [Pos2::new(x, y), Pos2::new(right, y)],
+        Stroke::new(1.0, Color32::from_gray(55).gamma_multiply(t)),
+    );
+    y += 25.0 * s;
+
+    // Version columns (the yt-dlp card's two-column layout).
+    let small = FontId::proportional(14.0 * s);
+    let big = FontId::proportional(18.0 * s);
+    painter.text(
+        Pos2::new(x, y),
+        Align2::LEFT_TOP,
+        "CURRENT VERSION",
+        small.clone(),
+        darkgray.gamma_multiply(t),
+    );
+    let vrect = painter.text(
+        Pos2::new(x, y + 20.0 * s),
+        Align2::LEFT_TOP,
+        cur,
+        big.clone(),
+        whitesmoke.gamma_multiply(t),
+    );
+    let col_w = vrect.width().max(
+        painter
+            .layout_no_wrap("CURRENT VERSION".to_string(), small.clone(), Color32::WHITE)
+            .rect
+            .width(),
+    );
+    if let Some(rel) = newer {
+        let ux = x + col_w + 40.0 * s;
+        painter.text(
+            Pos2::new(ux, y),
+            Align2::LEFT_TOP,
+            "UPDATE AVAILABLE",
+            small,
+            Color32::GOLD.gamma_multiply(t),
+        );
+        painter.text(
+            Pos2::new(ux, y + 20.0 * s),
+            Align2::LEFT_TOP,
+            &rel.tag,
+            big,
+            Color32::GOLD.gamma_multiply(t),
+        );
+    }
+    y += 56.0 * s;
+
+    // Button row: Update (gold, when newer) + Check for Updates.
+    let gray = Color32::from_gray(0x3C);
+    let mut bx = x;
+    if let Some(rel) = newer.cloned() {
+        let (clicked, w) = flat_button(
+            ui,
+            Pos2::new(bx, y),
+            &format!("Update to {}", rel.tag),
+            s,
+            !busy,
+            Color32::GOLD,
+            Color32::BLACK,
+            t,
+        );
+        bx += w + 10.0 * s;
+        if clicked {
+            upd.job = Some(updater::start(rel));
+            upd.open = true;
+        }
+    }
+    let (clicked, _) = flat_button(
+        ui,
+        Pos2::new(bx, y),
+        "Check for Updates",
+        s,
+        !busy && upd.rels_rx.is_none() && upd.check_rx.is_none(),
+        gray,
+        Color32::WHITE,
+        t,
+    );
+    if clicked {
+        upd.rels_rx = Some(updater::spawn_list());
+        upd.check_rx = Some(updater::spawn_latest());
+        ui.ctx().request_repaint();
+    }
+    y += 48.0 * s;
+
+    // "Check for updates on start" toggle — persists like every other
+    // settings flip.
+    painter.text(
+        Pos2::new(x, y + 4.0 * s),
+        Align2::LEFT_CENTER,
+        "Check for updates on start",
+        FontId::proportional(16.0 * s),
+        whitesmoke.gamma_multiply(t),
+    );
+    let sw = Rect::from_min_size(
+        Pos2::new(x + 240.0 * s, y - 2.0 * s),
+        Vec2::new(44.0 * s, 22.0 * s),
+    );
+    let was = settings.updates.check_on_start;
+    toggle_switch(ui, sw, "upd-on-start", &mut settings.updates.check_on_start, t);
+    if settings.updates.check_on_start != was {
+        settings::save(settings);
+    }
+    y += 42.0 * s;
+
+    // Running job — stage text + the 2px busy bar the Libraries card
+    // uses (the shared overlay shows the same progress centered).
+    if let Some(j) = &upd.job {
+        let (stage, frac) = j
+            .lock()
+            .map(|g| (g.stage.clone(), g.frac))
+            .unwrap_or_default();
+        painter.text(
+            Pos2::new(x, y),
+            Align2::LEFT_TOP,
+            &stage,
+            FontId::proportional(14.0 * s),
+            darkgray.gamma_multiply(t),
+        );
+        let bar = Rect::from_min_size(
+            Pos2::new(x, y + 24.0 * s),
+            Vec2::new(400.0 * s, 2.0 * s),
+        );
+        painter.rect_filled(bar, 0, Color32::from_gray(60).gamma_multiply(t));
+        painter.rect_filled(
+            Rect::from_min_size(
+                bar.min,
+                Vec2::new(bar.width() * frac.clamp(0.0, 1.0), bar.height()),
+            ),
+            0,
+            Color32::from_gray(220).gamma_multiply(t),
+        );
+        ui.ctx().request_repaint();
+        y += 46.0 * s;
+    }
+
+    // Releases list — stable + pre; Update for newer, Revert for
+    // older, Installed for the running build.
+    painter.text(
+        Pos2::new(x, y),
+        Align2::LEFT_TOP,
+        "RELEASES",
+        FontId::proportional(13.0 * s),
+        darkgray.gamma_multiply(t),
+    );
+    y += 24.0 * s;
+    painter.line_segment(
+        [Pos2::new(x, y), Pos2::new(right, y)],
+        Stroke::new(1.0, Color32::from_gray(45).gamma_multiply(t)),
+    );
+    y += 12.0 * s;
+
+    if let Some(err) = &upd.rels_err {
+        painter.text(
+            Pos2::new(x, y + 8.0 * s),
+            Align2::LEFT_TOP,
+            &format!("Couldn't fetch releases: {err}"),
+            FontId::proportional(14.0 * s),
+            Color32::from_rgb(0xE0, 0x70, 0x70).gamma_multiply(t),
+        );
+        let (clicked, _) = flat_button(
+            ui,
+            Pos2::new(x, y + 40.0 * s),
+            "Retry",
+            s,
+            upd.rels_rx.is_none(),
+            gray,
+            Color32::WHITE,
+            t,
+        );
+        if clicked {
+            upd.rels_err = None;
+            upd.rels_rx = Some(updater::spawn_list());
+        }
+        return;
+    }
+    let Some(releases) = &upd.releases else {
+        painter.text(
+            Pos2::new(x, y + 8.0 * s),
+            Align2::LEFT_TOP,
+            "Fetching releases…",
+            FontId::proportional(14.0 * s),
+            darkgray.gamma_multiply(t),
+        );
+        return;
+    };
+    if releases.is_empty() {
+        painter.text(
+            Pos2::new(x, y + 8.0 * s),
+            Align2::LEFT_TOP,
+            "No releases published yet.",
+            FontId::proportional(14.0 * s),
+            darkgray.gamma_multiply(t),
+        );
+        return;
+    }
+
+    let row_h = 38.0 * s;
+    let tag_f = FontId::proportional(15.0 * s);
+    let meta_f = FontId::proportional(12.0 * s);
+    // Right-aligned row buttons need the width up front — same math
+    // flat_button uses (text + 30*s padding).
+    let btn_at = |origin: Pos2, label: &str| -> Rect {
+        let tw = painter
+            .layout_no_wrap(label.to_string(), FontId::proportional(14.0 * s), Color32::WHITE)
+            .rect
+            .width();
+        Rect::from_min_size(origin, Vec2::new(tw + 30.0 * s, 30.0 * s))
+    };
+    for rel in releases.clone() {
+        if y + row_h > panel.max.y - 90.0 * s {
+            break;
+        }
+        let cy = y + row_h / 2.0;
+        let mut tx = x;
+        let trect = painter.text(
+            Pos2::new(tx, cy - 8.0 * s),
+            Align2::LEFT_TOP,
+            &rel.tag,
+            tag_f.clone(),
+            whitesmoke.gamma_multiply(t),
+        );
+        tx += trect.width() + 10.0 * s;
+        if rel.prerelease {
+            // Small "PRE" chip — picks prereleases out of the list.
+            let pw = painter
+                .layout_no_wrap("PRE".to_string(), FontId::proportional(10.0 * s), Color32::WHITE)
+                .rect
+                .width()
+                + 10.0 * s;
+            let chip = Rect::from_min_size(
+                Pos2::new(tx, cy - 9.0 * s),
+                Vec2::new(pw, 16.0 * s),
+            );
+            painter.rect_filled(
+                chip,
+                CornerRadius::same((7.0 * s).round() as u8),
+                Color32::from_rgb(0x2A, 0x4A, 0x6A).gamma_multiply(t),
+            );
+            painter.text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                "PRE",
+                FontId::proportional(10.0 * s),
+                Color32::from_rgb(0x9C, 0xC8, 0xFF).gamma_multiply(t),
+            );
+            tx += pw + 10.0 * s;
+        }
+        painter.text(
+            Pos2::new(tx, cy - 6.0 * s),
+            Align2::LEFT_TOP,
+            &rel.date,
+            meta_f.clone(),
+            darkgray.gamma_multiply(t),
+        );
+
+        // Right-aligned action.
+        let cmp = updater::version_cmp(&rel.tag, cur);
+        let (label, enabled, bg, fg) = match cmp {
+            std::cmp::Ordering::Equal => {
+                ("Installed", false, gray, Color32::WHITE)
+            }
+            std::cmp::Ordering::Greater => {
+                ("Update", !busy, Color32::GOLD, Color32::BLACK)
+            }
+            std::cmp::Ordering::Less => ("Revert", !busy, gray, Color32::WHITE),
+        };
+        let br = btn_at(Pos2::new(0.0, cy - 15.0 * s), label);
+        // Scoped per release tag — several rows can all say "Update",
+        // and flat_button's interact id is keyed on the label.
+        let clicked = ui
+            .push_id(&rel.tag, |ui| {
+                flat_button(
+                    ui,
+                    Pos2::new(right - br.width(), br.min.y),
+                    label,
+                    s,
+                    enabled,
+                    bg,
+                    fg,
+                    t,
+                )
+                .0
+            })
+            .inner;
+        if clicked {
+            upd.job = Some(updater::start(rel));
+            upd.open = true;
+        }
+        y += row_h;
+        painter.line_segment(
+            [Pos2::new(x, y), Pos2::new(right, y)],
+            Stroke::new(1.0, Color32::from_gray(38).gamma_multiply(t)),
+        );
+    }
 }
 
 /// Libraries tab: Lacrima's "External tools" section — this build
